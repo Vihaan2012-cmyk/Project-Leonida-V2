@@ -45,6 +45,8 @@ pub enum Un {
     FFract,
     FSin,
     FCos,
+    F16ToF32,
+    F32ToF16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

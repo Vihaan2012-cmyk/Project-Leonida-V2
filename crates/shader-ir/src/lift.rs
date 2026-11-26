@@ -426,6 +426,60 @@ impl Lifter {
         }
     }
 
+    fn half_source(
+        &mut self,
+        arg: &Arg,
+        high: bool,
+        modifiers: bool,
+        inst: &Inst,
+    ) -> Result<Tmp, LiftError> {
+        let raw = match &arg.operand {
+            Operand::Float(_) => {
+                let bits = arg.operand.float_bits().unwrap_or(0);
+                return Ok(self.half_modifiers(self_constant_half(bits), arg, modifiers));
+            }
+            _ => self.lane(arg, inst)?,
+        };
+        let raw = if high {
+            let sixteen = self.c(16);
+            self.bin(Bin::ShrU, raw, sixteen)
+        } else {
+            raw
+        };
+        let mask = self.c(0xFFFF);
+        let half = self.bin(Bin::And, raw, mask);
+        Ok(self.half_modifiers(half.into(), arg, modifiers))
+    }
+
+    fn half_modifiers(&mut self, half: Half, arg: &Arg, modifiers: bool) -> Tmp {
+        let mut half = match half {
+            Half::Tmp(tmp) => tmp,
+            Half::Bits(bits) => self.c(bits),
+        };
+        if modifiers && arg.abs {
+            let mask = self.c(0x7FFF);
+            half = self.bin(Bin::And, half, mask);
+        }
+        if modifiers && arg.neg {
+            let sign = self.c(0x8000);
+            half = self.bin(Bin::Xor, half, sign);
+        }
+        half
+    }
+
+    fn keep_half(&mut self, target: u8, half: Tmp, high: bool) -> Tmp {
+        let old = self.value(Expr::Get(Reg::V(target)));
+        let keep = self.c(if high { 0xFFFF } else { 0xFFFF_0000 });
+        let kept = self.bin(Bin::And, old, keep);
+        let placed = if high {
+            let sixteen = self.c(16);
+            self.bin(Bin::Shl, half, sixteen)
+        } else {
+            half
+        };
+        self.bin(Bin::Or, kept, placed)
+    }
+
     fn extract(&mut self, value: Tmp, select: Select, sext: bool) -> Tmp {
         let Some((shift, width)) = field(select) else {
             return value;
@@ -1096,6 +1150,65 @@ impl Lifter {
                 let add = self.lane(arg(2)?, inst)?;
                 self.bin(Bin::Add, count, add)
             }
+            "v_cvt_f32_f16" => {
+                let half = self.half_source(arg(1)?, false, true, inst)?;
+                let value = self.un(Un::F16ToF32, half);
+                self.output_modifiers(value, inst)
+            }
+            "v_cvt_f16_f32" => {
+                if has_output_modifiers(inst) {
+                    return Err(unsupported(inst));
+                }
+                let (target, _) = vgprs(arg(0)?, inst)?;
+                let single = self.flane(arg(1)?, inst)?;
+                let half = self.un(Un::F32ToF16, single);
+                if self.destination.is_some() {
+                    half
+                } else {
+                    self.keep_half(target, half, false)
+                }
+            }
+            "v_pack_b32_f16" => {
+                if has_output_modifiers(inst) {
+                    return Err(unsupported(inst));
+                }
+                let select = op_sel(inst, "op_sel");
+                let low = self.half_source(arg(1)?, select[0], true, inst)?;
+                let high = self.half_source(arg(2)?, select[1], true, inst)?;
+                let sixteen = self.c(16);
+                let high = self.bin(Bin::Shl, high, sixteen);
+                self.bin(Bin::Or, low, high)
+            }
+            "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
+                let halves = op_sel(inst, "op_sel_hi");
+                let select = op_sel(inst, "op_sel");
+                let mut sources = Vec::new();
+                for i in 0..3 {
+                    let source = arg(i + 1)?;
+                    let mut value = if halves[i] {
+                        let half = self.half_source(source, select[i], false, inst)?;
+                        self.un(Un::F16ToF32, half)
+                    } else {
+                        self.lane(source, inst)?
+                    };
+                    if source.abs {
+                        value = self.un(Un::FAbs, value);
+                    }
+                    if source.neg {
+                        value = self.un(Un::FNeg, value);
+                    }
+                    sources.push(value);
+                }
+                let value = self.value(Expr::Tri(Tri::FFma, sources[0], sources[1], sources[2]));
+                let value = self.output_modifiers(value, inst);
+                if name == "v_fma_mix_f32" {
+                    value
+                } else {
+                    let (target, _) = vgprs(arg(0)?, inst)?;
+                    let half = self.un(Un::F32ToF16, value);
+                    self.keep_half(target, half, name == "v_fma_mixhi_f16")
+                }
+            }
             "v_fmaak_f32" | "v_madak_f32" | "v_fmamk_f32" | "v_madmk_f32" => {
                 let a = self.flane(arg(1)?, inst)?;
                 let b = self.flane(arg(2)?, inst)?;
@@ -1729,6 +1842,42 @@ fn harmless_setreg(inst: &Inst) -> bool {
     let offset = (code >> 6) & 31;
     let size = ((code >> 11) & 31) + 1;
     code & 63 == 1 && offset + size <= 4 && value == 0
+}
+
+enum Half {
+    Tmp(Tmp),
+    Bits(u32),
+}
+
+impl From<Tmp> for Half {
+    fn from(tmp: Tmp) -> Half {
+        Half::Tmp(tmp)
+    }
+}
+
+fn self_constant_half(bits: u32) -> Half {
+    Half::Bits(rdna::format::f32_to_f16(bits))
+}
+
+fn has_output_modifiers(inst: &Inst) -> bool {
+    inst.mods
+        .iter()
+        .any(|m| m == "clamp" || m.starts_with("mul:") || m.starts_with("div:"))
+}
+
+fn op_sel(inst: &Inst, key: &str) -> [bool; 4] {
+    let mut bits = [false; 4];
+    let list = inst
+        .mods
+        .iter()
+        .find_map(|m| m.strip_prefix(key)?.strip_prefix(":["))
+        .and_then(|rest| rest.strip_suffix(']'));
+    if let Some(list) = list {
+        for (slot, value) in bits.iter_mut().zip(list.split(',')) {
+            *slot = value.trim() == "1";
+        }
+    }
+    bits
 }
 
 fn vgprs(arg: &Arg, inst: &Inst) -> Result<(u8, u8), LiftError> {

@@ -180,6 +180,8 @@ fn unary(op: Un, a: u64, mode: Mode) -> u64 {
     let x = a as u32;
     match op {
         Un::Not => u64::from(!x),
+        Un::F16ToF32 => u64::from(rdna::format::f16_to_f32(x & 0xFFFF, true)),
+        Un::F32ToF16 => u64::from(rdna::format::f32_to_f16(x)),
         Un::Bfrev => u64::from(x.reverse_bits()),
         Un::Ffbl => u64::from(if x == 0 { u32::MAX } else { x.trailing_zeros() }),
         Un::Ffbh => u64::from(if x == 0 { u32::MAX } else { x.leading_zeros() }),

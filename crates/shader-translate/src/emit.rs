@@ -712,7 +712,11 @@ impl Emitter {
         let is_nan_payload = ok(self.b.i_not_equal(bool_, None, mantissa, empty))?;
         let infinity = c(self, 0x7F80_0000);
         let special = ok(self.b.select(u32_, None, is_nan_payload, special, infinity))?;
-        let special = ok(self.b.bitwise_or(u32_, None, special, wide))?;
+        let special = if quiet {
+            special
+        } else {
+            ok(self.b.bitwise_or(u32_, None, special, wide))?
+        };
         let float = ok(self.b.convert_u_to_f(f32_, None, mantissa))?;
         let scale = self.f32c(f32::from_bits(0x3380_0000));
         let small = ok(self.b.f_mul(f32_, None, float, scale))?;
@@ -723,6 +727,68 @@ impl Emitter {
         let magnitude = ok(self.b.select(u32_, None, bottom, small, normal))?;
         let magnitude = ok(self.b.select(u32_, None, top, special, magnitude))?;
         ok(self.b.bitwise_or(u32_, None, sign, magnitude))
+    }
+
+    fn single_to_half(&mut self, single: Word) -> Result<Word, EmitError> {
+        let (u32_, bool_) = (self.t.u32_, self.t.bool_);
+        let c = |e: &mut Self, v: u32| e.u32c(v);
+        let sixteen = c(self, 16);
+        let sign = ok(self.b.shift_right_logical(u32_, None, single, sixteen))?;
+        let sign_bit = c(self, 0x8000);
+        let sign = ok(self.b.bitwise_and(u32_, None, sign, sign_bit))?;
+        let twenty_three = c(self, 23);
+        let exponent = ok(self.b.shift_right_logical(u32_, None, single, twenty_three))?;
+        let byte = c(self, 0xFF);
+        let exponent = ok(self.b.bitwise_and(u32_, None, exponent, byte))?;
+        let fraction = c(self, 0x7F_FFFF);
+        let mantissa = ok(self.b.bitwise_and(u32_, None, single, fraction))?;
+        let zero = c(self, 0);
+        let one = c(self, 1);
+        let bias = c(self, 112);
+        let biased = ok(self.b.i_sub(u32_, None, exponent, bias))?;
+        let round = |e: &mut Self, value: Word, shift: Word| -> Result<Word, EmitError> {
+            let quotient = ok(e.b.shift_right_logical(u32_, None, value, shift))?;
+            let one = e.u32c(1);
+            let bit = ok(e.b.shift_left_logical(u32_, None, one, shift))?;
+            let low = ok(e.b.i_sub(u32_, None, bit, one))?;
+            let rest = ok(e.b.bitwise_and(u32_, None, value, low))?;
+            let half = ok(e.b.shift_right_logical(u32_, None, bit, one))?;
+            let above = ok(e.b.u_greater_than(bool_, None, rest, half))?;
+            let tie = ok(e.b.i_equal(bool_, None, rest, half))?;
+            let odd = ok(e.b.bitwise_and(u32_, None, quotient, one))?;
+            let none = e.u32c(0);
+            let odd = ok(e.b.i_not_equal(bool_, None, odd, none))?;
+            let tie = ok(e.b.logical_and(bool_, None, tie, odd))?;
+            let up = ok(e.b.logical_or(bool_, None, above, tie))?;
+            let zero = e.u32c(0);
+            let step = ok(e.b.select(u32_, None, up, one, zero))?;
+            ok(e.b.i_add(u32_, None, quotient, step))
+        };
+        let packed = ok(self.b.shift_left_logical(u32_, None, biased, twenty_three))?;
+        let packed = ok(self.b.bitwise_or(u32_, None, packed, mantissa))?;
+        let thirteen = c(self, 13);
+        let normal = round(self, packed, thirteen)?;
+        let implicit = c(self, 0x80_0000);
+        let full = ok(self.b.bitwise_or(u32_, None, mantissa, implicit))?;
+        let fourteen = c(self, 14);
+        let shift = ok(self.b.i_sub(u32_, None, fourteen, biased))?;
+        let shift = self.masked_shift(shift, 31)?;
+        let tiny = round(self, full, shift)?;
+        let infinity = c(self, 0x7C00);
+        let nan = c(self, 0x7E00);
+        let empty = ok(self.b.i_equal(bool_, None, mantissa, zero))?;
+        let special = ok(self.b.select(u32_, None, empty, infinity, nan))?;
+        let top = ok(self.b.i_equal(bool_, None, exponent, byte))?;
+        let thirty_one = c(self, 31);
+        let overflow = ok(self.b.s_greater_than_equal(bool_, None, biased, thirty_one))?;
+        let positive = ok(self.b.s_greater_than_equal(bool_, None, biased, one))?;
+        let minus_ten = c(self, (-10i32) as u32);
+        let underflow = ok(self.b.s_less_than(bool_, None, biased, minus_ten))?;
+        let value = ok(self.b.select(u32_, None, positive, normal, tiny))?;
+        let value = ok(self.b.select(u32_, None, underflow, zero, value))?;
+        let value = ok(self.b.select(u32_, None, overflow, infinity, value))?;
+        let value = ok(self.b.select(u32_, None, top, special, value))?;
+        ok(self.b.bitwise_or(u32_, None, sign, value))
     }
 
     fn convert_field(
@@ -1219,6 +1285,12 @@ impl Emitter {
         let (u32_, u64_, f32_, bool_) = (self.t.u32_, self.t.u64_, self.t.f32_, self.t.bool_);
         Ok(match op {
             Un::Not => ok(self.b.not(u32_, None, a))?,
+            Un::F16ToF32 => {
+                let mask = self.u32c(0xFFFF);
+                let half = ok(self.b.bitwise_and(u32_, None, a, mask))?;
+                self.half_to_single(half, true)?
+            }
+            Un::F32ToF16 => self.single_to_half(a)?,
             Un::Not64 => ok(self.b.not(u64_, None, a))?,
             Un::Bfrev => ok(self.b.bit_reverse(u32_, None, a))?,
             Un::Ffbl => self.glsl(u32_, GLOp::FindILsb, &[a])?,

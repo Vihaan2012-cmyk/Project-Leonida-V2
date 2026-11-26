@@ -162,7 +162,8 @@ pub fn f16_to_f32(half: u32, quiet: bool) -> u32 {
     let mantissa = half & 0x3FF;
     match exponent {
         0x1F if mantissa == 0 => sign | 0x7F80_0000,
-        0x1F => sign | 0x7F80_0000 | (mantissa << 13) | if quiet { 0x40_0000 } else { 0 },
+        0x1F if quiet => sign | 0x7FC0_0000,
+        0x1F => sign | 0x7F80_0000 | (mantissa << 13),
         0 => sign | (mantissa as f32 * f32::from_bits(0x3380_0000)).to_bits(),
         _ => sign | ((exponent + 112) << 23) | (mantissa << 13),
     }
@@ -173,13 +174,7 @@ pub fn f32_to_f16(single: u32) -> u32 {
     let exponent = ((single >> 23) & 0xFF) as i32;
     let mantissa = single & 0x7F_FFFF;
     if exponent == 0xFF {
-        return sign
-            | 0x7C00
-            | if mantissa != 0 {
-                0x200 | (mantissa >> 13)
-            } else {
-                0
-            };
+        return sign | if mantissa != 0 { 0x7E00 } else { 0x7C00 };
     }
     let biased = exponent - 112;
     if biased >= 31 {

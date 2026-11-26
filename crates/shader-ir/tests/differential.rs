@@ -172,7 +172,7 @@ fn unsupported_instructions_are_reported() {
 #[test]
 fn random_programs_match_the_reference() {
     let mut completed = 0;
-    for seed in 1..=400u64 {
+    for seed in 1..=1500u64 {
         for wave64 in [false, true] {
             let mut generator = Generator {
                 rng: Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1),
@@ -186,5 +186,5 @@ fn random_programs_match_the_reference() {
             completed += usize::from(check(&source, wave, memory(seed)));
         }
     }
-    assert!(completed > 780, "{completed}");
+    assert!(completed > 2950, "{completed}");
 }

@@ -287,6 +287,11 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
             }
             return Ok(true);
         }
+        "v_cvt_f32_f16" | "v_cvt_f16_f32" | "v_pack_b32_f16" | "v_fma_mix_f32"
+        | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
+            half_op(name, inst, wave)?;
+            return Ok(true);
+        }
         "v_cvt_pk_u8_f32" => {
             for lane in wave.active_lanes() {
                 let x = wave.read_lane_f32(arg(inst, 1)?, lane, inst)?;
@@ -609,6 +614,7 @@ fn sdwa(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
             reg: (SCRATCH + 3) as u8,
             count: 1,
         });
+        wave.vgpr[SCRATCH + 3] = [0; 64];
         Some(usize::from(reg))
     };
     let done = execute(name, &modified, wave);
@@ -637,4 +643,125 @@ fn sdwa(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
         wave.vgpr[SCRATCH + i] = lanes;
     }
     done
+}
+
+fn selects(inst: &Inst, key: &str) -> [bool; 4] {
+    let mut bits = [false; 4];
+    if let Some(list) = inst
+        .mods
+        .iter()
+        .find_map(|m| m.strip_prefix(key)?.strip_prefix(":["))
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        for (slot, value) in bits.iter_mut().zip(list.split(',')) {
+            *slot = value.trim() == "1";
+        }
+    }
+    bits
+}
+
+fn output_modified(inst: &Inst) -> bool {
+    inst.mods
+        .iter()
+        .any(|m| m == "clamp" || m.starts_with("mul:") || m.starts_with("div:"))
+}
+
+fn half_of(
+    wave: &Wave,
+    source: &Arg,
+    lane: usize,
+    high: bool,
+    modifiers: bool,
+    inst: &Inst,
+) -> Result<u32> {
+    let mut half = match source.operand {
+        Operand::Float(_) => rdna::format::f32_to_f16(source.operand.float_bits().unwrap_or(0)),
+        _ => {
+            let raw = wave.read_lane(source, lane, inst)?;
+            (if high { raw >> 16 } else { raw }) & 0xFFFF
+        }
+    };
+    if modifiers && source.abs {
+        half &= 0x7FFF;
+    }
+    if modifiers && source.neg {
+        half ^= 0x8000;
+    }
+    Ok(half)
+}
+
+fn half_op(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
+    let Operand::Vgpr { reg, .. } = arg(inst, 0)?.operand else {
+        return Err(bad(inst));
+    };
+    let target = usize::from(reg);
+    if matches!(name, "v_cvt_f16_f32" | "v_pack_b32_f16") && output_modified(inst) {
+        return Err(crate::ExecError::Unsupported {
+            pc: inst.pc,
+            text: inst.text(),
+        });
+    }
+    for lane in wave.active_lanes() {
+        let old = wave.vgpr[target][lane];
+        let value = match name {
+            "v_cvt_f32_f16" => {
+                let half = half_of(wave, arg(inst, 1)?, lane, false, true, inst)?;
+                let single = rdna::format::f16_to_f32(half, true);
+                if output_modified(inst) {
+                    output_modifiers(wave, inst, f32::from_bits(single)).to_bits()
+                } else {
+                    single
+                }
+            }
+            "v_cvt_f16_f32" => {
+                let source = arg(inst, 1)?;
+                let mut bits = wave.read_lane(source, lane, inst)?;
+                if source.abs {
+                    bits &= 0x7FFF_FFFF;
+                }
+                if source.neg {
+                    bits ^= 0x8000_0000;
+                }
+                (old & 0xFFFF_0000) | rdna::format::f32_to_f16(bits)
+            }
+            "v_pack_b32_f16" => {
+                let select = selects(inst, "op_sel");
+                let low = half_of(wave, arg(inst, 1)?, lane, select[0], true, inst)?;
+                let high = half_of(wave, arg(inst, 2)?, lane, select[1], true, inst)?;
+                low | (high << 16)
+            }
+            _ => {
+                let halves = selects(inst, "op_sel_hi");
+                let select = selects(inst, "op_sel");
+                let mut values = [0.0f32; 3];
+                for (i, slot) in values.iter_mut().enumerate() {
+                    let source = arg(inst, i + 1)?;
+                    *slot = if halves[i] {
+                        let half = half_of(wave, source, lane, select[i], false, inst)?;
+                        let mut value = f32::from_bits(rdna::format::f16_to_f32(half, true));
+                        if source.abs {
+                            value = value.abs();
+                        }
+                        if source.neg {
+                            value = -value;
+                        }
+                        wave.flush(value)
+                    } else {
+                        wave.read_lane_f32(source, lane, inst)?
+                    };
+                }
+                let [a, b, c] = values;
+                let result = output_modifiers(wave, inst, nan_rule(a.mul_add(b, c), &[a, b, c]));
+                match name {
+                    "v_fma_mix_f32" => result.to_bits(),
+                    "v_fma_mixlo_f16" => {
+                        (old & 0xFFFF_0000) | rdna::format::f32_to_f16(result.to_bits())
+                    }
+                    _ => (old & 0xFFFF) | (rdna::format::f32_to_f16(result.to_bits()) << 16),
+                }
+            }
+        };
+        wave.vgpr[target][lane] = value;
+    }
+    Ok(())
 }

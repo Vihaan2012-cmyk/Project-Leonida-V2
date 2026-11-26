@@ -211,6 +211,76 @@ impl Generator {
         }
     }
 
+    fn half_source(&mut self) -> String {
+        let value = if self.rng.chance(5) {
+            self.rng.pick(&FLOATS).to_string()
+        } else {
+            self.vsrc(false)
+        };
+        match self.rng.below(5) {
+            0 => format!("-{value}"),
+            1 => format!("|{value}|"),
+            _ => value,
+        }
+    }
+
+    fn half(&mut self) -> String {
+        let bit = |g: &mut Self| g.rng.below(2);
+        match self.rng.below(6) {
+            0 => format!("v_cvt_f16_f32_e32 {}, {}", self.vdst(), self.fvsrc(true)),
+            1 => format!("v_cvt_f16_f32_e64 {}, {}", self.vdst(), self.fsrc()),
+            2 => {
+                if self.rng.chance(2) {
+                    format!("v_cvt_f32_f16_e32 {}, {}", self.fdst(), self.vsrc(true))
+                } else {
+                    let omod = self.omod();
+                    format!(
+                        "v_cvt_f32_f16_e64 {}, {}{omod}",
+                        self.fdst(),
+                        self.half_source()
+                    )
+                }
+            }
+            3 => {
+                let (a, b) = (bit(self), bit(self));
+                let (x, y) = (self.half_source(), self.half_source());
+                format!("v_pack_b32_f16 {}, {x}, {y} op_sel:[{a},{b}]", self.vdst())
+            }
+            _ => {
+                let op = self
+                    .rng
+                    .pick(&["v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16"]);
+                let hi = [bit(self), bit(self), bit(self)];
+                let sel = [bit(self), bit(self), bit(self)];
+                let mut sources = Vec::new();
+                for half in hi {
+                    let source = if half == 1 {
+                        self.half_source()
+                    } else {
+                        self.fsrc()
+                    };
+                    sources.push(source);
+                }
+                let target = if op == "v_fma_mix_f32" {
+                    self.fdst()
+                } else {
+                    self.vdst()
+                };
+                let clamp = if self.rng.chance(4) { " clamp" } else { "" };
+                format!(
+                    "{op} {target}, {} op_sel:[{},{},{}] op_sel_hi:[{},{},{}]{clamp}",
+                    sources.join(", "),
+                    sel[0],
+                    sel[1],
+                    sel[2],
+                    hi[0],
+                    hi[1],
+                    hi[2]
+                )
+            }
+        }
+    }
+
     fn sdwa_source(&mut self, scalar: bool) -> String {
         let register = if scalar && self.rng.chance(4) {
             self.sreg()
@@ -256,15 +326,17 @@ impl Generator {
                 )
             }
             1 => {
-                let op =
-                    self.rng
-                        .pick(&["v_mov_b32", "v_not_b32", "v_cvt_f32_u32", "v_cvt_f32_i32"]);
-                let target = if op.starts_with("v_cvt") {
-                    self.fdst()
-                } else {
-                    self.vdst()
-                };
-                let d = if op.starts_with("v_cvt") { "DWORD" } else { d };
+                let op = self.rng.pick(&[
+                    "v_mov_b32",
+                    "v_not_b32",
+                    "v_cvt_f32_u32",
+                    "v_cvt_f32_i32",
+                    "v_cvt_f16_f32",
+                    "v_cvt_f32_f16",
+                ]);
+                let float_out = op.starts_with("v_cvt_f32");
+                let target = if float_out { self.fdst() } else { self.vdst() };
+                let d = if float_out { "DWORD" } else { d };
                 let source = self.sdwa_source(true);
                 format!(
                     "{op}_sdwa {target}, {source} dst_sel:{d} dst_unused:{unused} src0_sel:{s0}"
@@ -459,7 +531,7 @@ impl Generator {
     }
 
     fn vector(&mut self) -> String {
-        match self.rng.below(19) {
+        match self.rng.below(21) {
             0 | 1 => {
                 let op = self.rng.pick(&[
                     "v_add_nc_u32",
@@ -661,6 +733,7 @@ impl Generator {
             }
             10 => self.compare(),
             16 => self.sdwa(),
+            18 | 19 => self.half(),
             17 => {
                 let mut selectors = 0u32;
                 for i in 0..4 {
