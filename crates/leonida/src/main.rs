@@ -18,6 +18,7 @@ fn main() -> ExitCode {
         Some(Command::Shaders(shaders)) => match &shaders.command {
             ShadersCommand::Scan(args) => cmd_shaders::scan_command(args),
             ShadersCommand::Disasm(args) => cmd_shaders::disasm_command(args),
+            ShadersCommand::Report(args) => cmd_shaders::report_command(args),
         },
     };
     result.unwrap_or_else(|error| {

@@ -498,6 +498,8 @@ dependencies = [
  "leonida-ui",
  "rdna",
  "shader-container",
+ "shader-ir",
+ "shader-translate",
  "tempfile",
 ]
 

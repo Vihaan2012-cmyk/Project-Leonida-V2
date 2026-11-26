@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -7,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use game_package::{Manifest, map_file, package_path};
 use shader_container::{CodeRange, Fssm, ScanSummary, WaveSize, carve, scan::scan, unpack_all};
 
-use crate::cli::{DisasmArgs, ScanArgs};
+use crate::cli::{DisasmArgs, ReportArgs, ScanArgs};
 use crate::game::resolve_game;
 
 fn with_archive<T>(
@@ -75,5 +76,124 @@ fn print_program(name: &Path, blob: &[u8]) -> Result<ExitCode> {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    })
+}
+
+#[derive(Default)]
+struct Report {
+    shaders: usize,
+    wave64: usize,
+    unreadable: usize,
+    invalid: usize,
+    complete: usize,
+    lifted: usize,
+    emitted: usize,
+    instructions: usize,
+    unsupported: usize,
+    missing: BTreeMap<String, (usize, usize)>,
+    lift_errors: BTreeMap<String, usize>,
+}
+
+impl Report {
+    fn add(&mut self, blob: &[u8]) -> Option<()> {
+        let fssm = Fssm::parse(blob).ok()?;
+        let CodeRange::Header { start, end } = fssm.code_range() else {
+            return None;
+        };
+        let wave64 = fssm.wave_size() == WaveSize::Wave64;
+        let code = blob.get(start..end)?;
+        self.shaders += 1;
+        self.wave64 += usize::from(wave64);
+        let coverage = shader_ir::coverage(code, wave64);
+        self.instructions += coverage.instructions;
+        self.unsupported += coverage.unsupported.len();
+        self.invalid += usize::from(coverage.invalid_words > 0);
+        for name in &coverage.unsupported {
+            self.missing.entry(name.clone()).or_default().1 += 1;
+        }
+        for name in coverage.unsupported.iter().collect::<BTreeSet<_>>() {
+            self.missing.entry(name.clone()).or_default().0 += 1;
+        }
+        if coverage.unsupported.is_empty() && coverage.invalid_words == 0 {
+            self.complete += 1;
+            match shader_ir::lift(code, wave64) {
+                Ok(function) if function.verify().is_ok() => {
+                    self.lifted += 1;
+                    let options = shader_translate::HarnessOptions {
+                        lds_words: 4096,
+                        nan_preserve: false,
+                        flush_denormals: false,
+                        preserve_denormals: false,
+                    };
+                    self.emitted +=
+                        usize::from(shader_translate::harness(&function, &options).is_ok());
+                }
+                Ok(_) => {
+                    *self
+                        .lift_errors
+                        .entry("does not verify".into())
+                        .or_default() += 1
+                }
+                Err(error) => *self.lift_errors.entry(error.to_string()).or_default() += 1,
+            }
+        }
+        Some(())
+    }
+
+    fn print(&self, top: usize) {
+        let percent = |part: usize, whole: usize| 100.0 * part as f64 / whole.max(1) as f64;
+        println!(
+            "shaders: {} ({} wave64, {} wave32), {} unreadable",
+            self.shaders,
+            self.wave64,
+            self.shaders - self.wave64,
+            self.unreadable
+        );
+        println!(
+            "instructions: {}, of which the translator handles {:.1}%",
+            self.instructions,
+            percent(self.instructions - self.unsupported, self.instructions)
+        );
+        println!("shaders with undecodable words: {}", self.invalid);
+        println!(
+            "shaders the translator fully handles: {} ({:.1}%), lifted and checked: {}, turned into SPIR-V: {}",
+            self.complete,
+            percent(self.complete, self.shaders),
+            self.lifted,
+            self.emitted
+        );
+        for (error, count) in &self.lift_errors {
+            println!("  {count} stopped at: {error}");
+        }
+        let mut missing: Vec<_> = self.missing.iter().collect();
+        missing.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        println!(
+            "missing instructions ({} kinds), by shaders that need them:",
+            missing.len()
+        );
+        for (name, (shaders, uses)) in missing.into_iter().take(top) {
+            println!("  {name:<32} {shaders:>6} shaders {uses:>9} uses");
+        }
+    }
+}
+
+pub fn report_command(args: &ReportArgs) -> Result<ExitCode> {
+    with_archive(args.game.as_ref(), |archive| {
+        let mut report = Report::default();
+        carve(archive, |shader| {
+            let added = unpack_all(&shader.dxbc)
+                .ok()
+                .and_then(|blobs| blobs.last().and_then(|blob| report.add(blob)));
+            if added.is_none() {
+                report.unreadable += 1;
+            }
+            ControlFlow::Continue(())
+        });
+        report.print(args.top);
+        Ok(if report.shaders == 0 {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        })
     })
 }

@@ -30,6 +30,18 @@ pub enum ShadersCommand {
     Scan(ScanArgs),
     /// Print one shader's GPU instructions.
     Disasm(DisasmArgs),
+    /// Check how much of every shader the translator handles, and list what it can't yet. Writes nothing.
+    Report(ReportArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ReportArgs {
+    /// The game folder. Searched for when omitted.
+    #[arg(long)]
+    pub game: Option<PathBuf>,
+    /// How many missing instructions to list.
+    #[arg(long, default_value_t = 40)]
+    pub top: usize,
 }
 
 #[derive(Debug, Args)]

@@ -12,6 +12,8 @@ game-package.workspace = true
 leonida-ui.workspace = true
 rdna.workspace = true
 shader-container.workspace = true
+shader-ir.workspace = true
+shader-translate.workspace = true
 
 [build-dependencies]
 embed-manifest = "1.5"

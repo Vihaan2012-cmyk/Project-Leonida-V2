@@ -101,6 +101,45 @@ pub fn lift(code: &[u8], wave64: bool) -> Result<Function, LiftError> {
     })
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct Coverage {
+    pub instructions: usize,
+    pub invalid_words: usize,
+    pub unsupported: Vec<String>,
+}
+
+pub fn coverage(code: &[u8], wave64: bool) -> Coverage {
+    let decoded = rdna::decode_all(code, !wave64, 0);
+    let mut unsupported = Vec::new();
+    for inst in &decoded.insts {
+        let mut lifter = Lifter {
+            wave64,
+            stmts: Vec::new(),
+            next: 0,
+        };
+        let supported = if is_end(inst) {
+            true
+        } else if branch_target(inst).is_some() {
+            lifter.condition(inst).is_ok()
+        } else {
+            lifter.inst(inst).is_ok()
+        };
+        if !supported {
+            let name = inst.name.as_str();
+            let base = name
+                .strip_suffix("_e32")
+                .or_else(|| name.strip_suffix("_e64"))
+                .unwrap_or(name);
+            unsupported.push(base.to_string());
+        }
+    }
+    Coverage {
+        instructions: decoded.insts.len(),
+        invalid_words: decoded.invalid,
+        unsupported,
+    }
+}
+
 fn is_end(inst: &Inst) -> bool {
     inst.name.starts_with("s_endpgm")
 }
