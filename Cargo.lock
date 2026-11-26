@@ -616,6 +616,9 @@ dependencies = [
 [[package]]
 name = "rdna"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "rfd"

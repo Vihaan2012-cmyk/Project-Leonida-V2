@@ -1,5 +1,6 @@
 use crate::formats::FORMATS;
 use crate::inst::{Arg, Inst, Operand};
+use crate::names::{MIMG_DIMS, SDWA_SELS, SDWA_UNUSED, hwreg, sendmsg};
 use crate::opcodes as op;
 use crate::table::{Field, OpInfo, contains, lookup};
 
@@ -27,22 +28,8 @@ const INLINE_FLOATS: [(u32, &str); 9] = [
     (248, "0.15915494"),
 ];
 const VOP2_MANDATORY_LITERAL: [u32; 6] = [0x20, 0x21, 0x2C, 0x2D, 0x37, 0x38];
-const MIMG_DIMS: [&str; 8] = [
-    "SQ_RSRC_IMG_1D",
-    "SQ_RSRC_IMG_2D",
-    "SQ_RSRC_IMG_3D",
-    "SQ_RSRC_IMG_CUBE",
-    "SQ_RSRC_IMG_1D_ARRAY",
-    "SQ_RSRC_IMG_2D_ARRAY",
-    "SQ_RSRC_IMG_2D_MSAA",
-    "SQ_RSRC_IMG_2D_MSAA_ARRAY",
-];
 const MIMG_DIM_COORDS: [usize; 8] = [1, 2, 3, 3, 2, 3, 3, 4];
 const MIMG_GRAD_COORDS: [usize; 8] = [1, 2, 3, 2, 1, 2, 2, 2];
-const SDWA_SELS: [&str; 8] = [
-    "BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD", "DWORD",
-];
-const SDWA_UNUSED: [&str; 4] = ["UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE", "UNUSED_PAD"];
 const SOPP_BRANCHES: [&str; 11] = [
     "s_branch",
     "s_cbranch_scc0",
@@ -338,7 +325,10 @@ fn dpp16_mods(w1: u32, mods: &mut Vec<String>) {
     }
 }
 
-fn sdwa_src(reg: u32, is_sgpr: bool, sext: bool, neg: bool, abs: bool) -> Arg {
+fn sdwa_src(reg: u32, is_sgpr: bool, sext: bool, neg: bool, abs: bool) -> Option<Arg> {
+    if is_sgpr && reg == 255 {
+        return None;
+    }
     let mut arg = if is_sgpr {
         plain_src(reg, 1, None)
     } else {
@@ -347,7 +337,7 @@ fn sdwa_src(reg: u32, is_sgpr: bool, sext: bool, neg: bool, abs: bool) -> Arg {
     arg.sext = sext;
     arg.neg = neg;
     arg.abs = abs;
-    arg
+    Some(arg)
 }
 
 fn sdwa_dst_mods(w1: u32, mods: &mut Vec<String>) {
@@ -379,6 +369,9 @@ fn vector_32(words: &Words<'_>, w0: u32, wave32: bool) -> Decode {
             let vdst = (w0 >> 17) & 0xFF;
             let mut mods = Vec::new();
             if extended {
+                if info.spec.is_empty() {
+                    return None;
+                }
                 let w1 = words.get(1)?;
                 let src0_reg = w1 & 0xFF;
                 let (suffix, s0) = if is_dpp16 {
@@ -394,7 +387,8 @@ fn vector_32(words: &Words<'_>, w0: u32, wave32: bool) -> Decode {
                     }
                     ("_dpp", vreg(src0_reg, 1))
                 } else {
-                    let s0 = sdwa_src(src0_reg, bit(w1, 23), bit(w1, 19), bit(w1, 20), bit(w1, 21));
+                    let s0 =
+                        sdwa_src(src0_reg, bit(w1, 23), bit(w1, 19), bit(w1, 20), bit(w1, 21))?;
                     sdwa_dst_mods(w1, &mut mods);
                     ("_sdwa", s0)
                 };
@@ -445,8 +439,8 @@ fn vector_32(words: &Words<'_>, w0: u32, wave32: bool) -> Decode {
                     bit(w1, 19),
                     bit(w1, 20),
                     bit(w1, 21),
-                );
-                let s1 = sdwa_src(vsrc1, bit(w1, 31), bit(w1, 27), bit(w1, 28), bit(w1, 29));
+                )?;
+                let s1 = sdwa_src(vsrc1, bit(w1, 31), bit(w1, 27), bit(w1, 28), bit(w1, 29))?;
                 let mods = vec![
                     format!("src0_sel:{}", SDWA_SELS[((w1 >> 16) & 7) as usize]),
                     format!("src1_sel:{}", SDWA_SELS[((w1 >> 24) & 7) as usize]),
@@ -483,6 +477,9 @@ fn vector_32(words: &Words<'_>, w0: u32, wave32: bool) -> Decode {
             let vsrc1 = (w0 >> 9) & 0xFF;
             let mut mods = Vec::new();
             if extended {
+                if VOP2_MANDATORY_LITERAL.contains(&opcode) {
+                    return None;
+                }
                 let w1 = words.get(1)?;
                 let src0_reg = w1 & 0xFF;
                 let (suffix, s0, s1) = if is_dpp16 {
@@ -501,8 +498,9 @@ fn vector_32(words: &Words<'_>, w0: u32, wave32: bool) -> Decode {
                     }
                     ("_dpp", vreg(src0_reg, 1), vreg(vsrc1, 1))
                 } else {
-                    let s0 = sdwa_src(src0_reg, bit(w1, 23), bit(w1, 19), bit(w1, 20), bit(w1, 21));
-                    let s1 = sdwa_src(vsrc1, bit(w1, 31), bit(w1, 27), bit(w1, 28), bit(w1, 29));
+                    let s0 =
+                        sdwa_src(src0_reg, bit(w1, 23), bit(w1, 19), bit(w1, 20), bit(w1, 21))?;
+                    let s1 = sdwa_src(vsrc1, bit(w1, 31), bit(w1, 27), bit(w1, 28), bit(w1, 29))?;
                     sdwa_dst_mods(w1, &mut mods);
                     mods.push(format!("src1_sel:{}", SDWA_SELS[((w1 >> 24) & 7) as usize]));
                     ("_sdwa", s0, s1)
@@ -682,38 +680,6 @@ fn scalar(words: &Words<'_>, w0: u32, wave32: bool) -> Decode {
     }
 }
 
-fn hwreg(simm16: u32) -> String {
-    let id = simm16 & 0x3F;
-    let offset = (simm16 >> 6) & 0x1F;
-    let size = ((simm16 >> 11) & 0x1F) + 1;
-    let name = match id {
-        1 => "HW_REG_MODE".to_string(),
-        2 => "HW_REG_STATUS".to_string(),
-        3 => "HW_REG_TRAPSTS".to_string(),
-        4 => "HW_REG_HW_ID1".to_string(),
-        5 => "HW_REG_GPR_ALLOC".to_string(),
-        6 => "HW_REG_LDS_ALLOC".to_string(),
-        7 => "HW_REG_IB_STS".to_string(),
-        15 => "HW_REG_SH_MEM_BASES".to_string(),
-        16 => "HW_REG_TBA_LO".to_string(),
-        17 => "HW_REG_TBA_HI".to_string(),
-        18 => "HW_REG_TMA_LO".to_string(),
-        19 => "HW_REG_TMA_HI".to_string(),
-        20 => "HW_REG_FLAT_SCR_LO".to_string(),
-        21 => "HW_REG_FLAT_SCR_HI".to_string(),
-        22 => "HW_REG_XNACK_MASK".to_string(),
-        23 => "HW_REG_HW_ID2".to_string(),
-        24 => "HW_REG_POPS_PACKER".to_string(),
-        26 => "HW_REG_SHADER_CYCLES".to_string(),
-        other => other.to_string(),
-    };
-    if offset == 0 && size == 32 {
-        format!("hwreg({name})")
-    } else {
-        format!("hwreg({name}, {offset}, {size})")
-    }
-}
-
 fn waitcnt(simm16: u32) -> Vec<Arg> {
     let vmcnt = (simm16 & 0xF) | (((simm16 >> 14) & 3) << 4);
     let expcnt = (simm16 >> 4) & 7;
@@ -732,40 +698,6 @@ fn waitcnt(simm16: u32) -> Vec<Arg> {
         parts.push(Arg::new(Operand::Int(i64::from(simm16))));
     }
     parts
-}
-
-fn sendmsg(simm16: u32) -> String {
-    let id = simm16 & 0xF;
-    let op = (simm16 >> 4) & 7;
-    let stream = (simm16 >> 8) & 3;
-    let name = match id {
-        1 => "MSG_INTERRUPT",
-        2 => "MSG_GS",
-        3 => "MSG_GS_DONE",
-        4 => "MSG_SAVEWAVE",
-        5 => "MSG_STALL_WAVE_GEN",
-        6 => "MSG_HALT_WAVES",
-        7 => "MSG_ORDERED_PS_DONE",
-        8 => "MSG_EARLY_PRIM_DEALLOC",
-        9 => "MSG_GS_ALLOC_REQ",
-        10 => "MSG_GET_DOORBELL",
-        11 => "MSG_GET_DDID",
-        15 => "MSG_SYSMSG",
-        _ => return format!("sendmsg({simm16})"),
-    };
-    if id == 2 || id == 3 {
-        let op_name = ["GS_OP_NOP", "GS_OP_CUT", "GS_OP_EMIT", "GS_OP_EMIT_CUT"]
-            .get(op as usize)
-            .map_or_else(|| op.to_string(), |name| (*name).to_string());
-        if op == 0 {
-            return format!("sendmsg({name}|{op_name})");
-        }
-        return format!("sendmsg({name}|{op_name}|{stream})");
-    }
-    if op != 0 {
-        return format!("sendmsg({name}|{op})");
-    }
-    format!("sendmsg({name})")
 }
 
 fn interp_param(value: u32) -> String {
@@ -895,7 +827,7 @@ fn vop3(words: &Words<'_>, w0: u32, w1: u32, wave32: bool) -> Decode {
     } else {
         name.to_string()
     };
-    if opcode == 0x106 || opcode == 0x11F {
+    if matches!(opcode, 0x106 | 0x11F | 0x200..=0x202) {
         op_name = format!("{name}_e64");
     }
     let is_interp = matches!(opcode, 0x200 | 0x201 | 0x202 | 0x342 | 0x343 | 0x35A);
@@ -930,11 +862,11 @@ fn vop3(words: &Words<'_>, w0: u32, w1: u32, wave32: bool) -> Decode {
             _ => {}
         }
     }
-    if op_sel != 0 {
-        let mut bits = bits_list(op_sel, nsrc);
-        if opcode >= 0x100 {
-            bits.push((op_sel >> 3) & 1);
-        }
+    let mut bits = bits_list(op_sel, nsrc);
+    if opcode >= 0x100 {
+        bits.push((op_sel >> 3) & 1);
+    }
+    if bits.contains(&1) {
         mods.push(format!("op_sel:[{}]", join_bits(&bits)));
     }
     if bit(w0, 15) {
@@ -1268,6 +1200,9 @@ fn mimg(words: &Words<'_>, w0: u32, w1: u32) -> Decode {
         return None;
     }
     let address_count = mimg_address_count(name, dim, a16);
+    if nsa_dwords > 0 && nsa_dwords != address_count.saturating_sub(1).div_ceil(4) {
+        return None;
+    }
     let vaddr0 = w1 & 0xFF;
     let vaddr = if nsa_dwords > 0 {
         let extra = &words.code[words.pc + 8..words.pc + len];
