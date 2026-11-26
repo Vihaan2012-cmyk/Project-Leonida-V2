@@ -1,0 +1,18 @@
+[package]
+name = "shader-container"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Exposes `testutil` (synthetic container builders) to other crates' tests.
+test-support = []
+
+[dependencies]
+flate2.workspace = true
+memchr.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
