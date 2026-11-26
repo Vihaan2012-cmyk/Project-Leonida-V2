@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use crate::dxbc::{ShaderModel, Stage, parts, shader_model, u32_at};
 use crate::xdat::inflate;
 
@@ -26,8 +28,8 @@ pub struct CarveStats {
 }
 
 /// Find every shader record in `archive` (the bytes of shaders.rpf) without reading its encrypted table of
-/// contents, and pass each one to `each` in archive order.
-pub fn carve(archive: &[u8], mut each: impl FnMut(CarvedShader)) -> CarveStats {
+/// contents, and pass each one to `each` in archive order. `each` returning `ControlFlow::Break` stops the scan.
+pub fn carve(archive: &[u8], mut each: impl FnMut(CarvedShader) -> ControlFlow<()>) -> CarveStats {
     let mut stats = CarveStats::default();
     let mut floor = 0; // names never start before the end of the last carved record
     let mut pos = 0;
@@ -54,7 +56,10 @@ pub fn carve(archive: &[u8], mut each: impl FnMut(CarvedShader)) -> CarveStats {
         match decode(&archive[data_start..data_end], size) {
             Some((dxbc, stage, shader_model)) => {
                 let name = String::from_utf8_lossy(&archive[name_start..nul]).into_owned();
-                each(CarvedShader {
+                stats.carved += 1;
+                pos = data_end;
+                floor = data_end;
+                let flow = each(CarvedShader {
                     name,
                     offset: name_start,
                     kind,
@@ -62,9 +67,9 @@ pub fn carve(archive: &[u8], mut each: impl FnMut(CarvedShader)) -> CarveStats {
                     shader_model,
                     dxbc,
                 });
-                stats.carved += 1;
-                pos = data_end;
-                floor = data_end;
+                if flow.is_break() {
+                    break;
+                }
             }
             None => stats.rejected += 1,
         }
@@ -106,8 +111,27 @@ mod tests {
 
     fn collect(archive: &[u8]) -> (Vec<CarvedShader>, CarveStats) {
         let mut found = Vec::new();
-        let stats = carve(archive, |shader| found.push(shader));
+        let stats = carve(archive, |shader| {
+            found.push(shader);
+            ControlFlow::Continue(())
+        });
         (found, stats)
+    }
+
+    #[test]
+    fn break_stops_after_the_current_record() {
+        let ps = container(0, &[fssm(false, &[NOP])]);
+        let mut archive = vec![0u8];
+        archive.extend(rpf_entry("ps_one", 3, 1, &ps));
+        archive.push(0);
+        archive.extend(rpf_entry("ps_two", 3, 2, &ps));
+        let mut names = Vec::new();
+        let stats = carve(&archive, |shader| {
+            names.push(shader.name);
+            ControlFlow::Break(())
+        });
+        assert_eq!(names, vec!["ps_one".to_string()]);
+        assert_eq!(stats.carved, 1);
     }
 
     #[test]

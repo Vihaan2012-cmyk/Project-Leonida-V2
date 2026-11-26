@@ -1,0 +1,21 @@
+[package]
+name = "leonida-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "persistence", "accesskit", "wayland", "x11"] }
+egui_extras = "0.37"
+rfd = "0.18"
+serde.workspace = true
+game-package.workspace = true
+shader-container.workspace = true
+
+[lints]
+workspace = true
+[dev-dependencies]
+tempfile.workspace = true
+shader-container = { workspace = true, features = ["test-support"] }
+
