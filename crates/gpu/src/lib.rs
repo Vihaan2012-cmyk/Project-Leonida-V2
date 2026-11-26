@@ -214,12 +214,14 @@ impl Gpu {
             let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
                 .subgroup_size_control(chosen.info.subgroup_size_control)
                 .compute_full_subgroups(chosen.info.full_subgroups);
+            let mut f12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
             let base = vk::PhysicalDeviceFeatures::default()
                 .shader_int64(chosen.info.int64)
                 .shader_float64(chosen.info.float64);
             let mut features = vk::PhysicalDeviceFeatures2::default()
                 .features(base)
-                .push_next(&mut f13);
+                .push_next(&mut f13)
+                .push_next(&mut f12);
             let create = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queues)
                 .push_next(&mut features);
@@ -263,6 +265,18 @@ impl Gpu {
         groups: [u32; 3],
         subgroup_size: Option<u32>,
     ) -> Result<(), GpuError> {
+        self.dispatch_with(spirv, buffers, |_| Vec::new(), groups, subgroup_size)
+    }
+
+    /// Like `dispatch`, with push constants built from the buffers' device addresses.
+    pub fn dispatch_with(
+        &self,
+        spirv: &[u32],
+        buffers: &mut [&mut [u32]],
+        push: impl FnOnce(&[u64]) -> Vec<u32>,
+        groups: [u32; 3],
+        subgroup_size: Option<u32>,
+    ) -> Result<(), GpuError> {
         if spirv.is_empty() {
             return Err(GpuError::BadSpirv);
         }
@@ -274,9 +288,10 @@ impl Gpu {
             for data in buffers.iter() {
                 let size = (data.len().max(1) * 4) as u64;
                 let buffer = device.create_buffer(
-                    &vk::BufferCreateInfo::default()
-                        .size(size)
-                        .usage(vk::BufferUsageFlags::STORAGE_BUFFER),
+                    &vk::BufferCreateInfo::default().size(size).usage(
+                        vk::BufferUsageFlags::STORAGE_BUFFER
+                            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    ),
                     None,
                 )?;
                 scratch
@@ -286,10 +301,13 @@ impl Gpu {
                 let kind = self
                     .memory_type(needs.memory_type_bits)
                     .ok_or(GpuError::NoMemory)?;
+                let mut flags = vk::MemoryAllocateFlagsInfo::default()
+                    .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
                 let memory = device.allocate_memory(
                     &vk::MemoryAllocateInfo::default()
                         .allocation_size(needs.size)
-                        .memory_type_index(kind),
+                        .memory_type_index(kind)
+                        .push_next(&mut flags),
                     None,
                 )?;
                 scratch.buffers.last_mut().expect("just pushed").1 = memory;
@@ -312,11 +330,25 @@ impl Gpu {
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
                 None,
             )?;
+            let addresses: Vec<u64> = scratch
+                .buffers
+                .iter()
+                .map(|(buffer, _, _)| {
+                    device.get_buffer_device_address(
+                        &vk::BufferDeviceAddressInfo::default().buffer(*buffer),
+                    )
+                })
+                .collect();
+            let constants = push(&addresses);
+            let ranges = [vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .size((constants.len() * 4) as u32)];
             let set_layouts = [scratch.set_layout];
-            scratch.pipeline_layout = device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
-                None,
-            )?;
+            let mut layout = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+            if !constants.is_empty() {
+                layout = layout.push_constant_ranges(&ranges);
+            }
+            scratch.pipeline_layout = device.create_pipeline_layout(&layout, None)?;
             scratch.module = device
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spirv), None)?;
             let mut required = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
@@ -398,6 +430,16 @@ impl Gpu {
                 &[set],
                 &[],
             );
+            if !constants.is_empty() {
+                let bytes: Vec<u8> = constants.iter().flat_map(|w| w.to_le_bytes()).collect();
+                device.cmd_push_constants(
+                    command,
+                    scratch.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &bytes,
+                );
+            }
             device.cmd_dispatch(command, groups[0], groups[1], groups[2]);
             let barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)

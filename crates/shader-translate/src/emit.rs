@@ -29,10 +29,56 @@ pub enum EmitError {
     Build(String),
     #[error("LDS size must be a power of two number of words")]
     LdsSize,
+    #[error("{0}")]
+    Unsupported(&'static str),
 }
 
 fn ok<T>(result: Result<T, rspirv::dr::Error>) -> Result<T, EmitError> {
     result.map_err(|e| EmitError::Build(format!("{e:?}")))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FloatMode {
+    pub nan_preserve: bool,
+    pub flush_denormals: bool,
+    pub preserve_denormals: bool,
+}
+
+pub const PUSH_WORDS: u32 = 36;
+pub const PUSH_HEAP: u32 = 32;
+pub const PUSH_CODE: u32 = 34;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ComputeOptions {
+    pub group_size: [u32; 3],
+    pub user_sgprs: u32,
+    pub workgroup_ids: [bool; 3],
+    pub thread_ids: u32,
+    pub lds_bytes: u32,
+    pub float: FloatMode,
+}
+
+impl ComputeOptions {
+    /// From the FSSM's COMPUTE_PGM_RSRC2 word and thread-group size.
+    pub fn from_rsrc2(rsrc2: u32, group_size: [u32; 3], float: FloatMode) -> ComputeOptions {
+        ComputeOptions {
+            group_size,
+            user_sgprs: (rsrc2 >> 1) & 31,
+            workgroup_ids: [
+                rsrc2 >> 7 & 1 != 0,
+                rsrc2 >> 8 & 1 != 0,
+                rsrc2 >> 9 & 1 != 0,
+            ],
+            thread_ids: ((rsrc2 >> 11) & 3) + 1,
+            lds_bytes: ((rsrc2 >> 15) & 0x1FF) * 512,
+            float,
+        }
+    }
+}
+
+enum Entry<'a> {
+    Harness(&'a HarnessOptions),
+    Compute(&'a ComputeOptions),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +101,8 @@ struct Types {
     ptr_function_bool: Word,
     ptr_storage_u32: Word,
     ptr_workgroup_u32: Word,
+    ptr_heap_u32: Word,
+    ptr_push_u32: Word,
 }
 
 struct Emitter {
@@ -80,6 +128,15 @@ struct Emitter {
     memory_last: Word,
     decode: Option<Word>,
     code_base: u64,
+    heap: Option<Word>,
+    code: Option<Word>,
+    push: Word,
+    exchange_base: Word,
+    label: Word,
+    compute: Option<ComputeOptions>,
+    group_ids: Word,
+    thread_ids: Word,
+    thread_index: Word,
     values: Vec<Word>,
     types: Vec<Ty>,
 }
@@ -125,8 +182,44 @@ fn registers(function: &Function) -> (BTreeSet<u8>, BTreeSet<u8>) {
 }
 
 pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>, EmitError> {
+    build(function, Entry::Harness(options))
+}
+
+/// A compute shader following the runtime contract: push constants hold s0-s31, the heap base and the code
+/// base; enabled workgroup IDs follow the user SGPRs; v0-v2 hold the thread ID; memory is heap base + Xbox VA.
+pub fn compute(function: &Function, options: &ComputeOptions) -> Result<Vec<u32>, EmitError> {
+    build(function, Entry::Compute(options))
+}
+
+fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     let lanes: u32 = if function.wave64 { 64 } else { 32 };
-    if !options.lds_words.is_power_of_two() {
+    let (float, group_size, lds_words) = match entry {
+        Entry::Harness(options) => (
+            FloatMode {
+                nan_preserve: options.nan_preserve,
+                flush_denormals: options.flush_denormals,
+                preserve_denormals: options.preserve_denormals,
+            },
+            [lanes, 1, 1],
+            options.lds_words,
+        ),
+        Entry::Compute(options) => {
+            let words = (options.lds_bytes / 4).max(lanes).next_power_of_two();
+            if words > 12 * 1024 {
+                return Err(EmitError::Unsupported("LDS larger than 48 KiB"));
+            }
+            (options.float, options.group_size, words)
+        }
+    };
+    let threads: u32 = group_size.iter().product();
+    if threads == 0 || !threads.is_multiple_of(lanes) {
+        return Err(EmitError::Unsupported(
+            "thread-group size is not a whole number of waves",
+        ));
+    }
+    let waves = threads / lanes;
+    let heap_mode = matches!(entry, Entry::Compute(_));
+    if !lds_words.is_power_of_two() {
         return Err(EmitError::LdsSize);
     }
     let types = function.verify()?;
@@ -141,60 +234,80 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
     ] {
         b.capability(capability);
     }
-    if options.nan_preserve {
+    if heap_mode {
+        b.capability(Capability::PhysicalStorageBufferAddresses);
+        b.extension("SPV_KHR_physical_storage_buffer");
+    }
+    if float.nan_preserve {
         b.capability(Capability::SignedZeroInfNanPreserve);
     }
-    if options.flush_denormals {
+    if float.flush_denormals {
         b.capability(Capability::DenormFlushToZero);
     }
-    if options.preserve_denormals {
+    if float.preserve_denormals {
         b.capability(Capability::DenormPreserve);
     }
-    if options.nan_preserve || options.flush_denormals || options.preserve_denormals {
+    if float.nan_preserve || float.flush_denormals || float.preserve_denormals {
         b.extension("SPV_KHR_float_controls");
     }
     let glsl = b.ext_inst_import("GLSL.std.450");
-    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let addressing = if heap_mode {
+        AddressingModel::PhysicalStorageBuffer64
+    } else {
+        AddressingModel::Logical
+    };
+    b.memory_model(addressing, MemoryModel::GLSL450);
     let bool_ = b.type_bool();
     let u32_ = b.type_int(32, 0);
     let u64_ = b.type_int(64, 0);
     let f32_ = b.type_float(32, None);
+    let uvec3 = b.type_vector(u32_, 3);
     let uvec4 = b.type_vector(u32_, 4);
     let wide = b.type_struct([u32_, u32_]);
-    let runtime = b.type_runtime_array(u32_);
-    b.decorate(runtime, Decoration::ArrayStride, [Operand::LiteralBit32(4)]);
-    let block = b.type_struct([runtime]);
-    b.decorate(block, Decoration::Block, []);
-    b.member_decorate(block, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
-    let ptr_block = b.type_pointer(None, StorageClass::StorageBuffer, block);
-    let buffer = |b: &mut Builder, binding: u32| {
-        let var = b.variable(ptr_block, None, StorageClass::StorageBuffer, None);
-        b.decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
-        b.decorate(var, Decoration::Binding, [Operand::LiteralBit32(binding)]);
-        var
-    };
-    let state = buffer(&mut b, 0);
-    let memory = buffer(&mut b, 1);
-    let lds_image = buffer(&mut b, 2);
-    let exports = buffer(&mut b, 3);
-    let lds_len = b.constant_bit32(u32_, options.lds_words);
+    let (mut state, mut memory, mut lds_image, mut exports, mut push) = (0, 0, 0, 0, 0);
+    if heap_mode {
+        let count = b.constant_bit32(u32_, PUSH_WORDS);
+        let array = b.type_array(u32_, count);
+        b.decorate(array, Decoration::ArrayStride, [Operand::LiteralBit32(4)]);
+        let block = b.type_struct([array]);
+        b.decorate(block, Decoration::Block, []);
+        b.member_decorate(block, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+        let ptr_block = b.type_pointer(None, StorageClass::PushConstant, block);
+        push = b.variable(ptr_block, None, StorageClass::PushConstant, None);
+    } else {
+        let runtime = b.type_runtime_array(u32_);
+        b.decorate(runtime, Decoration::ArrayStride, [Operand::LiteralBit32(4)]);
+        let block = b.type_struct([runtime]);
+        b.decorate(block, Decoration::Block, []);
+        b.member_decorate(block, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+        let ptr_block = b.type_pointer(None, StorageClass::StorageBuffer, block);
+        let buffer = |b: &mut Builder, binding: u32| {
+            let var = b.variable(ptr_block, None, StorageClass::StorageBuffer, None);
+            b.decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
+            b.decorate(var, Decoration::Binding, [Operand::LiteralBit32(binding)]);
+            var
+        };
+        state = buffer(&mut b, 0);
+        memory = buffer(&mut b, 1);
+        lds_image = buffer(&mut b, 2);
+        exports = buffer(&mut b, 3);
+    }
+    let lds_len = b.constant_bit32(u32_, lds_words);
     let lds_array = b.type_array(u32_, lds_len);
     let ptr_lds = b.type_pointer(None, StorageClass::Workgroup, lds_array);
     let lds = b.variable(ptr_lds, None, StorageClass::Workgroup, None);
     let ptr_input_u32 = b.type_pointer(None, StorageClass::Input, u32_);
-    let lane_input = b.variable(ptr_input_u32, None, StorageClass::Input, None);
-    b.decorate(
-        lane_input,
-        Decoration::BuiltIn,
-        [Operand::BuiltIn(BuiltIn::SubgroupLocalInvocationId)],
-    );
-    let half_input = b.variable(ptr_input_u32, None, StorageClass::Input, None);
-    b.decorate(
-        half_input,
-        Decoration::BuiltIn,
-        [Operand::BuiltIn(BuiltIn::SubgroupId)],
-    );
-    let slots = b.constant_bit32(u32_, 64);
+    let ptr_input_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
+    let input = |b: &mut Builder, ty: Word, builtin: BuiltIn| {
+        let var = b.variable(ty, None, StorageClass::Input, None);
+        b.decorate(var, Decoration::BuiltIn, [Operand::BuiltIn(builtin)]);
+        var
+    };
+    let lane_input = input(&mut b, ptr_input_u32, BuiltIn::SubgroupLocalInvocationId);
+    let half_input = input(&mut b, ptr_input_u32, BuiltIn::SubgroupId);
+    let group_input = input(&mut b, ptr_input_uvec3, BuiltIn::WorkgroupId);
+    let thread_input = input(&mut b, ptr_input_uvec3, BuiltIn::LocalInvocationId);
+    let slots = b.constant_bit32(u32_, 64 * waves);
     let exchange_array = b.type_array(u32_, slots);
     let ptr_exchange = b.type_pointer(None, StorageClass::Workgroup, exchange_array);
     let exchange = b.variable(ptr_exchange, None, StorageClass::Workgroup, None);
@@ -209,11 +322,21 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
         ptr_function_bool: b.type_pointer(None, StorageClass::Function, bool_),
         ptr_storage_u32: b.type_pointer(None, StorageClass::StorageBuffer, u32_),
         ptr_workgroup_u32: b.type_pointer(None, StorageClass::Workgroup, u32_),
+        ptr_heap_u32: if heap_mode {
+            b.type_pointer(None, StorageClass::PhysicalStorageBuffer, u32_)
+        } else {
+            0
+        },
+        ptr_push_u32: if heap_mode {
+            b.type_pointer(None, StorageClass::PushConstant, u32_)
+        } else {
+            0
+        },
     };
     let void = b.type_void();
     let function_type = b.type_function(void, []);
     let main = ok(b.begin_function(void, None, FunctionControl::NONE, function_type))?;
-    ok(b.begin_block(None))?;
+    let entry_label = ok(b.begin_block(None))?;
     let (scalars, vectors) = registers(function);
     let sgpr: HashMap<u8, Word> = scalars
         .iter()
@@ -238,18 +361,41 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
     let iterations = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let messages = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let local = ok(b.load(u32_, None, lane_input, None, []))?;
-    let (lane, half) = if function.wave64 {
-        let half = ok(b.load(u32_, None, half_input, None, []))?;
+    let subgroup = ok(b.load(u32_, None, half_input, None, []))?;
+    let (lane, half, wave) = if function.wave64 {
+        let one = b.constant_bit32(u32_, 1);
+        let half = ok(b.bitwise_and(u32_, None, subgroup, one))?;
+        let wave = ok(b.shift_right_logical(u32_, None, subgroup, one))?;
         let shift = b.constant_bit32(u32_, 5);
         let base = ok(b.shift_left_logical(u32_, None, half, shift))?;
-        (ok(b.i_add(u32_, None, base, local))?, half)
+        (ok(b.i_add(u32_, None, base, local))?, half, wave)
     } else {
-        (local, local)
+        (local, local, subgroup)
     };
-    let interface = if function.wave64 {
-        vec![lane_input, half_input]
+    let six = b.constant_bit32(u32_, 6);
+    let exchange_base = ok(b.shift_left_logical(u32_, None, wave, six))?;
+    let lanes_constant = b.constant_bit32(u32_, lanes);
+    let thread_index = ok(b.i_mul(u32_, None, wave, lanes_constant))?;
+    let thread_index = ok(b.i_add(u32_, None, thread_index, lane))?;
+    let (group_ids, thread_ids) = if heap_mode {
+        (
+            ok(b.load(uvec3, None, group_input, None, []))?,
+            ok(b.load(uvec3, None, thread_input, None, []))?,
+        )
     } else {
-        vec![lane_input]
+        (0, 0)
+    };
+    let mut interface = vec![lane_input, half_input];
+    if heap_mode {
+        interface.extend([group_input, thread_input]);
+    }
+    let compute_options = match entry {
+        Entry::Compute(options) => Some(*options),
+        Entry::Harness(_) => None,
+    };
+    let code_base = match entry {
+        Entry::Harness(options) => options.code_base,
+        Entry::Compute(_) => 0,
     };
     let mut e = Emitter {
         b,
@@ -270,14 +416,27 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
         exports,
         messages,
         lds,
-        lds_words: options.lds_words,
+        lds_words,
         memory_last: 0,
         decode: None,
-        code_base: options.code_base,
+        code_base,
+        heap: None,
+        code: None,
+        push,
+        exchange_base,
+        label: entry_label,
+        compute: compute_options,
+        group_ids,
+        thread_ids,
+        thread_index,
         values: vec![0; function.temps as usize],
         types,
     };
-    e.prologue()?;
+    if heap_mode {
+        e.compute_prologue()?;
+    } else {
+        e.prologue()?;
+    }
     let linear = function
         .blocks
         .iter()
@@ -299,21 +458,23 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
     } else {
         e.dispatch(function, current, iterations)?;
     }
-    e.epilogue()?;
+    if !heap_mode {
+        e.epilogue()?;
+    }
     ok(e.b.ret())?;
     ok(e.b.end_function())?;
     if let Some(decode) = e.decode {
         e.decode_function(decode)?;
     }
     e.b.entry_point(ExecutionModel::GLCompute, main, "main", interface);
-    e.b.execution_mode(main, ExecutionMode::LocalSize, [lanes, 1, 1]);
-    if options.nan_preserve {
+    e.b.execution_mode(main, ExecutionMode::LocalSize, group_size);
+    if float.nan_preserve {
         e.b.execution_mode(main, ExecutionMode::SignedZeroInfNanPreserve, [32]);
     }
-    if options.flush_denormals {
+    if float.flush_denormals {
         e.b.execution_mode(main, ExecutionMode::DenormFlushToZero, [32]);
     }
-    if options.preserve_denormals {
+    if float.preserve_denormals {
         e.b.execution_mode(main, ExecutionMode::DenormPreserve, [32]);
     }
     Ok(e.b.module().assemble())
@@ -405,10 +566,10 @@ impl Emitter {
         let merge = self.b.id();
         ok(self.b.selection_merge(merge, SelectionControl::NONE))?;
         ok(self.b.branch_conditional(condition, then, merge, []))?;
-        ok(self.b.begin_block(Some(then)))?;
+        self.begin(then)?;
         body(self)?;
         ok(self.b.branch(merge))?;
-        ok(self.b.begin_block(Some(merge)))?;
+        self.begin(merge)?;
         Ok(())
     }
 
@@ -529,10 +690,10 @@ impl Emitter {
         let default = self.b.id();
         let cases: Vec<Word> = function.blocks.iter().map(|_| self.b.id()).collect();
         ok(self.b.branch(header))?;
-        ok(self.b.begin_block(Some(header)))?;
+        self.begin(header)?;
         ok(self.b.loop_merge(merge, cont, LoopControl::NONE, []))?;
         ok(self.b.branch(body))?;
-        ok(self.b.begin_block(Some(body)))?;
+        self.begin(body)?;
         let selector = self.load(current)?;
         ok(self.b.selection_merge(switch_merge, SelectionControl::NONE))?;
         let targets: Vec<(Operand, Word)> = cases
@@ -542,7 +703,7 @@ impl Emitter {
             .collect();
         ok(self.b.switch(selector, default, targets))?;
         for (block, label) in function.blocks.iter().zip(&cases) {
-            ok(self.b.begin_block(Some(*label)))?;
+            self.begin(*label)?;
             for stmt in &block.stmts {
                 self.stmt(stmt)?;
             }
@@ -560,13 +721,13 @@ impl Emitter {
             self.store(current, next)?;
             ok(self.b.branch(switch_merge))?;
         }
-        ok(self.b.begin_block(Some(default)))?;
+        self.begin(default)?;
         let end = self.u32c(END);
         self.store(current, end)?;
         ok(self.b.branch(switch_merge))?;
-        ok(self.b.begin_block(Some(switch_merge)))?;
+        self.begin(switch_merge)?;
         ok(self.b.branch(cont))?;
-        ok(self.b.begin_block(Some(cont)))?;
+        self.begin(cont)?;
         let u32_ = self.t.u32_;
         let bool_ = self.t.bool_;
         let count = self.load(iterations)?;
@@ -579,7 +740,7 @@ impl Emitter {
         let finished = ok(self.b.i_equal(bool_, None, next, end))?;
         let leave = ok(self.b.logical_or(bool_, None, finished, exhausted))?;
         ok(self.b.branch_conditional(leave, merge, header, []))?;
-        ok(self.b.begin_block(Some(merge)))?;
+        self.begin(merge)?;
         Ok(())
     }
 
@@ -632,7 +793,145 @@ impl Emitter {
     fn exchange_slot(&mut self, index: Word) -> Result<Word, EmitError> {
         let ptr = self.t.ptr_workgroup_u32;
         let exchange = self.exchange;
+        let u32_ = self.t.u32_;
+        let index = ok(self.b.i_add(u32_, None, index, self.exchange_base))?;
         ok(self.b.access_chain(ptr, None, exchange, [index]))
+    }
+
+    fn begin(&mut self, label: Word) -> Result<(), EmitError> {
+        ok(self.b.begin_block(Some(label)))?;
+        self.label = label;
+        Ok(())
+    }
+
+    fn push_word(&mut self, index: u32) -> Result<Word, EmitError> {
+        let ptr = self.t.ptr_push_u32;
+        let zero = self.u32c(0);
+        let index = self.u32c(index);
+        let push = self.push;
+        let ptr = ok(self.b.access_chain(ptr, None, push, [zero, index]))?;
+        self.load(ptr)
+    }
+
+    fn heap_pointer(&mut self, address: Word) -> Result<Word, EmitError> {
+        let u64_ = self.t.u64_;
+        let base = self.heap.expect("heap mode");
+        let sum = ok(self.b.i_add(u64_, None, base, address))?;
+        let ptr = self.t.ptr_heap_u32;
+        ok(self.b.convert_u_to_ptr(ptr, None, sum))
+    }
+
+    fn heap_load(&mut self, address: Word) -> Result<Word, EmitError> {
+        let ptr = self.heap_pointer(address)?;
+        let u32_ = self.t.u32_;
+        ok(self.b.load(
+            u32_,
+            None,
+            ptr,
+            Some(rspirv::spirv::MemoryAccess::ALIGNED),
+            [Operand::LiteralBit32(4)],
+        ))
+    }
+
+    fn heap_store(&mut self, address: Word, value: Word) -> Result<(), EmitError> {
+        let ptr = self.heap_pointer(address)?;
+        ok(self.b.store(
+            ptr,
+            value,
+            Some(rspirv::spirv::MemoryAccess::ALIGNED),
+            [Operand::LiteralBit32(4)],
+        ))
+    }
+
+    fn guarded_loads(
+        &mut self,
+        condition: Word,
+        addresses: &[Word],
+    ) -> Result<Vec<Word>, EmitError> {
+        let before = self.label;
+        let then = self.b.id();
+        let merge = self.b.id();
+        ok(self.b.selection_merge(merge, SelectionControl::NONE))?;
+        ok(self.b.branch_conditional(condition, then, merge, []))?;
+        self.begin(then)?;
+        let mut loaded = Vec::new();
+        for address in addresses {
+            loaded.push(self.heap_load(*address)?);
+        }
+        let end = self.label;
+        ok(self.b.branch(merge))?;
+        self.begin(merge)?;
+        let zero = self.u32c(0);
+        let u32_ = self.t.u32_;
+        loaded
+            .into_iter()
+            .map(|value| ok(self.b.phi(u32_, None, [(value, end), (zero, before)])))
+            .collect()
+    }
+
+    fn compute_prologue(&mut self) -> Result<(), EmitError> {
+        let options = self.compute.expect("compute mode");
+        let u32_ = self.t.u32_;
+        let low = self.push_word(PUSH_HEAP)?;
+        let high = self.push_word(PUSH_HEAP + 1)?;
+        self.heap = Some(self.pack(low, high)?);
+        let low = self.push_word(PUSH_CODE)?;
+        let high = self.push_word(PUSH_CODE + 1)?;
+        self.code = Some(self.pack(low, high)?);
+        let mut group_slots = Vec::new();
+        for (axis, enabled) in options.workgroup_ids.iter().enumerate() {
+            if *enabled {
+                group_slots.push(axis as u32);
+            }
+        }
+        let scalars: Vec<(u8, Word)> = self.sgpr.iter().map(|(r, v)| (*r, *v)).collect();
+        for (reg, var) in scalars {
+            let index = u32::from(reg);
+            let value = if index < options.user_sgprs.min(32) {
+                self.push_word(index)?
+            } else if let Some(axis) = index
+                .checked_sub(options.user_sgprs)
+                .and_then(|k| group_slots.get(k as usize))
+            {
+                ok(self
+                    .b
+                    .composite_extract(u32_, None, self.group_ids, [*axis]))?
+            } else if reg == EXEC || (reg == EXEC + 1 && self.lanes == 64) {
+                self.u32c(u32::MAX)
+            } else {
+                self.u32c(0)
+            };
+            self.store(var, value)?;
+        }
+        let vectors: Vec<(u8, Word)> = self.vgpr.iter().map(|(r, v)| (*r, *v)).collect();
+        for (reg, var) in vectors {
+            let value = if u32::from(reg) < options.thread_ids.min(3) {
+                ok(self
+                    .b
+                    .composite_extract(u32_, None, self.thread_ids, [u32::from(reg)]))?
+            } else {
+                self.u32c(0)
+            };
+            self.store(var, value)?;
+        }
+        let no = self.boolc(false);
+        self.store(self.scc, no)?;
+        let zero = self.u32c(0);
+        self.store(self.messages, zero)?;
+        let threads: u32 = options.group_size.iter().product();
+        for chunk in 0..self.lds_words.div_ceil(threads) {
+            let base = self.u32c(threads * chunk);
+            let index = ok(self.b.i_add(u32_, None, base, self.thread_index))?;
+            let limit = self.u32c(self.lds_words);
+            let bool_ = self.t.bool_;
+            let inside = ok(self.b.u_less_than(bool_, None, index, limit))?;
+            self.if_then(inside, |e| {
+                let ptr = e.lds_element(index)?;
+                let zero = e.u32c(0);
+                e.store(ptr, zero)
+            })?;
+        }
+        self.barrier()
     }
 
     fn active(&mut self) -> Result<Word, EmitError> {
@@ -1002,6 +1301,11 @@ impl Emitter {
                 let new = ok(self.b.select(u32_, None, hit, v(self, value), old))?;
                 self.store(var, new)?;
             }
+            Stmt::Export { .. } | Stmt::Message(..) if self.heap.is_some() => {
+                return Err(EmitError::Unsupported(
+                    "exports and messages in a compute shader",
+                ));
+            }
             Stmt::Export { target, values } => {
                 let active = self.active()?;
                 let values = *values;
@@ -1080,6 +1384,9 @@ impl Emitter {
                 }
                 let (address, value) = (v(self, address), v(self, value));
                 self.if_then(condition, |e| {
+                    if e.heap.is_some() {
+                        return e.heap_store(address, value);
+                    }
                     let index = e.memory_index(address)?;
                     let memory = e.memory;
                     let ptr = e.element(memory, index)?;
@@ -1118,7 +1425,10 @@ impl Emitter {
                 ok(self.b.select(ty, None, v(self, c), v(self, a), v(self, b)))?
             }
             Expr::LaneId => self.lane,
-            Expr::CodeBase => self.u64c(self.code_base),
+            Expr::CodeBase => match self.code {
+                Some(code) => code,
+                None => self.u64c(self.code_base),
+            },
             Expr::Active => {
                 if self.lanes == 64 {
                     self.get_pair(EXEC)?
@@ -1241,6 +1551,14 @@ impl Emitter {
                 let zero = self.u32c(0);
                 ok(self.b.select(u32_, None, active, value, zero))?
             }
+            Expr::Load { when, address } if self.heap.is_some() => {
+                let mut condition = self.active()?;
+                if let Some(when) = when {
+                    condition = ok(self.b.logical_and(bool_, None, condition, v(self, when)))?;
+                }
+                self.guarded_loads(condition, &[v(self, address)])?[0]
+            }
+            Expr::ScalarLoad(address) if self.heap.is_some() => self.heap_load(v(self, address))?,
             Expr::Load { when, address } => {
                 let index = self.memory_index(v(self, address))?;
                 let memory = self.memory;
@@ -1270,9 +1588,31 @@ impl Emitter {
                     None => self.u32c(4 + u32::from(*component)),
                 };
                 let address = v(self, address);
-                let words = self.element_words(address)?;
                 let active = self.active()?;
                 let fetch = ok(self.b.logical_and(bool_, None, active, v(self, in_range)))?;
+                let words = if self.heap.is_some() {
+                    let low = ok(self.b.u_convert(u32_, None, address))?;
+                    let three = self.u32c(3);
+                    let misaligned = ok(self.b.bitwise_and(u32_, None, low, three))?;
+                    let shift = ok(self.b.shift_left_logical(u32_, None, misaligned, three))?;
+                    let mask = self.u64c(!3);
+                    let aligned = ok(self.b.bitwise_and(u64_, None, address, mask))?;
+                    let mut addresses = Vec::new();
+                    for k in 0..5u64 {
+                        let step = self.u64c(4 * k);
+                        addresses.push(ok(self.b.i_add(u64_, None, aligned, step))?);
+                    }
+                    let dwords = self.guarded_loads(fetch, &addresses)?;
+                    let mut words = [0; 4];
+                    for (k, word) in words.iter_mut().enumerate() {
+                        let pair = self.pack(dwords[k], dwords[k + 1])?;
+                        let moved = ok(self.b.shift_right_logical(u64_, None, pair, shift))?;
+                        *word = ok(self.b.u_convert(u32_, None, moved))?;
+                    }
+                    words
+                } else {
+                    self.element_words(address)?
+                };
                 let (one, zero) = (self.u32c(1), self.u32c(0));
                 let fetch = ok(self.b.select(u32_, None, fetch, one, zero))?;
                 let decode = match self.decode {

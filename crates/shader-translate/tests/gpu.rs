@@ -3,8 +3,8 @@ use std::process::Command;
 
 use gpu::Gpu;
 use shader_translate::{
-    EXPORT_BUFFER_WORDS, HarnessOptions, MESSAGE_BASE, MESSAGE_LIMIT, STATE_SCC, STATE_VGPR,
-    STATE_WORDS, harness,
+    ComputeOptions, EXPORT_BUFFER_WORDS, FloatMode, HarnessOptions, MESSAGE_BASE, MESSAGE_LIMIT,
+    PUSH_HEAP, PUSH_WORDS, STATE_SCC, STATE_VGPR, STATE_WORDS, harness,
 };
 use testkit::random::{Generator, Rng, memory, start};
 use testkit::{Memory, Wave};
@@ -319,4 +319,155 @@ fn random_wave32_programs_match_on_the_gpu() {
 #[test]
 fn random_wave64_programs_match_on_the_gpu() {
     random_suite(true);
+}
+
+fn compute_options(gpu: &Gpu, group_size: [u32; 3], rsrc2: u32) -> ComputeOptions {
+    let float = FloatMode {
+        nan_preserve: gpu.info.nan_preserve_32,
+        flush_denormals: gpu.info.denorm_flush_32 && !gpu.info.denorm_preserve_32,
+        preserve_denormals: gpu.info.denorm_preserve_32,
+    };
+    ComputeOptions::from_rsrc2(rsrc2, group_size, float)
+}
+
+fn run_compute(gpu: &Gpu, spirv: &[u32], heap: &mut [u32], user: &[u32], groups: [u32; 3]) {
+    let user = user.to_vec();
+    gpu.dispatch_with(
+        spirv,
+        &mut [heap],
+        |addresses| {
+            let mut push = vec![0u32; PUSH_WORDS as usize];
+            push[..user.len()].copy_from_slice(&user);
+            push[PUSH_HEAP as usize] = addresses[0] as u32;
+            push[PUSH_HEAP as usize + 1] = (addresses[0] >> 32) as u32;
+            push
+        },
+        groups,
+        Some(32),
+    )
+    .unwrap();
+    assert_eq!(gpu::validation_errors(), 0);
+}
+
+#[test]
+fn compute_entry_reads_user_sgprs_group_ids_and_thread_ids() {
+    let Some(gpu) = gpu() else { return };
+    for wave64 in [false, true] {
+        let source = "v_lshlrev_b32_e32 v1, 2, v0
+             s_lshl_b32 s3, s2, 8
+             v_add_nc_u32_e32 v1, s3, v1
+             v_mad_u32_u24 v2, s2, 1000, v0
+             global_store_dword v1, v2, s[0:1]
+             s_endpgm";
+        let code = rdna::assemble(source, !wave64).unwrap();
+        let function = shader_ir::lift(&code, wave64).unwrap();
+        let rsrc2 = (2 << 1) | (1 << 7);
+        let options = compute_options(&gpu, [64, 1, 1], rsrc2);
+        let spirv = shader_translate::compute(&function, &options).unwrap();
+        spirv_val(
+            &spirv,
+            &format!("compute_groups{}", if wave64 { 64 } else { 32 }),
+        );
+        let mut heap = vec![0u32; 1024];
+        run_compute(&gpu, &spirv, &mut heap, &[0x100, 0], [4, 1, 1]);
+        for group in 0..4u32 {
+            for thread in 0..64u32 {
+                let at = (0x100 + group * 256 + thread * 4) as usize / 4;
+                assert_eq!(
+                    heap[at],
+                    group * 1000 + thread,
+                    "wave64 {wave64} group {group} thread {thread}"
+                );
+            }
+        }
+    }
+}
+
+fn dump(wave64: bool) -> String {
+    let mut lines = vec![
+        if wave64 {
+            "s_mov_b64 exec, -1"
+        } else {
+            "s_mov_b32 exec_lo, -1"
+        }
+        .to_string(),
+    ];
+    lines.push("v_mov_b32_e32 v11, 0".into());
+    for reg in 1..=9 {
+        lines.push(format!(
+            "v_lshl_add_u32 v10, v0, 2, 0x{:x}",
+            0x1000 + reg * 0x100
+        ));
+        lines.push(format!("global_store_dword v[10:11], v{reg}, off"));
+    }
+    for reg in 0..16 {
+        lines.push(format!("v_mov_b32_e32 v12, s{reg}"));
+        lines.push(format!("v_mov_b32_e32 v10, 0x{:x}", 0x1A00 + reg * 4));
+        lines.push("global_store_dword v[10:11], v12, off".into());
+    }
+    lines.join("\n")
+}
+
+fn compute_suite(wave64: bool) {
+    let Some(gpu) = gpu() else { return };
+    let lanes = if wave64 { 64 } else { 32 };
+    let mut completed = 0;
+    for seed in 1..=200u64 {
+        let mut generator = Generator {
+            rng: Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1),
+            wave64,
+            gpu: true,
+        };
+        let program = generator.program();
+        let body = program
+            .strip_suffix("s_endpgm")
+            .expect("programs end with s_endpgm");
+        let source = format!("{body}{}\ns_endpgm", dump(wave64));
+        let (mut wave, memory) = prepared(seed, wave64);
+        for reg in 1..256 {
+            wave.vgpr[reg] = [0; 64];
+        }
+        let mut heap_bytes = memory.bytes.clone();
+        heap_bytes.resize(0x2000, 0);
+        let mut reference_memory = Memory {
+            bytes: heap_bytes.clone(),
+        };
+        let code = rdna::assemble(&source, !wave64).unwrap_or_else(|e| panic!("{e:?}\n{source}"));
+        let user: Vec<u32> = wave.sgpr[..32].to_vec();
+        let mut reference = wave;
+        reference.flush_denormals = !gpu.info.denorm_preserve_32;
+        reference.canonical_nan = (gpu.info.vendor == 0x10DE).then_some(0x7FFF_FFFF);
+        if testkit::run(&code, &mut reference, &mut reference_memory).is_err() {
+            continue;
+        }
+        let function = shader_ir::lift(&code, wave64).unwrap_or_else(|e| panic!("{e}\n{source}"));
+        let options = compute_options(&gpu, [lanes, 1, 1], (16 << 1) | (32 << 15));
+        let mut options = options;
+        options.user_sgprs = 32;
+        let Ok(spirv) = shader_translate::compute(&function, &options) else {
+            continue;
+        };
+        let name = format!("compute{lanes}_{seed}");
+        spirv_val(&spirv, &name);
+        let mut heap = words(&heap_bytes);
+        run_compute(&gpu, &spirv, &mut heap, &user, [1, 1, 1]);
+        for (i, (a, b)) in heap.iter().zip(words(&reference_memory.bytes)).enumerate() {
+            assert!(
+                same(*a, b),
+                "{name} heap word {i:#x}: gpu {a:#x} cpu {b:#x}\n{source}\n{function}"
+            );
+        }
+        completed += 1;
+    }
+    assert!(completed > 150, "{completed}");
+}
+
+#[test]
+fn random_wave32_programs_match_as_compute_shaders() {
+    compute_suite(false);
+}
+
+#[test]
+fn random_wave64_programs_match_as_compute_shaders() {
+    compute_suite(true);
 }
