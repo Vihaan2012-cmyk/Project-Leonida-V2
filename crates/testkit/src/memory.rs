@@ -78,7 +78,45 @@ fn lds_write(wave: &mut Wave, address: u64, value: u32) -> Result<()> {
     Ok(())
 }
 
+fn lds_pair(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
+    let read = name.starts_with("ds_read");
+    let scale = if name.contains("st64") { 256 } else { 4 };
+    let first = offset_mod(inst, "offset0") as u64 * scale;
+    let second = offset_mod(inst, "offset1") as u64 * scale;
+    let address_arg = arg(inst, usize::from(read))?;
+    let lanes = wave.active_lanes();
+    let bases: Vec<u64> = lanes
+        .iter()
+        .map(|lane| wave.read_lane(address_arg, *lane, inst).map(u64::from))
+        .collect::<Result<_>>()?;
+    if read {
+        let reg = vreg(arg(inst, 0)?, inst)?;
+        let mut values = Vec::new();
+        for base in &bases {
+            values.push((
+                lds_read(wave, (base + first) & 0xFFFF_FFFF)?,
+                lds_read(wave, (base + second) & 0xFFFF_FFFF)?,
+            ));
+        }
+        for (lane, (low, high)) in lanes.iter().zip(values) {
+            wave.vgpr[reg][*lane] = low;
+            wave.vgpr[reg + 1][*lane] = high;
+        }
+    } else {
+        for (index, offset) in [(1, first), (2, second)] {
+            for (lane, base) in lanes.iter().zip(&bases) {
+                let data = wave.read_lane(arg(inst, index)?, *lane, inst)?;
+                lds_write(wave, (base + offset) & 0xFFFF_FFFF, data)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn lds(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
+    if name.starts_with("ds_read2") || name.starts_with("ds_write2") {
+        return lds_pair(name, inst, wave);
+    }
     let offset = offset_mod(inst, "offset") as u64;
     let returns = name.contains("_rtn_") || name.starts_with("ds_read");
     let first = usize::from(returns);

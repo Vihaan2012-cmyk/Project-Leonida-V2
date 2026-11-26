@@ -1639,6 +1639,31 @@ impl Lifter {
         let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
         let offset = Self::immediate(inst, "offset");
         match name {
+            "ds_write2_b32" | "ds_write2st64_b32" | "ds_read2_b32" | "ds_read2st64_b32" => {
+                let read = name.starts_with("ds_read");
+                let scale = if name.contains("st64") { 256 } else { 4 };
+                let first = Self::immediate(inst, "offset0") as u32;
+                let second = Self::immediate(inst, "offset1") as u32;
+                let base = self.lane(arg(usize::from(read))?, inst)?;
+                let mut addresses = Vec::new();
+                for slot in [first, second] {
+                    let immediate = self.c(slot * scale);
+                    addresses.push(self.bin(Bin::Add, base, immediate));
+                }
+                if read {
+                    let (target, _) = vgprs(arg(0)?, inst)?;
+                    let low = self.value(Expr::LdsLoad(addresses[0]));
+                    let high = self.value(Expr::LdsLoad(addresses[1]));
+                    self.stmts.push(Stmt::SetLane(target, low));
+                    self.stmts.push(Stmt::SetLane(target + 1, high));
+                } else {
+                    let low = self.lane(arg(1)?, inst)?;
+                    let high = self.lane(arg(2)?, inst)?;
+                    self.stmts.push(Stmt::LdsStore(addresses[0], low));
+                    self.stmts.push(Stmt::LdsStore(addresses[1], high));
+                }
+                Ok(true)
+            }
             "ds_write_b32" | "ds_read_b32" => {
                 let address_arg = if name == "ds_read_b32" {
                     arg(1)?

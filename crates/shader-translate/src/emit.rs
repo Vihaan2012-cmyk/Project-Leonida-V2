@@ -961,6 +961,9 @@ impl Emitter {
             Stmt::Let(tmp, expr) => {
                 let id = self.expr(expr)?;
                 self.values[*tmp as usize] = id;
+                if self.lanes == 64 && matches!(expr, Expr::LdsLoad(_)) {
+                    self.barrier()?;
+                }
             }
             Stmt::Set(reg, tmp) => {
                 let value = v(self, tmp);
@@ -1053,6 +1056,9 @@ impl Emitter {
                     let ptr = e.lds_element(index)?;
                     e.store(ptr, value)
                 })?;
+                if self.lanes == 64 {
+                    self.barrier()?;
+                }
             }
             Stmt::Store {
                 when,

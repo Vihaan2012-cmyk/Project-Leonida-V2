@@ -952,6 +952,29 @@ impl Generator {
             return address + &self.typed_load();
         }
         let op = match self.rng.below(7) {
+            0 if self.rng.chance(2) => {
+                let (op, limit) = if self.rng.chance(3) {
+                    ("ds_write2st64_b32", 16)
+                } else {
+                    ("ds_write2_b32", 64)
+                };
+                let (a, b) = (self.rng.below(limit), self.rng.below(limit));
+                format!(
+                    "{op} v9, {}, {} offset0:{a} offset1:{b}",
+                    self.vreg(),
+                    self.vreg()
+                )
+            }
+            1 if self.rng.chance(2) => {
+                let (op, limit) = if self.rng.chance(3) {
+                    ("ds_read2st64_b32", 16)
+                } else {
+                    ("ds_read2_b32", 64)
+                };
+                let (a, b) = (self.rng.below(limit), self.rng.below(limit));
+                let low = 1 + self.rng.below(if self.gpu { 3 } else { 7 });
+                format!("{op} v[{low}:{}], v9 offset0:{a} offset1:{b}", low + 1)
+            }
             0 => format!("ds_write_b32 v9, {} offset:{offset}", self.vreg()),
             1 => format!("ds_read_b32 {}, v9 offset:{offset}", self.vdst()),
             2 => format!(
