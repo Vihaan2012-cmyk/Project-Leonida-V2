@@ -113,7 +113,36 @@ fn lds_pair(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
     Ok(())
 }
 
+fn swizzle(inst: &Inst, wave: &mut Wave) -> Result<()> {
+    let text = inst
+        .mods
+        .iter()
+        .find_map(|m| m.strip_prefix("offset:"))
+        .unwrap_or("0");
+    let offset = if text.starts_with("swizzle(") {
+        rdna::parse_swizzle(text)
+    } else {
+        text.parse().ok()
+    }
+    .ok_or_else(|| bad(inst))? as usize;
+    let target = vreg(arg(inst, 0)?, inst)?;
+    let source = wave.vgpr[vreg(arg(inst, 1)?, inst)?];
+    for lane in wave.active_lanes() {
+        let from = if offset & 0x8000 != 0 {
+            (lane & !3) | ((offset >> (2 * (lane & 3))) & 3)
+        } else {
+            let (and, or, xor) = (offset & 0x1F, (offset >> 5) & 0x1F, (offset >> 10) & 0x1F);
+            (lane & 32) | ((((lane & 31) & and) | or) ^ xor)
+        };
+        wave.vgpr[target][lane] = if wave.active(from) { source[from] } else { 0 };
+    }
+    Ok(())
+}
+
 fn lds(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
+    if name == "ds_swizzle_b32" {
+        return swizzle(inst, wave);
+    }
     if name.starts_with("ds_read2") || name.starts_with("ds_write2") {
         return lds_pair(name, inst, wave);
     }

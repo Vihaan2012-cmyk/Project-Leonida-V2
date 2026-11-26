@@ -68,6 +68,48 @@ pub fn hwreg(simm16: u32) -> String {
     }
 }
 
+pub fn parse_swizzle(text: &str) -> Option<u32> {
+    let inner = text.strip_prefix("swizzle(")?.strip_suffix(')')?;
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    let number = |i: usize| parts.get(i)?.parse::<u32>().ok();
+    let bitmask =
+        |and: u32, or: u32, xor: u32| (and & 0x1F) | ((or & 0x1F) << 5) | ((xor & 0x1F) << 10);
+    Some(match parts[0] {
+        "QUAD_PERM" => {
+            let mut offset = 0x8000;
+            for i in 0..4 {
+                offset |= (number(i + 1)? & 3) << (2 * i);
+            }
+            offset
+        }
+        "SWAP" => bitmask(0x1F, 0, number(1)?),
+        "REVERSE" => bitmask(0x1F, 0, number(1)?.checked_sub(1)?),
+        "BROADCAST" => bitmask(0x1F ^ (number(1)?.checked_sub(1)?), number(2)?, 0),
+        "BITMASK_PERM" => {
+            let pattern = parts.get(1)?.trim_matches('"');
+            if pattern.len() != 5 {
+                return None;
+            }
+            let (mut and, mut or, mut xor) = (0, 0, 0);
+            for (i, c) in pattern.chars().enumerate() {
+                let bit = 1 << (4 - i);
+                match c {
+                    '0' => {}
+                    '1' => or |= bit,
+                    'p' => and |= bit,
+                    'i' => {
+                        and |= bit;
+                        xor |= bit;
+                    }
+                    _ => return None,
+                }
+            }
+            bitmask(and, or, xor)
+        }
+        _ => return None,
+    })
+}
+
 pub fn parse_hwreg(text: &str) -> Option<u32> {
     let inner = text.strip_prefix("hwreg(")?.strip_suffix(')')?;
     let parts: Vec<&str> = inner.split(',').map(str::trim).collect();

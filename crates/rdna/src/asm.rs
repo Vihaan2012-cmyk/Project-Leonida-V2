@@ -1051,7 +1051,12 @@ fn ds(entry: &Entry, parsed: &Parsed) -> Result<Vec<u32>, String> {
                 parsed.number("offset1")? as u32,
             )
         } else {
-            let offset = parsed.number("offset")? as u32;
+            let offset = match parsed.value("offset") {
+                Some(text) if text.starts_with("swizzle(") => {
+                    crate::names::parse_swizzle(text).ok_or("bad swizzle")?
+                }
+                _ => parsed.number("offset")? as u32,
+            };
             (offset & 0xFF, (offset >> 8) & 0xFF)
         };
     let w0 = 0xD800_0000

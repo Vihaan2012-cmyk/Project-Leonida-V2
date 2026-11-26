@@ -41,6 +41,7 @@ pub struct HarnessOptions {
     pub nan_preserve: bool,
     pub flush_denormals: bool,
     pub preserve_denormals: bool,
+    pub code_base: u64,
 }
 
 struct Types {
@@ -78,6 +79,7 @@ struct Emitter {
     lds_words: u32,
     memory_last: Word,
     decode: Option<Word>,
+    code_base: u64,
     values: Vec<Word>,
     types: Vec<Ty>,
 }
@@ -110,6 +112,10 @@ fn registers(function: &Function) -> (BTreeSet<u8>, BTreeSet<u8>) {
                 }
                 Stmt::SetLane(r, _) | Stmt::WriteLane(r, _, _) => {
                     vectors.insert(*r);
+                }
+                Stmt::Let(_, Expr::GetRelative(base, _)) => {
+                    vectors.insert(0);
+                    vectors.extend(*base..=255);
                 }
                 _ => {}
             }
@@ -188,8 +194,8 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
         Decoration::BuiltIn,
         [Operand::BuiltIn(BuiltIn::SubgroupId)],
     );
-    let two = b.constant_bit32(u32_, 2);
-    let exchange_array = b.type_array(u32_, two);
+    let slots = b.constant_bit32(u32_, 64);
+    let exchange_array = b.type_array(u32_, slots);
     let ptr_exchange = b.type_pointer(None, StorageClass::Workgroup, exchange_array);
     let exchange = b.variable(ptr_exchange, None, StorageClass::Workgroup, None);
     let t = Types {
@@ -267,6 +273,7 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
         lds_words: options.lds_words,
         memory_last: 0,
         decode: None,
+        code_base: options.code_base,
         values: vec![0; function.temps as usize],
         types,
     };
@@ -1110,6 +1117,7 @@ impl Emitter {
                 ok(self.b.select(ty, None, v(self, c), v(self, a), v(self, b)))?
             }
             Expr::LaneId => self.lane,
+            Expr::CodeBase => self.u64c(self.code_base),
             Expr::Active => {
                 if self.lanes == 64 {
                     self.get_pair(EXEC)?
@@ -1144,6 +1152,46 @@ impl Emitter {
                     self.barrier()?;
                     self.pack(low, high)?
                 }
+            }
+            Expr::Shuffle(source, lane) => {
+                let lane = self.masked_shift(v(self, lane), self.lanes - 1)?;
+                let source = v(self, source);
+                if self.lanes == 32 {
+                    let scope = self.u32c(3);
+                    ok(self
+                        .b
+                        .group_non_uniform_shuffle(u32_, None, scope, source, lane))?
+                } else {
+                    let mine = self.lane;
+                    let slot = self.exchange_slot(mine)?;
+                    self.store(slot, source)?;
+                    self.barrier()?;
+                    let slot = self.exchange_slot(lane)?;
+                    let value = self.load(slot)?;
+                    self.barrier()?;
+                    value
+                }
+            }
+            Expr::GetRelative(base, index) => {
+                let base_value = self.u32c(u32::from(*base));
+                let at = ok(self.b.i_add(u32_, None, base_value, v(self, index)))?;
+                let limit = self.u32c(256);
+                let inside = ok(self.b.u_less_than(bool_, None, at, limit))?;
+                let zero = self.u32c(0);
+                let at = ok(self.b.select(u32_, None, inside, at, zero))?;
+                let first = self.vgpr[&0];
+                let mut value = self.load(first)?;
+                for reg in *base..=255u8 {
+                    if reg == 0 {
+                        continue;
+                    }
+                    let candidate = self.vgpr[&reg];
+                    let candidate = self.load(candidate)?;
+                    let number = self.u32c(u32::from(reg));
+                    let hit = ok(self.b.i_equal(bool_, None, at, number))?;
+                    value = ok(self.b.select(u32_, None, hit, candidate, value))?;
+                }
+                value
             }
             Expr::ReadLane(source, lane) if self.lanes == 64 => {
                 let target = self.masked_shift(v(self, lane), 63)?;

@@ -16,6 +16,7 @@ pub struct Wave {
     pub canonical_nan: Option<u32>,
     pub exports: Vec<u32>,
     pub messages: Vec<(u32, u32)>,
+    pub code_base: u64,
 }
 
 pub const EXPORT_WORDS: usize = 64 * 4 * 64;
@@ -32,6 +33,7 @@ impl Wave {
             canonical_nan: None,
             exports: vec![0; EXPORT_WORDS],
             messages: Vec::new(),
+            code_base: 0,
         };
         wave.set_mask(EXEC, wave.full_mask());
         wave

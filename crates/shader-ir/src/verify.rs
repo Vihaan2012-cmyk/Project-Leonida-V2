@@ -100,7 +100,7 @@ impl Checker<'_> {
     fn expr(&self, expr: &Expr) -> Result<Ty, VerifyError> {
         Ok(match expr {
             Expr::Const(_) | Expr::LaneId | Expr::FirstActiveLane => Ty::U32,
-            Expr::Const64(_) | Expr::GetPair(_) | Expr::Active => Ty::U64,
+            Expr::Const64(_) | Expr::GetPair(_) | Expr::Active | Expr::CodeBase => Ty::U64,
             Expr::Get(reg) => reg_type(*reg),
             Expr::Un(op, a) => {
                 let (input, output) = unary(*op);
@@ -145,9 +145,13 @@ impl Checker<'_> {
                 self.expect(*a, Ty::Bool)?;
                 Ty::U64
             }
-            Expr::ReadLane(source, lane) => {
+            Expr::ReadLane(source, lane) | Expr::Shuffle(source, lane) => {
                 self.expect(*source, Ty::U32)?;
                 self.expect(*lane, Ty::U32)?;
+                Ty::U32
+            }
+            Expr::GetRelative(_, index) => {
+                self.expect(*index, Ty::U32)?;
                 Ty::U32
             }
             Expr::LdsLoad(address) => {

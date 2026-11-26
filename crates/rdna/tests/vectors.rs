@@ -230,3 +230,26 @@ fn listing_matches_llvm_layout_and_counts_invalid_words() {
     assert_eq!(decoded.invalid, 1);
     assert_eq!(decoded.insts.len(), 1);
 }
+
+#[test]
+fn ds_swizzle_offsets_round_trip_through_text() {
+    for offset in [
+        0x8000u32 | 0b11_10_01_00,
+        0x801B,
+        0x041F,
+        0x3C1F,
+        0x0010 | (3 << 5),
+        0x7FFF & 0x37BF,
+        0x1F | (5 << 10),
+    ] {
+        let word0 = 0xD800_0000u32 | (53 << 18) | (offset & 0xFFFF);
+        let code: Vec<u8> = [word0, 0x0100_0002]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let inst = rdna::decode_one(&code, 0, true).unwrap();
+        let text = inst.text();
+        let again = rdna::assemble(&text, true).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+        assert_eq!(again, code, "{text}");
+    }
+}

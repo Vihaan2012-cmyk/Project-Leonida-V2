@@ -202,6 +202,59 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
     if let Some(op) = name.strip_suffix("_sdwa") {
         return sdwa(op, inst, wave);
     }
+    if let Some(op) = name.strip_suffix("_dpp") {
+        return dpp(op, inst, wave);
+    }
+    match name {
+        "v_movrels_b32" => {
+            let Operand::Vgpr { reg, .. } = arg(inst, 1)?.operand else {
+                return Err(bad(inst));
+            };
+            let target = match arg(inst, 0)?.operand {
+                Operand::Vgpr { reg, .. } => usize::from(reg),
+                _ => return Err(bad(inst)),
+            };
+            let index = usize::from(reg) + wave.sgpr[124] as usize;
+            let index = if index < 256 { index } else { 0 };
+            for lane in wave.active_lanes() {
+                wave.vgpr[target][lane] = wave.vgpr[index][lane];
+            }
+            return Ok(true);
+        }
+        "v_permlane16_b32" | "v_permlanex16_b32" => {
+            let target = match arg(inst, 0)?.operand {
+                Operand::Vgpr { reg, .. } => usize::from(reg),
+                _ => return Err(bad(inst)),
+            };
+            let flags = selects(inst, "op_sel");
+            let low = wave.read_scalar(arg(inst, 2)?, inst)?;
+            let high = wave.read_scalar(arg(inst, 3)?, inst)?;
+            let mut source = [0u32; 64];
+            for (lane, slot) in source.iter_mut().enumerate().take(wave.lanes()) {
+                *slot = wave.read_lane(arg(inst, 1)?, lane, inst)?;
+            }
+            for lane in wave.active_lanes() {
+                let k = lane & 15;
+                let word = if k < 8 { low } else { high };
+                let select = ((word >> (4 * (k & 7))) & 15) as usize;
+                let mut base = lane & !15;
+                if name == "v_permlanex16_b32" {
+                    base ^= 16;
+                }
+                let from = base | select;
+                let value = if flags[0] || wave.active(from) {
+                    source[from]
+                } else if flags[1] {
+                    0
+                } else {
+                    wave.vgpr[target][lane]
+                };
+                wave.vgpr[target][lane] = value;
+            }
+            return Ok(true);
+        }
+        _ => {}
+    }
     if name.starts_with("v_cmp_") || name.starts_with("v_cmpx_") {
         compare(name, inst, wave)?;
         return Ok(true);
@@ -764,4 +817,102 @@ fn half_op(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
         wave.vgpr[target][lane] = value;
     }
     Ok(())
+}
+
+fn dpp_source(inst: &Inst, lane: usize) -> Option<(usize, bool)> {
+    let text = |key: &str| {
+        inst.mods
+            .iter()
+            .find_map(|m| m.strip_prefix(key)?.strip_prefix(':'))
+    };
+    let number = |value: &str| match value.strip_prefix("0x") {
+        Some(hex) => usize::from_str_radix(hex, 16).ok(),
+        None => value.parse().ok(),
+    };
+    let list = |value: &str| -> Vec<usize> {
+        value
+            .trim_matches(['[', ']'])
+            .split(',')
+            .map(|l| l.trim().parse().unwrap_or(0))
+            .collect()
+    };
+    if let Some(lanes) = text("dpp8") {
+        return Some(((lane & !7) | (list(lanes).get(lane & 7)? & 7), true));
+    }
+    let r = lane & 15;
+    let base = lane & !15;
+    let (within, inside) = if let Some(quad) = text("quad_perm") {
+        ((r & 12) | (list(quad).get(r & 3)? & 3), true)
+    } else if inst.mods.iter().any(|m| m == "row_mirror") {
+        (15 - r, true)
+    } else if inst.mods.iter().any(|m| m == "row_half_mirror") {
+        ((r & 8) | (7 - (r & 7)), true)
+    } else if let Some(n) = text("row_shl").and_then(number) {
+        ((r + n) & 15, r + n < 16)
+    } else if let Some(n) = text("row_shr").and_then(number) {
+        (r.wrapping_sub(n) & 15, r >= n)
+    } else if let Some(n) = text("row_ror").and_then(number) {
+        ((r + 16 - n) & 15, true)
+    } else if let Some(n) = text("row_share").and_then(number) {
+        (n & 15, true)
+    } else {
+        let n = text("row_xmask").and_then(number)?;
+        (r ^ (n & 15), true)
+    };
+    Some((base | within, inside))
+}
+
+fn dpp(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
+    let Operand::Vgpr { reg, .. } = arg(inst, 1)?.operand else {
+        return Err(bad(inst));
+    };
+    let Operand::Vgpr { reg: target, .. } = arg(inst, 0)?.operand else {
+        return Err(bad(inst));
+    };
+    let (source_reg, target) = (usize::from(reg), usize::from(target));
+    let flag = |key: &str| inst.mods.iter().any(|m| m == &format!("{key}:1"));
+    let mask = |key: &str| {
+        inst.mods
+            .iter()
+            .find_map(|m| m.strip_prefix(key)?.strip_prefix(":0x"))
+            .and_then(|hex| usize::from_str_radix(hex, 16).ok())
+            .unwrap_or(15)
+    };
+    let eight = inst.mods.iter().any(|m| m.starts_with("dpp8:"));
+    let bound = eight || flag("bound_ctrl");
+    let source = wave.vgpr[source_reg];
+    let mut permuted = [0u32; 64];
+    let mut write = [false; 64];
+    for lane in 0..wave.lanes() {
+        let (from, inside) = dpp_source(inst, lane).ok_or_else(|| bad(inst))?;
+        let ok = inside && (flag("fi") || wave.active(from));
+        permuted[lane] = if ok { source[from] } else { 0 };
+        let masks = eight
+            || ((mask("row_mask") >> ((lane >> 4) & 3)) & 1 != 0
+                && (mask("bank_mask") >> ((lane >> 2) & 3)) & 1 != 0);
+        write[lane] = masks && (ok || bound);
+    }
+    let saved = [wave.vgpr[SCRATCH], wave.vgpr[SCRATCH + 1]];
+    wave.vgpr[SCRATCH] = permuted;
+    wave.vgpr[SCRATCH + 1] = wave.vgpr[target];
+    let mut modified = inst.clone();
+    modified.args[1].operand = Operand::Vgpr {
+        reg: SCRATCH as u8,
+        count: 1,
+    };
+    modified.args[0].operand = Operand::Vgpr {
+        reg: (SCRATCH + 1) as u8,
+        count: 1,
+    };
+    let done = execute(name, &modified, wave);
+    if let Ok(true) = done {
+        for lane in wave.active_lanes() {
+            if write[lane] {
+                wave.vgpr[target][lane] = wave.vgpr[SCRATCH + 1][lane];
+            }
+        }
+    }
+    wave.vgpr[SCRATCH] = saved[0];
+    wave.vgpr[SCRATCH + 1] = saved[1];
+    done
 }

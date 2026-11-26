@@ -125,6 +125,7 @@ fn run(gpu: &Gpu, source: &str, wave: Wave, memory: Memory, name: &str) -> bool 
         nan_preserve: gpu.info.nan_preserve_32,
         flush_denormals: gpu.info.denorm_flush_32 && !gpu.info.denorm_preserve_32,
         preserve_denormals: gpu.info.denorm_preserve_32,
+        code_base: reference.code_base,
     };
     let spirv = harness(&function, &options).unwrap_or_else(|e| panic!("{e}\n{source}"));
     spirv_val(&spirv, name);

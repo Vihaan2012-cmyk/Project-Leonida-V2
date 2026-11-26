@@ -128,6 +128,7 @@ impl Report {
                         nan_preserve: false,
                         flush_denormals: false,
                         preserve_denormals: false,
+                        code_base: 0,
                     };
                     self.emitted +=
                         usize::from(shader_translate::harness(&function, &options).is_ok());

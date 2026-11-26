@@ -211,6 +211,128 @@ impl Generator {
         }
     }
 
+    fn dpp_control(&mut self) -> String {
+        let n = 1 + self.rng.below(15);
+        let mut control = match self.rng.below(9) {
+            0 => {
+                let q: Vec<String> = (0..4).map(|_| self.rng.below(4).to_string()).collect();
+                format!("quad_perm:[{}]", q.join(","))
+            }
+            1 => format!("row_shl:{n}"),
+            2 => format!("row_shr:{n}"),
+            3 => format!("row_ror:{n}"),
+            4 => "row_mirror".to_string(),
+            5 => "row_half_mirror".to_string(),
+            6 => format!("row_share:{}", self.rng.below(16)),
+            7 => format!("row_xmask:{}", self.rng.below(16)),
+            _ => {
+                let lanes: Vec<String> = (0..8).map(|_| self.rng.below(8).to_string()).collect();
+                let fi = if self.rng.chance(2) { " fi:1" } else { "" };
+                return format!("dpp8:[{}]{fi}", lanes.join(","));
+            }
+        };
+        let (row, bank) = if self.rng.chance(2) {
+            (15, 15)
+        } else {
+            (self.rng.below(16), self.rng.below(16))
+        };
+        control += &format!(" row_mask:0x{row:x} bank_mask:0x{bank:x}");
+        if self.rng.chance(2) {
+            control += " bound_ctrl:1";
+        }
+        if self.rng.chance(3) {
+            control += " fi:1";
+        }
+        control
+    }
+
+    fn cross_lane(&mut self) -> String {
+        match self.rng.below(5) {
+            0 | 1 => {
+                let control = self.dpp_control();
+                if self.rng.chance(3) {
+                    let op = self
+                        .rng
+                        .pick(&["v_add_f32", "v_mul_f32", "v_max_f32", "v_fmac_f32"]);
+                    format!(
+                        "{op}_dpp {}, {}, {} {control}",
+                        self.fdst(),
+                        self.fvreg(),
+                        self.fvreg()
+                    )
+                } else if self.rng.chance(3) {
+                    let op = self.rng.pick(&["v_mov_b32", "v_not_b32"]);
+                    format!("{op}_dpp {}, {} {control}", self.vdst(), self.vreg())
+                } else {
+                    let op = self.rng.pick(&[
+                        "v_add_nc_u32",
+                        "v_sub_nc_u32",
+                        "v_and_b32",
+                        "v_or_b32",
+                        "v_xor_b32",
+                        "v_min_u32",
+                        "v_max_u32",
+                    ]);
+                    format!(
+                        "{op}_dpp {}, {}, {} {control}",
+                        self.vdst(),
+                        self.vreg(),
+                        self.vreg()
+                    )
+                }
+            }
+            2 => {
+                let op = self.rng.pick(&["v_permlane16_b32", "v_permlanex16_b32"]);
+                let (fi, bc) = (self.rng.below(2), self.rng.below(2));
+                format!(
+                    "{op} {}, {}, {}, {} op_sel:[{fi},{bc}]",
+                    self.vdst(),
+                    self.vreg(),
+                    self.sreg(),
+                    self.sreg()
+                )
+            }
+            3 => {
+                let pattern = match self.rng.below(5) {
+                    0 => {
+                        let q: Vec<String> =
+                            (0..4).map(|_| self.rng.below(4).to_string()).collect();
+                        format!("QUAD_PERM,{}", q.join(","))
+                    }
+                    1 => format!("SWAP,{}", 1 << self.rng.below(5)),
+                    2 => format!("REVERSE,{}", 2 << self.rng.below(4)),
+                    3 => {
+                        let size = 2 << self.rng.below(4);
+                        format!("BROADCAST,{size},{}", self.rng.below(size))
+                    }
+                    _ => {
+                        let chars: String = (0..5)
+                            .map(|_| ['0', '1', 'p', 'i'][self.rng.below(4)])
+                            .collect();
+                        format!("BITMASK_PERM,\"{chars}\"")
+                    }
+                };
+                format!(
+                    "ds_swizzle_b32 {}, {} offset:swizzle({pattern})",
+                    self.vdst(),
+                    self.vreg()
+                )
+            }
+            _ => {
+                let index = if self.rng.chance(6) {
+                    300
+                } else {
+                    self.rng.below(9)
+                };
+                format!(
+                    "s_mov_b32 m0, {index}\nv_movrels_b32_e32 {}, v{}",
+                    self.vdst(),
+                    self.rng.below(3)
+                )
+            }
+        }
+    }
+
     fn half_source(&mut self) -> String {
         let value = if self.rng.chance(5) {
             self.rng.pick(&FLOATS).to_string()
@@ -531,7 +653,7 @@ impl Generator {
     }
 
     fn vector(&mut self) -> String {
-        match self.rng.below(21) {
+        match self.rng.below(23) {
             0 | 1 => {
                 let op = self.rng.pick(&[
                     "v_add_nc_u32",
@@ -734,6 +856,7 @@ impl Generator {
             10 => self.compare(),
             16 => self.sdwa(),
             18 | 19 => self.half(),
+            20 | 21 => self.cross_lane(),
             17 => {
                 let mut selectors = 0u32;
                 for i in 0..4 {
@@ -1030,6 +1153,9 @@ impl Generator {
                         };
                         let target = self.mask_reg();
                         format!("{op} {target}, {source}")
+                    } else if self.rng.chance(5) {
+                        let first = 2 * self.rng.below(8);
+                        format!("s_getpc_b64 s[{first}:{}]", first + 1)
                     } else if self.rng.chance(2) {
                         self.export()
                     } else if self.rng.chance(3) {

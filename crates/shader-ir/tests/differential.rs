@@ -14,6 +14,7 @@ fn check(source: &str, wave: Wave, memory: Memory) -> bool {
         canonical_nan: wave.canonical_nan,
         exports: wave.exports.clone(),
         messages: wave.messages.clone(),
+        code_base: wave.code_base,
     };
     let (mut reference, mut reference_memory) = (wave, memory);
     let expected = testkit::run(&code, &mut reference, &mut reference_memory);
@@ -182,6 +183,7 @@ fn random_programs_match_the_reference() {
             let source = generator.program();
             let mut wave = start(wave64, seed);
             wave.flush_denormals = seed % 3 == 0;
+            wave.code_base = seed.wrapping_mul(0x1_0000_1000);
             wave.canonical_nan = (seed % 4 == 0).then_some(0x7FFF_FFFF);
             completed += usize::from(check(&source, wave, memory(seed)));
         }

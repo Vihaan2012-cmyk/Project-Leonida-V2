@@ -133,9 +133,12 @@ pub enum Expr {
     Cmp(Cmp, Tmp, Tmp),
     Select(Tmp, Tmp, Tmp),
     LaneId,
+    CodeBase,
     Active,
     Ballot(Tmp),
     ReadLane(Tmp, Tmp),
+    Shuffle(Tmp, Tmp),
+    GetRelative(u8, Tmp),
     FirstActiveLane,
     LdsLoad(Tmp),
     Load {
@@ -197,7 +200,11 @@ impl Expr {
     pub fn operands(&self) -> Vec<Tmp> {
         match self {
             Expr::Un(_, a) | Expr::Ballot(a) | Expr::LdsLoad(a) | Expr::ScalarLoad(a) => vec![*a],
-            Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) | Expr::ReadLane(a, b) => vec![*a, *b],
+            Expr::Bin(_, a, b)
+            | Expr::Cmp(_, a, b)
+            | Expr::ReadLane(a, b)
+            | Expr::Shuffle(a, b) => vec![*a, *b],
+            Expr::GetRelative(_, index) => vec![*index],
             Expr::Tri(_, a, b, c) | Expr::Select(a, b, c) => vec![*a, *b, *c],
             Expr::Load { when, address } => when.iter().copied().chain([*address]).collect(),
             Expr::TypedLoad {
@@ -222,6 +229,8 @@ impl Expr {
                 | Expr::Load { .. }
                 | Expr::LdsLoad(_)
                 | Expr::TypedLoad { .. }
+                | Expr::Shuffle(..)
+                | Expr::GetRelative(..)
         )
     }
 

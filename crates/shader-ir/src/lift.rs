@@ -49,6 +49,7 @@ pub fn lift(code: &[u8], wave64: bool) -> Result<Function, LiftError> {
         next: 0,
         overrides: Vec::new(),
         destination: None,
+        write_when: None,
     };
     let mut blocks = Vec::new();
     for (id, start) in leaders.iter().enumerate() {
@@ -120,6 +121,7 @@ pub fn coverage(code: &[u8], wave64: bool) -> Coverage {
             next: 0,
             overrides: Vec::new(),
             destination: None,
+            write_when: None,
         };
         let supported = if is_end(inst) {
             true
@@ -164,6 +166,7 @@ struct Lifter {
     next: Tmp,
     overrides: Vec<(*const Arg, Tmp)>,
     destination: Option<(Select, Select)>,
+    write_when: Option<Tmp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,6 +422,13 @@ impl Lifter {
                     Some((select, unused)) => self.place(*reg, value, select, unused),
                     None => value,
                 };
+                let value = match self.write_when {
+                    Some(when) => {
+                        let old = self.value(Expr::Get(Reg::V(*reg)));
+                        self.value(Expr::Select(when, value, old))
+                    }
+                    None => value,
+                };
                 self.stmts.push(Stmt::SetLane(*reg, value));
                 Ok(())
             }
@@ -556,6 +566,158 @@ impl Lifter {
         };
         self.overrides.clear();
         self.destination = None;
+        result
+    }
+
+    fn lane_active(&mut self, lane: Tmp) -> Tmp {
+        let exec = self.mask_reg(Reg::Exec);
+        self.bin(Bin::LaneBit, exec, lane)
+    }
+
+    fn dpp(&mut self, name: &str, inst: &Inst) -> Result<(), LiftError> {
+        if name.starts_with("v_cmp") {
+            return Err(unsupported(inst));
+        }
+        let source_arg = inst.args.get(1).ok_or_else(|| unsupported(inst))?;
+        let Operand::Vgpr { reg, .. } = source_arg.operand else {
+            return Err(unsupported(inst));
+        };
+        let raw = self.value(Expr::Get(Reg::V(reg)));
+        let lane = self.value(Expr::LaneId);
+        let text = |key: &str| {
+            inst.mods
+                .iter()
+                .find_map(|m| m.strip_prefix(key)?.strip_prefix(':'))
+        };
+        let flag = |key: &str| inst.mods.iter().any(|m| m == &format!("{key}:1"));
+        let number = |value: &str| match value.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => value.parse().ok(),
+        };
+        let fetch_inactive = flag("fi");
+        let (from, in_row, bound) = if let Some(list) = text("dpp8") {
+            let lanes: Vec<u32> = list
+                .trim_matches(['[', ']'])
+                .split(',')
+                .map(|l| l.trim().parse().unwrap_or(0))
+                .collect();
+            if lanes.len() != 8 {
+                return Err(unsupported(inst));
+            }
+            let packed = lanes
+                .iter()
+                .enumerate()
+                .fold(0u32, |p, (i, l)| p | ((l & 7) << (3 * i)));
+            let seven = self.c(7);
+            let group_lane = self.bin(Bin::And, lane, seven);
+            let three = self.c(3);
+            let shift = self.value(Expr::Bin(Bin::Mul, group_lane, three));
+            let pattern = self.c(packed);
+            let select = self.bin(Bin::ShrU, pattern, shift);
+            let select = self.bin(Bin::And, select, seven);
+            let group = self.c(!7);
+            let base = self.bin(Bin::And, lane, group);
+            let from = self.bin(Bin::Or, base, select);
+            let yes = self.cmp(Cmp::True, lane, lane);
+            (from, yes, true)
+        } else {
+            let fifteen = self.c(15);
+            let r = self.bin(Bin::And, lane, fifteen);
+            let yes = self.cmp(Cmp::True, lane, lane);
+            let (within, inside) = if let Some(list) = text("quad_perm") {
+                let quad: Vec<u32> = list
+                    .trim_matches(['[', ']'])
+                    .split(',')
+                    .map(|l| l.trim().parse().unwrap_or(0))
+                    .collect();
+                let packed = quad
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |p, (i, l)| p | ((l & 3) << (2 * i)));
+                let three = self.c(3);
+                let quad_lane = self.bin(Bin::And, r, three);
+                let one = self.c(1);
+                let shift = self.bin(Bin::Shl, quad_lane, one);
+                let pattern = self.c(packed);
+                let select = self.bin(Bin::ShrU, pattern, shift);
+                let select = self.bin(Bin::And, select, three);
+                let quad = self.c(12);
+                let quad_base = self.bin(Bin::And, r, quad);
+                (self.bin(Bin::Or, quad_base, select), yes)
+            } else if inst.mods.iter().any(|m| m == "row_mirror") {
+                (self.bin(Bin::Sub, fifteen, r), yes)
+            } else if inst.mods.iter().any(|m| m == "row_half_mirror") {
+                let eight = self.c(8);
+                let half = self.bin(Bin::And, r, eight);
+                let seven = self.c(7);
+                let low = self.bin(Bin::And, r, seven);
+                let flipped = self.bin(Bin::Sub, seven, low);
+                (self.bin(Bin::Or, half, flipped), yes)
+            } else if let Some(n) = text("row_shl").and_then(number) {
+                let n = self.c(n);
+                let s = self.bin(Bin::Add, r, n);
+                let sixteen = self.c(16);
+                let inside = self.cmp(Cmp::LtU, s, sixteen);
+                (self.bin(Bin::And, s, fifteen), inside)
+            } else if let Some(n) = text("row_shr").and_then(number) {
+                let n = self.c(n);
+                let s = self.bin(Bin::Sub, r, n);
+                let inside = self.cmp(Cmp::GeU, r, n);
+                (self.bin(Bin::And, s, fifteen), inside)
+            } else if let Some(n) = text("row_ror").and_then(number) {
+                let n = self.c(n);
+                let s = self.bin(Bin::Sub, r, n);
+                (self.bin(Bin::And, s, fifteen), yes)
+            } else if let Some(n) = text("row_share").and_then(number) {
+                (self.c(n & 15), yes)
+            } else if let Some(n) = text("row_xmask").and_then(number) {
+                let n = self.c(n & 15);
+                (self.bin(Bin::Xor, r, n), yes)
+            } else {
+                return Err(unsupported(inst));
+            };
+            let row = self.c(!15);
+            let base = self.bin(Bin::And, lane, row);
+            (self.bin(Bin::Or, base, within), inside, flag("bound_ctrl"))
+        };
+        let source_ok = if fetch_inactive {
+            in_row
+        } else {
+            let active = self.lane_active(from);
+            self.value(Expr::Select(in_row, active, in_row))
+        };
+        let value = self.value(Expr::Shuffle(raw, from));
+        let zero = self.c(0);
+        let value = self.value(Expr::Select(source_ok, value, zero));
+        let mut write = if bound {
+            self.cmp(Cmp::True, lane, lane)
+        } else {
+            source_ok
+        };
+        if text("dpp8").is_none() {
+            for (key, shift) in [("row_mask", 4), ("bank_mask", 2)] {
+                let mask = text(key).and_then(number).unwrap_or(0xF);
+                let amount = self.c(shift);
+                let index = self.bin(Bin::ShrU, lane, amount);
+                let three = self.c(3);
+                let index = self.bin(Bin::And, index, three);
+                let bits = self.c(mask);
+                let bit = self.bin(Bin::ShrU, bits, index);
+                let one = self.c(1);
+                let bit = self.bin(Bin::And, bit, one);
+                let enabled = self.cmp(Cmp::Ne, bit, zero);
+                write = self.value(Expr::Select(enabled, write, enabled));
+            }
+        }
+        self.overrides.push((source_arg as *const Arg, value));
+        self.write_when = Some(write);
+        let result = if self.vector_op(name, inst)? {
+            Ok(())
+        } else {
+            Err(unsupported(inst))
+        };
+        self.overrides.clear();
+        self.write_when = None;
         result
     }
 
@@ -750,6 +912,9 @@ impl Lifter {
         if base.starts_with("s_") && self.scalar_op(base, inst)? {
             return Ok(());
         }
+        if let Some(op) = base.strip_suffix("_dpp") {
+            return self.dpp(op, inst);
+        }
         if let Some(op) = base.strip_suffix("_sdwa") {
             return self.sdwa(op, inst);
         }
@@ -801,6 +966,13 @@ impl Lifter {
 
     fn scalar_op(&mut self, name: &str, inst: &Inst) -> Result<bool, LiftError> {
         let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
+        if name == "s_getpc_b64" {
+            let base = self.value(Expr::CodeBase);
+            let next = self.c64(inst.pc as u64 + 4);
+            let address = self.bin(Bin::Add64, base, next);
+            self.set_scalar64(arg(0)?, address, inst)?;
+            return Ok(true);
+        }
         if name == "s_bcnt1_i32_b64" {
             let a = self.scalar64(arg(1)?, inst)?;
             let count = self.un(Un::Popcount64, a);
@@ -1106,6 +1278,49 @@ impl Lifter {
         let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
         let value = match name {
             "v_mov_b32" => self.lane(arg(1)?, inst)?,
+            "v_movrels_b32" => {
+                let (base, _) = vgprs(arg(1)?, inst)?;
+                let index = self.value(Expr::Get(Reg::M0));
+                self.value(Expr::GetRelative(base, index))
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                let (target, _) = vgprs(arg(0)?, inst)?;
+                let source = self.lane(arg(1)?, inst)?;
+                let low = self.scalar(arg(2)?, inst)?;
+                let high = self.scalar(arg(3)?, inst)?;
+                let flags = op_sel(inst, "op_sel");
+                let lane = self.value(Expr::LaneId);
+                let fifteen = self.c(15);
+                let row_lane = self.bin(Bin::And, lane, fifteen);
+                let eight = self.c(8);
+                let upper = self.cmp(Cmp::GeU, row_lane, eight);
+                let word = self.value(Expr::Select(upper, high, low));
+                let seven = self.c(7);
+                let nibble = self.bin(Bin::And, row_lane, seven);
+                let two = self.c(2);
+                let shift = self.bin(Bin::Shl, nibble, two);
+                let shifted = self.bin(Bin::ShrU, word, shift);
+                let select = self.bin(Bin::And, shifted, fifteen);
+                let row = self.c(!15);
+                let mut row_base = self.bin(Bin::And, lane, row);
+                if name == "v_permlanex16_b32" {
+                    let sixteen = self.c(16);
+                    row_base = self.bin(Bin::Xor, row_base, sixteen);
+                }
+                let from = self.bin(Bin::Or, row_base, select);
+                let value = self.value(Expr::Shuffle(source, from));
+                if flags[0] {
+                    value
+                } else {
+                    let active = self.lane_active(from);
+                    let fallback = if flags[1] {
+                        self.c(0)
+                    } else {
+                        self.value(Expr::Get(Reg::V(target)))
+                    };
+                    self.value(Expr::Select(active, value, fallback))
+                }
+            }
             "v_cndmask_b32" => {
                 let condition = if inst.args.len() > 3 {
                     self.mask(arg(3)?, inst)?
@@ -1639,6 +1854,51 @@ impl Lifter {
         let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
         let offset = Self::immediate(inst, "offset");
         match name {
+            "ds_swizzle_b32" => {
+                let text = inst
+                    .mods
+                    .iter()
+                    .find_map(|m| m.strip_prefix("offset:"))
+                    .unwrap_or("0");
+                let offset = if text.starts_with("swizzle(") {
+                    rdna::parse_swizzle(text)
+                } else {
+                    text.parse().ok()
+                }
+                .ok_or_else(|| unsupported(inst))?;
+                let source = self.lane(arg(1)?, inst)?;
+                let lane = self.value(Expr::LaneId);
+                let from = if offset & 0x8000 != 0 {
+                    let three = self.c(3);
+                    let quad_lane = self.bin(Bin::And, lane, three);
+                    let one = self.c(1);
+                    let shift = self.bin(Bin::Shl, quad_lane, one);
+                    let pattern = self.c(offset & 0xFF);
+                    let select = self.bin(Bin::ShrU, pattern, shift);
+                    let select = self.bin(Bin::And, select, three);
+                    let quad = self.c(!3);
+                    let quad_base = self.bin(Bin::And, lane, quad);
+                    self.bin(Bin::Or, quad_base, select)
+                } else {
+                    let low = self.c(31);
+                    let group_lane = self.bin(Bin::And, lane, low);
+                    let and_mask = self.c(offset & 0x1F);
+                    let or_mask = self.c((offset >> 5) & 0x1F);
+                    let xor_mask = self.c((offset >> 10) & 0x1F);
+                    let picked = self.bin(Bin::And, group_lane, and_mask);
+                    let picked = self.bin(Bin::Or, picked, or_mask);
+                    let picked = self.bin(Bin::Xor, picked, xor_mask);
+                    let group = self.c(32);
+                    let group_base = self.bin(Bin::And, lane, group);
+                    self.bin(Bin::Or, group_base, picked)
+                };
+                let value = self.value(Expr::Shuffle(source, from));
+                let active = self.lane_active(from);
+                let zero = self.c(0);
+                let value = self.value(Expr::Select(active, value, zero));
+                self.set_lane(arg(0)?, value, inst)?;
+                Ok(true)
+            }
             "ds_write2_b32" | "ds_write2st64_b32" | "ds_read2_b32" | "ds_read2st64_b32" => {
                 let read = name.starts_with("ds_read");
                 let scale = if name.contains("st64") { 256 } else { 4 };

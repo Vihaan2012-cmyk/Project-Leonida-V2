@@ -27,6 +27,7 @@ pub struct Machine {
     pub canonical_nan: Option<u32>,
     pub exports: Vec<u32>,
     pub messages: Vec<(u32, u32)>,
+    pub code_base: u64,
 }
 
 pub const EXPORT_WORDS: usize = 64 * 4 * 64;
@@ -47,6 +48,7 @@ impl Machine {
             canonical_nan: None,
             exports: vec![0; EXPORT_WORDS],
             messages: Vec::new(),
+            code_base: 0,
         };
         machine.sgpr[EXEC] = u32::MAX;
         if wave64 {
@@ -367,12 +369,18 @@ impl Run<'_> {
                 }
             }
             Expr::LaneId => lane as u64,
+            Expr::CodeBase => self.machine.code_base,
             Expr::Active => self.exec(),
             Expr::Ballot(t) => (0..self.lanes)
                 .filter(|l| self.active(*l) && self.values[*t as usize][*l] != 0)
                 .fold(0, |mask, l| mask | 1 << l),
-            Expr::ReadLane(source, which) => {
+            Expr::ReadLane(source, which) | Expr::Shuffle(source, which) => {
                 self.values[*source as usize][v(which) as usize % self.lanes]
+            }
+            Expr::GetRelative(base, index) => {
+                let at = usize::from(*base) + v(index) as u32 as usize;
+                let at = if at < 256 { at } else { 0 };
+                u64::from(self.machine.vgpr[at][lane])
             }
             Expr::FirstActiveLane => {
                 let exec = self.exec();
