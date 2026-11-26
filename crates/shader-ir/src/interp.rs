@@ -25,6 +25,14 @@ pub struct Machine {
     pub memory: Vec<u8>,
     pub flush_denormals: bool,
     pub canonical_nan: Option<u32>,
+    pub exports: Vec<u32>,
+    pub messages: Vec<(u32, u32)>,
+}
+
+pub const EXPORT_WORDS: usize = 64 * 4 * 64;
+
+pub fn export_slot(target: u8, component: usize, lane: usize) -> usize {
+    (usize::from(target) * 4 + component) * 64 + lane
 }
 
 impl Machine {
@@ -37,6 +45,8 @@ impl Machine {
             memory: vec![0; memory],
             flush_denormals: false,
             canonical_nan: None,
+            exports: vec![0; EXPORT_WORDS],
+            messages: Vec::new(),
         };
         machine.sgpr[EXEC] = u32::MAX;
         if wave64 {
@@ -437,6 +447,22 @@ impl Run<'_> {
             Stmt::WriteLane(r, lane, value) => {
                 let lane = self.values[*lane as usize][0] as usize % self.lanes;
                 self.machine.vgpr[usize::from(*r)][lane] = self.values[*value as usize][0] as u32;
+            }
+            Stmt::Export { target, values } => {
+                for lane in 0..self.lanes {
+                    if self.active(lane) {
+                        for (component, value) in values.iter().enumerate() {
+                            if let Some(value) = value {
+                                let word = self.values[*value as usize][lane] as u32;
+                                self.machine.exports[export_slot(*target, component, lane)] = word;
+                            }
+                        }
+                    }
+                }
+            }
+            Stmt::Message(code, m0) => {
+                let m0 = self.values[*m0 as usize][0] as u32;
+                self.machine.messages.push((*code, m0));
             }
             Stmt::LdsStore(address, value) => {
                 for lane in 0..self.lanes {

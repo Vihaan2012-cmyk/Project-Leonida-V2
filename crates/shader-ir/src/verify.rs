@@ -196,6 +196,12 @@ impl Checker<'_> {
                 self.expect(*address, Ty::U32)?;
                 self.expect(*value, Ty::U32)?;
             }
+            Stmt::Export { values, .. } => {
+                for value in values.iter().flatten() {
+                    self.expect(*value, Ty::U32)?;
+                }
+            }
+            Stmt::Message(_, m0) => self.expect(*m0, Ty::U32)?,
             Stmt::Store {
                 when,
                 address,

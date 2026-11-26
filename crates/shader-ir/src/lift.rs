@@ -423,7 +423,36 @@ impl Lifter {
         ) {
             return Ok(());
         }
-        if base.starts_with("s_setreg") && inst.text().contains("HW_REG_FLAT_SCR") {
+        if base.starts_with("s_setreg") && harmless_setreg(inst) {
+            return Ok(());
+        }
+        if base == "exp" {
+            let Operand::Named(target) = &arg(0)?.operand else {
+                return Err(unsupported(inst));
+            };
+            let target = export_target(target).ok_or_else(|| unsupported(inst))?;
+            let compressed = inst.mods.iter().any(|m| m == "compr");
+            let sources: Vec<usize> = if compressed {
+                vec![1, 3]
+            } else {
+                vec![1, 2, 3, 4]
+            };
+            let mut values = [None; 4];
+            for (component, index) in sources.into_iter().enumerate() {
+                if let Operand::Vgpr { reg, .. } = arg(index)?.operand {
+                    values[component] = Some(self.value(Expr::Get(Reg::V(reg))));
+                }
+            }
+            self.stmts.push(Stmt::Export { target, values });
+            return Ok(());
+        }
+        if base == "s_sendmsg" {
+            let Operand::Named(text) = &arg(0)?.operand else {
+                return Err(unsupported(inst));
+            };
+            let code = rdna::parse_sendmsg(text).ok_or_else(|| unsupported(inst))?;
+            let m0 = self.value(Expr::Get(Reg::M0));
+            self.stmts.push(Stmt::Message(code, m0));
             return Ok(());
         }
         if let Some(op) = base
@@ -1439,6 +1468,47 @@ impl Lifter {
             _ => Ok(false),
         }
     }
+}
+
+pub fn export_target(name: &str) -> Option<u8> {
+    let number = |prefix: &str| name.strip_prefix(prefix).and_then(|n| n.parse::<u8>().ok());
+    Some(match name {
+        "mrtz" => 8,
+        "null" => 9,
+        "prim" => 20,
+        _ => {
+            if let Some(n) = number("param") {
+                32 + n
+            } else if let Some(n) = number("pos") {
+                12 + n
+            } else if let Some(n) = number("mrt") {
+                n
+            } else {
+                number("tgt")?
+            }
+        }
+    })
+}
+
+fn harmless_setreg(inst: &Inst) -> bool {
+    let text = inst.text();
+    if text.contains("HW_REG_FLAT_SCR") {
+        return true;
+    }
+    let Some(Operand::Named(reg)) = inst.args.first().map(|a| &a.operand) else {
+        return false;
+    };
+    let Some(code) = rdna::parse_hwreg(reg) else {
+        return false;
+    };
+    let value = match inst.args.get(1).map(|a| &a.operand) {
+        Some(Operand::Int(value)) => *value,
+        Some(Operand::Literal(value)) => i64::from(*value),
+        _ => return false,
+    };
+    let offset = (code >> 6) & 31;
+    let size = ((code >> 11) & 31) + 1;
+    code & 63 == 1 && offset + size <= 4 && value == 0
 }
 
 fn vgprs(arg: &Arg, inst: &Inst) -> Result<(u8, u8), LiftError> {

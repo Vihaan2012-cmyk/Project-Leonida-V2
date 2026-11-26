@@ -148,6 +148,11 @@ pub enum Stmt {
     SetLane(u8, Tmp),
     WriteLane(u8, Tmp, Tmp),
     LdsStore(Tmp, Tmp),
+    Export {
+        target: u8,
+        values: [Option<Tmp>; 4],
+    },
+    Message(u32, Tmp),
     Store {
         when: Option<Tmp>,
         address: Tmp,

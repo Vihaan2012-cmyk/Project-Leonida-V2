@@ -2,7 +2,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use gpu::Gpu;
-use shader_translate::{HarnessOptions, STATE_SCC, STATE_VGPR, STATE_WORDS, harness};
+use shader_translate::{
+    EXPORT_BUFFER_WORDS, HarnessOptions, MESSAGE_BASE, MESSAGE_LIMIT, STATE_SCC, STATE_VGPR,
+    STATE_WORDS, harness,
+};
 use testkit::random::{Generator, Rng, memory, start};
 use testkit::{Memory, Wave};
 
@@ -109,6 +112,7 @@ fn run(gpu: &Gpu, source: &str, wave: Wave, memory: Memory, name: &str) -> bool 
     }
     let mut gpu_memory = words(&memory.bytes);
     let mut lds = words(&wave.lds[..4 * LDS_WORDS]);
+    let mut exports = vec![0u32; EXPORT_BUFFER_WORDS];
     let (mut reference, mut reference_memory) = (wave, memory);
     reference.flush_denormals = !gpu.info.denorm_preserve_32;
     reference.canonical_nan = (gpu.info.vendor == 0x10DE).then_some(0x7FFF_FFFF);
@@ -126,7 +130,7 @@ fn run(gpu: &Gpu, source: &str, wave: Wave, memory: Memory, name: &str) -> bool 
     spirv_val(&spirv, name);
     gpu.dispatch(
         &spirv,
-        &mut [&mut state, &mut gpu_memory, &mut lds],
+        &mut [&mut state, &mut gpu_memory, &mut lds, &mut exports],
         [1, 1, 1],
         Some(32),
     )
@@ -171,6 +175,34 @@ fn run(gpu: &Gpu, source: &str, wave: Wave, memory: Memory, name: &str) -> bool 
                 context()
             );
         }
+    }
+    for (i, (a, b)) in exports.iter().zip(&reference.exports).enumerate() {
+        assert!(
+            same(*a, *b),
+            "export word {i}: gpu {a:#x} cpu {b:#x}\n{}",
+            context()
+        );
+    }
+    let count = exports[MESSAGE_BASE as usize] as usize;
+    assert_eq!(
+        count,
+        reference.messages.len(),
+        "message count\n{}",
+        context()
+    );
+    for (i, (code, m0)) in reference
+        .messages
+        .iter()
+        .take(MESSAGE_LIMIT as usize)
+        .enumerate()
+    {
+        let at = MESSAGE_BASE as usize + 1 + 2 * i;
+        assert_eq!(
+            (exports[at], exports[at + 1]),
+            (*code, *m0),
+            "message {i}\n{}",
+            context()
+        );
     }
     for (i, (a, b)) in lds
         .iter()

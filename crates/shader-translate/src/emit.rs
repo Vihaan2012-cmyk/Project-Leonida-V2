@@ -12,6 +12,9 @@ use shader_ir::{Bin, Cmp, Expr, Function, Reg, Stmt, Terminator, Tri, Ty, Un, Ve
 pub const STATE_SCC: u32 = 128;
 pub const STATE_VGPR: u32 = 256;
 pub const STATE_WORDS: usize = 256 + 256 * 64;
+pub const MESSAGE_BASE: u32 = 64 * 4 * 64;
+pub const MESSAGE_LIMIT: u32 = 64;
+pub const EXPORT_BUFFER_WORDS: usize = MESSAGE_BASE as usize + 1 + 2 * MESSAGE_LIMIT as usize;
 const EXEC: u8 = 126;
 const VCC: u8 = 106;
 const M0: u8 = 124;
@@ -69,6 +72,8 @@ struct Emitter {
     state: Word,
     memory: Word,
     lds_image: Word,
+    exports: Word,
+    messages: Word,
     lds: Word,
     lds_words: u32,
     memory_last: Word,
@@ -164,6 +169,7 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
     let state = buffer(&mut b, 0);
     let memory = buffer(&mut b, 1);
     let lds_image = buffer(&mut b, 2);
+    let exports = buffer(&mut b, 3);
     let lds_len = b.constant_bit32(u32_, options.lds_words);
     let lds_array = b.type_array(u32_, lds_len);
     let ptr_lds = b.type_pointer(None, StorageClass::Workgroup, lds_array);
@@ -223,6 +229,7 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
     let scc = b.variable(t.ptr_function_bool, None, StorageClass::Function, None);
     let current = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let iterations = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
+    let messages = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let local = ok(b.load(u32_, None, lane_input, None, []))?;
     let (lane, half) = if function.wave64 {
         let half = ok(b.load(u32_, None, half_input, None, []))?;
@@ -253,6 +260,8 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
         state,
         memory,
         lds_image,
+        exports,
+        messages,
         lds,
         lds_words: options.lds_words,
         memory_last: 0,
@@ -420,6 +429,8 @@ impl Emitter {
     }
 
     fn prologue(&mut self) -> Result<(), EmitError> {
+        let zero = self.u32c(0);
+        self.store(self.messages, zero)?;
         let state = self.state;
         let scalars: Vec<(u8, Word)> = self.sgpr.iter().map(|(r, v)| (*r, *v)).collect();
         for (reg, var) in scalars {
@@ -478,7 +489,12 @@ impl Emitter {
             let value = ok(e.b.select(u32_, None, flag, one, zero))?;
             let index = e.u32c(STATE_SCC);
             let ptr = e.element(state, index)?;
-            e.store(ptr, value)
+            e.store(ptr, value)?;
+            let count = e.load(e.messages)?;
+            let index = e.u32c(MESSAGE_BASE);
+            let exports = e.exports;
+            let ptr = e.element(exports, index)?;
+            e.store(ptr, count)
         })
     }
 
@@ -690,6 +706,59 @@ impl Emitter {
                 let u32_ = self.t.u32_;
                 let new = ok(self.b.select(u32_, None, hit, v(self, value), old))?;
                 self.store(var, new)?;
+            }
+            Stmt::Export { target, values } => {
+                let active = self.active()?;
+                let values = *values;
+                let target = *target;
+                let resolved: Vec<Option<Word>> = values
+                    .iter()
+                    .map(|v| v.map(|t| self.values[t as usize]))
+                    .collect();
+                self.if_then(active, |e| {
+                    let exports = e.exports;
+                    for (component, value) in resolved.iter().enumerate() {
+                        if let Some(value) = value {
+                            let base = e.u32c((u32::from(target) * 4 + component as u32) * 64);
+                            let u32_ = e.t.u32_;
+                            let index = ok(e.b.i_add(u32_, None, base, e.lane))?;
+                            let ptr = e.element(exports, index)?;
+                            e.store(ptr, *value)?;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            Stmt::Message(code, m0) => {
+                let m0 = v(self, m0);
+                let code = *code;
+                let zero = self.u32c(0);
+                let bool_ = self.t.bool_;
+                let first = ok(self.b.i_equal(bool_, None, self.lane, zero))?;
+                let counter = self.messages;
+                let count = self.load(counter)?;
+                let limit = self.u32c(MESSAGE_LIMIT);
+                let room = ok(self.b.u_less_than(bool_, None, count, limit))?;
+                let first = ok(self.b.logical_and(bool_, None, first, room))?;
+                self.if_then(first, |e| {
+                    let u32_ = e.t.u32_;
+                    let base = e.u32c(MESSAGE_BASE + 1);
+                    let two = e.u32c(2);
+                    let at = ok(e.b.i_mul(u32_, None, count, two))?;
+                    let at = ok(e.b.i_add(u32_, None, at, base))?;
+                    let exports = e.exports;
+                    let ptr = e.element(exports, at)?;
+                    let code = e.u32c(code);
+                    e.store(ptr, code)?;
+                    let one = e.u32c(1);
+                    let next = ok(e.b.i_add(u32_, None, at, one))?;
+                    let ptr = e.element(exports, next)?;
+                    e.store(ptr, m0)
+                })?;
+                let one = self.u32c(1);
+                let u32_ = self.t.u32_;
+                let count = ok(self.b.i_add(u32_, None, count, one))?;
+                self.store(counter, count)?;
             }
             Stmt::LdsStore(address, value) => {
                 let active = self.active()?;

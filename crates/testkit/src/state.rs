@@ -14,7 +14,11 @@ pub struct Wave {
     pub lds: Vec<u8>,
     pub flush_denormals: bool,
     pub canonical_nan: Option<u32>,
+    pub exports: Vec<u32>,
+    pub messages: Vec<(u32, u32)>,
 }
+
+pub const EXPORT_WORDS: usize = 64 * 4 * 64;
 
 impl Wave {
     pub fn new(wave64: bool) -> Wave {
@@ -26,6 +30,8 @@ impl Wave {
             lds: vec![0; 64 * 1024],
             flush_denormals: false,
             canonical_nan: None,
+            exports: vec![0; EXPORT_WORDS],
+            messages: Vec::new(),
         };
         wave.set_mask(EXEC, wave.full_mask());
         wave

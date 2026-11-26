@@ -6,7 +6,7 @@ mod valu;
 
 use rdna::Inst;
 
-pub use state::{Memory, Wave};
+pub use state::{EXPORT_WORDS, Memory, Wave};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExecError {
@@ -69,6 +69,10 @@ fn execute(inst: &Inst, wave: &mut Wave, memory: &mut Memory) -> Result<Flow> {
         .strip_suffix("_e32")
         .or_else(|| name.strip_suffix("_e64"))
         .unwrap_or(name);
+    if base == "exp" {
+        export(inst, wave)?;
+        return Ok(Flow::Next);
+    }
     if let Some(flow) = salu::execute(base, inst, wave)? {
         return Ok(flow);
     }
@@ -82,4 +86,47 @@ fn execute(inst: &Inst, wave: &mut Wave, memory: &mut Memory) -> Result<Flow> {
         pc: inst.pc,
         text: inst.text(),
     })
+}
+
+fn export_target(name: &str) -> Option<usize> {
+    let number = |prefix: &str| {
+        name.strip_prefix(prefix)
+            .and_then(|n| n.parse::<usize>().ok())
+    };
+    Some(match name {
+        "mrtz" => 8,
+        "null" => 9,
+        "prim" => 20,
+        _ => {
+            if let Some(n) = number("param") {
+                32 + n
+            } else if let Some(n) = number("pos") {
+                12 + n
+            } else if let Some(n) = number("mrt") {
+                n
+            } else {
+                number("tgt")?
+            }
+        }
+    })
+}
+
+fn export(inst: &Inst, wave: &mut Wave) -> Result<()> {
+    let bad = || state::bad(inst);
+    let Some(rdna::Operand::Named(name)) = inst.args.first().map(|a| &a.operand) else {
+        return Err(bad());
+    };
+    let target = export_target(name).filter(|t| *t < 64).ok_or_else(bad)?;
+    let compressed = inst.mods.iter().any(|m| m == "compr");
+    let sources: &[usize] = if compressed { &[1, 3] } else { &[1, 2, 3, 4] };
+    for lane in wave.active_lanes() {
+        for (component, index) in sources.iter().enumerate() {
+            if let Some(rdna::Operand::Vgpr { reg, .. }) = inst.args.get(*index).map(|a| &a.operand)
+            {
+                let value = wave.vgpr[usize::from(*reg)][lane];
+                wave.exports[(target * 4 + component) * 64 + lane] = value;
+            }
+        }
+    }
+    Ok(())
 }

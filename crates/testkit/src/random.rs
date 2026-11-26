@@ -179,6 +179,35 @@ impl Generator {
         }
     }
 
+    fn export(&mut self) -> String {
+        match self.rng.below(4) {
+            0 => "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)".into(),
+            1 => "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0".into(),
+            2 => {
+                let target = self.rng.pick(&[
+                    "mrt0", "mrt3", "pos0", "pos1", "prim", "param0", "param5", "param31",
+                ]);
+                let (a, b) = (self.vreg(), self.vreg());
+                format!("exp {target} {a}, {a}, {b}, {b} compr")
+            }
+            _ => {
+                let target = self.rng.pick(&[
+                    "mrt1", "mrtz", "pos0", "pos3", "prim", "param1", "param7", "param30",
+                ]);
+                let mut sources = Vec::new();
+                for _ in 0..4 {
+                    sources.push(if self.rng.chance(4) {
+                        "off".to_string()
+                    } else {
+                        self.vreg()
+                    });
+                }
+                let done = if self.rng.chance(3) { " done" } else { "" };
+                format!("exp {target} {}{done}", sources.join(", "))
+            }
+        }
+    }
+
     fn float_literal(&mut self) -> String {
         let value = ((self.rng.word() % 2000) as f32 / 16.0 - 60.0).to_bits();
         format!("0x{value:x}")
@@ -780,6 +809,8 @@ impl Generator {
                         };
                         let target = self.mask_reg();
                         format!("{op} {target}, {source}")
+                    } else if self.rng.chance(2) {
+                        self.export()
                     } else if self.rng.chance(3) {
                         let which = self.rng.pick(&["LO", "HI"]);
                         format!(

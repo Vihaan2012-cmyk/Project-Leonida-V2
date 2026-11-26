@@ -12,6 +12,8 @@ fn check(source: &str, wave: Wave, memory: Memory) -> bool {
         memory: memory.bytes.clone(),
         flush_denormals: wave.flush_denormals,
         canonical_nan: wave.canonical_nan,
+        exports: wave.exports.clone(),
+        messages: wave.messages.clone(),
     };
     let (mut reference, mut reference_memory) = (wave, memory);
     let expected = testkit::run(&code, &mut reference, &mut reference_memory);
@@ -40,6 +42,17 @@ fn check(source: &str, wave: Wave, memory: Memory) -> bool {
         }
     }
     assert!(machine.lds == reference.lds, "lds\n{}", context());
+    assert!(
+        machine.exports == reference.exports,
+        "exports\n{}",
+        context()
+    );
+    assert_eq!(
+        machine.messages,
+        reference.messages,
+        "messages\n{}",
+        context()
+    );
     assert!(
         machine.memory == reference_memory.bytes,
         "memory\n{}",

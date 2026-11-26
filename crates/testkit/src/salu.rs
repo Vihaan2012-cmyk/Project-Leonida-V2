@@ -76,6 +76,26 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<Option<Flow>>
     narrow(name, inst, wave).map(|done| done.then_some(Flow::Next))
 }
 
+fn harmless_setreg(inst: &Inst) -> bool {
+    if inst.text().contains("HW_REG_FLAT_SCR") {
+        return true;
+    }
+    let Some(Operand::Named(reg)) = inst.args.first().map(|a| &a.operand) else {
+        return false;
+    };
+    let Some(code) = rdna::parse_hwreg(reg) else {
+        return false;
+    };
+    let value = match inst.args.get(1).map(|a| &a.operand) {
+        Some(Operand::Int(value)) => *value,
+        Some(Operand::Literal(value)) => i64::from(*value),
+        _ => return false,
+    };
+    let offset = (code >> 6) & 31;
+    let size = ((code >> 11) & 31) + 1;
+    code & 63 == 1 && offset + size <= 4 && value == 0
+}
+
 fn compare(op: &str, a: u32, b: u32) -> Option<bool> {
     let (ia, ib) = (a as i32, b as i32);
     Some(match op {
@@ -100,7 +120,15 @@ fn program_flow(name: &str, inst: &Inst, wave: &mut Wave) -> Result<Option<Flow>
     };
     let taken = match name {
         "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done" => return Ok(Some(Flow::End)),
-        "s_setreg_imm32_b32" | "s_setreg_b32" if inst.text().contains("HW_REG_FLAT_SCR") => {
+        "s_setreg_imm32_b32" | "s_setreg_b32" if harmless_setreg(inst) => {
+            return Ok(Some(Flow::Next));
+        }
+        "s_sendmsg" => {
+            let Some(Operand::Named(text)) = inst.args.first().map(|a| &a.operand) else {
+                return Err(bad(inst));
+            };
+            let code = rdna::parse_sendmsg(text).ok_or_else(|| bad(inst))?;
+            wave.messages.push((code, wave.sgpr[124]));
             return Ok(Some(Flow::Next));
         }
         "s_nop" | "s_waitcnt" | "s_waitcnt_vscnt" | "s_barrier" | "s_clause"
