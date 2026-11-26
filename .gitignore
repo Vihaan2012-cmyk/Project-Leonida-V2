@@ -1,0 +1,36 @@
+# Build output
+/target/
+**/*.rs.bk
+
+# Leonida's own generated data (never commit)
+/Output/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Game data backstop: none of this may ever be committed, under any name.
+# CI also scans file contents (see docs/specs), because a renamed file slips past extensions.
+*.rpf
+*.ttpf
+*.xvd
+*.xvc
+*.msixvc
+*.dxbc
+*.fssm
+*.spv
+*.spvasm
+*.dds
+*.ktx2
+*.bk2
+*.awc
+*.ogg
+*.wav
+*.glb
+*.gltf
+*.obj
+*.exe
+*.dll
+*.pdb
+*.dmp
+MicrosoftGame.Config
