@@ -23,6 +23,8 @@ pub struct Machine {
     pub scc: bool,
     pub lds: Vec<u8>,
     pub memory: Vec<u8>,
+    pub flush_denormals: bool,
+    pub canonical_nan: Option<u32>,
 }
 
 impl Machine {
@@ -33,6 +35,8 @@ impl Machine {
             scc: false,
             lds: vec![0; 64 * 1024],
             memory: vec![0; memory],
+            flush_denormals: false,
+            canonical_nan: None,
         };
         machine.sgpr[EXEC] = u32::MAX;
         if wave64 {
@@ -69,11 +73,31 @@ fn f(bits: u64) -> f32 {
     f32::from_bits(bits as u32)
 }
 
-fn bits(value: f32) -> u64 {
-    u64::from(value.to_bits())
+#[derive(Clone, Copy)]
+struct Mode {
+    flush: bool,
+    nan: Option<u32>,
 }
 
-fn unary(op: Un, a: u64) -> u64 {
+fn settle(value: f32, mode: Mode) -> f32 {
+    match mode.nan {
+        Some(bits) if value.is_nan() => f32::from_bits(bits),
+        _ if mode.flush && value.is_subnormal() => 0.0f32.copysign(value),
+        _ => value,
+    }
+}
+
+fn load(bits: u64, mode: Mode) -> f32 {
+    settle(f(bits), mode)
+}
+
+fn store(value: f32, mode: Mode) -> u64 {
+    u64::from(settle(value, mode).to_bits())
+}
+
+fn unary(op: Un, a: u64, mode: Mode) -> u64 {
+    let f = |x: u64| load(x, mode);
+    let bits = |v: f32| store(v, mode);
     let x = a as u32;
     match op {
         Un::Not => u64::from(!x),
@@ -90,9 +114,9 @@ fn unary(op: Un, a: u64) -> u64 {
         Un::CvtF32I32 => bits(x as i32 as f32),
         Un::CvtU32F32 => u64::from(f(a) as u32),
         Un::CvtI32F32 => u64::from(f(a) as i32 as u32),
-        Un::FNeg => bits(-f(a)),
-        Un::FAbs => bits(f(a).abs()),
-        Un::FClamp01 => bits(f(a).clamp(0.0, 1.0)),
+        Un::FNeg => u64::from(x ^ 0x8000_0000),
+        Un::FAbs => u64::from(x & 0x7FFF_FFFF),
+        Un::FClamp01 => bits(if f(a) > 0.0 { f(a).min(1.0) } else { 0.0 }),
         Un::FRcp => bits(1.0 / f(a)),
         Un::FRsq => bits(1.0 / f(a).sqrt()),
         Un::FSqrt => bits(f(a).sqrt()),
@@ -106,7 +130,9 @@ fn unary(op: Un, a: u64) -> u64 {
     }
 }
 
-fn binary(op: Bin, a: u64, b: u64) -> u64 {
+fn binary(op: Bin, a: u64, b: u64, mode: Mode) -> u64 {
+    let f = |x: u64| load(x, mode);
+    let bits = |v: f32| store(v, mode);
     let (x, y) = (a as u32, b as u32);
     u64::from(match op {
         Bin::Add => x.wrapping_add(y),
@@ -123,11 +149,11 @@ fn binary(op: Bin, a: u64, b: u64) -> u64 {
         Bin::MaxU => x.max(y),
         Bin::MinS => (x as i32).min(y as i32) as u32,
         Bin::MaxS => (x as i32).max(y as i32) as u32,
-        Bin::FAdd => (f(a) + f(b)).to_bits(),
-        Bin::FSub => (f(a) - f(b)).to_bits(),
-        Bin::FMul => (f(a) * f(b)).to_bits(),
-        Bin::FMin => f(a).min(f(b)).to_bits(),
-        Bin::FMax => f(a).max(f(b)).to_bits(),
+        Bin::FAdd => return bits(f(a) + f(b)),
+        Bin::FSub => return bits(f(a) - f(b)),
+        Bin::FMul => return bits(f(a) * f(b)),
+        Bin::FMin => return bits(f(a).min(f(b))),
+        Bin::FMax => return bits(f(a).max(f(b))),
         Bin::Add64 => return a.wrapping_add(b),
         Bin::Sub64 => return a.wrapping_sub(b),
         Bin::And64 => return a & b,
@@ -140,10 +166,12 @@ fn binary(op: Bin, a: u64, b: u64) -> u64 {
     })
 }
 
-fn ternary(op: Tri, a: u64, b: u64, c: u64) -> u64 {
+fn ternary(op: Tri, a: u64, b: u64, c: u64, mode: Mode) -> u64 {
+    let f = |x: u64| load(x, mode);
+    let bits = |v: f32| store(v, mode);
     match op {
         Tri::FFma => bits(f(a).mul_add(f(b), f(c))),
-        Tri::FMad => bits(f(a) * f(b) + f(c)),
+        Tri::FMad => bits(f(bits(f(a) * f(b))) + f(c)),
         Tri::BfeU => {
             let width = c as u32 & 31;
             if width == 0 {
@@ -155,7 +183,8 @@ fn ternary(op: Tri, a: u64, b: u64, c: u64) -> u64 {
     }
 }
 
-fn compare(op: Cmp, a: u64, b: u64) -> bool {
+fn compare(op: Cmp, a: u64, b: u64, mode: Mode) -> bool {
+    let f = |x: u64| load(x, mode);
     use std::cmp::Ordering::{Equal, Greater, Less};
     let (x, y) = (a as u32, b as u32);
     let ord = f(a).partial_cmp(&f(b));
@@ -200,6 +229,13 @@ struct Run<'a> {
 }
 
 impl Run<'_> {
+    fn mode(&self) -> Mode {
+        Mode {
+            flush: self.machine.flush_denormals,
+            nan: self.machine.canonical_nan,
+        }
+    }
+
     fn exec(&self) -> u64 {
         let mask = if self.lanes == 64 {
             u64::MAX
@@ -232,10 +268,10 @@ impl Run<'_> {
             Expr::Const64(c) => *c,
             Expr::Get(reg) => self.get(*reg, lane),
             Expr::GetPair(r) => self.machine.pair(usize::from(*r)),
-            Expr::Un(op, a) => unary(*op, v(a)),
-            Expr::Bin(op, a, b) => binary(*op, v(a), v(b)),
-            Expr::Tri(op, a, b, c) => ternary(*op, v(a), v(b), v(c)),
-            Expr::Cmp(op, a, b) => u64::from(compare(*op, v(a), v(b))),
+            Expr::Un(op, a) => unary(*op, v(a), self.mode()),
+            Expr::Bin(op, a, b) => binary(*op, v(a), v(b), self.mode()),
+            Expr::Tri(op, a, b, c) => ternary(*op, v(a), v(b), v(c), self.mode()),
+            Expr::Cmp(op, a, b) => u64::from(compare(*op, v(a), v(b), self.mode())),
             Expr::Select(c, a, b) => {
                 if v(c) != 0 {
                     v(a)

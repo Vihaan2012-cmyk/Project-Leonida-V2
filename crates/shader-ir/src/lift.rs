@@ -80,6 +80,20 @@ pub fn lift(code: &[u8], wave64: bool) -> Result<Function, LiftError> {
             terminator,
         });
     }
+    let falls_off = blocks.iter().any(|block| match block.terminator {
+        Terminator::Jump(target) => target == leaders.len(),
+        Terminator::Branch(_, taken, fallthrough) => {
+            taken == leaders.len() || fallthrough == leaders.len()
+        }
+        Terminator::End => false,
+    });
+    if falls_off {
+        blocks.push(Block {
+            pc: code.len(),
+            stmts: Vec::new(),
+            terminator: Terminator::End,
+        });
+    }
     Ok(Function {
         wave64,
         blocks,
@@ -828,7 +842,7 @@ impl Lifter {
                 let zero = self.c(0);
                 let a_zero = self.cmp(Cmp::FEq, a, zero);
                 let b_zero = self.cmp(Cmp::FEq, b, zero);
-                let either = self.bin(Bin::Or, a_zero, b_zero);
+                let either = self.value(Expr::Select(a_zero, a_zero, b_zero));
                 let product = self.bin(Bin::FMul, a, b);
                 let value = self.value(Expr::Select(either, zero, product));
                 self.output_modifiers(value, inst)
@@ -856,7 +870,10 @@ impl Lifter {
                 let carry_in = if name.contains("_ci_") {
                     let mask = self.mask(arg(inst.args.len() - 1)?, inst)?;
                     let lane = self.value(Expr::LaneId);
-                    self.bin(Bin::LaneBit, mask, lane)
+                    let bit = self.bin(Bin::LaneBit, mask, lane);
+                    let one = self.c64(1);
+                    let zero = self.c64(0);
+                    self.value(Expr::Select(bit, one, zero))
                 } else {
                     self.c64(0)
                 };

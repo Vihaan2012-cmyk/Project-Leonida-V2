@@ -1,0 +1,19 @@
+[package]
+name = "shader-translate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rspirv.workspace = true
+shader-ir.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+gpu.workspace = true
+rdna.workspace = true
+testkit.workspace = true
+
+[lints]
+workspace = true

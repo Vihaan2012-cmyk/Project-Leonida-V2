@@ -10,11 +10,14 @@ rust-version = "1.97"
 
 [workspace.dependencies]
 anyhow = "1"
+ash = "0.38"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
 memchr = "2"
 memmap2 = "0.9"
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }
 rayon = "1"
+rspirv = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -23,8 +26,10 @@ thiserror = "2"
 game-package = { path = "crates/game-package" }
 shader-container = { path = "crates/shader-container" }
 leonida-ui = { path = "crates/leonida-ui" }
+gpu = { path = "crates/gpu" }
 rdna = { path = "crates/rdna" }
 shader-ir = { path = "crates/shader-ir" }
+shader-translate = { path = "crates/shader-translate" }
 testkit = { path = "crates/testkit" }
 
 [workspace.lints.rust]

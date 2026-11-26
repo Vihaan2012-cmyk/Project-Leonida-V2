@@ -12,6 +12,8 @@ pub struct Wave {
     pub vgpr: Vec<[u32; 64]>,
     pub scc: bool,
     pub lds: Vec<u8>,
+    pub flush_denormals: bool,
+    pub canonical_nan: Option<u32>,
 }
 
 impl Wave {
@@ -22,6 +24,8 @@ impl Wave {
             vgpr: vec![[0; 64]; 256],
             scc: false,
             lds: vec![0; 64 * 1024],
+            flush_denormals: false,
+            canonical_nan: None,
         };
         wave.set_mask(EXEC, wave.full_mask());
         wave
@@ -184,7 +188,15 @@ impl Wave {
         if arg.neg {
             value = -value;
         }
-        Ok(value)
+        Ok(self.flush(value))
+    }
+
+    pub fn flush(&self, value: f32) -> f32 {
+        match self.canonical_nan {
+            Some(bits) if value.is_nan() => f32::from_bits(bits),
+            _ if self.flush_denormals && value.is_subnormal() => 0.0f32.copysign(value),
+            _ => value,
+        }
     }
 
     pub fn write_lane(&mut self, arg: &Arg, lane: usize, value: u32, inst: &Inst) -> Result<()> {

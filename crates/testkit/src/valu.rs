@@ -123,6 +123,15 @@ fn kind(name: &str) -> Option<Kind> {
         "v_max_f32" => F2(f32::max),
         "v_fma_f32" => F3(f32::mul_add),
         "v_mad_f32" => F3(|a, b, c| a * b + c),
+        "v_mad_f32_flushed" => F3(|a, b, c| {
+            let product = a * b;
+            let product = if product.is_subnormal() {
+                0.0f32.copysign(product)
+            } else {
+                product
+            };
+            product + c
+        }),
         "v_med3_f32" => F3(med3),
         "v_min3_f32" => F3(|a, b, c| a.min(b).min(c)),
         "v_max3_f32" => F3(|a, b, c| a.max(b).max(c)),
@@ -142,17 +151,18 @@ fn kind(name: &str) -> Option<Kind> {
     })
 }
 
-fn output_modifiers(inst: &Inst, mut value: f32) -> f32 {
+fn output_modifiers(wave: &Wave, inst: &Inst, value: f32) -> f32 {
+    let mut value = wave.flush(value);
     for modifier in &inst.mods {
-        value = match modifier.as_str() {
+        value = wave.flush(match modifier.as_str() {
             "mul:2" => value * 2.0,
             "mul:4" => value * 4.0,
             "div:2" => value * 0.5,
             _ => value,
-        };
+        });
     }
     if inst.mods.iter().any(|m| m == "clamp") {
-        value = value.clamp(0.0, 1.0);
+        value = clamp_unit(value);
     }
     value
 }
@@ -232,16 +242,17 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
                 let value = if name == "v_fmac_f32" {
                     a.mul_add(b, c)
                 } else {
-                    a * b + c
+                    wave.flush(a * b) + c
                 };
-                let value = output_modifiers(inst, value);
+                let value = output_modifiers(wave, inst, value);
                 wave.write_lane(arg(inst, 0)?, lane, value.to_bits(), inst)?;
             }
             return Ok(true);
         }
         _ => {}
     }
-    let Some(kind) = kind(name) else {
+    let flushed = name == "v_mad_f32" && wave.flush_denormals;
+    let Some(kind) = kind(if flushed { "v_mad_f32_flushed" } else { name }) else {
         return Ok(false);
     };
     for lane in wave.active_lanes() {
@@ -251,11 +262,13 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
             Kind::I1(op) => op(int(1)?),
             Kind::I2(op) => op(int(1)?, int(2)?),
             Kind::I3(op) => op(int(1)?, int(2)?, int(3)?),
-            Kind::F1(op) => output_modifiers(inst, op(float(1)?)).to_bits(),
-            Kind::F2(op) => output_modifiers(inst, op(float(1)?, float(2)?)).to_bits(),
-            Kind::F3(op) => output_modifiers(inst, op(float(1)?, float(2)?, float(3)?)).to_bits(),
+            Kind::F1(op) => output_modifiers(wave, inst, op(float(1)?)).to_bits(),
+            Kind::F2(op) => output_modifiers(wave, inst, op(float(1)?, float(2)?)).to_bits(),
+            Kind::F3(op) => {
+                output_modifiers(wave, inst, op(float(1)?, float(2)?, float(3)?)).to_bits()
+            }
             Kind::FloatToInt(op) => op(float(1)?),
-            Kind::IntToFloat(op) => output_modifiers(inst, op(int(1)?)).to_bits(),
+            Kind::IntToFloat(op) => output_modifiers(wave, inst, op(int(1)?)).to_bits(),
         };
         wave.write_lane(arg(inst, 0)?, lane, value, inst)?;
     }
@@ -364,4 +377,8 @@ fn compare(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
         wave.set_mask(target, result);
     }
     Ok(())
+}
+
+fn clamp_unit(value: f32) -> f32 {
+    if value > 0.0 { value.min(1.0) } else { 0.0 }
 }

@@ -1,4 +1,5 @@
 mod memory;
+pub mod random;
 mod salu;
 mod state;
 mod valu;
