@@ -52,6 +52,7 @@ pub struct DeviceInfo {
     pub min_subgroup_size: u32,
     pub max_subgroup_size: u32,
     pub subgroup_size_control: bool,
+    pub full_subgroups: bool,
     pub ballot_and_shuffle: bool,
     pub int64: bool,
     pub denorm_preserve_32: bool,
@@ -124,6 +125,7 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
                 min_subgroup_size: v13.min_subgroup_size,
                 max_subgroup_size: v13.max_subgroup_size,
                 subgroup_size_control: size_control,
+                full_subgroups: f13.compute_full_subgroups == vk::TRUE,
                 ballot_and_shuffle: v11.subgroup_supported_operations.contains(needed)
                     && v11
                         .subgroup_supported_stages
@@ -208,7 +210,7 @@ impl Gpu {
                 .queue_priorities(&priorities)];
             let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
                 .subgroup_size_control(chosen.info.subgroup_size_control)
-                .compute_full_subgroups(chosen.info.subgroup_size_control);
+                .compute_full_subgroups(chosen.info.full_subgroups);
             let base = vk::PhysicalDeviceFeatures::default().shader_int64(chosen.info.int64);
             let mut features = vk::PhysicalDeviceFeatures2::default()
                 .features(base)
@@ -323,6 +325,9 @@ impl Gpu {
                 && (self.info.min_subgroup_size..=self.info.max_subgroup_size).contains(&size)
             {
                 stage = stage.push_next(&mut required);
+                if self.info.full_subgroups {
+                    stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
+                }
             }
             let create = vk::ComputePipelineCreateInfo::default()
                 .stage(stage)

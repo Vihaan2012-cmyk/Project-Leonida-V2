@@ -24,8 +24,6 @@ pub enum EmitError {
     Verify(#[from] VerifyError),
     #[error("building SPIR-V failed: {0}")]
     Build(String),
-    #[error("wave64 shaders need the wave64 lowering")]
-    Wave64,
     #[error("LDS size must be a power of two number of words")]
     LdsSize,
 }
@@ -64,6 +62,10 @@ struct Emitter {
     vgpr: HashMap<u8, Word>,
     scc: Word,
     lane: Word,
+    local: Word,
+    half: Word,
+    lanes: u32,
+    exchange: Word,
     state: Word,
     memory: Word,
     lds_image: Word,
@@ -111,9 +113,7 @@ fn registers(function: &Function) -> (BTreeSet<u8>, BTreeSet<u8>) {
 }
 
 pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>, EmitError> {
-    if function.wave64 {
-        return Err(EmitError::Wave64);
-    }
+    let lanes: u32 = if function.wave64 { 64 } else { 32 };
     if !options.lds_words.is_power_of_two() {
         return Err(EmitError::LdsSize);
     }
@@ -175,6 +175,16 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
         Decoration::BuiltIn,
         [Operand::BuiltIn(BuiltIn::SubgroupLocalInvocationId)],
     );
+    let half_input = b.variable(ptr_input_u32, None, StorageClass::Input, None);
+    b.decorate(
+        half_input,
+        Decoration::BuiltIn,
+        [Operand::BuiltIn(BuiltIn::SubgroupId)],
+    );
+    let two = b.constant_bit32(u32_, 2);
+    let exchange_array = b.type_array(u32_, two);
+    let ptr_exchange = b.type_pointer(None, StorageClass::Workgroup, exchange_array);
+    let exchange = b.variable(ptr_exchange, None, StorageClass::Workgroup, None);
     let t = Types {
         bool_,
         u32_,
@@ -213,7 +223,20 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
     let scc = b.variable(t.ptr_function_bool, None, StorageClass::Function, None);
     let current = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let iterations = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
-    let lane = ok(b.load(u32_, None, lane_input, None, []))?;
+    let local = ok(b.load(u32_, None, lane_input, None, []))?;
+    let (lane, half) = if function.wave64 {
+        let half = ok(b.load(u32_, None, half_input, None, []))?;
+        let shift = b.constant_bit32(u32_, 5);
+        let base = ok(b.shift_left_logical(u32_, None, half, shift))?;
+        (ok(b.i_add(u32_, None, base, local))?, half)
+    } else {
+        (local, local)
+    };
+    let interface = if function.wave64 {
+        vec![lane_input, half_input]
+    } else {
+        vec![lane_input]
+    };
     let mut e = Emitter {
         b,
         glsl,
@@ -223,6 +246,10 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
         vgpr,
         scc,
         lane,
+        local,
+        half,
+        lanes,
+        exchange,
         state,
         memory,
         lds_image,
@@ -257,8 +284,8 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
     e.epilogue()?;
     ok(e.b.ret())?;
     ok(e.b.end_function())?;
-    e.b.entry_point(ExecutionModel::GLCompute, main, "main", [lane_input]);
-    e.b.execution_mode(main, ExecutionMode::LocalSize, [32, 1, 1]);
+    e.b.entry_point(ExecutionModel::GLCompute, main, "main", interface);
+    e.b.execution_mode(main, ExecutionMode::LocalSize, [lanes, 1, 1]);
     if options.nan_preserve {
         e.b.execution_mode(main, ExecutionMode::SignedZeroInfNanPreserve, [32]);
     }
@@ -374,8 +401,9 @@ impl Emitter {
 
     fn copy_lds(&mut self, inward: bool) -> Result<(), EmitError> {
         let u32_ = self.t.u32_;
-        for chunk in 0..self.lds_words / 32 {
-            let base = self.u32c(32 * chunk);
+        let lanes = self.lanes;
+        for chunk in 0..self.lds_words / lanes {
+            let base = self.u32c(lanes * chunk);
             let index = ok(self.b.i_add(u32_, None, base, self.lane))?;
             let image = self.lds_image;
             let outside = self.element(image, index)?;
@@ -561,10 +589,28 @@ impl Emitter {
         Ok((low, high))
     }
 
-    fn active(&mut self) -> Result<Word, EmitError> {
-        let exec = self.load(self.sgpr_var(EXEC))?;
+    fn exec_word(&mut self) -> Result<Word, EmitError> {
+        let low = self.load(self.sgpr_var(EXEC))?;
+        if self.lanes == 32 {
+            return Ok(low);
+        }
+        let high = self.load(self.sgpr_var(EXEC + 1))?;
         let (u32_, bool_) = (self.t.u32_, self.t.bool_);
-        let shifted = ok(self.b.shift_right_logical(u32_, None, exec, self.lane))?;
+        let zero = self.u32c(0);
+        let upper = ok(self.b.i_not_equal(bool_, None, self.half, zero))?;
+        ok(self.b.select(u32_, None, upper, high, low))
+    }
+
+    fn exchange_slot(&mut self, index: Word) -> Result<Word, EmitError> {
+        let ptr = self.t.ptr_workgroup_u32;
+        let exchange = self.exchange;
+        ok(self.b.access_chain(ptr, None, exchange, [index]))
+    }
+
+    fn active(&mut self) -> Result<Word, EmitError> {
+        let exec = self.exec_word()?;
+        let (u32_, bool_) = (self.t.u32_, self.t.bool_);
+        let shifted = ok(self.b.shift_right_logical(u32_, None, exec, self.local))?;
         let one = self.u32c(1);
         let bit = ok(self.b.bitwise_and(u32_, None, shifted, one))?;
         let zero = self.u32c(0);
@@ -636,7 +682,7 @@ impl Emitter {
                 self.store(var, value)?;
             }
             Stmt::WriteLane(reg, lane, value) => {
-                let target = self.masked_shift(v(self, lane), 31)?;
+                let target = self.masked_shift(v(self, lane), self.lanes - 1)?;
                 let bool_ = self.t.bool_;
                 let hit = ok(self.b.i_equal(bool_, None, target, self.lane))?;
                 let var = self.vgpr[reg];
@@ -705,8 +751,12 @@ impl Emitter {
             }
             Expr::LaneId => self.lane,
             Expr::Active => {
-                let exec = self.load(self.sgpr_var(EXEC))?;
-                ok(self.b.u_convert(u64_, None, exec))?
+                if self.lanes == 64 {
+                    self.get_pair(EXEC)?
+                } else {
+                    let exec = self.load(self.sgpr_var(EXEC))?;
+                    ok(self.b.u_convert(u64_, None, exec))?
+                }
             }
             Expr::Ballot(a) => {
                 let active = self.active()?;
@@ -714,8 +764,41 @@ impl Emitter {
                 let scope = self.u32c(3);
                 let uvec4 = self.t.uvec4;
                 let ballot = ok(self.b.group_non_uniform_ballot(uvec4, None, scope, both))?;
-                let low = ok(self.b.composite_extract(u32_, None, ballot, [0]))?;
-                ok(self.b.u_convert(u64_, None, low))?
+                let mine = ok(self.b.composite_extract(u32_, None, ballot, [0]))?;
+                if self.lanes == 32 {
+                    ok(self.b.u_convert(u64_, None, mine))?
+                } else {
+                    let zero = self.u32c(0);
+                    let first = ok(self.b.i_equal(bool_, None, self.local, zero))?;
+                    let half = self.half;
+                    self.if_then(first, |e| {
+                        let slot = e.exchange_slot(half)?;
+                        e.store(slot, mine)
+                    })?;
+                    self.barrier()?;
+                    let one = self.u32c(1);
+                    let low = self.exchange_slot(zero)?;
+                    let low = self.load(low)?;
+                    let high = self.exchange_slot(one)?;
+                    let high = self.load(high)?;
+                    self.barrier()?;
+                    self.pack(low, high)?
+                }
+            }
+            Expr::ReadLane(source, lane) if self.lanes == 64 => {
+                let target = self.masked_shift(v(self, lane), 63)?;
+                let hit = ok(self.b.i_equal(bool_, None, target, self.lane))?;
+                let source = v(self, source);
+                let zero = self.u32c(0);
+                self.if_then(hit, |e| {
+                    let slot = e.exchange_slot(zero)?;
+                    e.store(slot, source)
+                })?;
+                self.barrier()?;
+                let slot = self.exchange_slot(zero)?;
+                let value = self.load(slot)?;
+                self.barrier()?;
+                value
             }
             Expr::ReadLane(source, lane) => {
                 let lane = self.masked_shift(v(self, lane), 31)?;
@@ -729,7 +812,17 @@ impl Emitter {
                 let lowest = self.glsl(u32_, GLOp::FindILsb, &[exec])?;
                 let zero = self.u32c(0);
                 let none = ok(self.b.i_equal(bool_, None, exec, zero))?;
-                ok(self.b.select(u32_, None, none, zero, lowest))?
+                if self.lanes == 32 {
+                    ok(self.b.select(u32_, None, none, zero, lowest))?
+                } else {
+                    let high = self.load(self.sgpr_var(EXEC + 1))?;
+                    let upper = self.glsl(u32_, GLOp::FindILsb, &[high])?;
+                    let thirty_two = self.u32c(32);
+                    let upper = ok(self.b.i_add(u32_, None, upper, thirty_two))?;
+                    let high_none = ok(self.b.i_equal(bool_, None, high, zero))?;
+                    let upper = ok(self.b.select(u32_, None, high_none, zero, upper))?;
+                    ok(self.b.select(u32_, None, none, upper, lowest))?
+                }
             }
             Expr::LdsLoad(address) => {
                 let index = self.lds_index(v(self, address))?;

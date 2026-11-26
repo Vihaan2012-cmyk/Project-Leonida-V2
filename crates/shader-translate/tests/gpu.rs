@@ -97,7 +97,9 @@ fn words(bytes: &[u8]) -> Vec<u32> {
 }
 
 fn run(gpu: &Gpu, source: &str, wave: Wave, memory: Memory, name: &str) -> bool {
-    let code = rdna::assemble(source, true).unwrap_or_else(|e| panic!("{e:?}\n{source}"));
+    let wave64 = wave.wave64;
+    let lanes = if wave64 { 64 } else { 32 };
+    let code = rdna::assemble(source, !wave64).unwrap_or_else(|e| panic!("{e:?}\n{source}"));
     let mut state = vec![0u32; STATE_WORDS];
     state[..128].copy_from_slice(&wave.sgpr);
     state[STATE_SCC as usize] = u32::from(wave.scc);
@@ -113,7 +115,7 @@ fn run(gpu: &Gpu, source: &str, wave: Wave, memory: Memory, name: &str) -> bool 
     if testkit::run(&code, &mut reference, &mut reference_memory).is_err() {
         return false;
     }
-    let function = shader_ir::lift(&code, false).unwrap_or_else(|e| panic!("{e}\n{source}"));
+    let function = shader_ir::lift(&code, wave64).unwrap_or_else(|e| panic!("{e}\n{source}"));
     let options = HarnessOptions {
         lds_words: LDS_WORDS as u32,
         nan_preserve: gpu.info.nan_preserve_32,
@@ -160,9 +162,9 @@ fn run(gpu: &Gpu, source: &str, wave: Wave, memory: Memory, name: &str) -> bool 
         "scc\n{}",
         context()
     );
-    for (reg, lanes) in reference.vgpr.iter().enumerate() {
+    for (reg, cpu_lanes) in reference.vgpr.iter().enumerate() {
         let at = STATE_VGPR as usize + 64 * reg;
-        for (lane, (gpu, cpu)) in state[at..at + 32].iter().zip(lanes).enumerate() {
+        for (lane, (gpu, cpu)) in state[at..at + lanes].iter().zip(cpu_lanes).enumerate() {
             assert!(
                 same(*gpu, *cpu),
                 "v{reg} lane {lane}: gpu {gpu:#x} cpu {cpu:#x}\n{}",
@@ -196,8 +198,8 @@ fn run(gpu: &Gpu, source: &str, wave: Wave, memory: Memory, name: &str) -> bool 
     true
 }
 
-fn prepared(seed: u64) -> (Wave, Memory) {
-    let (mut wave, mut memory) = (start(false, seed), memory(seed));
+fn prepared(seed: u64, wave64: bool) -> (Wave, Memory) {
+    let (mut wave, mut memory) = (start(wave64, seed), memory(seed));
     without_denormals(&mut wave, &mut memory);
     (wave, memory)
 }
@@ -248,13 +250,12 @@ fn hand_written_programs_match_on_the_gpu() {
          s_endpgm",
     ];
     for (index, source) in programs.iter().enumerate() {
-        let (wave, memory) = prepared(index as u64 + 11);
+        let (wave, memory) = prepared(index as u64 + 11, false);
         assert!(run(&gpu, source, wave, memory, &format!("fixed{index}")));
     }
 }
 
-#[test]
-fn random_programs_match_on_the_gpu() {
+fn random_suite(wave64: bool) {
     let Some(gpu) = gpu() else { return };
     let mut completed = 0;
     let only: Option<u64> = std::env::var("LEONIDA_SEED")
@@ -266,12 +267,23 @@ fn random_programs_match_on_the_gpu() {
         }
         let mut generator = Generator {
             rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
-            wave64: false,
+            wave64,
             gpu: true,
         };
         let source = generator.program();
-        let (wave, memory) = prepared(seed);
-        completed += usize::from(run(&gpu, &source, wave, memory, &format!("random{seed}")));
+        let (wave, memory) = prepared(seed, wave64);
+        let name = format!("random{}_{seed}", if wave64 { 64 } else { 32 });
+        completed += usize::from(run(&gpu, &source, wave, memory, &name));
     }
     assert!(only.is_some() || completed > 290, "{completed}");
+}
+
+#[test]
+fn random_wave32_programs_match_on_the_gpu() {
+    random_suite(false);
+}
+
+#[test]
+fn random_wave64_programs_match_on_the_gpu() {
+    random_suite(true);
 }
