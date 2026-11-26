@@ -28,6 +28,7 @@ game-package = { path = "crates/game-package" }
 shader-container = { path = "crates/shader-container" }
 leonida-ui = { path = "crates/leonida-ui" }
 pe-image = { path = "crates/pe-image" }
+decompile = { path = "crates/decompile" }
 gpu = { path = "crates/gpu" }
 rdna = { path = "crates/rdna" }
 shader-ir = { path = "crates/shader-ir" }

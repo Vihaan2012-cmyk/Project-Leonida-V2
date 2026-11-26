@@ -342,6 +342,29 @@ impl<'a> Image<'a> {
         functions
     }
 
+    /// The first piece of a function the compiler split into parts with chained unwind data.
+    pub fn primary(&self, mut function: Function) -> Function {
+        for _ in 0..32 {
+            let Some(info) = self.read(function.unwind & !1, 4) else {
+                break;
+            };
+            if (info[0] >> 3) & 0x4 == 0 {
+                break;
+            }
+            let codes = (u32::from(info[2]) + 1) & !1;
+            let Some(entry) = self.read((function.unwind & !1) + 4 + 2 * codes, 12) else {
+                break;
+            };
+            let (Some(begin), Some(end), Some(unwind)) =
+                (u32_at(entry, 0), u32_at(entry, 4), u32_at(entry, 8))
+            else {
+                break;
+            };
+            function = Function { begin, end, unwind };
+        }
+        function
+    }
+
     pub fn function_containing(&self, rva: u32) -> Option<Function> {
         let functions = self.functions();
         let index = functions.partition_point(|f| f.begin <= rva);

@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, anyhow, bail};
 use game_package::{Manifest, map_file};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter};
-use pe_image::Image;
+use pe_image::{Function, Image};
 
 use crate::cli::{ExeArgs, ExeCommand};
 use crate::game::resolve_game;
@@ -38,6 +38,7 @@ pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
     let image = Image::parse(&bytes)?;
     match &args.command {
         ExeCommand::Info => info(&image),
+        ExeCommand::Decompile { address, depth } => decompile(&image, address, *depth)?,
         ExeCommand::Imports { dll } => imports(&image, dll.as_deref()),
         ExeCommand::Functions { top } => functions(&image, *top),
         ExeCommand::Disasm { address, limit } => disasm(&image, address, *limit)?,
@@ -362,5 +363,144 @@ fn xrefs(
         }
     }
     println!("{found} references");
+    Ok(())
+}
+
+struct Program<'a> {
+    image: &'a Image<'a>,
+    functions: Vec<Function>,
+    imports: HashMap<u32, String>,
+}
+
+impl Program<'_> {
+    fn rva(&self, va: u64) -> Option<u32> {
+        u32::try_from(va.checked_sub(self.image.image_base)?).ok()
+    }
+
+    fn containing(&self, rva: u32) -> Option<Function> {
+        let index = self.functions.partition_point(|f| f.begin <= rva);
+        self.functions[..index]
+            .last()
+            .copied()
+            .filter(|f| rva < f.end)
+    }
+
+    fn owner(&self, rva: u32) -> Option<u32> {
+        self.containing(rva).map(|f| self.image.primary(f).begin)
+    }
+}
+
+impl decompile::Program for Program<'_> {
+    fn image_base(&self) -> u64 {
+        self.image.image_base
+    }
+
+    fn code(&self, va: u64) -> Option<&[u8]> {
+        let rva = self.rva(va)?;
+        self.image
+            .section_of(rva)?
+            .executable()
+            .then(|| self.image.bytes_at(rva))
+            .flatten()
+    }
+
+    fn bytes(&self, va: u64) -> Option<&[u8]> {
+        self.image.bytes_at(self.rva(va)?)
+    }
+
+    fn symbol(&self, va: u64) -> decompile::Symbol {
+        use decompile::Symbol;
+        let Some(rva) = self.rva(va) else {
+            return Symbol::Unknown;
+        };
+        if let Some(name) = self.imports.get(&rva) {
+            return Symbol::Import(name.clone());
+        }
+        match self.image.section_of(rva) {
+            Some(section) if section.executable() => {
+                match thunk_target(self.image, rva).and_then(|slot| self.imports.get(&slot)) {
+                    Some(name) => Symbol::Import(name.clone()),
+                    None => Symbol::Function,
+                }
+            }
+            Some(_) => text_at(self.image, rva).map_or(Symbol::Data, Symbol::Text),
+            None => Symbol::Unknown,
+        }
+    }
+
+    fn inside(&self, entry: u64, target: u64) -> bool {
+        let (Some(entry), Some(target)) = (self.rva(entry), self.rva(target)) else {
+            return false;
+        };
+        match (self.owner(entry), self.owner(target)) {
+            (None, None) => target.abs_diff(entry) < 0x400,
+            (a, b) => a == b,
+        }
+    }
+}
+
+fn short_names(image: &Image<'_>) -> HashMap<u32, String> {
+    import_names(image)
+        .into_iter()
+        .map(|(slot, name)| (slot, name.rsplit('!').next().unwrap_or(&name).to_string()))
+        .collect()
+}
+
+fn decompile(image: &Image<'_>, address: &str, depth: usize) -> Result<()> {
+    let rva = parse_address(image, address)?;
+    let program = Program {
+        image,
+        functions: image.functions(),
+        imports: short_names(image),
+    };
+    let start = program
+        .containing(rva)
+        .map_or(rva, |f| image.primary(f).begin);
+    let mut queue = std::collections::VecDeque::from([(start, 0)]);
+    let mut seen = HashSet::from([start]);
+    while let Some((rva, level)) = queue.pop_front() {
+        let entry = image.image_base + u64::from(rva);
+        let text = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(256 << 20)
+                .spawn_scoped(scope, || decompile::decompile(&program, entry))
+                .map(|handle| handle.join())
+        })
+        .context("starting the decompiler")?;
+        match text {
+            Ok(Ok(text)) => println!("{text}"),
+            Ok(Err(error)) => println!("// sub_{rva:08x}: {error}\n"),
+            Err(_) => println!("// sub_{rva:08x}: the decompiler hit an internal error\n"),
+        }
+        if level < depth {
+            let Some(function) = program.containing(rva) else {
+                continue;
+            };
+            let Some(bytes) = image.read(function.begin, (function.end - function.begin) as usize)
+            else {
+                continue;
+            };
+            let mut decoder = Decoder::with_ip(
+                64,
+                bytes,
+                image.image_base + u64::from(function.begin),
+                DecoderOptions::NONE,
+            );
+            for instruction in decoder.iter() {
+                if instruction.flow_control() != FlowControl::Call
+                    || instruction.near_branch_target() == 0
+                {
+                    continue;
+                }
+                let Some(callee) = program.rva(instruction.near_branch_target()) else {
+                    continue;
+                };
+                if thunk_target(image, callee).is_some() || !seen.insert(callee) {
+                    continue;
+                }
+                queue.push_back((callee, level + 1));
+            }
+        }
+    }
     Ok(())
 }

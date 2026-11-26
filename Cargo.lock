@@ -267,6 +267,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "decompile"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+ "thiserror",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -508,6 +516,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "decompile",
  "embed-manifest",
  "game-package",
  "iced-x86",

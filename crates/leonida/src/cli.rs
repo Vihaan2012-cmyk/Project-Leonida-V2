@@ -52,6 +52,13 @@ pub enum ExeCommand {
         #[arg(long, default_value_t = 400)]
         limit: usize,
     },
+    /// C-like pseudocode for the function containing an address (hex RVA or virtual address).
+    Decompile {
+        address: String,
+        /// Also decompile the functions it calls, this many levels deep.
+        #[arg(long, default_value_t = 0)]
+        depth: usize,
+    },
     /// Code that calls, jumps to or references an address, an import or a string.
     Xrefs {
         /// A hex RVA or virtual address.
