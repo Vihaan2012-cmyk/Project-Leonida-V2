@@ -737,6 +737,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shader-ir"
+version = "0.1.0"
+dependencies = [
+ "rdna",
+ "testkit",
+ "thiserror",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

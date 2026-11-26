@@ -24,6 +24,7 @@ game-package = { path = "crates/game-package" }
 shader-container = { path = "crates/shader-container" }
 leonida-ui = { path = "crates/leonida-ui" }
 rdna = { path = "crates/rdna" }
+shader-ir = { path = "crates/shader-ir" }
 testkit = { path = "crates/testkit" }
 
 [workspace.lints.rust]

@@ -80,7 +80,7 @@ fn kind(name: &str) -> Option<Kind> {
         "v_min_i32" => I2(|a, b| (a as i32).min(b as i32) as u32),
         "v_max_i32" => I2(|a, b| (a as i32).max(b as i32) as u32),
         "v_bfm_b32" => I2(|a, b| ((1u64 << (a & 31)) as u32).wrapping_sub(1) << (b & 31)),
-        "v_bcnt_u32_b32" => I2(|a, b| a.count_ones() + b),
+        "v_bcnt_u32_b32" => I2(|a, b| a.count_ones().wrapping_add(b)),
         "v_add3_u32" => I3(|a, b, c| a.wrapping_add(b).wrapping_add(c)),
         "v_lshl_add_u32" => I3(|a, b, c| (a << (b & 31)).wrapping_add(c)),
         "v_add_lshl_u32" => I3(|a, b, c| a.wrapping_add(b) << (c & 31)),
@@ -211,7 +211,10 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
                 } else {
                     mask & ((1u64 << lane.min(32)) - 1) as u32
                 };
-                let value = before.count_ones() + wave.read_lane(arg(inst, 2)?, lane, inst)?;
+                let value =
+                    before
+                        .count_ones()
+                        .wrapping_add(wave.read_lane(arg(inst, 2)?, lane, inst)?);
                 wave.write_lane(arg(inst, 0)?, lane, value, inst)?;
             }
             return Ok(true);
@@ -323,7 +326,7 @@ fn compare(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
                     "nle" => !(lt || eq),
                     "neq" => !eq,
                     "nlt" => !lt,
-                    "t" => true,
+                    "t" | "tru" => true,
                     _ => return Err(bad(inst)),
                 }
             }

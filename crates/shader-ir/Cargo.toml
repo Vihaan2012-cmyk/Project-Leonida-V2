@@ -1,0 +1,16 @@
+[package]
+name = "shader-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rdna.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+testkit.workspace = true
+
+[lints]
+workspace = true
