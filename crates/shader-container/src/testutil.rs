@@ -79,3 +79,21 @@ pub fn container(kind: u16, fssm_blobs: &[Vec<u8>]) -> Vec<u8> {
     let dxil = dxil(kind, &entries);
     dxbc(&[(b"DXIL", &dxil[..]), (b"PRIV", &b"private"[..])])
 }
+
+/// A minimal FSSM blob: magic, version 1, code offset 0x100 at 0xC0 (so code starts at 0x128), the wave flag at
+/// 0xD4, then `code` and a closing s_endpgm.
+pub fn fssm(wave32: bool, code: &[u32]) -> Vec<u8> {
+    const CODE_OFFSET: usize = 0x100;
+    let mut out = vec![0u8; CODE_OFFSET + 0x28];
+    out[..4].copy_from_slice(b"FSSM");
+    out[4..6].copy_from_slice(&1u16.to_le_bytes());
+    out[0xC0..0xC4].copy_from_slice(&(CODE_OFFSET as u32).to_le_bytes());
+    if wave32 {
+        out[0xD4..0xD8].copy_from_slice(&0x20u32.to_le_bytes());
+    }
+    for word in code {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    out.extend_from_slice(&crate::ENDPGM);
+    out
+}
