@@ -135,6 +135,10 @@ fn program_flow(name: &str, inst: &Inst, wave: &mut Wave) -> Result<Option<Flow>
         | "s_inst_prefetch" | "s_code_end" => {
             return Ok(Some(Flow::Next));
         }
+        "s_swappc_b64" if inst.pc == 0 => {
+            wave.write_scalar64(arg(inst, 0)?, wave.code_base + 4, inst)?;
+            return Ok(Some(Flow::Next));
+        }
         "s_getpc_b64" => {
             let address = wave.code_base + inst.pc as u64 + 4;
             wave.write_scalar64(arg(inst, 0)?, address, inst)?;

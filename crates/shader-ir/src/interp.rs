@@ -505,6 +505,7 @@ impl Run<'_> {
                     }
                 }
             }
+            Stmt::FetchVertexInputs => {}
             Stmt::Message(code, m0) => {
                 let m0 = self.values[*m0 as usize][0] as u32;
                 self.machine.messages.push((*code, m0));

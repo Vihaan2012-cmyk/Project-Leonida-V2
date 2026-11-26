@@ -168,6 +168,7 @@ pub enum Stmt {
         values: [Option<Tmp>; 4],
     },
     Message(u32, Tmp),
+    FetchVertexInputs,
     Store {
         when: Option<Tmp>,
         address: Tmp,

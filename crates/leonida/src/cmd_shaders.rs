@@ -6,7 +6,10 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use game_package::{Manifest, map_file, package_path};
-use shader_container::{CodeRange, Fssm, ScanSummary, WaveSize, carve, scan::scan, unpack_all};
+use shader_container::{
+    CodeRange, Fssm, Interface, ScanSummary, SignatureElement, WaveSize, carve, interface, parts,
+    scan::scan, unpack_all,
+};
 
 use crate::cli::{DisasmArgs, ReportArgs, ScanArgs};
 use crate::game::resolve_game;
@@ -52,8 +55,59 @@ pub fn disasm_command(args: &DisasmArgs) -> Result<ExitCode> {
         let Some(blob) = blobs.last() else {
             bail!("{} has no GPU program", args.name);
         };
+        if let Ok(list) = parts(&dxbc)
+            && let Ok(found) = interface(&list, None)
+        {
+            print_interface(&found);
+        }
         print_program(Path::new(&args.name), blob)
     })
+}
+
+fn describe(element: &SignatureElement) -> String {
+    let channels: String = "xyzw"
+        .chars()
+        .enumerate()
+        .filter(|(i, _)| element.mask >> i & 1 != 0)
+        .map(|(_, c)| c)
+        .collect();
+    let kind = match element.component_type {
+        1 => "uint",
+        2 => "int",
+        3 => "float",
+        _ => "?",
+    };
+    format!(
+        "{}{} r{}.{channels} {kind}",
+        element.semantic, element.semantic_index, element.register
+    )
+}
+
+fn print_interface(found: &Interface) {
+    let list = |elements: &[SignatureElement]| {
+        elements.iter().map(describe).collect::<Vec<_>>().join(", ")
+    };
+    if !found.inputs.is_empty() {
+        println!("; inputs: {}", list(&found.inputs));
+    }
+    if !found.outputs.is_empty() {
+        println!("; outputs: {}", list(&found.outputs));
+    }
+    if let Some(pipeline) = &found.pipeline {
+        if let Some([x, y, z]) = pipeline.threads {
+            println!("; threads: {x}x{y}x{z}");
+        }
+        if let Some(mesh) = pipeline.mesh {
+            println!(
+                "; mesh: up to {} vertices and {} primitives, topology {}, payload {} bytes, shared {} bytes",
+                mesh.max_vertices,
+                mesh.max_primitives,
+                mesh.topology,
+                mesh.payload_bytes,
+                mesh.shared_bytes
+            );
+        }
+    }
 }
 
 fn print_program(name: &Path, blob: &[u8]) -> Result<ExitCode> {

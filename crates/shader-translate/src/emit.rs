@@ -1024,6 +1024,7 @@ impl Emitter {
                     Ok(())
                 })?;
             }
+            Stmt::FetchVertexInputs => {}
             Stmt::Message(code, m0) => {
                 let m0 = v(self, m0);
                 let code = *code;

@@ -966,6 +966,14 @@ impl Lifter {
 
     fn scalar_op(&mut self, name: &str, inst: &Inst) -> Result<bool, LiftError> {
         let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
+        if name == "s_swappc_b64" && inst.pc == 0 {
+            let base = self.value(Expr::CodeBase);
+            let next = self.c64(4);
+            let address = self.bin(Bin::Add64, base, next);
+            self.set_scalar64(arg(0)?, address, inst)?;
+            self.stmts.push(Stmt::FetchVertexInputs);
+            return Ok(true);
+        }
         if name == "s_getpc_b64" {
             let base = self.value(Expr::CodeBase);
             let next = self.c64(inst.pc as u64 + 4);

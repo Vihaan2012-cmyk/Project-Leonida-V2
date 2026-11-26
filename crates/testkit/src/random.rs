@@ -1224,6 +1224,9 @@ impl Generator {
             });
         }
         parts.push("s_endpgm".into());
+        if self.rng.chance(8) {
+            parts.insert(0, "s_swappc_b64 s[4:5], s[4:5]".into());
+        }
         parts.join("\n")
     }
 

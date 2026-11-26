@@ -221,6 +221,7 @@ impl Checker<'_> {
                 }
             }
             Stmt::Message(_, m0) => self.expect(*m0, Ty::U32)?,
+            Stmt::FetchVertexInputs => {}
             Stmt::Store {
                 when,
                 address,
