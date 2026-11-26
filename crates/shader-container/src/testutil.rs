@@ -3,7 +3,7 @@
 use std::io::Write;
 
 use flate2::Compression;
-use flate2::write::ZlibEncoder;
+use flate2::write::{DeflateEncoder, ZlibEncoder};
 
 /// A DXBC container holding `parts` in order.
 pub fn dxbc(parts: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
@@ -95,5 +95,22 @@ pub fn fssm(wave32: bool, code: &[u32]) -> Vec<u8> {
         out.extend_from_slice(&word.to_le_bytes());
     }
     out.extend_from_slice(&crate::ENDPGM);
+    out
+}
+
+/// One shader record as stored in shaders.rpf: name, NUL, kind, stored, id, stored, size, raw deflate of `dxbc`.
+pub fn rpf_entry(name: &str, kind: u8, id: u32, dxbc: &[u8]) -> Vec<u8> {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(dxbc).expect("in-memory write");
+    let stored = encoder.finish().expect("in-memory write");
+    let mut out = Vec::new();
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    out.push(kind);
+    out.extend_from_slice(&(stored.len() as u32).to_le_bytes());
+    out.extend_from_slice(&id.to_le_bytes());
+    out.extend_from_slice(&(stored.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(dxbc.len() as u32).to_le_bytes());
+    out.extend_from_slice(&stored);
     out
 }
