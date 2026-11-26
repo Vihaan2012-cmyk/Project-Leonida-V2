@@ -17,6 +17,7 @@ fn main() -> ExitCode {
             .map_err(|error| anyhow!("could not open the window: {error}")),
         Some(Command::Shaders(shaders)) => match &shaders.command {
             ShadersCommand::Scan(args) => cmd_shaders::scan_command(args),
+            ShadersCommand::Disasm(args) => cmd_shaders::disasm_command(args),
         },
     };
     result.unwrap_or_else(|error| {

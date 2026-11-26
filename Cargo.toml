@@ -23,6 +23,7 @@ thiserror = "2"
 game-package = { path = "crates/game-package" }
 shader-container = { path = "crates/shader-container" }
 leonida-ui = { path = "crates/leonida-ui" }
+rdna = { path = "crates/rdna" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

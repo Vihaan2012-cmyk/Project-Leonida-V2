@@ -1,24 +1,79 @@
 use std::fs::File;
 use std::ops::ControlFlow;
+use std::path::Path;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use game_package::{Manifest, map_file, package_path};
-use shader_container::{ScanSummary, scan::scan};
+use shader_container::{CodeRange, Fssm, ScanSummary, WaveSize, carve, scan::scan, unpack_all};
 
-use crate::cli::ScanArgs;
+use crate::cli::{DisasmArgs, ScanArgs};
 use crate::game::resolve_game;
 
-pub fn scan_command(args: &ScanArgs) -> Result<ExitCode> {
-    let game = resolve_game(args.game.as_ref(), &Manifest::builtin())?;
+fn with_archive<T>(
+    game: Option<&std::path::PathBuf>,
+    work: impl FnOnce(&[u8]) -> Result<T>,
+) -> Result<T> {
+    let game = resolve_game(game, &Manifest::builtin())?;
     let path = package_path(&game, "shaders.rpf");
     let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     let archive = map_file(&file).with_context(|| format!("mapping {}", path.display()))?;
-    let result = scan(&archive, |_| ControlFlow::Continue(()));
-    print!("{}", ScanSummary::of(&result).report());
-    Ok(if result.stats.carved == 0 {
-        ExitCode::FAILURE
-    } else {
+    work(&archive)
+}
+
+pub fn scan_command(args: &ScanArgs) -> Result<ExitCode> {
+    with_archive(args.game.as_ref(), |archive| {
+        let result = scan(archive, |_| ControlFlow::Continue(()));
+        print!("{}", ScanSummary::of(&result).report());
+        Ok(if result.stats.carved == 0 {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        })
+    })
+}
+
+pub fn disasm_command(args: &DisasmArgs) -> Result<ExitCode> {
+    with_archive(args.game.as_ref(), |archive| {
+        let mut container = None;
+        carve(archive, |shader| {
+            if shader.name == args.name {
+                container = Some(shader.dxbc);
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        let Some(dxbc) = container else {
+            bail!("no shader named {} in shaders.rpf", args.name);
+        };
+        let blobs = unpack_all(&dxbc)?;
+        let Some(blob) = blobs.last() else {
+            bail!("{} has no GPU program", args.name);
+        };
+        print_program(Path::new(&args.name), blob)
+    })
+}
+
+fn print_program(name: &Path, blob: &[u8]) -> Result<ExitCode> {
+    let fssm = Fssm::parse(blob)?;
+    let CodeRange::Header { start, end } = fssm.code_range() else {
+        bail!(
+            "could not find where {}'s instructions start",
+            name.display()
+        );
+    };
+    let wave32 = fssm.wave_size() == WaveSize::Wave32;
+    let (listing, invalid) = rdna::disassemble(&blob[start..end], wave32, start);
+    println!(
+        "; {}  code 0x{start:x}..0x{end:x}, {}, {invalid} invalid words",
+        name.display(),
+        if wave32 { "wave32" } else { "wave64" }
+    );
+    print!("{listing}");
+    Ok(if invalid == 0 {
         ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     })
 }

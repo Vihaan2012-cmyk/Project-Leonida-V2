@@ -387,6 +387,7 @@ dependencies = [
  "embed-manifest",
  "game-package",
  "leonida-ui",
+ "rdna",
  "shader-container",
  "tempfile",
 ]
@@ -611,6 +612,10 @@ dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
 ]
+
+[[package]]
+name = "rdna"
+version = "0.1.0"
 
 [[package]]
 name = "rfd"

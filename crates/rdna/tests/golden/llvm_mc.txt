@@ -1,0 +1,45 @@
+# wave<TAB>encoding hex<TAB>text printed by llvm-mc -mcpu=gfx1013, from upstream Leonida's saved llvm-mc listings of hand-written test shaders
+w32	81038abe	s_mov_b32 s10, 1
+w32	001f84be	s_getpc_b64 s[4:5]
+w32	04ff0480b8000000	s_add_u32 s4, s4, 0xb8
+w32	05800582	s_addc_u32 s5, s5, 0
+w32	042080be	s_setpc_b64 s[4:5]
+w32	0aff0a8800010000	s_or_b32 s10, s10, 0x100
+w32	000080bf	s_nop 0
+w32	0a820a88	s_or_b32 s10, s10, 2
+w32	001f88be	s_getpc_b64 s[8:9]
+w32	08ff0880b8000000	s_add_u32 s8, s8, 0xb8
+w32	09800982	s_addc_u32 s9, s9, 0
+w32	082080be	s_setpc_b64 s[8:9]
+w32	0aff0a8800020000	s_or_b32 s10, s10, 0x200
+w32	0a840a88	s_or_b32 s10, s10, 4
+w32	80038bbe	s_mov_b32 s11, 0
+w32	0b810b80	s_add_u32 s11, s11, 1
+w32	0b8309bf	s_cmp_ge_u32 s11, 3
+w32	050085bf	s_cbranch_scc1 5
+w32	001f86be	s_getpc_b64 s[6:7]
+w32	06ff8680b0000000	s_sub_u32 s6, s6, 0xb0
+w32	07808782	s_subb_u32 s7, s7, 0
+w32	062080be	s_setpc_b64 s[6:7]
+w32	0b900b88	s_or_b32 s11, s11, 16
+w32	80038cbe	s_mov_b32 s12, 0
+w32	0c900c80	s_add_u32 s12, s12, 16
+w32	0cff09bf50000000	s_cmp_ge_u32 s12, 0x50
+w32	08ff08804cffffff	s_add_u32 s8, s8, 0xffffff4c
+w32	09c10982	s_addc_u32 s9, s9, -1
+w32	0c810c88	s_or_b32 s12, s12, 1
+w32	80038dbe	s_mov_b32 s13, 0
+w32	0d8106bf	s_cmp_eq_u32 s13, 1
+w32	050084bf	s_cbranch_scc0 5
+w32	04ff0480b4000000	s_add_u32 s4, s4, 0xb4
+w32	0d810d88	s_or_b32 s13, s13, 1
+w32	0d820d88	s_or_b32 s13, s13, 2
+w32	0d8306bf	s_cmp_eq_u32 s13, 3
+w32	0d840d88	s_or_b32 s13, s13, 4
+w32	0d880d88	s_or_b32 s13, s13, 8
+w32	0a02147e	v_mov_b32_e32 v10, s10
+w32	0b02167e	v_mov_b32_e32 v11, s11
+w32	0c02187e	v_mov_b32_e32 v12, s12
+w32	0d021a7e	v_mov_b32_e32 v13, s13
+w32	0f1800f80a0b0c0d	exp mrt0 v10, v11, v12, v13 done vm
+w32	000081bf	s_endpgm

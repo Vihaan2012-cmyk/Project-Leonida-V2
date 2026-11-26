@@ -28,6 +28,17 @@ pub struct ShadersArgs {
 pub enum ShadersCommand {
     /// Read every shader container in shaders.rpf and report what it holds. Writes nothing.
     Scan(ScanArgs),
+    /// Print one shader's GPU instructions.
+    Disasm(DisasmArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DisasmArgs {
+    /// The shader's name, as shown by the scan or the shader report.
+    pub name: String,
+    /// The game folder. Searched for when omitted.
+    #[arg(long)]
+    pub game: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

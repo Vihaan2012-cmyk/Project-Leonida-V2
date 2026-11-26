@@ -60,3 +60,34 @@ fn missing_archive_is_an_error() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("shaders.rpf"));
 }
+
+#[test]
+fn disasm_prints_one_shaders_instructions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut archive = vec![0u8; 8];
+    archive.extend(rpf_entry(
+        "ps_one",
+        3,
+        1,
+        &container(0, &[fssm(false, &[NOP])]),
+    ));
+    std::fs::write(dir.path().join("shaders.rpf"), &archive).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_leonida"))
+        .args(["shaders", "disasm", "ps_one", "--game"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("; ps_one  code 0x128..0x130, wave64, 0 invalid words"),
+        "{text}"
+    );
+    assert!(text.contains("s_nop 0"), "{text}");
+    assert!(text.contains("s_endpgm"), "{text}");
+}

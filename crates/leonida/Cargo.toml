@@ -10,6 +10,7 @@ anyhow.workspace = true
 clap.workspace = true
 game-package.workspace = true
 leonida-ui.workspace = true
+rdna.workspace = true
 shader-container.workspace = true
 
 [build-dependencies]
