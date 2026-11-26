@@ -16,6 +16,68 @@ pub enum Command {
     Ui,
     /// Work with the game's shaders.
     Shaders(ShadersArgs),
+    /// Read the game executable's structure and code without running it.
+    Exe(ExeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ExeArgs {
+    /// The game folder. Searched for when omitted.
+    #[arg(long, global = true)]
+    pub game: Option<PathBuf>,
+    #[command(subcommand)]
+    pub command: ExeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ExeCommand {
+    /// Headers, sections and table sizes.
+    Info,
+    /// Every imported function, by DLL.
+    Imports {
+        /// Only DLLs whose name contains this text.
+        #[arg(long)]
+        dll: Option<String>,
+    },
+    /// Functions from the exception table, largest first.
+    Functions {
+        /// How many to list.
+        #[arg(long, default_value_t = 40)]
+        top: usize,
+    },
+    /// Disassemble the function containing an address (hex RVA or virtual address).
+    Disasm {
+        address: String,
+        /// Most instructions to print.
+        #[arg(long, default_value_t = 400)]
+        limit: usize,
+    },
+    /// Code that calls, jumps to or references an address, an import or a string.
+    Xrefs {
+        /// A hex RVA or virtual address.
+        address: Option<String>,
+        /// An imported function's name, e.g. CreateFileW.
+        #[arg(long)]
+        import: Option<String>,
+        /// Text of a string in the data sections.
+        #[arg(long)]
+        string: Option<String>,
+        /// Most references to print.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Readable text in the executable's data sections.
+    Strings {
+        /// Only strings containing this text.
+        #[arg(long)]
+        find: Option<String>,
+        /// Shortest string to report.
+        #[arg(long, default_value_t = 8)]
+        min: usize,
+        /// Most strings to print.
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Args)]

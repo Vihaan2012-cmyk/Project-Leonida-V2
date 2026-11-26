@@ -1,4 +1,5 @@
 mod cli;
+mod cmd_exe;
 mod cmd_shaders;
 mod game;
 
@@ -20,6 +21,7 @@ fn main() -> ExitCode {
             ShadersCommand::Disasm(args) => cmd_shaders::disasm_command(args),
             ShadersCommand::Report(args) => cmd_shaders::report_command(args),
         },
+        Some(Command::Exe(exe)) => cmd_exe::exe_command(exe),
     };
     result.unwrap_or_else(|error| {
         eprintln!("error: {error:#}");
