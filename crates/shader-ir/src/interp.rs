@@ -95,6 +95,75 @@ fn store(value: f32, mode: Mode) -> u64 {
     u64::from(settle(value, mode).to_bits())
 }
 
+pub fn float_class(bits: u32) -> u32 {
+    let negative = bits >> 31 != 0;
+    let exponent = (bits >> 23) & 0xFF;
+    let mantissa = bits & 0x7F_FFFF;
+    match (exponent, mantissa) {
+        (0xFF, 0) => {
+            if negative {
+                2
+            } else {
+                9
+            }
+        }
+        (0xFF, m) => u32::from(m & 0x40_0000 != 0),
+        (0, 0) => {
+            if negative {
+                5
+            } else {
+                6
+            }
+        }
+        (0, _) => {
+            if negative {
+                4
+            } else {
+                7
+            }
+        }
+        _ => {
+            if negative {
+                3
+            } else {
+                8
+            }
+        }
+    }
+}
+
+pub fn fmin(a: f32, b: f32) -> f32 {
+    if a.is_nan() {
+        b
+    } else if b.is_nan() || a < b || (a == b && a.is_sign_negative()) {
+        a
+    } else {
+        b
+    }
+}
+
+pub fn fmax(a: f32, b: f32) -> f32 {
+    if a.is_nan() {
+        b
+    } else if b.is_nan() || a > b || (a == b && a.is_sign_positive()) {
+        a
+    } else {
+        b
+    }
+}
+
+pub fn nan_rule(result: f32, inputs: &[f32]) -> f32 {
+    if !result.is_nan() {
+        return result;
+    }
+    inputs
+        .iter()
+        .find(|x| x.is_nan())
+        .map_or(f32::from_bits(0x7FC0_0000), |x| {
+            f32::from_bits(x.to_bits() | 0x40_0000)
+        })
+}
+
 fn unary(op: Un, a: u64, mode: Mode) -> u64 {
     let f = |x: u64| load(x, mode);
     let bits = |v: f32| store(v, mode);
@@ -117,16 +186,18 @@ fn unary(op: Un, a: u64, mode: Mode) -> u64 {
         Un::FNeg => u64::from(x ^ 0x8000_0000),
         Un::FAbs => u64::from(x & 0x7FFF_FFFF),
         Un::FClamp01 => bits(if f(a) > 0.0 { f(a).min(1.0) } else { 0.0 }),
-        Un::FRcp => bits(1.0 / f(a)),
-        Un::FRsq => bits(1.0 / f(a).sqrt()),
-        Un::FSqrt => bits(f(a).sqrt()),
-        Un::FExp2 => bits(f(a).exp2()),
-        Un::FLog2 => bits(f(a).log2()),
-        Un::FFloor => bits(f(a).floor()),
-        Un::FCeil => bits(f(a).ceil()),
-        Un::FTrunc => bits(f(a).trunc()),
-        Un::FRndne => bits(f(a).round_ties_even()),
-        Un::FFract => bits(f(a) - f(a).floor()),
+        Un::FRcp => bits(nan_rule(1.0 / f(a), &[f(a)])),
+        Un::FRsq => bits(nan_rule(1.0 / f(a).sqrt(), &[f(a)])),
+        Un::FSqrt => bits(nan_rule(f(a).sqrt(), &[f(a)])),
+        Un::FExp2 => bits(nan_rule(f(a).exp2(), &[f(a)])),
+        Un::FLog2 => bits(nan_rule(f(a).log2(), &[f(a)])),
+        Un::FFloor => bits(nan_rule(f(a).floor(), &[f(a)])),
+        Un::FCeil => bits(nan_rule(f(a).ceil(), &[f(a)])),
+        Un::FTrunc => bits(nan_rule(f(a).trunc(), &[f(a)])),
+        Un::FRndne => bits(nan_rule(f(a).round_ties_even(), &[f(a)])),
+        Un::FFract => bits(nan_rule(f(a) - f(a).floor(), &[f(a)])),
+        Un::FSin => bits(nan_rule((f(a) * std::f32::consts::TAU).sin(), &[f(a)])),
+        Un::FCos => bits(nan_rule((f(a) * std::f32::consts::TAU).cos(), &[f(a)])),
     }
 }
 
@@ -149,11 +220,11 @@ fn binary(op: Bin, a: u64, b: u64, mode: Mode) -> u64 {
         Bin::MaxU => x.max(y),
         Bin::MinS => (x as i32).min(y as i32) as u32,
         Bin::MaxS => (x as i32).max(y as i32) as u32,
-        Bin::FAdd => return bits(f(a) + f(b)),
-        Bin::FSub => return bits(f(a) - f(b)),
-        Bin::FMul => return bits(f(a) * f(b)),
-        Bin::FMin => return bits(f(a).min(f(b))),
-        Bin::FMax => return bits(f(a).max(f(b))),
+        Bin::FAdd => return bits(nan_rule(f(a) + f(b), &[f(a), f(b)])),
+        Bin::FSub => return bits(nan_rule(f(a) - f(b), &[f(a), f(b)])),
+        Bin::FMul => return bits(nan_rule(f(a) * f(b), &[f(a), f(b)])),
+        Bin::FMin => return bits(nan_rule(fmin(f(a), f(b)), &[f(a), f(b)])),
+        Bin::FMax => return bits(nan_rule(fmax(f(a), f(b)), &[f(a), f(b)])),
         Bin::Add64 => return a.wrapping_add(b),
         Bin::Sub64 => return a.wrapping_sub(b),
         Bin::And64 => return a & b,
@@ -170,8 +241,11 @@ fn ternary(op: Tri, a: u64, b: u64, c: u64, mode: Mode) -> u64 {
     let f = |x: u64| load(x, mode);
     let bits = |v: f32| store(v, mode);
     match op {
-        Tri::FFma => bits(f(a).mul_add(f(b), f(c))),
-        Tri::FMad => bits(f(bits(f(a) * f(b))) + f(c)),
+        Tri::FFma => bits(nan_rule(f(a).mul_add(f(b), f(c)), &[f(a), f(b), f(c)])),
+        Tri::FMad => {
+            let product = f(bits(nan_rule(f(a) * f(b), &[f(a), f(b)])));
+            bits(nan_rule(product + f(c), &[product, f(c)]))
+        }
         Tri::BfeU => {
             let width = c as u32 & 31;
             if width == 0 {
@@ -218,6 +292,7 @@ fn compare(op: Cmp, a: u64, b: u64, mode: Mode) -> bool {
         Cmp::FNlt => !lt,
         Cmp::False => false,
         Cmp::True => true,
+        Cmp::Class => (y >> float_class(x)) & 1 != 0,
     }
 }
 

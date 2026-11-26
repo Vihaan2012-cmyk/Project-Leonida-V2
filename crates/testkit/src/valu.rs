@@ -1,4 +1,4 @@
-use rdna::Inst;
+use rdna::{Inst, Operand};
 
 use crate::Result;
 use crate::state::{EXEC, VCC, Wave, arg, bad};
@@ -119,23 +119,18 @@ fn kind(name: &str) -> Option<Kind> {
         "v_subrev_f32" => F2(|a, b| b - a),
         "v_mul_f32" => F2(|a, b| a * b),
         "v_mul_legacy_f32" => F2(|a, b| if a == 0.0 || b == 0.0 { 0.0 } else { a * b }),
-        "v_min_f32" => F2(f32::min),
-        "v_max_f32" => F2(f32::max),
-        "v_fma_f32" => F3(f32::mul_add),
-        "v_mad_f32" => F3(|a, b, c| a * b + c),
-        "v_mad_f32_flushed" => F3(|a, b, c| {
-            let product = a * b;
-            let product = if product.is_subnormal() {
-                0.0f32.copysign(product)
+        "v_min_f32" => F2(fmin),
+        "v_max_f32" => F2(fmax),
+        "v_med3_f32" => F3(|a, b, c| {
+            if a.is_nan() || b.is_nan() || c.is_nan() {
+                fmin(fmin(a, b), c)
             } else {
-                product
-            };
-            product + c
+                fmax(fmin(a, b), fmin(fmax(a, b), c))
+            }
         }),
-        "v_med3_f32" => F3(med3),
-        "v_min3_f32" => F3(|a, b, c| a.min(b).min(c)),
-        "v_max3_f32" => F3(|a, b, c| a.max(b).max(c)),
-        "v_rcp_f32" => F1(|a| 1.0 / a),
+        "v_min3_f32" => F3(|a, b, c| fmin(fmin(a, b), c)),
+        "v_max3_f32" => F3(|a, b, c| fmax(fmax(a, b), c)),
+        "v_rcp_f32" | "v_rcp_iflag_f32" => F1(|a| 1.0 / a),
         "v_rsq_f32" => F1(|a| 1.0 / a.sqrt()),
         "v_sqrt_f32" => F1(f32::sqrt),
         "v_exp_f32" => F1(f32::exp2),
@@ -151,13 +146,45 @@ fn kind(name: &str) -> Option<Kind> {
     })
 }
 
+pub fn fmin(a: f32, b: f32) -> f32 {
+    if a.is_nan() {
+        b
+    } else if b.is_nan() || a < b || (a == b && a.is_sign_negative()) {
+        a
+    } else {
+        b
+    }
+}
+
+pub fn fmax(a: f32, b: f32) -> f32 {
+    if a.is_nan() {
+        b
+    } else if b.is_nan() || a > b || (a == b && a.is_sign_positive()) {
+        a
+    } else {
+        b
+    }
+}
+
+pub fn nan_rule(result: f32, inputs: &[f32]) -> f32 {
+    if !result.is_nan() {
+        return result;
+    }
+    inputs
+        .iter()
+        .find(|x| x.is_nan())
+        .map_or(f32::from_bits(0x7FC0_0000), |x| {
+            f32::from_bits(x.to_bits() | 0x40_0000)
+        })
+}
+
 fn output_modifiers(wave: &Wave, inst: &Inst, value: f32) -> f32 {
     let mut value = wave.flush(value);
     for modifier in &inst.mods {
         value = wave.flush(match modifier.as_str() {
-            "mul:2" => value * 2.0,
-            "mul:4" => value * 4.0,
-            "div:2" => value * 0.5,
+            "mul:2" => nan_rule(value * 2.0, &[value]),
+            "mul:4" => nan_rule(value * 4.0, &[value]),
+            "div:2" => nan_rule(value * 0.5, &[value]),
             _ => value,
         });
     }
@@ -234,15 +261,68 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
             carry(name, inst, wave)?;
             return Ok(true);
         }
+        "v_fma_f32" | "v_mad_f32" | "v_fmaak_f32" | "v_madak_f32" | "v_fmamk_f32"
+        | "v_madmk_f32" | "v_mad_legacy_f32" => {
+            for lane in wave.active_lanes() {
+                let a = wave.read_lane_f32(arg(inst, 1)?, lane, inst)?;
+                let b = wave.read_lane_f32(arg(inst, 2)?, lane, inst)?;
+                let c = wave.read_lane_f32(arg(inst, 3)?, lane, inst)?;
+                let value = if name.starts_with("v_fma") {
+                    nan_rule(a.mul_add(b, c), &[a, b, c])
+                } else {
+                    let product = if name == "v_mad_legacy_f32" && (a == 0.0 || b == 0.0) {
+                        0.0
+                    } else {
+                        a * b
+                    };
+                    let product = wave.flush(nan_rule(product, &[a, b]));
+                    nan_rule(product + c, &[product, c])
+                };
+                let value = output_modifiers(wave, inst, value);
+                wave.write_lane(arg(inst, 0)?, lane, value.to_bits(), inst)?;
+            }
+            return Ok(true);
+        }
+        "v_cvt_pk_u8_f32" => {
+            for lane in wave.active_lanes() {
+                let x = wave.read_lane_f32(arg(inst, 1)?, lane, inst)?;
+                let byte = (x.round_ties_even() as u32).min(255);
+                let shift = 8 * (wave.read_lane(arg(inst, 2)?, lane, inst)? & 3);
+                let old = wave.read_lane(arg(inst, 3)?, lane, inst)?;
+                let value = (old & !(0xFF << shift)) | (byte << shift);
+                wave.write_lane(arg(inst, 0)?, lane, value, inst)?;
+            }
+            return Ok(true);
+        }
+        "v_lshlrev_b64" => {
+            let Operand::Vgpr { reg, .. } = arg(inst, 0)?.operand else {
+                return Err(bad(inst));
+            };
+            for lane in wave.active_lanes() {
+                let shift = wave.read_lane(arg(inst, 1)?, lane, inst)? & 63;
+                let value = match arg(inst, 2)?.operand {
+                    Operand::Vgpr { reg: source, .. } => {
+                        let source = usize::from(source);
+                        u64::from(wave.vgpr[source][lane])
+                            | (u64::from(wave.vgpr[source + 1][lane]) << 32)
+                    }
+                    _ => wave.read_scalar64(arg(inst, 2)?, inst)?,
+                } << shift;
+                wave.vgpr[usize::from(reg)][lane] = value as u32;
+                wave.vgpr[usize::from(reg) + 1][lane] = (value >> 32) as u32;
+            }
+            return Ok(true);
+        }
         "v_fmac_f32" | "v_mac_f32" => {
             for lane in wave.active_lanes() {
                 let a = wave.read_lane_f32(arg(inst, 1)?, lane, inst)?;
                 let b = wave.read_lane_f32(arg(inst, 2)?, lane, inst)?;
                 let c = wave.read_lane_f32(arg(inst, 0)?, lane, inst)?;
                 let value = if name == "v_fmac_f32" {
-                    a.mul_add(b, c)
+                    nan_rule(a.mul_add(b, c), &[a, b, c])
                 } else {
-                    wave.flush(a * b) + c
+                    let product = wave.flush(nan_rule(a * b, &[a, b]));
+                    nan_rule(product + c, &[product, c])
                 };
                 let value = output_modifiers(wave, inst, value);
                 wave.write_lane(arg(inst, 0)?, lane, value.to_bits(), inst)?;
@@ -251,8 +331,7 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
         }
         _ => {}
     }
-    let flushed = name == "v_mad_f32" && wave.flush_denormals;
-    let Some(kind) = kind(if flushed { "v_mad_f32_flushed" } else { name }) else {
+    let Some(kind) = kind(name) else {
         return Ok(false);
     };
     for lane in wave.active_lanes() {
@@ -262,10 +341,22 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
             Kind::I1(op) => op(int(1)?),
             Kind::I2(op) => op(int(1)?, int(2)?),
             Kind::I3(op) => op(int(1)?, int(2)?, int(3)?),
-            Kind::F1(op) => output_modifiers(wave, inst, op(float(1)?)).to_bits(),
-            Kind::F2(op) => output_modifiers(wave, inst, op(float(1)?, float(2)?)).to_bits(),
+            Kind::F1(op) => {
+                let x = float(1)?;
+                output_modifiers(wave, inst, nan_rule(op(x), &[x])).to_bits()
+            }
+            Kind::F2(op) => {
+                let (x, y) = (float(1)?, float(2)?);
+                let order = if name == "v_subrev_f32" {
+                    [y, x]
+                } else {
+                    [x, y]
+                };
+                output_modifiers(wave, inst, nan_rule(op(x, y), &order)).to_bits()
+            }
             Kind::F3(op) => {
-                output_modifiers(wave, inst, op(float(1)?, float(2)?, float(3)?)).to_bits()
+                let (x, y, z) = (float(1)?, float(2)?, float(3)?);
+                output_modifiers(wave, inst, nan_rule(op(x, y, z), &[x, y, z])).to_bits()
             }
             Kind::FloatToInt(op) => op(float(1)?),
             Kind::IntToFloat(op) => output_modifiers(wave, inst, op(int(1)?)).to_bits(),
@@ -317,6 +408,17 @@ fn compare(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
         let a = arg(inst, first_source)?;
         let b = arg(inst, first_source + 1)?;
         let outcome = match ty {
+            "f32" if op == "class" => {
+                let mut bits = wave.read_lane(a, lane, inst)?;
+                if a.abs {
+                    bits &= 0x7FFF_FFFF;
+                }
+                if a.neg {
+                    bits ^= 0x8000_0000;
+                }
+                let mask = wave.read_lane(b, lane, inst)?;
+                (mask >> float_class(bits)) & 1 != 0
+            }
             "f32" => {
                 use std::cmp::Ordering::{Equal, Greater, Less};
                 let x = wave.read_lane_f32(a, lane, inst)?;
@@ -381,4 +483,41 @@ fn compare(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
 
 fn clamp_unit(value: f32) -> f32 {
     if value > 0.0 { value.min(1.0) } else { 0.0 }
+}
+
+fn float_class(bits: u32) -> u32 {
+    let negative = bits >> 31 != 0;
+    let exponent = (bits >> 23) & 0xFF;
+    let mantissa = bits & 0x7F_FFFF;
+    match (exponent, mantissa) {
+        (0xFF, 0) => {
+            if negative {
+                2
+            } else {
+                9
+            }
+        }
+        (0xFF, m) => u32::from(m & 0x40_0000 != 0),
+        (0, 0) => {
+            if negative {
+                5
+            } else {
+                6
+            }
+        }
+        (0, _) => {
+            if negative {
+                4
+            } else {
+                7
+            }
+        }
+        _ => {
+            if negative {
+                3
+            } else {
+                8
+            }
+        }
+    }
 }

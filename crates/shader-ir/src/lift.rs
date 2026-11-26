@@ -423,6 +423,35 @@ impl Lifter {
         ) {
             return Ok(());
         }
+        if base.starts_with("s_setreg") && inst.text().contains("HW_REG_FLAT_SCR") {
+            return Ok(());
+        }
+        if let Some(op) = base
+            .strip_suffix("_wrexec_b32")
+            .or_else(|| base.strip_suffix("_wrexec_b64"))
+        {
+            let source = self.mask(arg(1)?, inst)?;
+            let old = self.mask_reg(Reg::Exec);
+            let new = match op {
+                "s_andn1" => {
+                    let inverted = self.un(Un::Not64, source);
+                    self.bin(Bin::And64, inverted, old)
+                }
+                "s_andn2" => {
+                    let inverted = self.un(Un::Not64, old);
+                    self.bin(Bin::And64, source, inverted)
+                }
+                _ => return Err(unsupported(inst)),
+            };
+            let full = self.full_mask();
+            let new = self.bin(Bin::And64, new, full);
+            self.set_exec(new);
+            self.set_mask(arg(0)?, new, inst)?;
+            let zero = self.c64(0);
+            let scc = self.cmp(Cmp::Ne64, new, zero);
+            self.stmts.push(Stmt::Set(Reg::Scc, scc));
+            return Ok(());
+        }
         if let Some(op) = base
             .strip_prefix("s_cmp_")
             .or_else(|| base.strip_prefix("s_cmpk_"))
@@ -534,6 +563,8 @@ impl Lifter {
                 | "s_sext_i32_i16"
                 | "s_addk_i32"
                 | "s_mulk_i32"
+                | "s_flbit_i32_b32"
+                | "s_bitset1_b32"
         );
         if !unary && !binary_scalar(name) {
             return Ok(false);
@@ -551,6 +582,13 @@ impl Lifter {
                 "s_brev_b32" => (self.un(Un::Bfrev, x), Flag::Keep),
                 "s_bcnt1_i32_b32" => (self.un(Un::Popcount, x), Flag::NonZero),
                 "s_ff1_i32_b32" => (self.un(Un::Ffbl, x), Flag::Keep),
+                "s_flbit_i32_b32" => (self.un(Un::Ffbh, x), Flag::Keep),
+                "s_bitset1_b32" => {
+                    let old = self.scalar(arg(0)?, inst)?;
+                    let one = self.c(1);
+                    let bit = self.bin(Bin::Shl, one, x);
+                    (self.bin(Bin::Or, old, bit), Flag::Keep)
+                }
                 "s_sext_i32_i8" | "s_sext_i32_i16" => {
                     let shift = self.c(if name.ends_with("i8") { 24 } else { 16 });
                     let up = self.bin(Bin::Shl, x, shift);
@@ -661,6 +699,24 @@ impl Lifter {
                 (self.bin(Bin::Or, low, high), Flag::Keep)
             }
             "s_mul_i32" => (self.bin(Bin::Mul, x, y), Flag::Keep),
+            "s_mul_hi_u32" => (self.bin(Bin::MulHiU, x, y), Flag::Keep),
+            "s_bfe_i32" => {
+                let field = self.c(31);
+                let offset = self.bin(Bin::And, y, field);
+                let sixteen = self.c(16);
+                let width = self.bin(Bin::ShrU, y, sixteen);
+                let seven = self.c(0x7F);
+                let width = self.bin(Bin::And, width, seven);
+                let limit = self.c(32);
+                let width = self.bin(Bin::MinU, width, limit);
+                let spare = self.bin(Bin::Sub, limit, width);
+                let shifted = self.bin(Bin::ShrU, x, offset);
+                let up = self.bin(Bin::Shl, shifted, spare);
+                let value = self.bin(Bin::ShrS, up, spare);
+                let zero = self.c(0);
+                let empty = self.cmp(Cmp::Eq, width, zero);
+                (self.value(Expr::Select(empty, zero, value)), Flag::NonZero)
+            }
             _ => {
                 let (op, invert_result, invert_second) =
                     logic_scalar(name).expect("checked by caller");
@@ -831,6 +887,83 @@ impl Lifter {
                 let count = self.un(Un::Popcount, partial);
                 let add = self.lane(arg(2)?, inst)?;
                 self.bin(Bin::Add, count, add)
+            }
+            "v_fmaak_f32" | "v_madak_f32" | "v_fmamk_f32" | "v_madmk_f32" => {
+                let a = self.flane(arg(1)?, inst)?;
+                let b = self.flane(arg(2)?, inst)?;
+                let c = self.flane(arg(3)?, inst)?;
+                let op = if name.starts_with("v_fma") {
+                    Tri::FFma
+                } else {
+                    Tri::FMad
+                };
+                let value = self.value(Expr::Tri(op, a, b, c));
+                self.output_modifiers(value, inst)
+            }
+            "v_mad_legacy_f32" => {
+                let a = self.flane(arg(1)?, inst)?;
+                let b = self.flane(arg(2)?, inst)?;
+                let c = self.flane(arg(3)?, inst)?;
+                let zero = self.c(0);
+                let a_zero = self.cmp(Cmp::FEq, a, zero);
+                let b_zero = self.cmp(Cmp::FEq, b, zero);
+                let either = self.value(Expr::Select(a_zero, a_zero, b_zero));
+                let product = self.bin(Bin::FMul, a, b);
+                let product = self.value(Expr::Select(either, zero, product));
+                let value = self.bin(Bin::FAdd, product, c);
+                self.output_modifiers(value, inst)
+            }
+            "v_med3_f32" => {
+                let a = self.flane(arg(1)?, inst)?;
+                let b = self.flane(arg(2)?, inst)?;
+                let c = self.flane(arg(3)?, inst)?;
+                let low = self.bin(Bin::FMin, a, b);
+                let high = self.bin(Bin::FMax, a, b);
+                let capped = self.bin(Bin::FMin, high, c);
+                let median = self.bin(Bin::FMax, low, capped);
+                let smallest = self.bin(Bin::FMin, low, c);
+                let unordered = self.cmp(Cmp::FU, a, b);
+                let c_nan = self.cmp(Cmp::FU, c, c);
+                let any_nan = self.value(Expr::Select(unordered, unordered, c_nan));
+                let value = self.value(Expr::Select(any_nan, smallest, median));
+                self.output_modifiers(value, inst)
+            }
+            "v_cvt_pk_u8_f32" => {
+                let x = self.flane(arg(1)?, inst)?;
+                let rounded = self.un(Un::FRndne, x);
+                let converted = self.un(Un::CvtU32F32, rounded);
+                let limit = self.c(255);
+                let byte = self.bin(Bin::MinU, converted, limit);
+                let selector = self.lane(arg(2)?, inst)?;
+                let three = self.c(3);
+                let selector = self.bin(Bin::And, selector, three);
+                let shift = self.bin(Bin::Shl, selector, three);
+                let old = self.lane(arg(3)?, inst)?;
+                let mask = self.c(0xFF);
+                let mask = self.bin(Bin::Shl, mask, shift);
+                let keep = self.un(Un::Not, mask);
+                let kept = self.bin(Bin::And, old, keep);
+                let placed = self.bin(Bin::Shl, byte, shift);
+                self.bin(Bin::Or, kept, placed)
+            }
+            "v_lshlrev_b64" => {
+                let (target, _) = vgprs(arg(0)?, inst)?;
+                let shift = self.lane(arg(1)?, inst)?;
+                let shift = self.un(Un::Zext, shift);
+                let value = match arg(2)?.operand {
+                    Operand::Vgpr { reg, .. } => {
+                        let low = self.value(Expr::Get(Reg::V(reg)));
+                        let high = self.value(Expr::Get(Reg::V(reg + 1)));
+                        self.bin(Bin::Pack64, low, high)
+                    }
+                    _ => self.scalar64(arg(2)?, inst)?,
+                };
+                let shifted = self.bin(Bin::Shl64, value, shift);
+                let low = self.un(Un::Lo, shifted);
+                let high = self.un(Un::Hi, shifted);
+                self.stmts.push(Stmt::SetLane(target, low));
+                self.stmts.push(Stmt::SetLane(target + 1, high));
+                return Ok(true);
             }
             "v_fmac_f32" | "v_mac_f32" => {
                 let a = self.flane(arg(1)?, inst)?;
@@ -1114,6 +1247,45 @@ impl Lifter {
         value
     }
 
+    fn buffer_address(&mut self, inst: &Inst) -> Result<(Tmp, Tmp), LiftError> {
+        let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
+        let has = |flag: &str| inst.mods.iter().any(|m| m == flag);
+        let offset = Self::immediate(inst, "offset");
+        let (base, words) = self.descriptor(arg(2)?, inst)?;
+        let zero = self.c(0);
+        let (index, voffset) = match (has("idxen"), has("offen")) {
+            (false, false) => (zero, zero),
+            (true, false) => (self.lane(arg(1)?, inst)?, zero),
+            (false, true) => (zero, self.lane(arg(1)?, inst)?),
+            (true, true) => {
+                let (reg, _) = vgprs(arg(1)?, inst)?;
+                let index = self.value(Expr::Get(Reg::V(reg)));
+                let voffset = self.value(Expr::Get(Reg::V(reg + 1)));
+                (index, voffset)
+            }
+        };
+        let immediate = self.c(offset as u32);
+        let local = self.bin(Bin::Add, voffset, immediate);
+        let records = words[2];
+        let sixteen = self.c(16);
+        let stride = self.bin(Bin::ShrU, words[1], sixteen);
+        let field = self.c(0x3FFF);
+        let stride = self.bin(Bin::And, stride, field);
+        let raw = self.cmp(Cmp::Eq, stride, zero);
+        let within = self.cmp(Cmp::LtU, local, records);
+        let indexed = self.cmp(Cmp::LtU, index, records);
+        let in_range = self.value(Expr::Select(raw, within, indexed));
+        let soffset = self.scalar(arg(3)?, inst)?;
+        let total = self.bin(Bin::Add, local, soffset);
+        let total = self.un(Un::Zext, total);
+        let low = self.bin(Bin::Mul, stride, index);
+        let high = self.bin(Bin::MulHiU, stride, index);
+        let element = self.bin(Bin::Pack64, low, high);
+        let start = self.bin(Bin::Add64, base, element);
+        let start = self.bin(Bin::Add64, start, total);
+        Ok((start, in_range))
+    }
+
     fn descriptor(&mut self, arg: &Arg, inst: &Inst) -> Result<(Tmp, [Tmp; 4]), LiftError> {
         let Operand::Sgpr { reg, .. } = arg.operand else {
             return Err(unsupported(inst));
@@ -1166,32 +1338,9 @@ impl Lifter {
             _ if name.starts_with("buffer_load_dword")
                 || name.starts_with("buffer_store_dword") =>
             {
-                if inst.mods.iter().any(|m| m == "idxen") {
-                    return Err(unsupported(inst));
-                }
                 let (data, count) = vgprs(arg(0)?, inst)?;
-                let (base, words) = self.descriptor(arg(2)?, inst)?;
-                let voffset = if inst.mods.iter().any(|m| m == "offen") {
-                    self.lane(arg(1)?, inst)?
-                } else {
-                    self.c(0)
-                };
-                let immediate = self.c(offset as u32);
-                let local = self.bin(Bin::Add, voffset, immediate);
-                let records = words[2];
-                let sixteen = self.c(16);
-                let stride = self.bin(Bin::ShrU, words[1], sixteen);
-                let field = self.c(0x3FFF);
-                let stride = self.bin(Bin::And, stride, field);
+                let (start, in_range) = self.buffer_address(inst)?;
                 let zero = self.c(0);
-                let raw = self.cmp(Cmp::Eq, stride, zero);
-                let within = self.cmp(Cmp::LtU, local, records);
-                let any = self.cmp(Cmp::Ne, records, zero);
-                let in_range = self.value(Expr::Select(raw, within, any));
-                let soffset = self.scalar(arg(3)?, inst)?;
-                let total = self.bin(Bin::Add, local, soffset);
-                let total = self.un(Un::Zext, total);
-                let start = self.bin(Bin::Add64, base, total);
                 for dword in 0..count {
                     let step = self.c64(4 * u64::from(dword));
                     let address = self.bin(Bin::Add64, start, step);
@@ -1340,6 +1489,8 @@ fn binary_scalar(name: &str) -> bool {
                 | "s_pack_lh_b32_b16"
                 | "s_pack_hh_b32_b16"
                 | "s_mul_i32"
+                | "s_mul_hi_u32"
+                | "s_bfe_i32"
         )
 }
 
@@ -1423,7 +1574,9 @@ fn unary(name: &str) -> Option<Un> {
         "v_cvt_f32_i32" => Un::CvtF32I32,
         "v_cvt_u32_f32" => Un::CvtU32F32,
         "v_cvt_i32_f32" => Un::CvtI32F32,
-        "v_rcp_f32" => Un::FRcp,
+        "v_rcp_f32" | "v_rcp_iflag_f32" => Un::FRcp,
+        "v_sin_f32" => Un::FSin,
+        "v_cos_f32" => Un::FCos,
         "v_rsq_f32" => Un::FRsq,
         "v_sqrt_f32" => Un::FSqrt,
         "v_exp_f32" => Un::FExp2,
@@ -1450,6 +1603,8 @@ fn is_float_un(op: Un) -> bool {
             | Un::FTrunc
             | Un::FRndne
             | Un::FFract
+            | Un::FSin
+            | Un::FCos
     )
 }
 
@@ -1518,6 +1673,7 @@ fn float_compare(op: &str) -> Option<Cmp> {
         "neq" => Cmp::FNeq,
         "nlt" => Cmp::FNlt,
         "t" | "tru" => Cmp::True,
+        "class" => Cmp::Class,
         _ => return None,
     })
 }

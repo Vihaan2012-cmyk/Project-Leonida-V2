@@ -30,11 +30,10 @@ fn check(source: &str, wave: Wave, memory: Memory) -> bool {
         assert_eq!(a, b, "s{reg}\n{}", context());
     }
     assert_eq!(machine.scc, reference.scc, "scc\n{}", context());
-    let nan = |x: u32| f32::from_bits(x).is_nan();
     for (reg, (a, b)) in machine.vgpr.iter().zip(&reference.vgpr).enumerate() {
         for (lane, (x, y)) in a.iter().zip(b).enumerate() {
             assert!(
-                x == y || (nan(*x) && nan(*y)),
+                x == y,
                 "v{reg} lane {lane}: {x:#x} vs {y:#x}\n{}",
                 context()
             );

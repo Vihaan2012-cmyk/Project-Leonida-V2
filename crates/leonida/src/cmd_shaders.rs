@@ -90,12 +90,12 @@ struct Report {
     emitted: usize,
     instructions: usize,
     unsupported: usize,
-    missing: BTreeMap<String, (usize, usize)>,
+    missing: BTreeMap<String, (usize, usize, String)>,
     lift_errors: BTreeMap<String, usize>,
 }
 
 impl Report {
-    fn add(&mut self, blob: &[u8]) -> Option<()> {
+    fn add(&mut self, name: &str, blob: &[u8]) -> Option<()> {
         let fssm = Fssm::parse(blob).ok()?;
         let CodeRange::Header { start, end } = fssm.code_range() else {
             return None;
@@ -111,8 +111,12 @@ impl Report {
         for name in &coverage.unsupported {
             self.missing.entry(name.clone()).or_default().1 += 1;
         }
-        for name in coverage.unsupported.iter().collect::<BTreeSet<_>>() {
-            self.missing.entry(name.clone()).or_default().0 += 1;
+        for missing in coverage.unsupported.iter().collect::<BTreeSet<_>>() {
+            let entry = self.missing.entry(missing.clone()).or_default();
+            entry.0 += 1;
+            if entry.2.is_empty() {
+                entry.2 = name.to_string();
+            }
         }
         if coverage.unsupported.is_empty() && coverage.invalid_words == 0 {
             self.complete += 1;
@@ -166,13 +170,13 @@ impl Report {
             println!("  {count} stopped at: {error}");
         }
         let mut missing: Vec<_> = self.missing.iter().collect();
-        missing.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        missing.sort_by(|a, b| (b.1.0, b.1.1).cmp(&(a.1.0, a.1.1)).then(a.0.cmp(b.0)));
         println!(
             "missing instructions ({} kinds), by shaders that need them:",
             missing.len()
         );
-        for (name, (shaders, uses)) in missing.into_iter().take(top) {
-            println!("  {name:<32} {shaders:>6} shaders {uses:>9} uses");
+        for (name, (shaders, uses, example)) in missing.into_iter().take(top) {
+            println!("  {name:<32} {shaders:>6} shaders {uses:>9} uses   e.g. {example}");
         }
     }
 }
@@ -183,7 +187,7 @@ pub fn report_command(args: &ReportArgs) -> Result<ExitCode> {
         carve(archive, |shader| {
             let added = unpack_all(&shader.dxbc)
                 .ok()
-                .and_then(|blobs| blobs.last().and_then(|blob| report.add(blob)));
+                .and_then(|blobs| blobs.last().and_then(|blob| report.add(&shader.name, blob)));
             if added.is_none() {
                 report.unreadable += 1;
             }

@@ -963,6 +963,15 @@ impl Emitter {
             Un::FCeil => self.float_unary(GLOp::Ceil, a)?,
             Un::FTrunc => self.float_unary(GLOp::Trunc, a)?,
             Un::FRndne => self.float_unary(GLOp::RoundEven, a)?,
+            Un::FSin | Un::FCos => {
+                let x = self.float(a)?;
+                let tau = self.f32c(std::f32::consts::TAU);
+                let turns = ok(self.b.f_mul(f32_, None, x, tau))?;
+                let turns = self.exact(turns);
+                let op = if op == Un::FSin { GLOp::Sin } else { GLOp::Cos };
+                let r = self.glsl(f32_, op, &[turns])?;
+                self.bits(r)?
+            }
             Un::FFract => {
                 let x = self.float(a)?;
                 let floor = self.glsl(f32_, GLOp::Floor, &[x])?;
@@ -1071,6 +1080,44 @@ impl Emitter {
         })
     }
 
+    fn class(&mut self, bits: Word, mask: Word) -> Result<Word, EmitError> {
+        let (u32_, bool_) = (self.t.u32_, self.t.bool_);
+        let c = |e: &mut Self, v: u32| e.u32c(v);
+        let thirty_one = c(self, 31);
+        let sign = ok(self.b.shift_right_logical(u32_, None, bits, thirty_one))?;
+        let zero = c(self, 0);
+        let negative = ok(self.b.i_not_equal(bool_, None, sign, zero))?;
+        let twenty_three = c(self, 23);
+        let exponent = ok(self.b.shift_right_logical(u32_, None, bits, twenty_three))?;
+        let byte = c(self, 0xFF);
+        let exponent = ok(self.b.bitwise_and(u32_, None, exponent, byte))?;
+        let fraction = c(self, 0x7F_FFFF);
+        let mantissa = ok(self.b.bitwise_and(u32_, None, bits, fraction))?;
+        let quiet_bit = c(self, 0x40_0000);
+        let quiet = ok(self.b.bitwise_and(u32_, None, bits, quiet_bit))?;
+        let quiet = ok(self.b.i_not_equal(bool_, None, quiet, zero))?;
+        let top = ok(self.b.i_equal(bool_, None, exponent, byte))?;
+        let bottom = ok(self.b.i_equal(bool_, None, exponent, zero))?;
+        let empty = ok(self.b.i_equal(bool_, None, mantissa, zero))?;
+        let pick = |e: &mut Self, when: Word, yes: u32, no: u32| -> Result<Word, EmitError> {
+            let (yes, no) = (e.u32c(yes), e.u32c(no));
+            ok(e.b.select(u32_, None, when, yes, no))
+        };
+        let normal = pick(self, negative, 3, 8)?;
+        let denormal = pick(self, negative, 4, 7)?;
+        let zero_class = pick(self, negative, 5, 6)?;
+        let infinity = pick(self, negative, 2, 9)?;
+        let nan = pick(self, quiet, 1, 0)?;
+        let small = ok(self.b.select(u32_, None, empty, zero_class, denormal))?;
+        let large = ok(self.b.select(u32_, None, empty, infinity, nan))?;
+        let index = ok(self.b.select(u32_, None, bottom, small, normal))?;
+        let index = ok(self.b.select(u32_, None, top, large, index))?;
+        let shifted = ok(self.b.shift_right_logical(u32_, None, mask, index))?;
+        let one = c(self, 1);
+        let bit = ok(self.b.bitwise_and(u32_, None, shifted, one))?;
+        ok(self.b.i_not_equal(bool_, None, bit, zero))
+    }
+
     fn compare(&mut self, op: Cmp, a: Word, b: Word) -> Result<Word, EmitError> {
         let bool_ = self.t.bool_;
         let b_ = &mut self.b;
@@ -1087,6 +1134,7 @@ impl Emitter {
             Cmp::GeS => Some(ok(b_.s_greater_than_equal(bool_, None, a, b))?),
             Cmp::False => return Ok(self.boolc(false)),
             Cmp::True => return Ok(self.boolc(true)),
+            Cmp::Class => return self.class(a, b),
             _ => None,
         };
         if let Some(result) = integer {

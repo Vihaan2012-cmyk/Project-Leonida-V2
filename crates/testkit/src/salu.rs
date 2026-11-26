@@ -20,6 +20,30 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<Option<Flow>>
         return Ok(Some(Flow::Next));
     }
     if let Some(op) = name
+        .strip_suffix("_wrexec_b32")
+        .or_else(|| name.strip_suffix("_wrexec_b64"))
+    {
+        let source = if name.ends_with("_b64") {
+            wave.read_scalar64(arg(inst, 1)?, inst)?
+        } else {
+            u64::from(wave.read_scalar(arg(inst, 1)?, inst)?)
+        };
+        let old = wave.exec();
+        let new = match op {
+            "s_andn1" => !source & old,
+            "s_andn2" => source & !old,
+            _ => return Err(bad(inst)),
+        } & wave.full_mask();
+        wave.set_mask(EXEC, new);
+        if name.ends_with("_b64") {
+            wave.write_scalar64(arg(inst, 0)?, new, inst)?;
+        } else {
+            wave.write_scalar(arg(inst, 0)?, new as u32, inst)?;
+        }
+        wave.scc = new != 0;
+        return Ok(Some(Flow::Next));
+    }
+    if let Some(op) = name
         .strip_suffix("_saveexec_b32")
         .or_else(|| name.strip_suffix("_saveexec_b64"))
     {
@@ -76,6 +100,9 @@ fn program_flow(name: &str, inst: &Inst, wave: &mut Wave) -> Result<Option<Flow>
     };
     let taken = match name {
         "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done" => return Ok(Some(Flow::End)),
+        "s_setreg_imm32_b32" | "s_setreg_b32" if inst.text().contains("HW_REG_FLAT_SCR") => {
+            return Ok(Some(Flow::Next));
+        }
         "s_nop" | "s_waitcnt" | "s_waitcnt_vscnt" | "s_barrier" | "s_clause"
         | "s_inst_prefetch" | "s_code_end" => {
             return Ok(Some(Flow::Next));
@@ -115,6 +142,14 @@ fn narrow(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
             let v = src(1)?.count_ones();
             (v, Some(v != 0))
         }
+        "s_flbit_i32_b32" => {
+            let v = src(1)?;
+            (if v == 0 { u32::MAX } else { v.leading_zeros() }, None)
+        }
+        "s_bitset1_b32" => (
+            wave.read_scalar(arg(inst, 0)?, inst)? | (1 << (src(1)? & 31)),
+            None,
+        ),
         "s_ff1_i32_b32" => {
             let v = src(1)?;
             (if v == 0 { u32::MAX } else { v.trailing_zeros() }, None)
@@ -172,6 +207,18 @@ fn binary(name: &str, a: u32, b: u32, scc_in: bool) -> Option<(u32, Option<bool>
             (v as u32, Some(overflow))
         }
         "s_mul_i32" => ((a as i32).wrapping_mul(b as i32) as u32, None),
+        "s_mul_hi_u32" => (((u64::from(a) * u64::from(b)) >> 32) as u32, None),
+        "s_bfe_i32" => {
+            let offset = b & 31;
+            let width = ((b >> 16) & 0x7F).min(32);
+            let v = if width == 0 {
+                0
+            } else {
+                let spare = 32 - width;
+                (((a >> offset) << spare) as i32 >> spare) as u32
+            };
+            nonzero(v)
+        }
         "s_and_b32" => nonzero(a & b),
         "s_or_b32" => nonzero(a | b),
         "s_xor_b32" => nonzero(a ^ b),

@@ -179,6 +179,11 @@ impl Generator {
         }
     }
 
+    fn float_literal(&mut self) -> String {
+        let value = ((self.rng.word() % 2000) as f32 / 16.0 - 60.0).to_bits();
+        format!("0x{value:x}")
+    }
+
     fn omod(&mut self) -> &'static str {
         self.rng.pick(&[
             "",
@@ -235,6 +240,8 @@ impl Generator {
                     "s_pack_ll_b32_b16",
                     "s_pack_lh_b32_b16",
                     "s_pack_hh_b32_b16",
+                    "s_mul_hi_u32",
+                    "s_bfe_i32",
                 ]);
                 format!(
                     "{op} {}, {}, {}",
@@ -253,6 +260,8 @@ impl Generator {
                     "s_ff1_i32_b32",
                     "s_sext_i32_i8",
                     "s_sext_i32_i16",
+                    "s_flbit_i32_b32",
+                    "s_bitset1_b32",
                 ]);
                 format!("{op} {}, {}", self.sdst(), self.ssrc(true))
             }
@@ -312,7 +321,7 @@ impl Generator {
     }
 
     fn vector(&mut self) -> String {
-        match self.rng.below(14) {
+        match self.rng.below(17) {
             0 | 1 => {
                 let op = self.rng.pick(&[
                     "v_add_nc_u32",
@@ -513,6 +522,72 @@ impl Generator {
                 )
             }
             10 => self.compare(),
+            14 => match self.rng.below(4) {
+                0 => {
+                    let op = self.rng.pick(&["v_fmaak_f32", "v_madak_f32"]);
+                    let k = self.float_literal();
+                    format!(
+                        "{op} {}, {}, {}, {k}",
+                        self.fdst(),
+                        self.fvsrc(false),
+                        self.fvreg()
+                    )
+                }
+                1 => {
+                    let op = self.rng.pick(&["v_fmamk_f32", "v_madmk_f32"]);
+                    let k = self.float_literal();
+                    format!(
+                        "{op} {}, {}, {k}, {}",
+                        self.fdst(),
+                        self.fvsrc(false),
+                        self.fvreg()
+                    )
+                }
+                2 => {
+                    let op = self.rng.pick(&["v_mad_legacy_f32", "v_med3_f32"]);
+                    let omod = self.omod();
+                    format!(
+                        "{op} {}, {}, {}, {}{omod}",
+                        self.fdst(),
+                        self.fsrc(),
+                        self.fsrc(),
+                        self.fsrc()
+                    )
+                }
+                _ => {
+                    let op = if self.gpu {
+                        "v_trunc_f32"
+                    } else {
+                        self.rng
+                            .pick(&["v_rcp_iflag_f32", "v_sin_f32", "v_cos_f32"])
+                    };
+                    format!("{op}_e32 {}, {}", self.fdst(), self.fvsrc(true))
+                }
+            },
+            15 => {
+                if self.rng.chance(2) {
+                    format!(
+                        "v_cvt_pk_u8_f32 {}, {}, {}, {}",
+                        self.vdst(),
+                        self.fsrc(),
+                        self.vsrc(false),
+                        self.vsrc(false)
+                    )
+                } else {
+                    let low = if self.gpu {
+                        1 + 2 * self.rng.below(2)
+                    } else {
+                        1 + self.rng.below(7)
+                    };
+                    let source = self.rng.below(8);
+                    format!(
+                        "v_lshlrev_b64 v[{low}:{}], {}, v[{source}:{}]",
+                        low + 1,
+                        self.vsrc(false),
+                        source + 1
+                    )
+                }
+            }
             11 => {
                 if self.rng.chance(2) {
                     format!(
@@ -617,6 +692,14 @@ impl Generator {
                 self.rng.pick(&["u32", "i32"]),
             )
         };
+        if float && self.rng.chance(6) {
+            let mask = self.vsrc(false);
+            return format!(
+                "v_cmp_class_f32_e64 {}, {}, {mask}",
+                self.mask_reg(),
+                self.fsrc()
+            );
+        }
         if self.rng.chance(2) {
             let (a, b) = if float {
                 (self.fvsrc(true), self.fvreg())
@@ -689,6 +772,20 @@ impl Generator {
                 _ => {
                     if self.rng.chance(4) {
                         format!("v_cmpx_gt_u32_e32 {}, {}", self.vsrc(true), self.vreg())
+                    } else if self.rng.chance(3) {
+                        let (op, source) = if self.wave64 {
+                            ("s_andn2_wrexec_b64", self.pair())
+                        } else {
+                            ("s_andn2_wrexec_b32", self.sreg())
+                        };
+                        let target = self.mask_reg();
+                        format!("{op} {target}, {source}")
+                    } else if self.rng.chance(3) {
+                        let which = self.rng.pick(&["LO", "HI"]);
+                        format!(
+                            "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_{which}), 0x{:x}",
+                            self.rng.word()
+                        )
                     } else {
                         let mov = if self.wave64 {
                             "s_mov_b64"

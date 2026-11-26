@@ -85,6 +85,9 @@ fn name_start(archive: &[u8], floor: usize, nul: usize) -> Option<usize> {
     while start > lowest && (0x21..=0x7E).contains(&archive[start - 1]) {
         start -= 1;
     }
+    if start < nul && usize::from(archive[start]) == nul - start {
+        start += 1;
+    }
     (nul - start >= MIN_NAME).then_some(start)
 }
 
@@ -184,6 +187,16 @@ mod tests {
                 rejected: 1
             }
         );
+    }
+
+    #[test]
+    fn a_printable_length_byte_before_the_name_is_dropped() {
+        let ps = container(0, &[fssm(false, &[NOP])]);
+        let name = "MS_VS_CascadeShadows_draw_f6ce4799_Wrapped";
+        let mut archive = vec![0u8, name.len() as u8 + 1];
+        archive.extend(rpf_entry(name, 3, 1, &ps));
+        let (found, _) = collect(&archive);
+        assert_eq!(found[0].name, name);
     }
 
     #[test]

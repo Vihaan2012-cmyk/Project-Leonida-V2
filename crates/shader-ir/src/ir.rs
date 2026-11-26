@@ -43,6 +43,8 @@ pub enum Un {
     FTrunc,
     FRndne,
     FFract,
+    FSin,
+    FCos,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +116,7 @@ pub enum Cmp {
     FNlt,
     False,
     True,
+    Class,
 }
 
 #[derive(Debug, Clone, PartialEq)]
