@@ -12,6 +12,7 @@ decompile.workspace = true
 game-package.workspace = true
 iced-x86.workspace = true
 leonida-ui.workspace = true
+offline.workspace = true
 pe-image.workspace = true
 rdna.workspace = true
 shader-container.workspace = true

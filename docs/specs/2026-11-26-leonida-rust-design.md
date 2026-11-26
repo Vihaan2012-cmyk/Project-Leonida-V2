@@ -31,7 +31,8 @@ replaces its code, formats and interfaces.
   that quote them. Enforced by `.gitignore` and a CI content scan (section 10).
 - **No keys, decryption or protection workarounds.** Where a format is encrypted (for example the RPF table of
   contents), we read only plaintext data around it, as upstream does, and document the limit.
-- **Offline**: no Xbox Live, Rockstar or other online services; the runtime blocks network DLLs by policy.
+- **Offline, no exceptions**: no Xbox Live, Rockstar or other online services. The runtime blocks every way the game
+  could reach the network, by one policy in the `offline` crate (section 9.2).
 - **Only the player's own copy.** Nothing in Leonida downloads, describes how to obtain, or ships game files.
 
 ### Current situation
@@ -71,6 +72,9 @@ One Cargo workspace. Each crate has one job; no source file should pass roughly 
 | `gpu` | Vulkan foundation (`ash`, `gpu-allocator`): device, memory, bindless descriptors, pipeline cache | all |
 | `render` | Renderer: passes, resource upload, GPU detiling, upscaling | all |
 | `scene` | Harness that draws real game models with the game's real translated shaders | all |
+| `pe-image` | Read-only executable parsing: sections, imports, exception table, strings | all |
+| `decompile` | Readable pseudocode from executable functions, for study only | all |
+| `offline` | The offline policy: every DLL, function and path that could reach the network | all |
 | `pe-loader` | Maps and links the game executable | Windows |
 | `shims` | Reimplemented system/GDK libraries | Windows |
 | `xbox-d3d12` | The console's D3D12 interface on top of `render` | Windows |
@@ -346,9 +350,16 @@ Further rules:
   compile time.
 - Written against the publicly documented GDK signatures. Before an executable exists, coverage is driven by the
   import tables of the package's own DLLs (`XboxBvhBuilder.dll`, `XCurl.dll`, `libHttpClient.GDK.dll`, ...).
-- **Offline by policy**: host DLLs on an allow-list (`kernel32`, `ntdll`, `user32`, ...); network DLLs (`ws2_32`,
-  `wininet`, unshimmed `winhttp` exports, ...) bound to stubs that log and fail.
-- All file access goes through `vfs`: package read-only, packages layered on top, all writes to `Output/`.
+- **Offline, no exceptions**: host DLLs on an allow-list (`kernel32`, `ntdll`, `user32`, ...). Every import,
+  `LoadLibrary` and `GetProcAddress` that the `offline` crate names is bound to a stub that logs and fails as if
+  there were no network: sockets, WinHTTP, WinINet, `libHttpClient.GDK`, `XCurl`, name lookups, network status,
+  remote procedure calls, and the Xbox Live and `XNetworking` functions. No network function is ever made to work,
+  not even through a shim, so the crash reporter's uploads, telemetry, Xbox Live and Rockstar services all fail
+  quietly. The package's own network DLLs are never loaded. `leonida exe network` lists everything the policy
+  catches in the executable.
+- All file access goes through `vfs`: package read-only, packages layered on top, all writes to `Output/`. Paths the
+  `offline` crate names are refused: `tcpip:` (the engine's remote file loading, which can also open a listening
+  port), shared folders on other computers, and web addresses.
 
 ### 9.3 `xbox-d3d12`
 

@@ -521,6 +521,7 @@ dependencies = [
  "game-package",
  "iced-x86",
  "leonida-ui",
+ "offline",
  "pe-image",
  "rdna",
  "shader-container",
@@ -708,6 +709,10 @@ dependencies = [
  "objc2",
  "objc2-foundation",
 ]
+
+[[package]]
+name = "offline"
+version = "0.1.0"
 
 [[package]]
 name = "once_cell"

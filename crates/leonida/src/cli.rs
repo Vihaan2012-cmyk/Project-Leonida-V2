@@ -39,6 +39,8 @@ pub enum ExeCommand {
         #[arg(long)]
         dll: Option<String>,
     },
+    /// Everything the executable could use to reach the network. Leonida blocks all of it.
+    Network,
     /// Functions from the exception table, largest first.
     Functions {
         /// How many to list.

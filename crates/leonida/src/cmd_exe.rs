@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -40,6 +40,7 @@ pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
         ExeCommand::Info => info(&image),
         ExeCommand::Decompile { address, depth } => decompile(&image, address, *depth)?,
         ExeCommand::Imports { dll } => imports(&image, dll.as_deref()),
+        ExeCommand::Network => network(&image),
         ExeCommand::Functions { top } => functions(&image, *top),
         ExeCommand::Disasm { address, limit } => disasm(&image, address, *limit)?,
         ExeCommand::Strings { find, min, limit } => strings(&image, find.as_deref(), *min, *limit),
@@ -113,6 +114,64 @@ fn imports(image: &Image<'_>, filter: Option<&str>) {
             }
         }
     }
+}
+
+fn network(image: &Image<'_>) {
+    let mut found: BTreeMap<offline::Reason, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+    let mut add = |reason, group: String, item: String| {
+        found
+            .entry(reason)
+            .or_default()
+            .entry(group)
+            .or_default()
+            .insert(item);
+    };
+    let mut imported = HashSet::new();
+    for dll in image.imports() {
+        imported.insert(dll.name.to_ascii_lowercase());
+        for entry in &dll.entries {
+            let name = match (&entry.name, entry.ordinal) {
+                (Some(name), _) => name.clone(),
+                (None, ordinal) => format!("#{}", ordinal.unwrap_or_default()),
+            };
+            imported.insert(name.to_ascii_lowercase());
+            if let Some(reason) = offline::import(&dll.name, entry.name.as_deref()) {
+                add(reason, format!("{} imports", dll.name), name);
+            }
+        }
+    }
+    for section in image.sections.iter().filter(|s| !s.executable()) {
+        let Some(bytes) = image.read(section.virtual_address, section.raw_size as usize) else {
+            continue;
+        };
+        for (_, text) in pe_image::strings(bytes, 6) {
+            let lower = text.to_ascii_lowercase();
+            if imported.contains(&lower) {
+                continue;
+            }
+            if lower.ends_with(".dll") {
+                if let Some(reason) = offline::import(&text, None) {
+                    add(reason, "libraries it loads by name".into(), text);
+                }
+            } else if let Some(reason) =
+                offline::path(&text).filter(|r| *r != offline::Reason::NetworkShares)
+            {
+                add(reason, "addresses and paths in its text".into(), text);
+            } else if text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && let Some(reason) = offline::function(&text)
+            {
+                add(reason, "functions named in its text".into(), text);
+            }
+        }
+    }
+    for (reason, groups) in &found {
+        println!("{}:", reason.describe());
+        for (group, items) in groups {
+            let items: Vec<&str> = items.iter().map(String::as_str).collect();
+            println!("  {group} ({}): {}", items.len(), items.join(", "));
+        }
+    }
+    println!("Leonida blocks every item above when the game runs: nothing reaches the network.");
 }
 
 fn functions(image: &Image<'_>, top: usize) {
