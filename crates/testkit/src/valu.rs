@@ -1,4 +1,4 @@
-use rdna::{Inst, Operand};
+use rdna::{Arg, Inst, Operand};
 
 use crate::Result;
 use crate::state::{EXEC, VCC, Wave, arg, bad};
@@ -93,6 +93,7 @@ fn kind(name: &str) -> Option<Kind> {
             I3(|a, b, c| (a & 0xFF_FFFF).wrapping_mul(b & 0xFF_FFFF).wrapping_add(c))
         }
         "v_bfe_u32" => I3(bfe),
+        "v_perm_b32" => I3(perm),
         "v_bfe_i32" => I3(|a, b, c| {
             let width = c & 31;
             if width == 0 {
@@ -197,6 +198,9 @@ fn output_modifiers(wave: &Wave, inst: &Inst, value: f32) -> f32 {
 pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
     if !name.starts_with("v_") {
         return Ok(false);
+    }
+    if let Some(op) = name.strip_suffix("_sdwa") {
+        return sdwa(op, inst, wave);
     }
     if name.starts_with("v_cmp_") || name.starts_with("v_cmpx_") {
         compare(name, inst, wave)?;
@@ -520,4 +524,117 @@ fn float_class(bits: u32) -> u32 {
             }
         }
     }
+}
+
+fn perm(a: u32, b: u32, selectors: u32) -> u32 {
+    let data = (u64::from(a) << 32) | u64::from(b);
+    let mut result = 0;
+    for i in 0..4 {
+        let selector = (selectors >> (8 * i)) & 0xFF;
+        let byte = match selector {
+            13.. => 0xFF,
+            12 => 0,
+            8..=11 => {
+                let bit = 16 * (selector - 8) + 15;
+                if data >> bit & 1 != 0 { 0xFF } else { 0 }
+            }
+            _ => (data >> (8 * selector)) as u32 & 0xFF,
+        };
+        result |= byte << (8 * i);
+    }
+    result
+}
+
+const SCRATCH: usize = 252;
+
+fn sdwa_field(text: &str) -> Option<(u32, u32)> {
+    match text {
+        "BYTE_0" => Some((0, 8)),
+        "BYTE_1" => Some((8, 8)),
+        "BYTE_2" => Some((16, 8)),
+        "BYTE_3" => Some((24, 8)),
+        "WORD_0" => Some((0, 16)),
+        "WORD_1" => Some((16, 16)),
+        _ => None,
+    }
+}
+
+fn sdwa_mod<'a>(inst: &'a Inst, key: &str) -> Option<&'a str> {
+    inst.mods
+        .iter()
+        .find_map(|m| m.strip_prefix(key)?.strip_prefix(':'))
+}
+
+fn sdwa(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
+    let compare = name.starts_with("v_cmp");
+    let sources: Vec<usize> = if name.starts_with("v_cmpx") {
+        vec![0, 1]
+    } else {
+        (1..inst.args.len()).collect()
+    };
+    let saved: Vec<[u32; 64]> = (0..4).map(|i| wave.vgpr[SCRATCH + i]).collect();
+    let mut modified = inst.clone();
+    for (n, index) in sources.iter().enumerate() {
+        let source = arg(inst, *index)?;
+        let select = sdwa_mod(inst, &format!("src{n}_sel")).unwrap_or("DWORD");
+        let mut values = [0u32; 64];
+        for (lane, slot) in values.iter_mut().enumerate().take(wave.lanes()) {
+            let raw = wave.read_lane(source, lane, inst)?;
+            *slot = match sdwa_field(select) {
+                None => raw,
+                Some((shift, width)) if source.sext => {
+                    (((raw >> shift) << (32 - width)) as i32 >> (32 - width)) as u32
+                }
+                Some((shift, width)) => (raw >> shift) & (u32::MAX >> (32 - width)),
+            };
+        }
+        wave.vgpr[SCRATCH + n] = values;
+        modified.args[*index] = Arg {
+            operand: Operand::Vgpr {
+                reg: (SCRATCH + n) as u8,
+                count: 1,
+            },
+            neg: source.neg,
+            abs: source.abs,
+            sext: false,
+        };
+    }
+    let target = if compare {
+        None
+    } else {
+        let Operand::Vgpr { reg, .. } = arg(inst, 0)?.operand else {
+            return Err(bad(inst));
+        };
+        modified.args[0] = Arg::new(Operand::Vgpr {
+            reg: (SCRATCH + 3) as u8,
+            count: 1,
+        });
+        Some(usize::from(reg))
+    };
+    let done = execute(name, &modified, wave);
+    if let (Ok(true), Some(target)) = (&done, target) {
+        let select = sdwa_mod(inst, "dst_sel").unwrap_or("DWORD");
+        let unused = sdwa_mod(inst, "dst_unused").unwrap_or("UNUSED_PRESERVE");
+        for lane in wave.active_lanes() {
+            let value = wave.vgpr[SCRATCH + 3][lane];
+            let old = wave.vgpr[target][lane];
+            wave.vgpr[target][lane] = match sdwa_field(select) {
+                None => value,
+                Some((shift, width)) => {
+                    let mask = u32::MAX >> (32 - width);
+                    match unused {
+                        "UNUSED_SEXT" => {
+                            ((((value << (32 - width)) as i32) >> (32 - width)) as u32) << shift
+                        }
+                        "UNUSED_PRESERVE" => (old & !(mask << shift)) | ((value & mask) << shift),
+                        _ => (value & mask) << shift,
+                    }
+                }
+            };
+        }
+    }
+    for (i, lanes) in saved.into_iter().enumerate() {
+        wave.vgpr[SCRATCH + i] = lanes;
+    }
+    done
 }

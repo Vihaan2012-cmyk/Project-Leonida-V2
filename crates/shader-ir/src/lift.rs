@@ -47,6 +47,8 @@ pub fn lift(code: &[u8], wave64: bool) -> Result<Function, LiftError> {
         wave64,
         stmts: Vec::new(),
         next: 0,
+        overrides: Vec::new(),
+        destination: None,
     };
     let mut blocks = Vec::new();
     for (id, start) in leaders.iter().enumerate() {
@@ -116,6 +118,8 @@ pub fn coverage(code: &[u8], wave64: bool) -> Coverage {
             wave64,
             stmts: Vec::new(),
             next: 0,
+            overrides: Vec::new(),
+            destination: None,
         };
         let supported = if is_end(inst) {
             true
@@ -158,6 +162,49 @@ struct Lifter {
     wave64: bool,
     stmts: Vec<Stmt>,
     next: Tmp,
+    overrides: Vec<(*const Arg, Tmp)>,
+    destination: Option<(Select, Select)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Select {
+    Byte(u32),
+    Word(u32),
+    Dword,
+    Pad,
+    Sext,
+    Preserve,
+}
+
+fn selection(inst: &Inst, key: &str, default: Select) -> Option<Select> {
+    let Some(text) = inst
+        .mods
+        .iter()
+        .find_map(|m| m.strip_prefix(key)?.strip_prefix(':'))
+    else {
+        return Some(default);
+    };
+    Some(match text {
+        "BYTE_0" => Select::Byte(0),
+        "BYTE_1" => Select::Byte(1),
+        "BYTE_2" => Select::Byte(2),
+        "BYTE_3" => Select::Byte(3),
+        "WORD_0" => Select::Word(0),
+        "WORD_1" => Select::Word(1),
+        "DWORD" => Select::Dword,
+        "UNUSED_PAD" => Select::Pad,
+        "UNUSED_SEXT" => Select::Sext,
+        "UNUSED_PRESERVE" => Select::Preserve,
+        _ => return None,
+    })
+}
+
+fn field(select: Select) -> Option<(u32, u32)> {
+    match select {
+        Select::Byte(n) => Some((8 * n, 8)),
+        Select::Word(n) => Some((16 * n, 16)),
+        _ => None,
+    }
 }
 
 fn unsupported(inst: &Inst) -> LiftError {
@@ -280,6 +327,9 @@ impl Lifter {
     }
 
     fn lane(&mut self, arg: &Arg, inst: &Inst) -> Result<Tmp, LiftError> {
+        if let Some((_, value)) = self.overrides.iter().find(|(p, _)| std::ptr::eq(*p, arg)) {
+            return Ok(*value);
+        }
         match &arg.operand {
             Operand::Vgpr { reg, .. } => Ok(self.value(Expr::Get(Reg::V(*reg)))),
             _ => self.scalar(arg, inst),
@@ -365,11 +415,137 @@ impl Lifter {
     fn set_lane(&mut self, arg: &Arg, value: Tmp, inst: &Inst) -> Result<(), LiftError> {
         match &arg.operand {
             Operand::Vgpr { reg, .. } => {
+                let value = match self.destination {
+                    Some((select, unused)) => self.place(*reg, value, select, unused),
+                    None => value,
+                };
                 self.stmts.push(Stmt::SetLane(*reg, value));
                 Ok(())
             }
             _ => Err(unsupported(inst)),
         }
+    }
+
+    fn extract(&mut self, value: Tmp, select: Select, sext: bool) -> Tmp {
+        let Some((shift, width)) = field(select) else {
+            return value;
+        };
+        if sext {
+            let up = self.c(32 - width - shift);
+            let raised = self.bin(Bin::Shl, value, up);
+            let down = self.c(32 - width);
+            self.bin(Bin::ShrS, raised, down)
+        } else {
+            let amount = self.c(shift);
+            let shifted = self.bin(Bin::ShrU, value, amount);
+            let mask = self.c(u32::MAX >> (32 - width));
+            self.bin(Bin::And, shifted, mask)
+        }
+    }
+
+    fn place(&mut self, reg: u8, value: Tmp, select: Select, unused: Select) -> Tmp {
+        let Some((shift, width)) = field(select) else {
+            return value;
+        };
+        let mask = self.c(u32::MAX >> (32 - width));
+        let low = self.bin(Bin::And, value, mask);
+        let amount = self.c(shift);
+        let placed = self.bin(Bin::Shl, low, amount);
+        match unused {
+            Select::Sext => {
+                let up = self.c(32 - width);
+                let raised = self.bin(Bin::Shl, value, up);
+                let extended = self.bin(Bin::ShrS, raised, up);
+                self.bin(Bin::Shl, extended, amount)
+            }
+            Select::Preserve => {
+                let old = self.value(Expr::Get(Reg::V(reg)));
+                let hole = self.c(!((u32::MAX >> (32 - width)) << shift));
+                let kept = self.bin(Bin::And, old, hole);
+                self.bin(Bin::Or, kept, placed)
+            }
+            _ => placed,
+        }
+    }
+
+    fn sdwa(&mut self, name: &str, inst: &Inst) -> Result<(), LiftError> {
+        let compare = name.starts_with("v_cmp");
+        let sources: Vec<usize> = if name.starts_with("v_cmpx") {
+            vec![0, 1]
+        } else {
+            (1..inst.args.len()).collect()
+        };
+        for (n, index) in sources.into_iter().enumerate() {
+            let arg = inst.args.get(index).ok_or_else(|| unsupported(inst))?;
+            let select = selection(inst, &format!("src{n}_sel"), Select::Dword)
+                .ok_or_else(|| unsupported(inst))?;
+            let raw = match &arg.operand {
+                Operand::Vgpr { reg, .. } => self.value(Expr::Get(Reg::V(*reg))),
+                _ => self.scalar(arg, inst)?,
+            };
+            let value = self.extract(raw, select, arg.sext);
+            self.overrides.push((arg as *const Arg, value));
+        }
+        if !compare {
+            let select =
+                selection(inst, "dst_sel", Select::Dword).ok_or_else(|| unsupported(inst))?;
+            let unused =
+                selection(inst, "dst_unused", Select::Preserve).ok_or_else(|| unsupported(inst))?;
+            self.destination = Some((select, unused));
+        }
+        let result = if compare {
+            self.vector_compare(name, inst)
+        } else if self.vector_op(name, inst)? {
+            Ok(())
+        } else {
+            Err(unsupported(inst))
+        };
+        self.overrides.clear();
+        self.destination = None;
+        result
+    }
+
+    fn perm(&mut self, a: Tmp, b: Tmp, c: Tmp) -> Tmp {
+        let data = self.bin(Bin::Pack64, b, a);
+        let mut result = self.c(0);
+        let (byte, zero, ones) = (self.c(0xFF), self.c(0), self.c(0xFF));
+        for i in 0..4 {
+            let shift = self.c(8 * i);
+            let selector = self.bin(Bin::ShrU, c, shift);
+            let selector = self.bin(Bin::And, selector, byte);
+            let seven = self.c(7);
+            let index = self.bin(Bin::And, selector, seven);
+            let three = self.c(3);
+            let bits = self.bin(Bin::Shl, index, three);
+            let bits = self.un(Un::Zext, bits);
+            let moved = self.bin(Bin::ShrU64, data, bits);
+            let moved = self.un(Un::Lo, moved);
+            let plain = self.bin(Bin::And, moved, byte);
+            let pair = self.bin(Bin::And, selector, three);
+            let four = self.c(4);
+            let top = self.bin(Bin::Shl, pair, four);
+            let fifteen = self.c(15);
+            let top = self.bin(Bin::Add, top, fifteen);
+            let top = self.un(Un::Zext, top);
+            let sign = self.bin(Bin::ShrU64, data, top);
+            let sign = self.un(Un::Lo, sign);
+            let one = self.c(1);
+            let sign = self.bin(Bin::And, sign, one);
+            let negative = self.cmp(Cmp::Ne, sign, zero);
+            let sign = self.value(Expr::Select(negative, ones, zero));
+            let eight = self.c(8);
+            let high = self.cmp(Cmp::GeU, selector, eight);
+            let value = self.value(Expr::Select(high, sign, plain));
+            let twelve = self.c(12);
+            let blank = self.cmp(Cmp::Eq, selector, twelve);
+            let value = self.value(Expr::Select(blank, zero, value));
+            let thirteen = self.c(13);
+            let full = self.cmp(Cmp::GeU, selector, thirteen);
+            let value = self.value(Expr::Select(full, ones, value));
+            let value = self.bin(Bin::Shl, value, shift);
+            result = self.bin(Bin::Or, result, value);
+        }
+        result
     }
 
     fn condition(&mut self, inst: &Inst) -> Result<Option<Tmp>, LiftError> {
@@ -519,6 +695,9 @@ impl Lifter {
         }
         if base.starts_with("s_") && self.scalar_op(base, inst)? {
             return Ok(());
+        }
+        if let Some(op) = base.strip_suffix("_sdwa") {
+            return self.sdwa(op, inst);
         }
         if base.starts_with("v_cmp") {
             return self.vector_compare(base, inst);
@@ -1238,6 +1417,7 @@ impl Lifter {
                 let capped = self.bin(min, high, c);
                 self.bin(max, low, capped)
             }
+            Ternary::Perm => self.perm(a, b, c),
             Ternary::BfeI => {
                 let mask = self.c(31);
                 let width = self.bin(Bin::And, c, mask);
@@ -1595,6 +1775,7 @@ enum Ternary {
     Max3F,
     Med3 { min: Bin, max: Bin },
     BfeI,
+    Perm,
 }
 
 fn ternary(name: &str) -> Option<Ternary> {
@@ -1621,6 +1802,7 @@ fn ternary(name: &str) -> Option<Ternary> {
             max: Bin::MaxS,
         },
         "v_bfe_i32" => Ternary::BfeI,
+        "v_perm_b32" => Ternary::Perm,
         "v_fma_f32" => Ternary::Fma,
         "v_mad_f32" => Ternary::Mad,
         "v_add3_u32" => Ternary::Add3,

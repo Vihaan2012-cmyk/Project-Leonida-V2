@@ -179,6 +179,83 @@ impl Generator {
         }
     }
 
+    fn sdwa_source(&mut self, scalar: bool) -> String {
+        let register = if scalar && self.rng.chance(4) {
+            self.sreg()
+        } else {
+            self.vreg()
+        };
+        if self.rng.chance(4) {
+            format!("sext({register})")
+        } else {
+            register
+        }
+    }
+
+    fn sdwa(&mut self) -> String {
+        const SELECTS: [&str; 7] = [
+            "BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD",
+        ];
+        let (s0, s1, d) = (
+            self.rng.pick(&SELECTS),
+            self.rng.pick(&SELECTS),
+            self.rng.pick(&SELECTS),
+        );
+        let unused = self
+            .rng
+            .pick(&["UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE"]);
+        match self.rng.below(3) {
+            0 => {
+                let op = self.rng.pick(&[
+                    "v_add_nc_u32",
+                    "v_sub_nc_u32",
+                    "v_and_b32",
+                    "v_or_b32",
+                    "v_xor_b32",
+                    "v_lshlrev_b32",
+                    "v_mul_u32_u24",
+                    "v_min_u32",
+                    "v_max_i32",
+                ]);
+                let (a, b) = (self.sdwa_source(true), self.sdwa_source(false));
+                format!(
+                    "{op}_sdwa {}, {a}, {b} dst_sel:{d} dst_unused:{unused} src0_sel:{s0} src1_sel:{s1}",
+                    self.vdst()
+                )
+            }
+            1 => {
+                let op =
+                    self.rng
+                        .pick(&["v_mov_b32", "v_not_b32", "v_cvt_f32_u32", "v_cvt_f32_i32"]);
+                let target = if op.starts_with("v_cvt") {
+                    self.fdst()
+                } else {
+                    self.vdst()
+                };
+                let d = if op.starts_with("v_cvt") { "DWORD" } else { d };
+                let source = self.sdwa_source(true);
+                format!(
+                    "{op}_sdwa {target}, {source} dst_sel:{d} dst_unused:{unused} src0_sel:{s0}"
+                )
+            }
+            _ => {
+                let op = self.rng.pick(&["lt", "eq", "ne", "gt"]);
+                let ty = self.rng.pick(&["u32", "i32"]);
+                let (a, b) = (self.sdwa_source(true), self.sdwa_source(false));
+                if self.rng.chance(4) {
+                    format!("v_cmpx_{op}_{ty}_sdwa {a}, {b} src0_sel:{s0} src1_sel:{s1}")
+                } else {
+                    let target = if self.rng.chance(2) {
+                        self.vcc().to_string()
+                    } else {
+                        self.mask_reg()
+                    };
+                    format!("v_cmp_{op}_{ty}_sdwa {target}, {a}, {b} src0_sel:{s0} src1_sel:{s1}")
+                }
+            }
+        }
+    }
+
     fn export(&mut self) -> String {
         match self.rng.below(4) {
             0 => "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)".into(),
@@ -350,7 +427,7 @@ impl Generator {
     }
 
     fn vector(&mut self) -> String {
-        match self.rng.below(17) {
+        match self.rng.below(19) {
             0 | 1 => {
                 let op = self.rng.pick(&[
                     "v_add_nc_u32",
@@ -551,6 +628,19 @@ impl Generator {
                 )
             }
             10 => self.compare(),
+            16 => self.sdwa(),
+            17 => {
+                let mut selectors = 0u32;
+                for i in 0..4 {
+                    selectors |= (self.rng.word() % 16) << (8 * i);
+                }
+                format!(
+                    "v_perm_b32 {}, {}, {}, 0x{selectors:x}",
+                    self.vdst(),
+                    self.vsrc(false),
+                    self.vsrc(false)
+                )
+            }
             14 => match self.rng.below(4) {
                 0 => {
                     let op = self.rng.pick(&["v_fmaak_f32", "v_madak_f32"]);
