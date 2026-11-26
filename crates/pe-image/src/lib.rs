@@ -277,6 +277,18 @@ impl<'a> Image<'a> {
                 });
             }
         }
+        for dll in &mut dlls {
+            let sockets = ["ws2_32.dll", "wsock32.dll"]
+                .iter()
+                .any(|n| dll.name.eq_ignore_ascii_case(n));
+            for entry in dll
+                .entries
+                .iter_mut()
+                .filter(|e| sockets && e.name.is_none())
+            {
+                entry.name = entry.ordinal.and_then(socket_ordinal).map(str::to_string);
+            }
+        }
         dlls
     }
 
@@ -389,25 +401,97 @@ impl<'a> Image<'a> {
     }
 }
 
-/// Printable ASCII runs of at least `min` bytes in `bytes`, with their offsets.
+fn socket_ordinal(ordinal: u16) -> Option<&'static str> {
+    const LOW: [&str; 23] = [
+        "accept",
+        "bind",
+        "closesocket",
+        "connect",
+        "getpeername",
+        "getsockname",
+        "getsockopt",
+        "htonl",
+        "htons",
+        "ioctlsocket",
+        "inet_addr",
+        "inet_ntoa",
+        "listen",
+        "ntohl",
+        "ntohs",
+        "recv",
+        "recvfrom",
+        "select",
+        "send",
+        "sendto",
+        "setsockopt",
+        "shutdown",
+        "socket",
+    ];
+    const DATABASE: [&str; 7] = [
+        "gethostbyaddr",
+        "gethostbyname",
+        "getprotobyname",
+        "getprotobynumber",
+        "getservbyname",
+        "getservbyport",
+        "gethostname",
+    ];
+    const ASYNC: [&str; 16] = [
+        "WSAAsyncSelect",
+        "WSAAsyncGetHostByAddr",
+        "WSAAsyncGetHostByName",
+        "WSAAsyncGetProtoByNumber",
+        "WSAAsyncGetProtoByName",
+        "WSAAsyncGetServByPort",
+        "WSAAsyncGetServByName",
+        "WSACancelAsyncRequest",
+        "WSASetBlockingHook",
+        "WSAUnhookBlockingHook",
+        "WSAGetLastError",
+        "WSASetLastError",
+        "WSACancelBlockingCall",
+        "WSAIsBlocking",
+        "WSAStartup",
+        "WSACleanup",
+    ];
+    let index = usize::from(ordinal);
+    match ordinal {
+        1..=23 => Some(LOW[index - 1]),
+        51..=57 => Some(DATABASE[index - 51]),
+        101..=116 => Some(ASYNC[index - 101]),
+        151 => Some("__WSAFDIsSet"),
+        _ => None,
+    }
+}
+
+/// Printable ASCII and UTF-16LE runs of at least `min` characters in `bytes`, with their offsets.
 pub fn strings(bytes: &[u8], min: usize) -> Vec<(usize, String)> {
+    let mut found = runs(bytes, 1, min);
+    found.extend(runs(bytes, 2, min));
+    found.sort_by_key(|(offset, _)| *offset);
+    found
+}
+
+fn runs(bytes: &[u8], width: usize, min: usize) -> Vec<(usize, String)> {
     let mut found = Vec::new();
-    let mut start = None;
-    for (index, byte) in bytes.iter().enumerate() {
-        let printable = (0x20..0x7F).contains(byte);
-        match (printable, start) {
-            (true, None) => start = Some(index),
-            (false, Some(begin)) => {
-                if index - begin >= min {
-                    found.push((
-                        begin,
-                        String::from_utf8_lossy(&bytes[begin..index]).into_owned(),
-                    ));
-                }
-                start = None;
+    let mut text = String::new();
+    let mut start = 0;
+    for (index, unit) in bytes.chunks_exact(width).enumerate() {
+        let printable = (0x20..0x7F).contains(&unit[0]) && unit[1..].iter().all(|b| *b == 0);
+        if printable {
+            if text.is_empty() {
+                start = index * width;
             }
-            _ => {}
+            text.push(char::from(unit[0]));
+            continue;
         }
+        if text.len() >= min {
+            found.push((start, std::mem::take(&mut text)));
+        }
+        text.clear();
+    }
+    if text.len() >= min {
+        found.push((start, text));
     }
     found
 }
@@ -491,6 +575,30 @@ mod tests {
         );
         assert_eq!(image.function_containing(0x1025), None);
         assert!(strings(&bytes, 8).iter().any(|(_, s)| s == "hello world"));
+    }
+
+    #[test]
+    fn names_socket_ordinals() {
+        assert_eq!(socket_ordinal(23), Some("socket"));
+        assert_eq!(socket_ordinal(57), Some("gethostname"));
+        assert_eq!(socket_ordinal(115), Some("WSAStartup"));
+        assert_eq!(socket_ordinal(151), Some("__WSAFDIsSet"));
+        assert_eq!(socket_ordinal(24), None);
+    }
+
+    #[test]
+    fn finds_wide_strings() {
+        let mut bytes = vec![0u8; 8];
+        bytes.extend(
+            "https://a.example"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        bytes.extend([0, 0, b'x', b'y', b'z', b'w', b'v', 0]);
+        let found = strings(&bytes, 5);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0], (8, "https://a.example".to_string()));
+        assert_eq!(found[1], (44, "xyzwv".to_string()));
     }
 
     #[test]
