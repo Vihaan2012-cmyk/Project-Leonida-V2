@@ -17,37 +17,37 @@ pub enum StepState {
 
 pub struct Step {
     pub name: &'static str,
-    pub milestone: Option<&'static str>,
+    pub available: bool,
 }
 
 pub const STEPS: &[Step] = &[
     Step {
-        name: "Find and recognise your copy",
-        milestone: None,
+        name: "Recognise the game files",
+        available: true,
     },
     Step {
-        name: "Check every file",
-        milestone: Some("Phase 0, Task 6"),
+        name: "Verify the game files",
+        available: false,
     },
     Step {
-        name: "Read shader containers",
-        milestone: None,
+        name: "Read shaders",
+        available: true,
     },
     Step {
-        name: "Translate shaders to SPIR-V",
-        milestone: Some("M1.2–M1.8"),
+        name: "Convert shaders for your graphics card",
+        available: false,
     },
     Step {
-        name: "Index assets",
-        milestone: Some("M2.1"),
+        name: "Prepare models and textures",
+        available: false,
     },
     Step {
-        name: "Precompile pipelines",
-        milestone: Some("M3.4"),
+        name: "Prepare graphics pipelines",
+        available: false,
     },
     Step {
-        name: "Prepare the runtime",
-        milestone: Some("M4.0–M4.7"),
+        name: "Prepare the game engine",
+        available: false,
     },
 ];
 
@@ -61,17 +61,14 @@ pub struct StepReport {
 pub fn initial_reports() -> Vec<StepReport> {
     STEPS
         .iter()
-        .map(|step| match step.milestone {
-            Some(milestone) => StepReport {
-                name: step.name,
-                state: StepState::NotBuiltYet,
-                detail: format!("arrives in {milestone}"),
+        .map(|step| StepReport {
+            name: step.name,
+            state: if step.available {
+                StepState::Waiting
+            } else {
+                StepState::NotBuiltYet
             },
-            None => StepReport {
-                name: step.name,
-                state: StepState::Waiting,
-                detail: String::new(),
-            },
+            detail: String::new(),
         })
         .collect()
 }
@@ -112,11 +109,11 @@ pub fn run_build(game: Option<PathBuf>, manifests: Vec<Manifest>, reporter: &Rep
     let mut scan_result = None;
     let mut failed = false;
     for (index, step) in STEPS.iter().enumerate() {
-        if step.milestone.is_some() {
+        if !step.available {
             continue;
         }
         if failed {
-            steps[index].detail = "skipped: an earlier step failed".to_string();
+            steps[index].detail = "Skipped".to_string();
             continue;
         }
         let fraction = index as f32 / STEPS.len() as f32;
@@ -129,7 +126,7 @@ pub fn run_build(game: Option<PathBuf>, manifests: Vec<Manifest>, reporter: &Rep
                     scan_shaders(path, reporter, fraction, to).map(|result| {
                         let summary = ScanSummary::of(&result);
                         let detail = format!(
-                            "{} containers, {} problems",
+                            "{} shaders, {} with problems",
                             summary.carved,
                             summary.problems.values().sum::<usize>()
                         );
@@ -137,7 +134,7 @@ pub fn run_build(game: Option<PathBuf>, manifests: Vec<Manifest>, reporter: &Rep
                         detail
                     })
                 }
-                None => Err("no game folder".to_string()),
+                None => Err("No game folder chosen".to_string()),
             },
             _ => Ok(String::new()),
         };
@@ -155,7 +152,7 @@ pub fn run_build(game: Option<PathBuf>, manifests: Vec<Manifest>, reporter: &Rep
             }
         }
     }
-    reporter.progress(1.0, "Build finished");
+    reporter.progress(1.0, "Finished");
     Outcome::Build {
         steps,
         scan: scan_result,
@@ -163,10 +160,10 @@ pub fn run_build(game: Option<PathBuf>, manifests: Vec<Manifest>, reporter: &Rep
 }
 
 fn recognise_step(game: Option<&Path>, manifests: &[Manifest]) -> Result<String, String> {
-    let game = game.ok_or("no game folder chosen")?;
+    let game = game.ok_or("No game folder chosen")?;
     match match_version(game, manifests) {
         Some(manifest) => Ok(manifest.label()),
-        None => Err(format!("{} is not a supported version", game.display())),
+        None => Err("These game files are not a supported version".to_string()),
     }
 }
 
@@ -234,7 +231,7 @@ mod tests {
         assert_eq!(steps[0].detail, "Test package 9.9");
         assert_eq!(steps[1].state, StepState::NotBuiltYet);
         assert_eq!(steps[2].state, StepState::Done);
-        assert_eq!(steps[2].detail, "1 containers, 0 problems");
+        assert_eq!(steps[2].detail, "1 shaders, 0 with problems");
         assert!(steps[3..].iter().all(|s| s.state == StepState::NotBuiltYet));
         assert_eq!(scan.unwrap().shaders.len(), 1);
     }
@@ -244,7 +241,7 @@ mod tests {
         let (steps, scan) = build(None);
         assert_eq!(steps[0].state, StepState::Failed);
         assert_eq!(steps[2].state, StepState::Waiting);
-        assert!(steps[2].detail.contains("earlier step failed"));
+        assert_eq!(steps[2].detail, "Skipped");
         assert!(scan.is_none());
     }
 
@@ -253,6 +250,6 @@ mod tests {
         let reports = initial_reports();
         assert_eq!(reports[0].state, StepState::Waiting);
         assert_eq!(reports[3].state, StepState::NotBuiltYet);
-        assert_eq!(reports[3].detail, "arrives in M1.2–M1.8");
+        assert!(reports[3].detail.is_empty());
     }
 }

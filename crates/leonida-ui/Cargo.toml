@@ -6,16 +6,18 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "persistence", "accesskit", "wayland", "x11"] }
-egui_extras = "0.37"
-rfd = "0.18"
-serde.workspace = true
 game-package.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 shader-container.workspace = true
 
-[lints]
-workspace = true
+[target.'cfg(windows)'.dependencies]
+rfd = "0.18"
+winsafe = { version = "0.0.29", features = ["gui"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 shader-container = { workspace = true, features = ["test-support"] }
 
+[lints]
+workspace = true

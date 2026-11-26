@@ -12,6 +12,9 @@ game-package.workspace = true
 leonida-ui.workspace = true
 shader-container.workspace = true
 
+[build-dependencies]
+embed-manifest = "1.5"
+
 [dev-dependencies]
 tempfile.workspace = true
 shader-container = { workspace = true, features = ["test-support"] }

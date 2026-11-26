@@ -1,25 +1,18 @@
-mod app;
 mod build_steps;
 mod game;
 mod jobs;
-mod pages;
-mod theme;
+mod settings;
+#[cfg(windows)]
+mod window;
 
-use eframe::egui;
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-pub use app::LeonidaApp;
+#[cfg(windows)]
+pub fn run() -> Result<(), Error> {
+    window::run()
+}
 
-pub fn run() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Leonida")
-            .with_inner_size([1240.0, 780.0])
-            .with_min_inner_size([960.0, 600.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Leonida",
-        options,
-        Box::new(|cc| Ok(Box::new(LeonidaApp::new(cc)))),
-    )
+#[cfg(not(windows))]
+pub fn run() -> Result<(), Error> {
+    Err("the Leonida window is only available on Windows; see `leonida --help` for the command line".into())
 }

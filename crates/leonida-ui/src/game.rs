@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use game_package::{Manifest, default_roots, find_packages, match_version, package_path};
 
@@ -40,22 +40,11 @@ pub fn find_games(manifests: &[Manifest]) -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn short_path(path: &Path, max: usize) -> String {
-    let text = path.display().to_string();
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max || max < 8 {
-        return text;
-    }
-    let keep = (max - 1) / 2;
-    let head: String = chars[..keep].iter().collect();
-    let tail: String = chars[chars.len() - keep..].iter().collect();
-    format!("{head}…{tail}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
 
     const TEST_MANIFEST: &str = r#"{
         "title": "Test package", "version": "9.9", "expected_exe": "game.exe",
@@ -99,15 +88,5 @@ mod tests {
         let state = GameState::recognise(dir.path().to_path_buf(), &manifests);
         assert!(!state.is_supported());
         assert_eq!(state.path.as_deref(), Some(dir.path()));
-    }
-
-    #[test]
-    fn short_path_keeps_both_ends() {
-        let long = Path::new("E:/Project Leonida V2/a very long folder name/GTA6");
-        let short = short_path(long, 20);
-        assert_eq!(short.chars().count(), 19);
-        assert!(short.starts_with("E:/Proje"));
-        assert!(short.ends_with("e/GTA6"));
-        assert_eq!(short_path(Path::new("C:/x"), 20), "C:/x");
     }
 }

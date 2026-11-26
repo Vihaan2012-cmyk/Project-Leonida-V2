@@ -12,7 +12,6 @@ pub type Wake = Arc<dyn Fn() + Send + Sync>;
 
 pub enum Outcome {
     GamesFound(Vec<PathBuf>),
-    ShaderScan(Result<ScanResult, String>),
     Build {
         steps: Vec<StepReport>,
         scan: Option<ScanResult>,

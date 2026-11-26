@@ -79,8 +79,8 @@ Workspace rules:
 
 - No global mutable state. Configuration is passed in explicitly.
 - `unsafe` is confined to `gpu`, `pe-loader`, `shims` and `xbox-d3d12`, plus one read-only file-mapping helper in
-  `game-package` (`map_file`, used by every archive reader), behind safe wrappers, each block commented with the
-  invariant it relies on.
+  `game-package` (`map_file`, used by every archive reader) and one font helper in `leonida-ui` (`WM_SETFONT`),
+  behind safe wrappers, each block commented with the invariant it relies on.
 - Library crates return typed errors (`thiserror`); only the `leonida` binary turns them into user messages.
 - Output is deterministic: the same inputs give the same bytes.
 
@@ -99,7 +99,8 @@ Leonida contains no C or C++ code, and no dependency compiles any. Only a Rust c
 | Upscaler | AMD FSR 1 (MIT) ported to WGSL | FSR 2/3 C++ SDK |
 | Vulkan | `ash` bindings, `gpu-allocator` | C/C++ wrappers |
 | Windows APIs, including Projected File System | `windows` / `windows-sys` crates | C++ |
-| Windows and input | `winit`; `gilrs` for controllers; DualSense extras over HID through `windows` | SDL3 |
+| Desktop window (`leonida-ui`) | Native Win32 controls through `winsafe`; `rfd` for file dialogs; manifest embedded by `embed-manifest` | Qt, GTK, WinUI |
+| Game window and input | `winit`; `gilrs` for controllers; DualSense extras over HID through `windows` | SDL3 |
 | Audio output | `cpal` | XAudio2 wrappers in C++ |
 | XMA2 decoding | Our own Rust decoder | ffmpeg |
 | x86-64 disassembly for code patches | `iced-x86` | C libraries |
