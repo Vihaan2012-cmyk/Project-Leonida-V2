@@ -44,6 +44,10 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave, memory: &mut Memory) ->
         buffer(name, inst, wave, memory)?;
         return Ok(true);
     }
+    if name.starts_with("tbuffer_load_format_") || name.starts_with("buffer_load_format_") {
+        typed(name, inst, wave, memory)?;
+        return Ok(true);
+    }
     if name.starts_with("s_load_dword") || name.starts_with("s_buffer_load_dword") {
         scalar_load(name, inst, wave, memory)?;
         return Ok(true);
@@ -174,6 +178,70 @@ fn buffer(name: &str, inst: &Inst, wave: &mut Wave, memory: &mut Memory) -> Resu
             } else {
                 wave.vgpr[reg + dword][lane] = if in_range { memory.read(address)? } else { 0 };
             }
+        }
+    }
+    Ok(())
+}
+
+fn typed(name: &str, inst: &Inst, wave: &mut Wave, memory: &Memory) -> Result<()> {
+    let count = match name.rsplit('_').next() {
+        Some("x") => 1,
+        Some("xy") => 2,
+        Some("xyz") => 3,
+        Some("xyzw") => 4,
+        _ => return Err(bad(inst)),
+    };
+    let reg = vreg(arg(inst, 0)?, inst)?;
+    let rsrc = descriptor(wave, arg(inst, 2)?, inst)?;
+    let slot = sgpr_slot(arg(inst, 2)?).ok_or_else(|| bad(inst))?;
+    let word3 = wave.sgpr[slot + 3];
+    let (format, select) = if name.starts_with("tbuffer") {
+        let code = rdna::format::instruction_format(&inst.mods).ok_or_else(|| bad(inst))?;
+        (code, None)
+    } else {
+        ((word3 >> 12) & 0x7F, Some(word3))
+    };
+    let soffset = u64::from(wave.read_scalar(arg(inst, 3)?, inst)?);
+    let immediate = offset_mod(inst, "offset") as u64;
+    let (offen, idxen) = (has(inst, "offen"), has(inst, "idxen"));
+    let address_arg = arg(inst, 1)?;
+    for lane in wave.active_lanes() {
+        let (index, voffset) = match (idxen, offen) {
+            (false, false) => (0, 0),
+            (true, false) => (u64::from(wave.read_lane(address_arg, lane, inst)?), 0),
+            (false, true) => (0, u64::from(wave.read_lane(address_arg, lane, inst)?)),
+            (true, true) => {
+                let first = vreg(address_arg, inst)?;
+                (
+                    u64::from(wave.vgpr[first][lane]),
+                    u64::from(wave.vgpr[first + 1][lane]),
+                )
+            }
+        };
+        let offset = (voffset + immediate) & 0xFFFF_FFFF;
+        let in_range = if rsrc.stride == 0 {
+            offset < rsrc.records
+        } else {
+            index < rsrc.records
+        };
+        let start = rsrc.base + rsrc.stride * index + ((offset + soffset) & 0xFFFF_FFFF);
+        for component in 0..count {
+            let selector = select.map_or(4 + component as u32, |w| (w >> (3 * component)) & 7);
+            let mut failure = None;
+            let value = rdna::format::select(format, selector, in_range, |layout| {
+                let at = start as usize;
+                match memory.bytes.get(at..at + layout.bytes()) {
+                    Some(bytes) => layout.decode(bytes),
+                    None => {
+                        failure = Some(crate::ExecError::OutOfBounds { address: start });
+                        [0; 4]
+                    }
+                }
+            });
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            wave.vgpr[reg + component][lane] = value;
         }
     }
     Ok(())

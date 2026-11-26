@@ -179,6 +179,38 @@ impl Generator {
         }
     }
 
+    fn typed_load(&mut self) -> String {
+        let count = 1 + self.rng.below(4);
+        let suffix = ["x", "xy", "xyz", "xyzw"][count - 1];
+        let limit = if self.gpu { 4 } else { 8 };
+        let first = 1 + self.rng.below(limit + 1 - count);
+        let target = if count == 1 {
+            format!("v{first}")
+        } else {
+            format!("v[{first}:{}]", first + count - 1)
+        };
+        let offset = 4 * self.rng.below(16) + self.rng.below(4);
+        let code = 1 + self.rng.word() % 77;
+        let name = rdna::format::name(code).expect("codes 1 to 77 have names");
+        if self.rng.chance(2) {
+            format!(
+                "tbuffer_load_format_{suffix} {target}, v9, s[20:23], 0 offen offset:{offset} format:[{name}]"
+            )
+        } else {
+            let mut select = 0;
+            for channel in 0..4 {
+                select |= [0u32, 1, 4, 5, 6, 7][self.rng.below(6)] << (3 * channel);
+            }
+            if self.rng.chance(3) {
+                select = 4 | (5 << 3) | (6 << 6) | (7 << 9);
+            }
+            format!(
+                "s_mov_b32 s23, 0x{:x}\nbuffer_load_format_{suffix} {target}, v9, s[20:23], 0 offen offset:{offset}",
+                (code << 12) | select
+            )
+        }
+    }
+
     fn sdwa_source(&mut self, scalar: bool) -> String {
         let register = if scalar && self.rng.chance(4) {
             self.sreg()
@@ -843,6 +875,9 @@ impl Generator {
             format!("v_and_b32_e32 v9, 0xfc, {}\n", self.vreg())
         };
         let offset = 4 * self.rng.below(16);
+        if self.rng.chance(4) {
+            return address + &self.typed_load();
+        }
         let op = match self.rng.below(7) {
             0 => format!("ds_write_b32 v9, {} offset:{offset}", self.vreg()),
             1 => format!("ds_read_b32 {}, v9 offset:{offset}", self.vdst()),

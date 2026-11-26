@@ -161,6 +161,21 @@ impl Checker<'_> {
                 self.expect(*address, Ty::U64)?;
                 Ty::U32
             }
+            Expr::TypedLoad {
+                format,
+                address,
+                in_range,
+                select,
+                ..
+            } => {
+                self.expect(*format, Ty::U32)?;
+                self.expect(*address, Ty::U64)?;
+                self.expect(*in_range, Ty::Bool)?;
+                if let Some(select) = select {
+                    self.expect(*select, Ty::U32)?;
+                }
+                Ty::U32
+            }
             Expr::ScalarLoad(address) => {
                 self.expect(*address, Ty::U64)?;
                 Ty::U32

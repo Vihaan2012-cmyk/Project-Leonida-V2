@@ -55,6 +55,7 @@ pub struct DeviceInfo {
     pub full_subgroups: bool,
     pub ballot_and_shuffle: bool,
     pub int64: bool,
+    pub float64: bool,
     pub denorm_preserve_32: bool,
     pub denorm_flush_32: bool,
     pub nan_preserve_32: bool,
@@ -105,6 +106,7 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
         let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut f13);
         instance.get_physical_device_features2(physical, &mut features);
         let int64 = features.features.shader_int64 == vk::TRUE;
+        let float64 = features.features.shader_float64 == vk::TRUE;
         let size_control = f13.subgroup_size_control == vk::TRUE;
         let needed = vk::SubgroupFeatureFlags::BASIC
             | vk::SubgroupFeatureFlags::BALLOT
@@ -131,6 +133,7 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
                         .subgroup_supported_stages
                         .contains(vk::ShaderStageFlags::COMPUTE),
                 int64,
+                float64,
                 denorm_preserve_32: v12.shader_denorm_preserve_float32 == vk::TRUE,
                 denorm_flush_32: v12.shader_denorm_flush_to_zero_float32 == vk::TRUE,
                 nan_preserve_32: v12.shader_signed_zero_inf_nan_preserve_float32 == vk::TRUE,
@@ -211,7 +214,9 @@ impl Gpu {
             let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
                 .subgroup_size_control(chosen.info.subgroup_size_control)
                 .compute_full_subgroups(chosen.info.full_subgroups);
-            let base = vk::PhysicalDeviceFeatures::default().shader_int64(chosen.info.int64);
+            let base = vk::PhysicalDeviceFeatures::default()
+                .shader_int64(chosen.info.int64)
+                .shader_float64(chosen.info.float64);
             let mut features = vk::PhysicalDeviceFeatures2::default()
                 .features(base)
                 .push_next(&mut f13);

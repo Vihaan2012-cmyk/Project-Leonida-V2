@@ -136,8 +136,18 @@ pub enum Expr {
     ReadLane(Tmp, Tmp),
     FirstActiveLane,
     LdsLoad(Tmp),
-    Load { when: Option<Tmp>, address: Tmp },
+    Load {
+        when: Option<Tmp>,
+        address: Tmp,
+    },
     ScalarLoad(Tmp),
+    TypedLoad {
+        format: Tmp,
+        address: Tmp,
+        in_range: Tmp,
+        select: Option<Tmp>,
+        component: u8,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,6 +198,16 @@ impl Expr {
             Expr::Bin(_, a, b) | Expr::Cmp(_, a, b) | Expr::ReadLane(a, b) => vec![*a, *b],
             Expr::Tri(_, a, b, c) | Expr::Select(a, b, c) => vec![*a, *b, *c],
             Expr::Load { when, address } => when.iter().copied().chain([*address]).collect(),
+            Expr::TypedLoad {
+                format,
+                address,
+                in_range,
+                select,
+                ..
+            } => [*format, *address, *in_range]
+                .into_iter()
+                .chain(*select)
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -195,7 +215,11 @@ impl Expr {
     pub fn per_lane(&self) -> bool {
         matches!(
             self,
-            Expr::LaneId | Expr::Get(Reg::V(_)) | Expr::Load { .. } | Expr::LdsLoad(_)
+            Expr::LaneId
+                | Expr::Get(Reg::V(_))
+                | Expr::Load { .. }
+                | Expr::LdsLoad(_)
+                | Expr::TypedLoad { .. }
         )
     }
 

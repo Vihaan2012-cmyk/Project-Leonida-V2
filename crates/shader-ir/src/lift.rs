@@ -1571,6 +1571,46 @@ impl Lifter {
                 }
                 Ok(true)
             }
+            _ if name.starts_with("tbuffer_load_format_")
+                || name.starts_with("buffer_load_format_") =>
+            {
+                let suffix = name.rsplit('_').next().unwrap_or("");
+                let count = match suffix {
+                    "x" => 1,
+                    "xy" => 2,
+                    "xyz" => 3,
+                    "xyzw" => 4,
+                    _ => return Err(unsupported(inst)),
+                };
+                let (data, _) = vgprs(arg(0)?, inst)?;
+                let (address, in_range) = self.buffer_address(inst)?;
+                let (format, select) = if name.starts_with("tbuffer") {
+                    let code = rdna::format::instruction_format(&inst.mods)
+                        .ok_or_else(|| unsupported(inst))?;
+                    (self.c(code), None)
+                } else {
+                    let (_, words) = self.descriptor(arg(2)?, inst)?;
+                    let twelve = self.c(12);
+                    let format = self.bin(Bin::ShrU, words[3], twelve);
+                    let mask = self.c(0x7F);
+                    (self.bin(Bin::And, format, mask), Some(words[3]))
+                };
+                let mut values = Vec::new();
+                for component in 0..count {
+                    values.push(self.value(Expr::TypedLoad {
+                        format,
+                        address,
+                        in_range,
+                        select,
+                        component,
+                    }));
+                }
+                for (component, value) in values.into_iter().enumerate() {
+                    self.stmts
+                        .push(Stmt::SetLane(data + component as u8, value));
+                }
+                Ok(true)
+            }
             _ if name.starts_with("s_load_dword") || name.starts_with("s_buffer_load_dword") => {
                 let Operand::Sgpr { reg: target, count } = arg(0)?.operand else {
                     return Err(unsupported(inst));

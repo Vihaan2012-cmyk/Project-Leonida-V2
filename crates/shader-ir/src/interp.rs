@@ -398,6 +398,41 @@ impl Run<'_> {
                     word(&self.machine.memory, address).ok_or(RunError::OutOfBounds(address))?,
                 )
             }
+            Expr::TypedLoad {
+                format,
+                address,
+                in_range,
+                select,
+                component,
+            } => {
+                if !self.active(lane) {
+                    return Ok(0);
+                }
+                let shift = 3 * u32::from(*component);
+                let selector =
+                    select.map_or(4 + u32::from(*component), |s| (v(&s) as u32 >> shift) & 7);
+                let address = v(address);
+                let mut failure = None;
+                let value =
+                    rdna::format::select(v(format) as u32, selector, v(in_range) != 0, |layout| {
+                        let start = usize::try_from(address).unwrap_or(usize::MAX);
+                        match self
+                            .machine
+                            .memory
+                            .get(start..start.saturating_add(layout.bytes()))
+                        {
+                            Some(bytes) => layout.decode(bytes),
+                            None => {
+                                failure = Some(RunError::OutOfBounds(address));
+                                [0; 4]
+                            }
+                        }
+                    });
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+                u64::from(value)
+            }
             Expr::ScalarLoad(address) => {
                 let address = v(address);
                 u64::from(

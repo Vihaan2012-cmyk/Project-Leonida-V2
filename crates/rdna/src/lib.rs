@@ -1,5 +1,6 @@
 mod asm;
 mod decode;
+pub mod format;
 mod formats;
 mod inst;
 mod names;

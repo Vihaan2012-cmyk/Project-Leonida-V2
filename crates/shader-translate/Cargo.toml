@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rdna.workspace = true
 rspirv.workspace = true
 shader-ir.workspace = true
 thiserror.workspace = true

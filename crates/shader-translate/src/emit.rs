@@ -77,6 +77,7 @@ struct Emitter {
     lds: Word,
     lds_words: u32,
     memory_last: Word,
+    decode: Option<Word>,
     values: Vec<Word>,
     types: Vec<Ty>,
 }
@@ -265,6 +266,7 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
         lds,
         lds_words: options.lds_words,
         memory_last: 0,
+        decode: None,
         values: vec![0; function.temps as usize],
         types,
     };
@@ -293,6 +295,9 @@ pub fn harness(function: &Function, options: &HarnessOptions) -> Result<Vec<u32>
     e.epilogue()?;
     ok(e.b.ret())?;
     ok(e.b.end_function())?;
+    if let Some(decode) = e.decode {
+        e.decode_function(decode)?;
+    }
     e.b.entry_point(ExecutionModel::GLCompute, main, "main", interface);
     e.b.execution_mode(main, ExecutionMode::LocalSize, [lanes, 1, 1]);
     if options.nan_preserve {
@@ -654,6 +659,220 @@ impl Emitter {
         ok(self.b.bitwise_and(u32_, None, amount, mask))
     }
 
+    fn element_words(&mut self, address: Word) -> Result<[Word; 4], EmitError> {
+        let (u32_, u64_) = (self.t.u32_, self.t.u64_);
+        let low = ok(self.b.u_convert(u32_, None, address))?;
+        let three = self.u32c(3);
+        let misaligned = ok(self.b.bitwise_and(u32_, None, low, three))?;
+        let shift = ok(self.b.shift_left_logical(u32_, None, misaligned, three))?;
+        let first = self.memory_index(address)?;
+        let last = self.memory_last;
+        let mut dwords = Vec::new();
+        for k in 0..5 {
+            let step = self.u32c(k);
+            let index = ok(self.b.i_add(u32_, None, first, step))?;
+            let index = self.glsl(u32_, GLOp::UMin, &[index, last])?;
+            let memory = self.memory;
+            let ptr = self.element(memory, index)?;
+            dwords.push(self.load(ptr)?);
+        }
+        let mut words = [0; 4];
+        for (k, word) in words.iter_mut().enumerate() {
+            let pair = self.pack(dwords[k], dwords[k + 1])?;
+            let moved = ok(self.b.shift_right_logical(u64_, None, pair, shift))?;
+            *word = ok(self.b.u_convert(u32_, None, moved))?;
+        }
+        Ok(words)
+    }
+
+    fn half_to_single(&mut self, half: Word, quiet: bool) -> Result<Word, EmitError> {
+        let (u32_, f32_, bool_) = (self.t.u32_, self.t.f32_, self.t.bool_);
+        let c = |e: &mut Self, v: u32| e.u32c(v);
+        let fifteen = c(self, 15);
+        let sign = ok(self.b.shift_right_logical(u32_, None, half, fifteen))?;
+        let one = c(self, 1);
+        let sign = ok(self.b.bitwise_and(u32_, None, sign, one))?;
+        let thirty_one = c(self, 31);
+        let sign = ok(self.b.shift_left_logical(u32_, None, sign, thirty_one))?;
+        let ten = c(self, 10);
+        let exponent = ok(self.b.shift_right_logical(u32_, None, half, ten))?;
+        let five_bits = c(self, 0x1F);
+        let exponent = ok(self.b.bitwise_and(u32_, None, exponent, five_bits))?;
+        let ten_bits = c(self, 0x3FF);
+        let mantissa = ok(self.b.bitwise_and(u32_, None, half, ten_bits))?;
+        let thirteen = c(self, 13);
+        let wide = ok(self.b.shift_left_logical(u32_, None, mantissa, thirteen))?;
+        let bias = c(self, 112);
+        let rebased = ok(self.b.i_add(u32_, None, exponent, bias))?;
+        let twenty_three = c(self, 23);
+        let rebased = ok(self.b.shift_left_logical(u32_, None, rebased, twenty_three))?;
+        let normal = ok(self.b.bitwise_or(u32_, None, rebased, wide))?;
+        let special = c(self, if quiet { 0x7FC0_0000 } else { 0x7F80_0000 });
+        let empty = c(self, 0);
+        let is_nan_payload = ok(self.b.i_not_equal(bool_, None, mantissa, empty))?;
+        let infinity = c(self, 0x7F80_0000);
+        let special = ok(self.b.select(u32_, None, is_nan_payload, special, infinity))?;
+        let special = ok(self.b.bitwise_or(u32_, None, special, wide))?;
+        let float = ok(self.b.convert_u_to_f(f32_, None, mantissa))?;
+        let scale = self.f32c(f32::from_bits(0x3380_0000));
+        let small = ok(self.b.f_mul(f32_, None, float, scale))?;
+        let small = self.exact(small);
+        let small = self.bits(small)?;
+        let top = ok(self.b.i_equal(bool_, None, exponent, five_bits))?;
+        let bottom = ok(self.b.i_equal(bool_, None, exponent, empty))?;
+        let magnitude = ok(self.b.select(u32_, None, bottom, small, normal))?;
+        let magnitude = ok(self.b.select(u32_, None, top, special, magnitude))?;
+        ok(self.b.bitwise_or(u32_, None, sign, magnitude))
+    }
+
+    fn convert_field(
+        &mut self,
+        layout: &rdna::format::BufferFormat,
+        channel: usize,
+        field: Word,
+    ) -> Result<Word, EmitError> {
+        use rdna::format::Number;
+        let (u32_, f32_) = (self.t.u32_, self.t.f32_);
+        let width = u32::from(layout.widths[channel]);
+        let signed = if width == 32 {
+            field
+        } else {
+            let spare = self.u32c(32 - width);
+            let up = ok(self.b.shift_left_logical(u32_, None, field, spare))?;
+            ok(self.b.shift_right_arithmetic(u32_, None, up, spare))?
+        };
+        Ok(match layout.number {
+            Number::Uint => field,
+            Number::Sint => signed,
+            Number::Uscaled => {
+                let f = ok(self.b.convert_u_to_f(f32_, None, field))?;
+                self.bits(f)?
+            }
+            Number::Sscaled => {
+                let f = ok(self.b.convert_s_to_f(f32_, None, signed))?;
+                self.bits(f)?
+            }
+            Number::Unorm | Number::Snorm => {
+                let f64_ = self.b.type_float(64, None);
+                let max = if layout.number == Number::Unorm {
+                    (1u64 << width) - 1
+                } else {
+                    (1u64 << (width - 1)) - 1
+                };
+                let numerator = if layout.number == Number::Unorm {
+                    ok(self.b.convert_u_to_f(f64_, None, field))?
+                } else {
+                    ok(self.b.convert_s_to_f(f64_, None, signed))?
+                };
+                let denominator = self.b.constant_bit64(f64_, (max as f64).to_bits());
+                let quotient = ok(self.b.f_div(f64_, None, numerator, denominator))?;
+                let quotient = self.exact(quotient);
+                let quotient = if layout.number == Number::Snorm {
+                    let floor = self.b.constant_bit64(f64_, (-1.0f64).to_bits());
+                    self.glsl(f64_, GLOp::NMax, &[quotient, floor])?
+                } else {
+                    quotient
+                };
+                let narrow = ok(self.b.f_convert(f32_, None, quotient))?;
+                self.bits(narrow)?
+            }
+            Number::Float if width == 32 => field,
+            Number::Float => {
+                let half = if width == 16 {
+                    field
+                } else {
+                    let shift = self.u32c(15 - width);
+                    ok(self.b.shift_left_logical(u32_, None, field, shift))?
+                };
+                self.half_to_single(half, false)?
+            }
+        })
+    }
+
+    fn decode_function(&mut self, id: Word) -> Result<(), EmitError> {
+        let (u32_, bool_) = (self.t.u32_, self.t.bool_);
+        let function_type = self.b.type_function(u32_, [u32_; 7]);
+        ok(self
+            .b
+            .begin_function(u32_, Some(id), FunctionControl::NONE, function_type))?;
+        let params: Vec<Word> = (0..7)
+            .map(|_| ok(self.b.function_parameter(u32_)))
+            .collect::<Result<_, _>>()?;
+        let (format, words, selector, fetch) = (
+            params[0],
+            [params[1], params[2], params[3], params[4]],
+            params[5],
+            params[6],
+        );
+        ok(self.b.begin_block(None))?;
+        let four = self.u32c(4);
+        let channel = ok(self.b.i_sub(u32_, None, selector, four))?;
+        let merge = self.b.id();
+        let default = self.b.id();
+        let codes: Vec<u32> = (1..=77)
+            .filter(|c| rdna::format::buffer_format(*c).is_some())
+            .collect();
+        let labels: Vec<Word> = codes.iter().map(|_| self.b.id()).collect();
+        ok(self.b.selection_merge(merge, SelectionControl::NONE))?;
+        let targets: Vec<(Operand, Word)> = codes
+            .iter()
+            .zip(&labels)
+            .map(|(c, l)| (Operand::LiteralBit32(*c), *l))
+            .collect();
+        ok(self.b.switch(format, default, targets))?;
+        let mut values = Vec::new();
+        let mut ones = Vec::new();
+        for (code, label) in codes.iter().zip(&labels) {
+            ok(self.b.begin_block(Some(*label)))?;
+            let layout = rdna::format::buffer_format(*code).expect("listed above");
+            let mut decoded = Vec::new();
+            for index in 0..layout.count {
+                let offset = layout.offset(index);
+                let (word, shift) = ((offset / 32) as usize, offset % 32);
+                let width = u32::from(layout.widths[index]);
+                let shift = self.u32c(shift);
+                let shifted = ok(self.b.shift_right_logical(u32_, None, words[word], shift))?;
+                let field = if width == 32 {
+                    shifted
+                } else {
+                    let mask = self.u32c(u32::MAX >> (32 - width));
+                    ok(self.b.bitwise_and(u32_, None, shifted, mask))?
+                };
+                decoded.push(self.convert_field(&layout, index, field)?);
+            }
+            let count = self.u32c(layout.count as u32);
+            let which = ok(self.b.u_mod(u32_, None, channel, count))?;
+            let mut value = decoded[0];
+            for (index, candidate) in decoded.iter().enumerate().skip(1) {
+                let index = self.u32c(index as u32);
+                let hit = ok(self.b.i_equal(bool_, None, which, index))?;
+                value = ok(self.b.select(u32_, None, hit, *candidate, value))?;
+            }
+            let block = *label;
+            values.push((value, block));
+            ones.push((self.u32c(rdna::format::one(*code)), block));
+            ok(self.b.branch(merge))?;
+        }
+        ok(self.b.begin_block(Some(default)))?;
+        ok(self.b.branch(merge))?;
+        ok(self.b.begin_block(Some(merge)))?;
+        let zero = self.u32c(0);
+        let one = self.u32c(1);
+        values.push((zero, default));
+        ones.push((one, default));
+        let value = ok(self.b.phi(u32_, None, values))?;
+        let constant = ok(self.b.phi(u32_, None, ones))?;
+        let fetched = ok(self.b.i_not_equal(bool_, None, fetch, zero))?;
+        let value = ok(self.b.select(u32_, None, fetched, value, zero))?;
+        let data = ok(self.b.u_greater_than_equal(bool_, None, selector, four))?;
+        let value = ok(self.b.select(u32_, None, data, value, zero))?;
+        let is_one = ok(self.b.i_equal(bool_, None, selector, one))?;
+        let value = ok(self.b.select(u32_, None, is_one, constant, value))?;
+        ok(self.b.ret_value(value))?;
+        ok(self.b.end_function())?;
+        Ok(())
+    }
+
     fn memory_index(&mut self, address: Word) -> Result<Word, EmitError> {
         let (u32_, u64_) = (self.t.u32_, self.t.u64_);
         let two = self.u32c(2);
@@ -912,6 +1131,45 @@ impl Emitter {
                 }
                 let zero = self.u32c(0);
                 ok(self.b.select(u32_, None, condition, value, zero))?
+            }
+            Expr::TypedLoad {
+                format,
+                address,
+                in_range,
+                select,
+                component,
+            } => {
+                let selector = match select {
+                    Some(word) => {
+                        let shift = self.u32c(3 * u32::from(*component));
+                        let shifted =
+                            ok(self.b.shift_right_logical(u32_, None, v(self, word), shift))?;
+                        self.masked_shift(shifted, 7)?
+                    }
+                    None => self.u32c(4 + u32::from(*component)),
+                };
+                let address = v(self, address);
+                let words = self.element_words(address)?;
+                let active = self.active()?;
+                let fetch = ok(self.b.logical_and(bool_, None, active, v(self, in_range)))?;
+                let (one, zero) = (self.u32c(1), self.u32c(0));
+                let fetch = ok(self.b.select(u32_, None, fetch, one, zero))?;
+                let decode = match self.decode {
+                    Some(id) => id,
+                    None => {
+                        let id = self.b.id();
+                        self.decode = Some(id);
+                        self.b.capability(Capability::Float64);
+                        id
+                    }
+                };
+                let format = v(self, format);
+                let arguments = [
+                    format, words[0], words[1], words[2], words[3], selector, fetch,
+                ];
+                let value = ok(self.b.function_call(u32_, None, decode, arguments))?;
+                let zero = self.u32c(0);
+                ok(self.b.select(u32_, None, active, value, zero))?
             }
             Expr::ScalarLoad(address) => {
                 let index = self.memory_index(v(self, address))?;
