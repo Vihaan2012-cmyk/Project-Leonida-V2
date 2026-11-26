@@ -16,7 +16,7 @@ jobs:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       # rustup installs the toolchain pinned in rust-toolchain.toml on first use.
@@ -28,7 +28,7 @@ jobs:
   no-game-data:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: cargo xtask scan-game-data

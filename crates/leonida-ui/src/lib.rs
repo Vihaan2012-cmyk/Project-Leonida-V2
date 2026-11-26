@@ -1,3 +1,5 @@
+#![cfg_attr(not(windows), allow(dead_code))]
+
 mod build_steps;
 mod game;
 mod jobs;
