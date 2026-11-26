@@ -13,6 +13,43 @@ pub enum Operand {
     Attr { attr: u8, chan: u8 },
 }
 
+impl Operand {
+    pub fn special_code(&self) -> Option<u32> {
+        let Operand::Named(name) = self else {
+            return None;
+        };
+        Some(match name.as_str() {
+            "vcc_lo" | "vcc" => 106,
+            "vcc_hi" => 107,
+            "m0" => 124,
+            "null" => 125,
+            "exec_lo" | "exec" => 126,
+            "exec_hi" => 127,
+            "src_vccz" => 251,
+            "src_execz" => 252,
+            "src_scc" => 253,
+            _ => return None,
+        })
+    }
+
+    pub fn float_bits(&self) -> Option<u32> {
+        let Operand::Float(text) = self else {
+            return None;
+        };
+        Some(match *text {
+            "0.5" => 0x3F00_0000,
+            "-0.5" => 0xBF00_0000,
+            "1.0" => 0x3F80_0000,
+            "-1.0" => 0xBF80_0000,
+            "2.0" => 0x4000_0000,
+            "-2.0" => 0xC000_0000,
+            "4.0" => 0x4080_0000,
+            "-4.0" => 0xC080_0000,
+            _ => 0x3E22_F983,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Arg {
     pub operand: Operand,
