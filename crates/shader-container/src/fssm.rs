@@ -66,6 +66,16 @@ impl<'a> Fssm<'a> {
         }
     }
 
+    /// A compute shader's COMPUTE_PGM_RSRC2 (u32 at 0x138) and thread-group size (u32s at 0x13C, 0x140, 0x144).
+    pub fn compute_setup(&self) -> Option<(u32, [u32; 3])> {
+        let word = |at: usize| {
+            self.bytes
+                .get(at..at + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+        };
+        Some((word(0x138)?, [word(0x13C)?, word(0x140)?, word(0x144)?]))
+    }
+
     pub fn code_range(&self) -> CodeRange {
         code_range(self.bytes)
     }
@@ -195,5 +205,26 @@ mod tests {
             Fssm::parse(&blob),
             Err(ContainerError::Invalid(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+    use crate::testutil::fssm;
+
+    #[test]
+    fn compute_setup_reads_rsrc2_and_group_size() {
+        let mut blob = fssm(true, &[0xBF81_0000]);
+        blob.resize(blob.len().max(0x148), 0);
+        for (at, value) in [(0x138, 0x998u32), (0x13C, 32), (0x140, 4), (0x144, 1)] {
+            blob[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let parsed = Fssm::parse(&blob).unwrap();
+        assert_eq!(parsed.compute_setup(), Some((0x998, [32, 4, 1])));
+        let short = fssm(true, &[0xBF81_0000]);
+        if short.len() < 0x148 {
+            assert_eq!(Fssm::parse(&short).unwrap().compute_setup(), None);
+        }
     }
 }

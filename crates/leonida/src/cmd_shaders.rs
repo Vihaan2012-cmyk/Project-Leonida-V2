@@ -7,8 +7,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use game_package::{Manifest, map_file, package_path};
 use shader_container::{
-    CodeRange, Fssm, Interface, ScanSummary, SignatureElement, WaveSize, carve, interface, parts,
-    scan::scan, unpack_all,
+    CodeRange, Fssm, Interface, ScanSummary, SignatureElement, Stage, WaveSize, carve, interface,
+    parts, scan::scan, unpack_all,
 };
 
 use crate::cli::{DisasmArgs, ReportArgs, ScanArgs};
@@ -142,6 +142,7 @@ struct Report {
     complete: usize,
     lifted: usize,
     emitted: usize,
+    compute_entries: usize,
     instructions: usize,
     unsupported: usize,
     missing: BTreeMap<String, (usize, usize, String)>,
@@ -149,7 +150,7 @@ struct Report {
 }
 
 impl Report {
-    fn add(&mut self, name: &str, blob: &[u8]) -> Option<()> {
+    fn add(&mut self, name: &str, stage: Option<Stage>, blob: &[u8]) -> Option<()> {
         let fssm = Fssm::parse(blob).ok()?;
         let CodeRange::Header { start, end } = fssm.code_range() else {
             return None;
@@ -177,15 +178,32 @@ impl Report {
             match shader_ir::lift(code, wave64) {
                 Ok(function) if function.verify().is_ok() => {
                     self.lifted += 1;
-                    let options = shader_translate::HarnessOptions {
-                        lds_words: 4096,
-                        nan_preserve: false,
-                        flush_denormals: false,
-                        preserve_denormals: false,
-                        code_base: 0,
-                    };
-                    self.emitted +=
-                        usize::from(shader_translate::harness(&function, &options).is_ok());
+                    match (stage, fssm.compute_setup()) {
+                        (Some(Stage::Compute), Some((rsrc2, group))) => {
+                            let options = shader_translate::ComputeOptions::from_rsrc2(
+                                rsrc2,
+                                group,
+                                shader_translate::FloatMode::default(),
+                            );
+                            match shader_translate::compute(&function, &options) {
+                                Ok(_) => self.compute_entries += 1,
+                                Err(error) => {
+                                    *self.lift_errors.entry(error.to_string()).or_default() += 1
+                                }
+                            }
+                        }
+                        _ => {
+                            let options = shader_translate::HarnessOptions {
+                                lds_words: 4096,
+                                nan_preserve: false,
+                                flush_denormals: false,
+                                preserve_denormals: false,
+                                code_base: 0,
+                            };
+                            self.emitted +=
+                                usize::from(shader_translate::harness(&function, &options).is_ok());
+                        }
+                    }
                 }
                 Ok(_) => {
                     *self
@@ -215,11 +233,12 @@ impl Report {
         );
         println!("shaders with undecodable words: {}", self.invalid);
         println!(
-            "shaders the translator fully handles: {} ({:.1}%), lifted and checked: {}, turned into SPIR-V: {}",
+            "shaders the translator fully handles: {} ({:.1}%), lifted and checked: {}, turned into test-form SPIR-V: {}, into real compute shaders: {}",
             self.complete,
             percent(self.complete, self.shaders),
             self.lifted,
-            self.emitted
+            self.emitted,
+            self.compute_entries
         );
         for (error, count) in &self.lift_errors {
             println!("  {count} stopped at: {error}");
@@ -240,9 +259,11 @@ pub fn report_command(args: &ReportArgs) -> Result<ExitCode> {
     with_archive(args.game.as_ref(), |archive| {
         let mut report = Report::default();
         carve(archive, |shader| {
-            let added = unpack_all(&shader.dxbc)
-                .ok()
-                .and_then(|blobs| blobs.last().and_then(|blob| report.add(&shader.name, blob)));
+            let added = unpack_all(&shader.dxbc).ok().and_then(|blobs| {
+                blobs
+                    .last()
+                    .and_then(|blob| report.add(&shader.name, shader.stage, blob))
+            });
             if added.is_none() {
                 report.unreadable += 1;
             }
