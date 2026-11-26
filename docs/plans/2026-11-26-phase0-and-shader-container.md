@@ -241,7 +241,8 @@ Expected: `prints_version ... ok`
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 git add Cargo.toml rust-toolchain.toml .cargo crates xtask
-git commit -m "Workspace skeleton and leonida --version"```
+git commit -m "Workspace skeleton and leonida --version"
+```
 
 ---
 
@@ -469,7 +470,8 @@ Expected: `1 file(s) checked, no game data found.` and exit code 0.
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 git add xtask
-git commit -m "xtask: scan tracked files for game data by magic bytes"```
+git commit -m "xtask: scan tracked files for game data by magic bytes"
+```
 
 ---
 
@@ -759,7 +761,8 @@ cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo xtask scan-game-data crates/game-package/manifests/xbox-1.0.2.1.json
 git add crates/game-package
-git commit -m "game-package: version manifests and recognising a version by probe sizes"```
+git commit -m "game-package: version manifests and recognising a version by probe sizes"
+```
 
 ---
 
@@ -974,7 +977,8 @@ Expected: 11 tests pass.
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 git add crates/game-package
-git commit -m "game-package: check every file by size, optionally by SHA-256"```
+git commit -m "game-package: check every file by size, optionally by SHA-256"
+```
 
 ---
 
@@ -1160,7 +1164,8 @@ Expected: 16 tests pass.
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 git add crates/game-package
-git commit -m "game-package: find packages on disk, map files read-only"```
+git commit -m "game-package: find packages on disk, map files read-only"
+```
 
 ---
 
@@ -1463,7 +1468,8 @@ Expected: `Found Xbox Series package 1.0.2.1 at ...`, `All 108 files present wit
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 git add crates/leonida
-git commit -m "leonida check: find the package, recognise its version, check its files"```
+git commit -m "leonida check: find the package, recognise its version, check its files"
+```
 
 ---
 
@@ -1531,7 +1537,8 @@ Expected: all succeed; the scan prints `N file(s) checked, no game data found.`
 
 ```powershell
 git add .github
-git commit -m "CI: format, lint, tests on Windows and Linux, game-data scan"```
+git commit -m "CI: format, lint, tests on Windows and Linux, game-data scan"
+```
 
 Phase 0 is complete here.
 
@@ -1838,7 +1845,8 @@ Expected: 5 tests pass.
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 git add crates/shader-container
-git commit -m "shader-container: DXBC parts, stage and shader model"```
+git commit -m "shader-container: DXBC parts, stage and shader model"
+```
 
 ---
 
@@ -2113,7 +2121,8 @@ Expected: 11 tests pass.
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 git add crates/shader-container
-git commit -m "shader-container: XDAT directory and XBCH to FSSM unpacking"```
+git commit -m "shader-container: XDAT directory and XBCH to FSSM unpacking"
+```
 
 ---
 
@@ -2342,7 +2351,8 @@ Expected: 17 tests pass.
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 git add crates/shader-container
-git commit -m "shader-container: FSSM header, wave size and code range"```
+git commit -m "shader-container: FSSM header, wave size and code range"
+```
 
 ---
 
@@ -2578,7 +2588,8 @@ Expected: 21 tests pass.
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 git add crates/shader-container
-git commit -m "shader-container: carve shader records out of shaders.rpf"```
+git commit -m "shader-container: carve shader records out of shaders.rpf"
+```
 
 ---
 
@@ -2844,7 +2855,8 @@ cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo xtask scan-game-data
 git add crates/leonida
-git commit -m "leonida shaders scan: carve, unpack and summarise every shader container"```
+git commit -m "leonida shaders scan: carve, unpack and summarise every shader container"
+```
 
 ---
 
