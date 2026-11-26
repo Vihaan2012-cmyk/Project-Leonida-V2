@@ -184,6 +184,12 @@ impl Checker<'_> {
                 self.expect(*address, Ty::U64)?;
                 Ty::U32
             }
+            Expr::Image(image) => {
+                for tmp in image.operands() {
+                    self.expect(tmp, Ty::U32)?;
+                }
+                Ty::U32
+            }
         })
     }
 

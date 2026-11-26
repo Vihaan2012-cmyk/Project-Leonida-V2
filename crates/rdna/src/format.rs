@@ -149,6 +149,23 @@ pub fn select(
     }
 }
 
+/// The number type of any GFX10 format code, image-only formats included, read from its name.
+pub fn number(code: u32) -> Option<Number> {
+    let (_, name) = crate::formats::FORMATS
+        .iter()
+        .find(|(c, _)| u32::from(*c) == code)?;
+    Some(match name.trim().rsplit('_').next()? {
+        "UNORM" | "SRGB" => Number::Unorm,
+        "SNORM" => Number::Snorm,
+        "USCALED" => Number::Uscaled,
+        "SSCALED" => Number::Sscaled,
+        "UINT" => Number::Uint,
+        "SINT" => Number::Sint,
+        "FLOAT" | "UFLOAT" | "SFLOAT" => Number::Float,
+        _ => return None,
+    })
+}
+
 pub fn one(code: u32) -> u32 {
     match buffer_format(code) {
         Some(format) if !format.integer() => 0x3F80_0000,
@@ -205,6 +222,19 @@ mod tests {
 
     fn load(code: u32, bytes: &[u8]) -> [u32; 4] {
         buffer_format(code).unwrap().decode(bytes)
+    }
+
+    #[test]
+    fn number_types_come_from_format_names() {
+        assert_eq!(number(1), Some(Number::Unorm));
+        assert_eq!(number(20), Some(Number::Uint));
+        assert_eq!(number(21), Some(Number::Sint));
+        assert_eq!(number(22), Some(Number::Float));
+        assert_eq!(number(173), Some(Number::Unorm));
+        assert_eq!(number(179), Some(Number::Float));
+        assert_eq!(number(283), Some(Number::Unorm));
+        assert_eq!(number(0), None);
+        assert_eq!(number(511), None);
     }
 
     #[test]

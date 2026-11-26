@@ -14,6 +14,8 @@ pub enum RunError {
     LdsOutOfBounds(u64),
     #[error("ran more than {BLOCK_LIMIT} blocks")]
     TooLong,
+    #[error("images are not modelled by the interpreter")]
+    Image,
 }
 
 #[derive(Debug, Clone)]
@@ -449,6 +451,7 @@ impl Run<'_> {
                     word(&self.machine.memory, address).ok_or(RunError::OutOfBounds(address))?,
                 )
             }
+            Expr::Image(_) => return Err(RunError::Image),
         })
     }
 

@@ -121,6 +121,69 @@ pub enum Cmp {
     Class,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImageDim {
+    D1,
+    D2,
+    D3,
+    Cube,
+    D1Array,
+    D2Array,
+}
+
+impl ImageDim {
+    /// Address components before any LOD or mip: x, then y, then z, layer or cube face.
+    pub fn coordinates(self) -> usize {
+        match self {
+            ImageDim::D1 => 1,
+            ImageDim::D2 | ImageDim::D1Array => 2,
+            ImageDim::D3 | ImageDim::Cube | ImageDim::D2Array => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImageOp {
+    Load,
+    LoadMip,
+    Sample,
+    SampleLod,
+    SampleLodZero,
+    Gather { channel: u8 },
+}
+
+/// One result component of an image instruction. Every component of one instruction shares all other fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Image {
+    pub op: ImageOp,
+    pub dim: ImageDim,
+    pub resource: [Tmp; 8],
+    pub sampler: Option<[Tmp; 4]>,
+    pub coordinates: Vec<Tmp>,
+    pub lod: Option<Tmp>,
+    pub unnormalized: bool,
+    pub component: u8,
+}
+
+impl Image {
+    pub fn operands(&self) -> Vec<Tmp> {
+        self.resource
+            .iter()
+            .chain(self.sampler.iter().flatten())
+            .chain(&self.coordinates)
+            .chain(&self.lod)
+            .copied()
+            .collect()
+    }
+
+    pub fn same_instruction(&self, other: &Image) -> bool {
+        Image {
+            component: other.component,
+            ..self.clone()
+        } == *other
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Const(u32),
@@ -153,6 +216,7 @@ pub enum Expr {
         select: Option<Tmp>,
         component: u8,
     },
+    Image(Box<Image>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -218,6 +282,7 @@ impl Expr {
                 .into_iter()
                 .chain(*select)
                 .collect(),
+            Expr::Image(image) => image.operands(),
             _ => Vec::new(),
         }
     }
@@ -230,6 +295,7 @@ impl Expr {
                 | Expr::Load { .. }
                 | Expr::LdsLoad(_)
                 | Expr::TypedLoad { .. }
+                | Expr::Image(_)
                 | Expr::Shuffle(..)
                 | Expr::GetRelative(..)
         )

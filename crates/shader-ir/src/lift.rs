@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 
 use rdna::{Arg, Inst, Operand};
 
-use crate::ir::{Bin, Block, Cmp, Expr, Function, Reg, Stmt, Terminator, Tmp, Tri, Un};
+use crate::ir::{
+    Bin, Block, Cmp, Expr, Function, Image, ImageDim, ImageOp, Reg, Stmt, Terminator, Tmp, Tri, Un,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LiftError {
@@ -136,7 +138,7 @@ pub fn coverage(code: &[u8], wave64: bool) -> Coverage {
                 .strip_suffix("_e32")
                 .or_else(|| name.strip_suffix("_e64"))
                 .unwrap_or(name);
-            unsupported.push(base.to_string());
+            unsupported.push(coverage_name(inst, base));
         }
     }
     Coverage {
@@ -924,10 +926,103 @@ impl Lifter {
         if base.starts_with("v_") && self.vector_op(base, inst)? {
             return Ok(());
         }
+        if base.starts_with("image_") {
+            return self.image(base, inst);
+        }
         if self.memory_op(base, inst)? {
             return Ok(());
         }
         Err(unsupported(inst))
+    }
+
+    fn image(&mut self, name: &str, inst: &Inst) -> Result<(), LiftError> {
+        let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
+        let has = |flag: &str| inst.mods.iter().any(|m| m == flag);
+        if IMAGE_FLAGS.iter().any(|flag| has(flag)) {
+            return Err(unsupported(inst));
+        }
+        let dim = inst
+            .mods
+            .iter()
+            .find_map(|m| m.strip_prefix("dim:"))
+            .and_then(image_dim)
+            .ok_or_else(|| unsupported(inst))?;
+        let dmask = Self::immediate(inst, "dmask") as u32 & 0xF;
+        let (op, sampled, lod) = match name {
+            "image_load" => (ImageOp::Load, false, false),
+            "image_load_mip" => (ImageOp::LoadMip, false, true),
+            "image_sample" => (ImageOp::Sample, true, false),
+            "image_sample_l" => (ImageOp::SampleLod, true, true),
+            "image_sample_lz" => (ImageOp::SampleLodZero, true, false),
+            "image_gather4_lz" if dmask.count_ones() == 1 => {
+                let channel = dmask.trailing_zeros() as u8;
+                (ImageOp::Gather { channel }, true, false)
+            }
+            _ => return Err(unsupported(inst)),
+        };
+        let (data, count) = vgprs(arg(0)?, inst)?;
+        let addresses: Vec<u8> = match &arg(1)?.operand {
+            Operand::Vgpr { reg, count } => (0..*count).map(|i| reg + i).collect(),
+            Operand::VgprList(regs) => regs.clone(),
+            _ => return Err(unsupported(inst)),
+        };
+        let used = dim.coordinates() + usize::from(lod);
+        if addresses.len() < used {
+            return Err(unsupported(inst));
+        }
+        let Operand::Sgpr {
+            reg: resource,
+            count: 8,
+        } = arg(2)?.operand
+        else {
+            return Err(unsupported(inst));
+        };
+        let sampler = if sampled {
+            let Operand::Sgpr { reg, count: 4 } = arg(3)?.operand else {
+                return Err(unsupported(inst));
+            };
+            Some(reg)
+        } else {
+            None
+        };
+        let components: Vec<u8> = match op {
+            ImageOp::Gather { .. } => vec![0, 1, 2, 3],
+            _ => (0..4).filter(|c| dmask >> c & 1 != 0).collect(),
+        };
+        if components.is_empty() || components.len() > usize::from(count) {
+            return Err(unsupported(inst));
+        }
+        let values: Vec<Tmp> = addresses[..used]
+            .iter()
+            .map(|reg| self.value(Expr::Get(Reg::V(*reg))))
+            .collect();
+        let resource =
+            [0, 1, 2, 3, 4, 5, 6, 7].map(|i| self.value(Expr::Get(Reg::S(resource + i))));
+        let sampler =
+            sampler.map(|reg| [0, 1, 2, 3].map(|i| self.value(Expr::Get(Reg::S(reg + i)))));
+        let image = Image {
+            op,
+            dim,
+            resource,
+            sampler,
+            coordinates: values[..dim.coordinates()].to_vec(),
+            lod: lod.then(|| values[dim.coordinates()]),
+            unnormalized: has("unorm"),
+            component: 0,
+        };
+        let results: Vec<Tmp> = components
+            .iter()
+            .map(|component| {
+                self.value(Expr::Image(Box::new(Image {
+                    component: *component,
+                    ..image.clone()
+                })))
+            })
+            .collect();
+        for (offset, value) in results.into_iter().enumerate() {
+            self.stmts.push(Stmt::SetLane(data + offset as u8, value));
+        }
+        Ok(())
     }
 
     fn flag(&mut self, flag: Flag, value: Tmp) {
@@ -2171,6 +2266,41 @@ fn op_sel(inst: &Inst, key: &str) -> [bool; 4] {
         }
     }
     bits
+}
+
+const IMAGE_FLAGS: [&str; 5] = ["a16", "d16", "tfe", "lwe", "r128"];
+
+fn image_dim(name: &str) -> Option<ImageDim> {
+    Some(match name {
+        "SQ_RSRC_IMG_1D" => ImageDim::D1,
+        "SQ_RSRC_IMG_2D" => ImageDim::D2,
+        "SQ_RSRC_IMG_3D" => ImageDim::D3,
+        "SQ_RSRC_IMG_CUBE" => ImageDim::Cube,
+        "SQ_RSRC_IMG_1D_ARRAY" => ImageDim::D1Array,
+        "SQ_RSRC_IMG_2D_ARRAY" => ImageDim::D2Array,
+        _ => return None,
+    })
+}
+
+/// The report's name for an instruction the lifter refused: image forms carry the flags that stopped them.
+fn coverage_name(inst: &Inst, base: &str) -> String {
+    let mut name = base.to_string();
+    if base.starts_with("image_") {
+        for flag in IMAGE_FLAGS {
+            if inst.mods.iter().any(|m| m == flag) {
+                name.push(' ');
+                name.push_str(flag);
+            }
+        }
+        if inst
+            .mods
+            .iter()
+            .any(|m| m.starts_with("dim:") && m.contains("MSAA"))
+        {
+            name.push_str(" msaa");
+        }
+    }
+    name
 }
 
 fn vgprs(arg: &Arg, inst: &Inst) -> Result<(u8, u8), LiftError> {

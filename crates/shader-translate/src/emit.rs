@@ -7,7 +7,11 @@ use rspirv::spirv::{
     FunctionControl, GlslStd450Op as GLOp, LoopControl, MemoryModel, SelectionControl,
     StorageClass, Word,
 };
-use shader_ir::{Bin, Cmp, Expr, Function, Reg, Stmt, Terminator, Tri, Ty, Un, VerifyError};
+use shader_ir::{Bin, Cmp, Expr, Function, Image, Reg, Stmt, Terminator, Tri, Ty, Un, VerifyError};
+
+use crate::images::{Number, View};
+
+mod image;
 
 pub const STATE_SCC: u32 = 128;
 pub const STATE_VGPR: u32 = 256;
@@ -139,6 +143,11 @@ struct Emitter {
     thread_index: Word,
     values: Vec<Word>,
     types: Vec<Ty>,
+    storage_block: Option<Word>,
+    image_types: Option<image::ImageTypes>,
+    views: HashMap<(View, Number), image::ViewIds>,
+    lookups: [Option<Word>; 2],
+    image_cache: Option<(Image, [Word; 4])>,
 }
 
 fn registers(function: &Function) -> (BTreeSet<u8>, BTreeSet<u8>) {
@@ -265,6 +274,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     let uvec4 = b.type_vector(u32_, 4);
     let wide = b.type_struct([u32_, u32_]);
     let (mut state, mut memory, mut lds_image, mut exports, mut push) = (0, 0, 0, 0, 0);
+    let mut storage_block = None;
     if heap_mode {
         let count = b.constant_bit32(u32_, PUSH_WORDS);
         let array = b.type_array(u32_, count);
@@ -281,6 +291,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         b.decorate(block, Decoration::Block, []);
         b.member_decorate(block, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
         let ptr_block = b.type_pointer(None, StorageClass::StorageBuffer, block);
+        storage_block = Some(ptr_block);
         let buffer = |b: &mut Builder, binding: u32| {
             let var = b.variable(ptr_block, None, StorageClass::StorageBuffer, None);
             b.decorate(var, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
@@ -431,6 +442,11 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         thread_index,
         values: vec![0; function.temps as usize],
         types,
+        storage_block,
+        image_types: None,
+        views: HashMap::new(),
+        lookups: [None; 2],
+        image_cache: None,
     };
     if heap_mode {
         e.compute_prologue()?;
@@ -466,6 +482,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     if let Some(decode) = e.decode {
         e.decode_function(decode)?;
     }
+    e.lookup_bodies()?;
     e.b.entry_point(ExecutionModel::GLCompute, main, "main", interface);
     e.b.execution_mode(main, ExecutionMode::LocalSize, group_size);
     if float.nan_preserve {
@@ -801,7 +818,27 @@ impl Emitter {
     fn begin(&mut self, label: Word) -> Result<(), EmitError> {
         ok(self.b.begin_block(Some(label)))?;
         self.label = label;
+        self.image_cache = None;
         Ok(())
+    }
+
+    fn storage_block(&mut self) -> Word {
+        if let Some(block) = self.storage_block {
+            return block;
+        }
+        let u32_ = self.t.u32_;
+        let runtime = self.b.type_runtime_array(u32_);
+        self.b
+            .decorate(runtime, Decoration::ArrayStride, [Operand::LiteralBit32(4)]);
+        let block = self.b.type_struct([runtime]);
+        self.b.decorate(block, Decoration::Block, []);
+        self.b
+            .member_decorate(block, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+        let ptr = self
+            .b
+            .type_pointer(None, StorageClass::StorageBuffer, block);
+        self.storage_block = Some(ptr);
+        ptr
     }
 
     fn push_word(&mut self, index: u32) -> Result<Word, EmitError> {
@@ -1638,6 +1675,7 @@ impl Emitter {
                 let ptr = self.element(memory, index)?;
                 self.load(ptr)?
             }
+            Expr::Image(image) => self.image(image)?,
         })
     }
 

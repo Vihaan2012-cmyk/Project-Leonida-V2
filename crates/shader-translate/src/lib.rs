@@ -1,4 +1,5 @@
 mod emit;
+pub mod images;
 
 pub use emit::{
     ComputeOptions, EXPORT_BUFFER_WORDS, EmitError, FloatMode, HarnessOptions, MESSAGE_BASE,

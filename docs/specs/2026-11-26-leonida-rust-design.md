@@ -176,6 +176,20 @@ them are wave64 (counts from upstream's README).
    structured control flow, decorations and capabilities. `spirv-val` runs over the corpus in development and CI as an
    independent cross-check; on the player's PC, driver pipeline creation (`leonida pipelines`) is the final check.
 
+**Images and samplers.** A shader names a texture by its 8-word T# and a sampler by its 4-word S#, both in SGPRs.
+The runtime registers every texture and sampler it creates in two lookup tables, and the shader finds the bindless
+slot by looking its descriptor up:
+
+- Descriptor set 1: binding 0 is the texture table, binding 1 the sampler table (storage buffers), binding 2 the
+  sampler array, then one sampled-image array per dimension and number type: 2D (also 1D) at 3/4/5, 2D array (also
+  1D array and cube, as six layers) at 6/7/8, 3D at 9/10/11, for float, unsigned and signed formats.
+- A table is `mask` followed by `mask + 1` entries of ten words: the descriptor (S# padded with zeros), the slot,
+  and a spare word. FNV-1a over the eight key words picks the first entry; up to 16 entries are probed in order. The
+  slot's top two bits give the number type, so the shader never decodes the T# format. A descriptor that is not
+  found uses slot 0, which the runtime fills with a default texture and sampler.
+- The view's mip range and component swizzle come from the T# when the runtime creates it, so the shader only picks
+  the slot. `shader_translate::images` holds this contract and builds the tables.
+
 Unsupported instructions are errors carrying the instruction address, never guesses. Each shader returns
 `Result<TranslatedShader, TranslateError>`; one failure never stops a run. Translation runs in parallel with `rayon`.
 
