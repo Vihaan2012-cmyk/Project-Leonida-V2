@@ -8,6 +8,12 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+game-package.workspace = true
+shader-container.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+shader-container = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
