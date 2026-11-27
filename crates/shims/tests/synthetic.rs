@@ -275,8 +275,12 @@ fn imports_are_classified_without_loading() {
         Binding::Host
     );
     assert_eq!(
-        classify("api-ms-win-core-synch-l1-1-0.dll", "Sleep"),
+        classify("api-ms-win-core-synch-l1-1-0.dll", "WaitForSingleObject"),
         Binding::Host
+    );
+    assert_eq!(
+        classify("api-ms-win-core-synch-l1-2-0.dll", "Sleep"),
+        Binding::Shim
     );
     assert_eq!(
         classify("WINHTTP.dll", "WinHttpOpen"),
