@@ -21,6 +21,7 @@ rayon = "1"
 rspirv = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.9"
 sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
@@ -42,6 +43,7 @@ rdna = { path = "crates/rdna" }
 shader-ir = { path = "crates/shader-ir" }
 shader-translate = { path = "crates/shader-translate" }
 testkit = { path = "crates/testkit" }
+vfs = { path = "crates/vfs" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
