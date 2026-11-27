@@ -160,3 +160,146 @@ impl Equation {
             | (self.tile_log2[2] << 17)
     }
 }
+
+/// One mip (of one slice) to move between tiled and linear storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Job {
+    pub swizzle: Swizzle,
+    pub elem_bytes: u32,
+    /// Elements (pixels, or blocks of a compressed format) along x, y and z.
+    pub extent: [u32; 3],
+    /// Position of the mip inside its first tile (packed mip tail), in elements.
+    pub origin: [u32; 2],
+    /// Tiles per row and per column of the padded surface.
+    pub tiles: [u32; 2],
+    pub tiled_offset: u64,
+    pub linear_offset: u64,
+}
+
+impl Job {
+    pub fn equation(&self) -> Result<Equation, LayoutError> {
+        Equation::new(self.swizzle, self.elem_bytes)
+    }
+
+    pub fn tiles_z(&self) -> Result<u32, LayoutError> {
+        let eq = self.equation()?;
+        Ok(self.extent[2].div_ceil(eq.tile_extent()[2]))
+    }
+
+    /// Bytes of tiled storage the job spans, whole tiles.
+    pub fn tiled_bytes(&self) -> Result<u64, LayoutError> {
+        let tiles = self.tiles[0] as u64 * self.tiles[1] as u64 * self.tiles_z()? as u64;
+        Ok(tiles * self.swizzle.tile_bytes() as u64)
+    }
+
+    pub fn linear_bytes(&self) -> u64 {
+        self.extent.iter().map(|e| *e as u64).product::<u64>() * self.elem_bytes as u64
+    }
+
+    /// Whether every element falls inside the tile grid and the offsets fit the shader's 32-bit words.
+    pub fn validate(&self) -> Result<(), LayoutError> {
+        let eq = self.equation()?;
+        let [tw, th, _] = eq.tile_extent();
+        if self.extent.contains(&0) {
+            return Err(LayoutError::Empty);
+        }
+        let fits_x = (self.origin[0] + self.extent[0]).div_ceil(tw) <= self.tiles[0];
+        let fits_y = (self.origin[1] + self.extent[1]).div_ceil(th) <= self.tiles[1];
+        let tiled_end = self.tiled_offset + self.tiled_bytes()?;
+        let linear_end = self.linear_offset + self.linear_bytes();
+        let limit = u32::MAX as u64 - 16;
+        if !fits_x
+            || !fits_y
+            || tiled_end > limit
+            || linear_end > limit
+            || !self.tiled_offset.is_multiple_of(4)
+            || !self.linear_offset.is_multiple_of(4)
+        {
+            return Err(LayoutError::JobOutOfRange);
+        }
+        Ok(())
+    }
+
+    /// Byte offset, from `tiled_offset`, of byte 0 of the element at (x, y, z). This is the reference the
+    /// shader's `forward` repeats.
+    pub fn element_offset(&self, eq: &Equation, x: u32, y: u32, z: u32) -> u64 {
+        let xx = x + self.origin[0];
+        let yy = y + self.origin[1];
+        let tile = ((z >> eq.tile_log2[2]) as u64 * self.tiles[1] as u64
+            + (yy >> eq.tile_log2[1]) as u64)
+            * self.tiles[0] as u64
+            + (xx >> eq.tile_log2[0]) as u64;
+        let mut off = tile << eq.swizzle.tile_bits();
+        for (b, bit) in eq.bits.iter().enumerate() {
+            let (c, n) = match *bit {
+                Bit::Byte => continue,
+                Bit::X(n) => (xx, n),
+                Bit::Y(n) => (yy, n),
+                Bit::Z(n) => (z, n),
+            };
+            off |= (((c >> n) & 1) as u64) << b;
+        }
+        off
+    }
+
+    fn check_buffers(&self, tiled: usize, linear: usize) -> Result<(), LayoutError> {
+        self.validate()?;
+        if (self.tiled_offset + self.tiled_bytes()?) as usize > tiled
+            || (self.linear_offset + self.linear_bytes()) as usize > linear
+        {
+            return Err(LayoutError::JobOutOfRange);
+        }
+        Ok(())
+    }
+
+    fn linear_at(&self, x: u32, y: u32, z: u32) -> usize {
+        let [w, h, _] = self.extent;
+        self.linear_offset as usize + (((z * h + y) * w + x) as usize) * self.elem_bytes as usize
+    }
+}
+
+/// Tiled to linear, on the CPU. `tiled` is the whole tiled buffer, `linear` the whole linear one.
+pub fn detile(job: &Job, tiled: &[u8], linear: &mut [u8]) -> Result<(), LayoutError> {
+    job.check_buffers(tiled.len(), linear.len())?;
+    let eq = job.equation()?;
+    let eb = job.elem_bytes as usize;
+    let [w, h, d] = job.extent;
+    for zi in 0..d {
+        for yi in 0..h {
+            for xi in 0..w {
+                let from = (job.tiled_offset + job.element_offset(&eq, xi, yi, zi)) as usize;
+                let to = job.linear_at(xi, yi, zi);
+                linear[to..to + eb].copy_from_slice(&tiled[from..from + eb]);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Linear to tiled, on the CPU. Every 32-bit word of the tiled region that holds an element of the mip is
+/// rewritten whole (bytes of the word outside the mip become zero), other words are left alone.
+pub fn tile(job: &Job, linear: &[u8], tiled: &mut [u8]) -> Result<(), LayoutError> {
+    job.check_buffers(tiled.len(), linear.len())?;
+    let eq = job.equation()?;
+    let eb = job.elem_bytes as usize;
+    let [w, h, d] = job.extent;
+    let at = |xi, yi, zi| (job.tiled_offset + job.element_offset(&eq, xi, yi, zi)) as usize;
+    for zi in 0..d {
+        for yi in 0..h {
+            for xi in 0..w {
+                let word = at(xi, yi, zi) & !3;
+                tiled[word..word + 4].fill(0);
+            }
+        }
+    }
+    for zi in 0..d {
+        for yi in 0..h {
+            for xi in 0..w {
+                let to = at(xi, yi, zi);
+                let from = job.linear_at(xi, yi, zi);
+                tiled[to..to + eb].copy_from_slice(&linear[from..from + eb]);
+            }
+        }
+    }
+    Ok(())
+}
