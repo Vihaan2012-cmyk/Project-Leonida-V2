@@ -1,6 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::ControlFlow;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -216,15 +217,6 @@ fn check(gpu: &Gpu, partners: &mut Partners, built: &Built) -> Result<()> {
     Ok(())
 }
 
-fn spirv_words(built: &Built) -> usize {
-    match built {
-        Built::Compute(spirv) | Built::Mesh(spirv) => spirv.len(),
-        Built::Pixel(spirv, _) | Built::Vertex(spirv, _) => spirv.len(),
-        Built::Geometry(spirv, _) => spirv.len(),
-        Built::FirstHalf(spirv, _) => spirv.len(),
-    }
-}
-
 fn kind(built: &Built) -> &'static str {
     match built {
         Built::Compute(_) => "compute",
@@ -248,6 +240,9 @@ struct Tally {
 #[derive(Default)]
 struct Verify {
     each: bool,
+    save: Option<PathBuf>,
+    replacement: Option<Vec<u32>>,
+    no_build: bool,
     kinds: BTreeMap<&'static str, Tally>,
     failures: BTreeMap<String, (usize, String)>,
     containers: usize,
@@ -284,13 +279,29 @@ impl Verify {
                 translate(&fssm, &function)
             });
         let translate_time = started.elapsed();
-        let built = match built {
+        let mut built = match built {
             Ok(built) => built,
             Err(error) => return self.fail(format!("translation: {error}"), name),
         };
+        if let Some(folder) = &self.save {
+            let bytes: Vec<u8> = built.spirv().iter().flat_map(|w| w.to_le_bytes()).collect();
+            let path = folder.join(format!("{name}.{}.spv", kind(&built).replace(' ', "_")));
+            if let Err(error) = std::fs::write(&path, bytes) {
+                println!("could not write {}: {error}", path.display());
+            }
+        }
+        if let Some(words) = &self.replacement {
+            *built.spirv_mut() = words.clone();
+        }
+        if self.no_build {
+            if self.each {
+                println!("{name}: {} {} KiB", kind(&built), built.spirv().len() / 256);
+            }
+            return;
+        }
         let tally = self.kinds.entry(kind(&built)).or_default();
         tally.translated += 1;
-        tally.words += spirv_words(&built);
+        tally.words += built.spirv().len();
         tally.translate_time += translate_time;
         let errors = gpu::validation_errors();
         let started = Instant::now();
@@ -300,7 +311,7 @@ impl Verify {
             println!(
                 "{name}: {} {} KiB, {:.2} s",
                 kind(&built),
-                spirv_words(&built) / 256,
+                built.spirv().len() / 256,
                 took.as_secs_f64()
             );
         }
@@ -380,6 +391,23 @@ impl Verify {
 }
 
 pub fn verify_command(args: &VerifyArgs) -> Result<ExitCode> {
+    let replacement = match &args.use_spirv {
+        Some(path) => {
+            let bytes =
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            Some(
+                bytes
+                    .chunks_exact(4)
+                    .map(|w| u32::from_le_bytes(w.try_into().expect("4 bytes")))
+                    .collect::<Vec<u32>>(),
+            )
+        }
+        None => None,
+    };
+    if let Some(folder) = &args.save_spirv {
+        std::fs::create_dir_all(folder)
+            .with_context(|| format!("creating {}", folder.display()))?;
+    }
     let gpu = Gpu::new().context("opening the GPU")?;
     let workers = args.jobs.max(1);
     let started = Instant::now();
@@ -392,6 +420,9 @@ pub fn verify_command(args: &VerifyArgs) -> Result<ExitCode> {
                     let mut partners = Partners::new()?;
                     let mut verify = Verify {
                         each: args.each,
+                        save: args.save_spirv.clone(),
+                        replacement: replacement.clone(),
+                        no_build: args.no_build,
                         ..Verify::default()
                     };
                     loop {
@@ -413,6 +444,13 @@ pub fn verify_command(args: &VerifyArgs) -> Result<ExitCode> {
                 }
                 let stage = shader.stage.map(|s| s.short_name());
                 if args.stage.is_some() && args.stage != stage {
+                    return ControlFlow::Continue(());
+                }
+                if args
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| !shader.name.contains(name.as_str()))
+                {
                     return ControlFlow::Continue(());
                 }
                 sent += 1;

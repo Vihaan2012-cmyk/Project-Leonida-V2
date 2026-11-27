@@ -217,6 +217,37 @@ fn hand_written_programs_match_on_the_gpu() {
          s_cmp_le_u32 s1, 10
          s_cbranch_scc1 -4
          s_endpgm",
+        "s_mov_b32 s0, 0
+         s_mov_b32 s2, 0
+         s_mov_b32 s1, 0
+         s_add_u32 s2, s2, s1
+         s_add_u32 s1, s1, 1
+         v_add_nc_u32_e32 v1, s2, v1
+         s_cmp_eq_u32 s2, 7
+         s_cbranch_scc1 3
+         s_cmp_lt_u32 s1, 3
+         s_cbranch_scc1 -7
+         v_add_nc_u32_e32 v2, s1, v2
+         s_add_u32 s0, s0, 1
+         s_cmp_lt_u32 s0, 4
+         s_cbranch_scc1 -12
+         s_endpgm",
+        "s_mov_b32 s0, 0
+         s_mov_b32 s2, 0
+         s_add_u32 s2, s2, 1
+         s_mov_b32 s1, 0
+         s_add_u32 s2, s2, s1
+         s_add_u32 s1, s1, 1
+         v_add_nc_u32_e32 v1, s2, v1
+         s_cmp_eq_u32 s2, 6
+         s_cbranch_scc1 -7
+         s_cmp_lt_u32 s1, 3
+         s_cbranch_scc1 -7
+         v_add_nc_u32_e32 v2, s1, v2
+         s_add_u32 s0, s0, 1
+         s_cmp_lt_u32 s0, 4
+         s_cbranch_scc1 -13
+         s_endpgm",
         "v_cmp_gt_u32_e32 vcc_lo, 16, v0
          s_and_saveexec_b32 s8, vcc_lo
          v_mov_b32_e32 v1, 0x64

@@ -130,6 +130,18 @@ pub struct VerifyArgs {
     /// Only containers of this stage: ps, vs, gs, ms or cs.
     #[arg(long)]
     pub stage: Option<String>,
+    /// Only containers whose name contains this text.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Write each translated program into this folder.
+    #[arg(long)]
+    pub save_spirv: Option<PathBuf>,
+    /// Build this SPIR-V file in place of each translated program.
+    #[arg(long)]
+    pub use_spirv: Option<PathBuf>,
+    /// Only translate; build no pipelines.
+    #[arg(long)]
+    pub no_build: bool,
     /// Print each shader with its size and how long the driver took.
     #[arg(long)]
     pub each: bool,

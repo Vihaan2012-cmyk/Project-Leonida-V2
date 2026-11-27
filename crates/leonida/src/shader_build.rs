@@ -14,6 +14,26 @@ pub enum Built {
     FirstHalf(Vec<u32>, EsOptions),
 }
 
+impl Built {
+    pub fn spirv(&self) -> &[u32] {
+        match self {
+            Built::Compute(spirv) | Built::Mesh(spirv) => spirv,
+            Built::Pixel(spirv, _) | Built::Vertex(spirv, _) => spirv,
+            Built::Geometry(spirv, _) => spirv,
+            Built::FirstHalf(spirv, _) => spirv,
+        }
+    }
+
+    pub fn spirv_mut(&mut self) -> &mut Vec<u32> {
+        match self {
+            Built::Compute(spirv) | Built::Mesh(spirv) => spirv,
+            Built::Pixel(spirv, _) | Built::Vertex(spirv, _) => spirv,
+            Built::Geometry(spirv, _) => spirv,
+            Built::FirstHalf(spirv, _) => spirv,
+        }
+    }
+}
+
 /// Translates a container's main program for its stage.
 pub fn build(
     stage: Option<Stage>,

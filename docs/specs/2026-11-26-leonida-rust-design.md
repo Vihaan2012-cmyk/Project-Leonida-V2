@@ -288,14 +288,28 @@ Unsupported instructions are errors carrying the instruction address, never gues
 - On 64-wide hardware (AMD) the lowering is skipped and wave64 runs natively.
 - Exactness labels are stored and reported; approximate shaders are known, never hidden.
 
-**Control flow.** A program whose branches all go forward (every mesh shader in the game, and most others) runs
-its blocks in order, each guarded by a flag its predecessors set; drivers compile this several times faster than
-the general form, a loop over a switch on the current block, which programs with backward branches still use.
+**Control flow.** Blocks run in program order, each guarded by a flag its predecessors set. A span of blocks that a
+later block branches back to the start of becomes a structured loop, run again while a block in it branched back to
+its head; loops must nest. Programs whose loops overlap without nesting fall back to a loop over a switch on the
+current block, which drivers compile several times slower.
+
+**Lane writes.** A vector write keeps the old value of lanes exec leaves out only where something could see it: an
+instruction after a point that turns lanes back on, or a read across lanes (`v_readlane`, DPP, `ds_bpermute`, the
+derivatives of an implicit-level sample). Everywhere else it writes every lane, so the driver need not keep each
+register's old value alive across the write. A CPU test writes junk into the lanes such writes skip and checks that
+nothing visible changes.
+
+**Typed buffer loads.** A format the instruction names is decoded in place for that format alone; a format read from
+a descriptor goes through a 128-entry table of layouts. The words of one load are read once for all its channels.
+Together with the two items above this took the slowest mesh shader in the game from 168 s and 8.5 GB of driver
+time and memory to 9 s and 0.6 GB.
 
 **Checking against the driver.** `leonida shaders verify` translates every shader and has the graphics driver build
 each into a pipeline: compute shaders alone, pixel shaders after a vertex shader writing every parameter, vertex and
 mesh shaders before a fragment shader that does nothing, geometry shaders after a first half writing items of their
-size. With `LEONIDA_VALIDATION=1` the Vulkan layers also check the SPIR-V.
+size. With `LEONIDA_VALIDATION=1` the Vulkan layers also check the SPIR-V. It builds one shader at a time unless
+`--jobs` says more; `--name` picks shaders by name, `--save-spirv` keeps what was translated, `--use-spirv` builds a
+given file in place of each translation and `--no-build` only translates.
 
 ### 4.4 Storage
 

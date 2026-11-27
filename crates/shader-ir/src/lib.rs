@@ -2,6 +2,7 @@ mod halves;
 mod interp;
 mod ir;
 mod lift;
+mod unseen;
 mod verify;
 
 pub use halves::{Hazard, upper_lane_hazards};
@@ -11,4 +12,5 @@ pub use ir::{
     Round, Space, Stmt, Terminator, Tmp, Tri, Un, attribute_slot,
 };
 pub use lift::{Coverage, LiftError, coverage, export_target, lift};
+pub use unseen::free_writes;
 pub use verify::{Ty, VerifyError};

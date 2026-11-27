@@ -8,16 +8,18 @@ use rspirv::spirv::{
     StorageClass, Word,
 };
 use shader_ir::{
-    Bin, Cmp, Expr, Function, Image, Reg, Round, Stmt, Terminator, Tri, Ty, Un, VerifyError,
+    Bin, Block, Cmp, Expr, Function, Image, Reg, Round, Stmt, Terminator, Tri, Ty, Un, VerifyError,
 };
 
 use crate::images::{Number, View};
 
+mod flow;
 mod geometry;
 mod image;
 mod memory;
 mod merged;
 mod pixel;
+mod typed;
 
 pub const STATE_SCC: u32 = 128;
 pub const STATE_VGPR: u32 = 256;
@@ -226,6 +228,7 @@ struct Types {
     ptr_workgroup_u32: Word,
     ptr_heap_u32: Word,
     ptr_push_u32: Word,
+    ptr_private_u32: Word,
 }
 
 struct Emitter {
@@ -258,7 +261,13 @@ struct Emitter {
     lds: Word,
     lds_words: u32,
     memory_last: Word,
-    decode: Option<Word>,
+    constant_values: HashMap<Word, u32>,
+    layout_table: Option<Word>,
+    typed_cache: [Option<typed::Element>; 2],
+    float64: bool,
+    /// Per block and statement: `SetLane`s whose skipped lanes are never read again, so they write every lane.
+    free_writes: Vec<Vec<bool>>,
+    free_write: bool,
     code_base: u64,
     heap: Option<Word>,
     code: Option<Word>,
@@ -282,19 +291,6 @@ struct Emitter {
     stage_lds: Option<merged::StageLds>,
     merged: Option<merged::MergedState>,
     active_cache: [Option<(Word, Word)>; 2],
-}
-
-/// Whether every branch goes forward, so the blocks can run in order, each guarded by whether a branch reached it.
-fn forward_only(function: &Function) -> bool {
-    function
-        .blocks
-        .iter()
-        .enumerate()
-        .all(|(id, block)| match block.terminator {
-            Terminator::Jump(target) => target > id,
-            Terminator::Branch(_, taken, fallthrough) => taken > id && fallthrough > id,
-            Terminator::End => true,
-        })
 }
 
 fn registers(function: &Function) -> (BTreeSet<u8>, BTreeSet<u8>) {
@@ -585,7 +581,14 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         } else {
             0
         },
+        ptr_private_u32: b.type_pointer(None, StorageClass::Private, u32_),
     };
+    let typed_loads = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .any(|stmt| matches!(stmt, Stmt::Let(_, Expr::TypedLoad { .. })));
+    let layout_table = typed_loads.then(|| typed::layout_table(&mut b, u32_));
     let void = b.type_void();
     let function_type = b.type_function(void, []);
     let main = ok(b.begin_function(void, None, FunctionControl::NONE, function_type))?;
@@ -625,16 +628,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     let scc = b.variable(t.ptr_function_bool, None, StorageClass::Function, None);
     let current = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let iterations = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
-    let forward = forward_only(function);
-    let reached: Vec<Word> = if forward {
-        function
-            .blocks
-            .iter()
-            .map(|_| b.variable(t.ptr_function_bool, None, StorageClass::Function, None))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let flow = flow::flow(&mut b, function, t.ptr_function_bool);
     let messages = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let alive = b.variable(t.ptr_function_bool, None, StorageClass::Function, None);
     let stage_lds = match (&es_options, &gs_options) {
@@ -704,7 +698,12 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         lds,
         lds_words,
         memory_last: 0,
-        decode: None,
+        constant_values: HashMap::new(),
+        layout_table,
+        typed_cache: [None, None],
+        float64: false,
+        free_writes: shader_ir::free_writes(function, !heap_mode),
+        free_write: false,
         code_base,
         heap: None,
         code: None,
@@ -771,17 +770,15 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
             Terminator::End => true,
         });
     if linear {
-        for block in &function.blocks {
-            for stmt in &block.stmts {
-                e.stmt(stmt)?;
-            }
+        for (index, block) in function.blocks.iter().enumerate() {
+            e.block_stmts(index, block)?;
             if block.terminator == Terminator::End {
                 break;
             }
         }
     } else {
-        if forward {
-            e.sequence(function, &reached)?;
+        if let Some(flow) = &flow {
+            e.structured(function, flow, iterations)?;
         } else {
             e.dispatch(function, current, iterations)?;
         }
@@ -800,9 +797,6 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     }
     ok(e.b.ret())?;
     ok(e.b.end_function())?;
-    if let Some(decode) = e.decode {
-        e.decode_function(decode)?;
-    }
     e.lookup_bodies()?;
     e.encode_bodies()?;
     if let Some(state) = &e.merged {
@@ -892,10 +886,20 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
 impl Emitter {
     fn u32c(&mut self, value: u32) -> Word {
         let ty = self.t.u32_;
-        *self
+        let id = *self
             .constants
             .entry((0, u64::from(value)))
-            .or_insert_with(|| self.b.constant_bit32(ty, value))
+            .or_insert_with(|| self.b.constant_bit32(ty, value));
+        self.constant_values.insert(id, value);
+        id
+    }
+
+    fn doubles(&mut self) -> Word {
+        if !self.float64 {
+            self.float64 = true;
+            self.b.capability(Capability::Float64);
+        }
+        self.b.type_float(64, None)
     }
 
     fn u64c(&mut self, value: u64) -> Word {
@@ -1102,43 +1106,6 @@ impl Emitter {
         })
     }
 
-    /// Blocks whose branches all go forward, in order: each runs when a branch reached it and marks the blocks
-    /// it branches to. Drivers compile this far faster than a loop over a switch.
-    fn sequence(&mut self, function: &Function, reached: &[Word]) -> Result<(), EmitError> {
-        let (yes, no) = (self.boolc(true), self.boolc(false));
-        for (id, flag) in reached.iter().enumerate() {
-            self.store(*flag, if id == 0 { yes } else { no })?;
-        }
-        let bool_ = self.t.bool_;
-        for (block, flag) in function.blocks.iter().zip(reached) {
-            let here = ok(self.b.load(bool_, None, *flag, None, []))?;
-            self.if_then(here, |e| {
-                for stmt in &block.stmts {
-                    e.stmt(stmt)?;
-                }
-                let mark = |e: &mut Self, target: usize, when: Word| {
-                    let Some(flag) = reached.get(target) else {
-                        return Ok(());
-                    };
-                    let old = ok(e.b.load(bool_, None, *flag, None, []))?;
-                    let new = ok(e.b.logical_or(bool_, None, old, when))?;
-                    e.store(*flag, new)
-                };
-                match block.terminator {
-                    Terminator::Jump(target) => mark(e, target, yes),
-                    Terminator::Branch(condition, taken, fallthrough) => {
-                        let condition = e.val(condition);
-                        let other = ok(e.b.logical_not(bool_, None, condition))?;
-                        mark(e, taken, condition)?;
-                        mark(e, fallthrough, other)
-                    }
-                    Terminator::End => Ok(()),
-                }
-            })?;
-        }
-        Ok(())
-    }
-
     fn dispatch(
         &mut self,
         function: &Function,
@@ -1170,11 +1137,9 @@ impl Emitter {
             .map(|(i, label)| (Operand::LiteralBit32(i as u32), *label))
             .collect();
         ok(self.b.switch(selector, default, targets))?;
-        for (block, label) in function.blocks.iter().zip(&cases) {
+        for (index, (block, label)) in function.blocks.iter().zip(&cases).enumerate() {
             self.begin(*label)?;
-            for stmt in &block.stmts {
-                self.stmt(stmt)?;
-            }
+            self.block_stmts(index, block)?;
             let next = match block.terminator {
                 Terminator::Jump(target) => self.u32c(target as u32),
                 Terminator::End => self.u32c(END),
@@ -1694,7 +1659,7 @@ impl Emitter {
                 self.bits(f)?
             }
             Number::Unorm | Number::Snorm => {
-                let f64_ = self.b.type_float(64, None);
+                let f64_ = self.doubles();
                 let max = if layout.number == Number::Unorm {
                     (1u64 << width) - 1
                 } else {
@@ -1730,90 +1695,6 @@ impl Emitter {
         })
     }
 
-    fn decode_function(&mut self, id: Word) -> Result<(), EmitError> {
-        let (u32_, bool_) = (self.t.u32_, self.t.bool_);
-        let function_type = self.b.type_function(u32_, [u32_; 7]);
-        ok(self
-            .b
-            .begin_function(u32_, Some(id), FunctionControl::NONE, function_type))?;
-        let params: Vec<Word> = (0..7)
-            .map(|_| ok(self.b.function_parameter(u32_)))
-            .collect::<Result<_, _>>()?;
-        let (format, words, selector, fetch) = (
-            params[0],
-            [params[1], params[2], params[3], params[4]],
-            params[5],
-            params[6],
-        );
-        ok(self.b.begin_block(None))?;
-        let four = self.u32c(4);
-        let channel = ok(self.b.i_sub(u32_, None, selector, four))?;
-        let merge = self.b.id();
-        let default = self.b.id();
-        let codes: Vec<u32> = (1..=77)
-            .filter(|c| rdna::format::buffer_format(*c).is_some())
-            .collect();
-        let labels: Vec<Word> = codes.iter().map(|_| self.b.id()).collect();
-        ok(self.b.selection_merge(merge, SelectionControl::NONE))?;
-        let targets: Vec<(Operand, Word)> = codes
-            .iter()
-            .zip(&labels)
-            .map(|(c, l)| (Operand::LiteralBit32(*c), *l))
-            .collect();
-        ok(self.b.switch(format, default, targets))?;
-        let mut values = Vec::new();
-        let mut ones = Vec::new();
-        for (code, label) in codes.iter().zip(&labels) {
-            ok(self.b.begin_block(Some(*label)))?;
-            let layout = rdna::format::buffer_format(*code).expect("listed above");
-            let mut decoded = Vec::new();
-            for index in 0..layout.count {
-                let offset = layout.offset(index);
-                let (word, shift) = ((offset / 32) as usize, offset % 32);
-                let width = u32::from(layout.widths[index]);
-                let shift = self.u32c(shift);
-                let shifted = ok(self.b.shift_right_logical(u32_, None, words[word], shift))?;
-                let field = if width == 32 {
-                    shifted
-                } else {
-                    let mask = self.u32c(u32::MAX >> (32 - width));
-                    ok(self.b.bitwise_and(u32_, None, shifted, mask))?
-                };
-                decoded.push(self.convert_field(&layout, index, field)?);
-            }
-            let count = self.u32c(layout.count as u32);
-            let which = ok(self.b.u_mod(u32_, None, channel, count))?;
-            let mut value = decoded[0];
-            for (index, candidate) in decoded.iter().enumerate().skip(1) {
-                let index = self.u32c(index as u32);
-                let hit = ok(self.b.i_equal(bool_, None, which, index))?;
-                value = ok(self.b.select(u32_, None, hit, *candidate, value))?;
-            }
-            let block = *label;
-            values.push((value, block));
-            ones.push((self.u32c(rdna::format::one(*code)), block));
-            ok(self.b.branch(merge))?;
-        }
-        ok(self.b.begin_block(Some(default)))?;
-        ok(self.b.branch(merge))?;
-        ok(self.b.begin_block(Some(merge)))?;
-        let zero = self.u32c(0);
-        let one = self.u32c(1);
-        values.push((zero, default));
-        ones.push((one, default));
-        let value = ok(self.b.phi(u32_, None, values))?;
-        let constant = ok(self.b.phi(u32_, None, ones))?;
-        let fetched = ok(self.b.i_not_equal(bool_, None, fetch, zero))?;
-        let value = ok(self.b.select(u32_, None, fetched, value, zero))?;
-        let data = ok(self.b.u_greater_than_equal(bool_, None, selector, four))?;
-        let value = ok(self.b.select(u32_, None, data, value, zero))?;
-        let is_one = ok(self.b.i_equal(bool_, None, selector, one))?;
-        let value = ok(self.b.select(u32_, None, is_one, constant, value))?;
-        ok(self.b.ret_value(value))?;
-        ok(self.b.end_function())?;
-        Ok(())
-    }
-
     fn memory_index(&mut self, address: Word) -> Result<Word, EmitError> {
         let (u32_, u64_) = (self.t.u32_, self.t.u64_);
         let two = self.u32c(2);
@@ -1832,7 +1713,19 @@ impl Emitter {
 
     /// One statement; with lane pairs, per-lane work runs for part 0 and then part 1, in program order, and
     /// wave-wide values come from both parts at once.
+    fn block_stmts(&mut self, index: usize, block: &Block) -> Result<(), EmitError> {
+        for (at, stmt) in block.stmts.iter().enumerate() {
+            self.free_write = self.free_writes[index][at];
+            self.stmt(stmt)?;
+        }
+        self.free_write = false;
+        Ok(())
+    }
+
     fn stmt(&mut self, stmt: &Stmt) -> Result<(), EmitError> {
+        if !matches!(stmt, Stmt::Let(_, Expr::TypedLoad { .. })) {
+            self.typed_cache = [None, None];
+        }
         if !self.pair {
             return self.stmt_body(stmt);
         }
@@ -1980,6 +1873,9 @@ impl Emitter {
             Stmt::SetPair(reg, tmp) => {
                 self.active_cache = [None, None];
                 self.set_pair(*reg, v(self, tmp))?
+            }
+            Stmt::SetLane(reg, tmp) if self.free_write => {
+                self.store(self.vgpr_var(*reg), v(self, tmp))?;
             }
             Stmt::SetLane(reg, tmp) => {
                 let active = self.active()?;
@@ -2328,61 +2224,7 @@ impl Emitter {
                 in_range,
                 select,
                 component,
-            } => {
-                let selector = match select {
-                    Some(word) => {
-                        let shift = self.u32c(3 * u32::from(*component));
-                        let shifted =
-                            ok(self.b.shift_right_logical(u32_, None, v(self, word), shift))?;
-                        self.masked_shift(shifted, 7)?
-                    }
-                    None => self.u32c(4 + u32::from(*component)),
-                };
-                let address = v(self, address);
-                let active = self.active()?;
-                let fetch = ok(self.b.logical_and(bool_, None, active, v(self, in_range)))?;
-                let words = if self.heap.is_some() {
-                    let low = ok(self.b.u_convert(u32_, None, address))?;
-                    let three = self.u32c(3);
-                    let misaligned = ok(self.b.bitwise_and(u32_, None, low, three))?;
-                    let shift = ok(self.b.shift_left_logical(u32_, None, misaligned, three))?;
-                    let mask = self.u64c(!3);
-                    let aligned = ok(self.b.bitwise_and(u64_, None, address, mask))?;
-                    let mut addresses = Vec::new();
-                    for k in 0..5u64 {
-                        let step = self.u64c(4 * k);
-                        addresses.push(ok(self.b.i_add(u64_, None, aligned, step))?);
-                    }
-                    let dwords = self.guarded_loads(fetch, &addresses)?;
-                    let mut words = [0; 4];
-                    for (k, word) in words.iter_mut().enumerate() {
-                        let pair = self.pack(dwords[k], dwords[k + 1])?;
-                        let moved = ok(self.b.shift_right_logical(u64_, None, pair, shift))?;
-                        *word = ok(self.b.u_convert(u32_, None, moved))?;
-                    }
-                    words
-                } else {
-                    self.element_words(address)?
-                };
-                let (one, zero) = (self.u32c(1), self.u32c(0));
-                let fetch = ok(self.b.select(u32_, None, fetch, one, zero))?;
-                let decode = match self.decode {
-                    Some(id) => id,
-                    None => {
-                        let id = self.b.id();
-                        self.decode = Some(id);
-                        self.b.capability(Capability::Float64);
-                        id
-                    }
-                };
-                let format = v(self, format);
-                let arguments = [
-                    format, words[0], words[1], words[2], words[3], selector, fetch,
-                ];
-                let value = ok(self.b.function_call(u32_, None, decode, arguments))?;
-                let zero = self.u32c(0);
-                ok(self.b.select(u32_, None, active, value, zero))?
-            }
+            } => self.typed_load(*format, *address, *in_range, *select, *component)?,
             Expr::ScalarLoad(address) => {
                 let index = self.memory_index(v(self, address))?;
                 let memory = self.memory;
