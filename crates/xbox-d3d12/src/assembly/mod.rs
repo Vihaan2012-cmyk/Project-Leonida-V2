@@ -18,6 +18,7 @@
 //! (call it before the game allocates). Descriptor heaps are placed by `heap::ConsolePlacement`; the title's own
 //! allocation hook comes in through `set_heap_allocator`.
 
+pub mod access;
 pub mod arena;
 pub mod bindless;
 pub mod bridge;
