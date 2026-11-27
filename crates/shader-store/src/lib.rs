@@ -6,6 +6,7 @@
 mod error;
 mod program;
 mod record;
+mod runtime;
 mod store;
 pub mod translate;
 
@@ -19,5 +20,6 @@ pub use record::{
     Exactness, Options, PipelineOutcome, Record, Role, SCHEMA_VERSION, stage_kind,
     translator_version,
 };
+pub use runtime::{SourceStats, StoreSource};
 pub use store::{Program, Store};
 pub use translate::Built;

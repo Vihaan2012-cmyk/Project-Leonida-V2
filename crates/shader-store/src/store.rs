@@ -84,11 +84,7 @@ impl Store {
     }
 
     /// As [`current`](Self::current), for a record under `key` that was made in `context`.
-    pub fn current_for(
-        &self,
-        key: &Key,
-        context: [u8; 16],
-    ) -> Result<Option<Record>, StoreError> {
+    pub fn current_for(&self, key: &Key, context: [u8; 16]) -> Result<Option<Record>, StoreError> {
         Ok(match self.get(key) {
             Ok(Some(record))
                 if record.translator == translator_version() && record.context == context =>

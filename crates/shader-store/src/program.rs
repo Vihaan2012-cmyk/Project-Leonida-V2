@@ -229,10 +229,7 @@ pub fn uses_code_base(source: &Source) -> Result<bool, String> {
     let CodeRange::Header { start, end } = fssm.code_range() else {
         return Err("no code range in the header".into());
     };
-    let code = source
-        .fssm
-        .get(start..end)
-        .ok_or("code past the blob")?;
+    let code = source.fssm.get(start..end).ok_or("code past the blob")?;
     let function = shader_ir::lift(code, wave64).map_err(|e| e.to_string())?;
     Ok(reads_own_address(&function))
 }
