@@ -5,6 +5,7 @@ pub mod format;
 pub mod gfx10;
 pub mod registry;
 pub mod sampler;
+pub mod views;
 
 #[cfg(test)]
 mod gfx10_tests;
@@ -14,3 +15,6 @@ mod registry_tests;
 
 #[cfg(test)]
 mod sampler_tests;
+
+#[cfg(test)]
+mod views_tests;
