@@ -23,3 +23,6 @@ mod va_tests;
 
 #[cfg(test)]
 mod image_tests;
+
+#[cfg(test)]
+mod store_tests;
