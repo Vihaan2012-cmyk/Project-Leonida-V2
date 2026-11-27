@@ -1822,3 +1822,94 @@ impl Generator {
         )
     }
 }
+
+/// Node pointers into `ray_scene`: box nodes at 0x000 (32-bit) and 0x080 (16-bit), triangle nodes at 0x0C0
+/// (as both of its triangles) and 0x100, and a pointer of the instance type the instruction leaves alone.
+pub const RAY_NODES: [u32; 6] = [0x05, 0x14, 0x18, 0x19, 0x20, 0x26];
+
+/// Memory for the ray-tracing instructions: the nodes of `RAY_NODES` and, from 0x400, one ray per lane as
+/// 12 words: the node pointer's two halves, the extent, the origin, the direction and its inverse.
+pub fn ray_scene() -> Memory {
+    let mut memory = Memory::new(MEMORY);
+    let mut put = |address: u64, values: &[u32]| {
+        for (i, value) in values.iter().enumerate() {
+            memory
+                .write(address + 4 * i as u64, *value)
+                .expect("inside the scene");
+        }
+    };
+    let f = |v: f32| v.to_bits();
+    put(0x000, &[0x18, 0x19, 0x14, 0x20]);
+    let boxes = [
+        [-1.0, -1.0, 6.0, 1.0, 1.0, 7.0],
+        [-1.0, -1.0, 2.0, 1.0, 1.0, 3.0],
+        [-0.5, -1.0, 4.0, 1.0, 1.0, 5.0],
+        [5.0, 5.0, 1.0, 6.0, 6.0, 2.0],
+    ];
+    for (child, bounds) in boxes.iter().enumerate() {
+        let words: Vec<u32> = bounds.iter().map(|v| f(*v)).collect();
+        put(0x10 + 24 * child as u64, &words);
+    }
+    put(0x080, &[0x05, 0x18, 0x26, 0x20]);
+    for (child, bounds) in boxes.iter().rev().enumerate() {
+        let h: Vec<u32> = bounds
+            .iter()
+            .map(|v| rdna::format::f32_to_f16(v.to_bits()))
+            .collect();
+        put(
+            0x90 + 12 * child as u64,
+            &[h[0] | h[1] << 16, h[2] | h[3] << 16, h[4] | h[5] << 16],
+        );
+    }
+    let corners = [
+        [-1.0, -1.0, 3.0],
+        [1.0, -1.0, 3.0],
+        [-1.0, 1.0, 3.0],
+        [1.0, 1.0, 3.0],
+    ];
+    let words: Vec<u32> = corners.iter().flatten().map(|v| f(*v)).collect();
+    put(0x0C0, &words);
+    put(0x0C0 + 60, &[0x0609]);
+    let tilted = [[-2.0, -2.0, 1.0], [2.0, -2.0, 5.0], [0.0, 2.0, 3.0]];
+    let words: Vec<u32> = tilted.iter().flatten().map(|v| f(*v)).collect();
+    put(0x100, &words);
+    put(0x100 + 60, &[0x01]);
+    for lane in 0..64u32 {
+        let node = RAY_NODES[lane as usize % RAY_NODES.len()];
+        let x = (lane % 7) as f32 * 0.25 - 0.75;
+        let y = (lane % 5) as f32 * 0.3 - 0.6;
+        let direction = [0.03 * ((lane % 3) as f32 - 1.0) + 0.01, 0.02, 1.0];
+        let extent = if lane % 4 == 3 { 4.5 } else { 10.0 };
+        let mut ray = vec![node, 0, f(extent), f(x), f(y), f(0.0)];
+        ray.extend(direction.iter().map(|v| f(*v)));
+        ray.extend(direction.iter().map(|v| f(1.0 / v)));
+        put(0x400 + 48 * u64::from(lane), &ray);
+    }
+    memory
+}
+
+/// Loads each lane's ray from `ray_scene` and intersects it, the results in v14-v17; `high` is the
+/// descriptor's second word, which holds the sort and box-growth fields.
+pub fn ray_program(wide: bool, high: u32) -> String {
+    let (name, addresses) = if wide {
+        ("image_bvh64_intersect_ray", "v[1:12]")
+    } else {
+        (
+            "image_bvh_intersect_ray",
+            "[v1,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12]",
+        )
+    };
+    format!(
+        "v_mul_u32_u24_e32 v13, 48, v0
+         global_load_dwordx4 v[1:4], v13, s[24:25]
+         global_load_dwordx4 v[5:8], v13, s[24:25] offset:16
+         global_load_dwordx4 v[9:12], v13, s[24:25] offset:32
+         s_waitcnt vmcnt(0)
+         s_mov_b32 s0, 0
+         s_mov_b32 s1, 0x{high:x}
+         s_mov_b32 s2, -1
+         s_mov_b32 s3, 0x890003ff
+         {name} v[14:17], {addresses}, s[0:3]
+         s_endpgm"
+    )
+}

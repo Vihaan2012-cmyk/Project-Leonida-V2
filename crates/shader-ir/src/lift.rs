@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 
 use rdna::{Arg, Inst, Operand};
 
+mod bvh;
+
 use crate::ir::{
     AtomicOp, Bin, Block, Cmp, Expr, Function, Image, ImageDim, ImageOp, Reg, Round, Space, Stmt,
     Terminator, Tmp, Tri, Un,
@@ -1115,6 +1117,9 @@ impl Lifter {
         }
         if base.starts_with("v_") && self.vector_op(base, inst)? {
             return Ok(());
+        }
+        if base == "image_bvh_intersect_ray" || base == "image_bvh64_intersect_ray" {
+            return self.bvh_intersect(inst, base == "image_bvh64_intersect_ray");
         }
         if base.starts_with("image_") {
             return self.image(base, inst);

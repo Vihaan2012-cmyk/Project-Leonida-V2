@@ -40,6 +40,10 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave, memory: &mut Memory) ->
         lds(name, inst, wave)?;
         return Ok(true);
     }
+    if name == "image_bvh_intersect_ray" || name == "image_bvh64_intersect_ray" {
+        crate::bvh::intersect(name, inst, wave, memory)?;
+        return Ok(true);
+    }
     if name.starts_with("buffer_load_dword") || name.starts_with("buffer_store_dword") {
         buffer(name, inst, wave, memory)?;
         return Ok(true);

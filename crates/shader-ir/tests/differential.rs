@@ -216,3 +216,39 @@ fn random_programs_match_the_reference() {
     }
     assert!(completed > 2950, "{completed}");
 }
+
+#[test]
+fn ray_intersections_match_the_reference() {
+    use testkit::random::{ray_program, ray_scene};
+    for wave64 in [false, true] {
+        for wide in [false, true] {
+            for high in [0x8000_0000, 0, 0x8300_0000] {
+                let mut wave = start(wave64, 5);
+                wave.sgpr[25] = 0;
+                let source = ray_program(wide, high);
+                assert!(check(&source, wave, ray_scene()), "{source}");
+            }
+        }
+    }
+    let mut wave = start(false, 5);
+    wave.sgpr[25] = 0;
+    let code = rdna::assemble(&ray_program(true, 0x8000_0000), true).unwrap();
+    testkit::run(&code, &mut wave, &mut ray_scene()).unwrap();
+    let result = |lane: usize| [14, 15, 16, 17].map(|r| wave.vgpr[r][lane]);
+    assert_eq!(
+        result(0),
+        [0x19, 0x18, u32::MAX, u32::MAX],
+        "nearest box first"
+    );
+    assert_eq!(
+        result(7),
+        [0x26, u32::MAX, u32::MAX, u32::MAX],
+        "16-bit boxes within the extent"
+    );
+    assert_eq!(result(5), [u32::MAX; 4], "instance nodes are left alone");
+    let [numerator, denominator, ..] = result(2).map(f32::from_bits);
+    assert!(
+        (numerator / denominator - 3.0).abs() < 1e-5,
+        "triangle at z = 3"
+    );
+}

@@ -1,3 +1,4 @@
+mod bvh;
 mod memory;
 pub mod random;
 mod salu;

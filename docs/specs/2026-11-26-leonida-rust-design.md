@@ -215,6 +215,18 @@ window's size, so the area must start on a multiple of that window (a power of t
 primitive's vertices): the game's shaders place it at a table value times 256 plus s2, which is 0. Both halves
 take user SGPRs from s8.
 
+**Ray intersection.** `image_bvh_intersect_ray` and its 64-bit form follow AMD's own software emulation of the
+instruction for this hardware, from its open-source ray-tracing library (GPURT). A node sits at the descriptor's
+base address (bits 0-39) times 256 plus the node pointer without its 3 type bits times 8. Types 0-3 are triangle
+nodes (v0-v3 at bytes 0-47, the triangle ID at 60; type 1 is the triangle v1, v3, v2), 4 a box node of 16-bit floats
+and 5 one of 32-bit floats (four child pointers, then four boxes). A box node returns the children whose boxes the
+ray reaches within its extent, nearest entry first when descriptor bit 63 enables sorting, misses as all ones; boxes
+grow by the descriptor's bits 55-62 in units of 2^-24. A triangle node returns the hit distance's numerator and
+denominator (infinity and 1 on a miss) and the two barycentric numerators the triangle ID's I and J source fields
+select. Any other node returns all ones. The game's descriptors ask for barycentrics (bit 120); the triangle-ID
+return form is not translated. The lifter lowers the instruction into IR loads and float operations; the reference
+emulator implements it separately.
+
 **Compute groups.** A compute entry declares a flat group of whole waves and rebuilds the thread IDs from the flat
 index, x fastest, as the hardware packs threads into waves. A group that ends partway through a wave starts that wave
 with exec holding only the lanes that carry its threads. Implicit-LOD sampling outside pixel shaders takes its

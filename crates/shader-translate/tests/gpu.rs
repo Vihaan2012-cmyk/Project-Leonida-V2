@@ -508,3 +508,25 @@ fn random_wave32_programs_match_as_compute_shaders() {
 fn random_wave64_programs_match_as_compute_shaders() {
     compute_suite(true);
 }
+
+#[test]
+fn ray_intersections_match_on_the_gpu() {
+    let Some(gpu) = gpu() else { return };
+    for wave64 in [false, true] {
+        for wide in [false, true] {
+            for high in [0x8000_0000u32, 0, 0x8300_0000] {
+                let mut wave = start(wave64, 5);
+                wave.sgpr[25] = 0;
+                let source = testkit::random::ray_program(wide, high);
+                let name = format!("rays_{wave64}_{wide}_{high:x}");
+                assert!(run(
+                    &gpu,
+                    &source,
+                    wave,
+                    testkit::random::ray_scene(),
+                    &name
+                ));
+            }
+        }
+    }
+}
