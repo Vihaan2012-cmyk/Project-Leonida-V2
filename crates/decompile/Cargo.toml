@@ -11,3 +11,6 @@ thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+iced-x86 = { workspace = true, features = ["code_asm"] }

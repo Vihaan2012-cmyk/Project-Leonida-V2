@@ -39,6 +39,17 @@ fn agrees(a: f32, b: f32) -> bool {
     return abs(a - b) <= pf(6u) * max(a, b) + 1.0e-5;
 }
 
+fn max3(v: vec3<f32>) -> f32 { return max(v.x, max(v.y, v.z)); }
+
+// A texel that did not change between the real frames although the scene moves there, and whose two scene samples
+// disagree, is an overlay (HUD) drawn after the scene. Where the motion is zero nothing is flagged.
+fn overlay(i: u32, mv: vec2<f32>, c_cur: vec3<f32>, c_prev: vec3<f32>) -> bool {
+    let h = pf(10u);
+    if h <= 0.0 || abs(mv.x) + abs(mv.y) < 0.75 { return false; }
+    let stable = max3(abs(cur_color[i].rgb - prev_color[i].rgb)) < 0.25 * h;
+    return stable && max3(abs(c_cur - c_prev)) > h;
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= P[0] || id.y >= P[1] { return; }
@@ -85,6 +96,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         out = c_cur;
     } else if ok_prev && !ok_cur {
         out = c_prev;
+    }
+    let i = u32(q.y * w + q.x);
+    if overlay(i, mv, c_cur, c_prev) {
+        out = cur_color[i].rgb;
     }
     dst[u32(q.y * w + q.x)] = vec4<f32>(out, 1.0);
 }

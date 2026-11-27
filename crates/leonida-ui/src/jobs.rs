@@ -4,22 +4,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
-use shader_container::ScanResult;
-
-use crate::build_steps::StepReport;
-
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
 
 pub enum Outcome {
     GamesFound(Vec<PathBuf>),
-    Build {
-        steps: Vec<StepReport>,
-        scan: Option<ScanResult>,
-    },
+    /// A command run as a child process ended.
+    Command(CommandResult),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandResult {
+    pub name: String,
+    pub success: bool,
+    pub detail: String,
 }
 
 enum Event {
-    Progress { fraction: f32, message: String },
+    Progress {
+        fraction: Option<f32>,
+        message: String,
+    },
     Log(String),
     Finished(Outcome),
 }
@@ -34,7 +38,16 @@ impl Reporter {
     pub fn progress(&self, fraction: f32, message: impl Into<String>) {
         let fraction = fraction.clamp(0.0, 1.0);
         let _ = self.tx.send(Event::Progress {
-            fraction,
+            fraction: Some(fraction),
+            message: message.into(),
+        });
+        (self.wake)();
+    }
+
+    /// Work that cannot say how far along it is.
+    pub fn busy(&self, message: impl Into<String>) {
+        let _ = self.tx.send(Event::Progress {
+            fraction: None,
             message: message.into(),
         });
         (self.wake)();
@@ -52,13 +65,15 @@ impl Reporter {
 
 pub struct Running {
     pub title: String,
-    pub fraction: f32,
+    /// `None` while the work cannot say how far along it is.
+    pub fraction: Option<f32>,
     pub message: String,
     cancel: Arc<AtomicBool>,
     rx: Receiver<Event>,
 }
 
 impl Running {
+    #[cfg(test)]
     pub fn cancelling(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
@@ -107,7 +122,7 @@ impl Jobs {
         });
         self.running = Some(Running {
             title: title.into(),
-            fraction: 0.0,
+            fraction: Some(0.0),
             message: String::new(),
             cancel,
             rx,

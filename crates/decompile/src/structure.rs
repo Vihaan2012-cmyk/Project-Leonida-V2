@@ -332,6 +332,21 @@ pub fn structure(f: &Function) -> (Vec<Node>, HashSet<usize>) {
     (tidy(out, &gotos), gotos)
 }
 
+/// Whether the guard `guard` is the loop condition `again` evaluated with the variable the preceding statement set.
+fn guards_after_init(previous: Option<&Node>, guard: &Expr, again: &Expr) -> bool {
+    let Some(Node::Stmt(Stmt::Def(loc, _, value))) = previous else {
+        return false;
+    };
+    if value.has_load() || value.has_side_effects() {
+        return false;
+    }
+    let substituted = simplify(again.clone().map(&mut |x| match x {
+        Expr::Var(l, _) if l == *loc => value.clone(),
+        other => other,
+    }));
+    substituted == *guard
+}
+
 fn has_break(nodes: &[Node]) -> bool {
     nodes.iter().any(|n| match n {
         Node::Break => true,
@@ -357,7 +372,7 @@ pub fn ends_in_jump(nodes: &[Node]) -> bool {
     )
 }
 
-fn has_continue(nodes: &[Node]) -> bool {
+pub fn has_continue(nodes: &[Node]) -> bool {
     nodes.iter().any(|n| match n {
         Node::Continue => true,
         Node::If(_, a, b) => has_continue(a) || has_continue(b),
@@ -385,6 +400,17 @@ fn tidy(nodes: Vec<Node>, gotos: &HashSet<usize>) -> Vec<Node> {
                 if then.is_empty() {
                     c = negate(c);
                     std::mem::swap(&mut then, &mut els);
+                }
+                if els.is_empty()
+                    && let [Node::DoWhile(_, again)] = then.as_slice()
+                    && !c.has_side_effects()
+                    && (*again == c || guards_after_init(out.last(), &c, again))
+                {
+                    let Some(Node::DoWhile(body, again)) = then.pop() else {
+                        unreachable!()
+                    };
+                    out.push(Node::While(again, body));
+                    continue;
                 }
                 if !els.is_empty() && ends_in_jump(&then) {
                     out.push(Node::If(c, then, Vec::new()));

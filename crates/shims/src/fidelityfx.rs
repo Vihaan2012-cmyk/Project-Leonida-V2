@@ -593,6 +593,28 @@ mod imp {
         }
     }
 
+    /// Hands the frame's depth and motion vectors to frame generation, which the presenter reads at `PresentX`.
+    fn submit_frame_generation_inputs(inputs: &UpscaleInputs) {
+        let res = |r: &UpscaleResource| upscale::framegen::InputResource {
+            handle: r.resource,
+            width: r.width,
+            height: r.height,
+            format: r.format,
+        };
+        upscale::framegen::submit_inputs(&upscale::framegen::FrameInputs {
+            depth: res(&inputs.depth),
+            motion: res(&inputs.motion_vectors),
+            render_size: inputs.render_size,
+            output_size: inputs.upscale_size,
+            motion_vector_scale: inputs.motion_vector_scale,
+            jitter: inputs.jitter,
+            depth_reversed: inputs.depth_inverted,
+            camera_near: inputs.camera_near,
+            camera_far: inputs.camera_far,
+            reset: inputs.reset,
+        });
+    }
+
     /// # Safety
     /// `desc` heads a dispatch description.
     pub unsafe extern "win64" fn dispatch(context: *mut usize, desc: *const Header) -> ReturnCode {
@@ -665,6 +687,7 @@ mod imp {
             max_render_size: [max_render.width, max_render.height],
             max_upscale_size: [max_upscale.width, max_upscale.height],
         };
+        submit_frame_generation_inputs(&inputs);
         match upscale_dispatch(&inputs) {
             Ok(()) => OK,
             Err(failure) => {

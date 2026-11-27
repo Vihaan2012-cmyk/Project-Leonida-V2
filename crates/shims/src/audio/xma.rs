@@ -14,6 +14,26 @@ pub struct XmaRequest<'a> {
     pub frames: u32,
 }
 
+/// A request that owns its data, for a decode on another thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedXmaRequest {
+    pub data: Vec<u8>,
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub frames: u32,
+}
+
+impl OwnedXmaRequest {
+    pub fn borrow(&self) -> XmaRequest<'_> {
+        XmaRequest {
+            data: &self.data,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            frames: self.frames,
+        }
+    }
+}
+
 /// Interleaved 16-bit PCM.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decoded {

@@ -1,6 +1,7 @@
 //! The console D3D12 interface on top of the Vulkan renderer.
 #![allow(unsafe_code)]
 
+pub mod assembly;
 pub mod com;
 pub mod compile_queue;
 pub mod descriptor;
@@ -13,6 +14,7 @@ pub mod memory;
 pub mod pacing;
 pub mod pipeline;
 pub mod present;
+pub mod pso_stream;
 pub mod queue;
 pub mod resource;
 pub mod root;

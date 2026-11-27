@@ -31,6 +31,7 @@ rspirv = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
+toml_edit = "0.25"
 sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
@@ -39,6 +40,7 @@ assets = { path = "crates/assets" }
 game-package = { path = "crates/game-package" }
 rpf9 = { path = "crates/rpf9" }
 audio-codec = { path = "crates/audio-codec" }
+bink = { path = "crates/bink" }
 shader-container = { path = "crates/shader-container" }
 leonida-ui = { path = "crates/leonida-ui" }
 exe-analysis = { path = "crates/exe-analysis" }
@@ -51,6 +53,7 @@ upscale = { path = "crates/upscale" }
 config = { path = "crates/config" }
 systems = { path = "crates/systems" }
 decompile = { path = "crates/decompile" }
+source-export = { path = "crates/source-export" }
 offline = { path = "crates/offline" }
 gpu = { path = "crates/gpu" }
 gpu-passes = { path = "crates/gpu-passes" }
@@ -59,6 +62,7 @@ rdna = { path = "crates/rdna" }
 shader-ir = { path = "crates/shader-ir" }
 shader-translate = { path = "crates/shader-translate" }
 shader-store = { path = "crates/shader-store" }
+shader-census = { path = "crates/shader-census" }
 testkit = { path = "crates/testkit" }
 content-filter = { path = "crates/content-filter" }
 vfs = { path = "crates/vfs" }

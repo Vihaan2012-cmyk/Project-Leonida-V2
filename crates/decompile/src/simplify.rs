@@ -3,12 +3,12 @@ use std::collections::HashSet;
 use crate::expr::*;
 use crate::lift::{Block, Exit, Function, Stmt, volatile};
 
-fn partial(loc: Loc, w: u8) -> bool {
+pub fn partial(loc: Loc, w: u8) -> bool {
     match loc {
         Loc::Reg(r) if r < VECTOR => w < 4,
-        Loc::Reg(_) => w < 16,
+        Loc::Reg(_) => false,
         Loc::Stack(_) => w < 4,
-        Loc::Flags => false,
+        Loc::Flags | Loc::Var(_) => false,
     }
 }
 
@@ -21,7 +21,7 @@ impl Stmt {
         }
     }
 
-    fn map_exprs(&mut self, f: &mut impl FnMut(Expr) -> Expr) {
+    pub fn map_exprs(&mut self, f: &mut impl FnMut(Expr) -> Expr) {
         let take = |e: &mut Expr, f: &mut dyn FnMut(Expr) -> Expr| {
             let old = std::mem::replace(e, Expr::Const(0, 1));
             *e = f(old);
@@ -95,7 +95,7 @@ impl Exit {
         }
     }
 
-    fn map_expr(&mut self, f: &mut impl FnMut(Expr) -> Expr) {
+    pub fn map_expr(&mut self, f: &mut impl FnMut(Expr) -> Expr) {
         match self {
             Exit::Branch(e, ..)
             | Exit::Switch(e, ..)
@@ -173,7 +173,7 @@ pub fn parameters(f: &mut Function) -> u8 {
                     Some(slot) if defined & (1 << slot) == 0 => {
                         let n = slot % 4 + 1;
                         *count = (*count).max(n);
-                        Expr::Param(n)
+                        Expr::Param(n, w, slot >= 4)
                     }
                     _ => Expr::Var(loc, w),
                 },
@@ -272,9 +272,9 @@ fn natural_width(e: &Expr) -> Option<u8> {
     match e {
         Expr::Load(_, w, _) | Expr::Var(_, w) => Some(*w),
         Expr::Cast(ty, _) => match *ty {
-            "u8" | "i8" => Some(1),
-            "u16" | "i16" => Some(2),
-            "u32" | "i32" | "f32" => Some(4),
+            "uint8_t" | "int8_t" => Some(1),
+            "uint16_t" | "int16_t" => Some(2),
+            "uint32_t" | "int32_t" | "float" => Some(4),
             _ => Some(8),
         },
         Expr::Binary(op, ..)
@@ -296,14 +296,7 @@ fn adapt(e: &Expr, def_w: u8, read_w: u8, loc: Loc) -> Option<Expr> {
             Expr::Call(..) => e.clone(),
             Expr::Const(v, _) => konst(*v, read_w),
             _ if natural_width(e).is_some_and(|w| w <= read_w) => e.clone(),
-            _ => Expr::Cast(
-                match read_w {
-                    1 => "u8",
-                    2 => "u16",
-                    _ => "u32",
-                },
-                Box::new(e.clone()),
-            ),
+            _ => Expr::Cast(unsigned_type(read_w.min(4)), Box::new(e.clone())),
         });
     }
     (def_w == 4).then(|| e.clone())
@@ -311,7 +304,7 @@ fn adapt(e: &Expr, def_w: u8, read_w: u8, loc: Loc) -> Option<Expr> {
 
 fn cheap(e: &Expr, aliased: &HashSet<i64>) -> bool {
     match e {
-        Expr::Const(..) | Expr::Param(_) | Expr::Name(_) | Expr::Text(_) => true,
+        Expr::Const(..) | Expr::Param(..) | Expr::Name(_) | Expr::Text(_) => true,
         Expr::Var(Loc::Stack(o), _) => !aliased.contains(o),
         Expr::Var(..) => true,
         Expr::AddrOf(inner) => matches!(**inner, Expr::Var(Loc::Stack(_), _) | Expr::Name(_)),
@@ -477,6 +470,20 @@ fn propagate(
             };
             let count = reads.iter().filter(|(l, _)| *l == loc).count();
             if count > 0 {
+                let real = if j == len {
+                    count
+                } else {
+                    block.stmts[j]
+                        .exprs()
+                        .iter()
+                        .flat_map(|x| x.reads())
+                        .filter(|(l, _)| *l == loc)
+                        .count()
+                };
+                if real == 0 {
+                    blocked = true;
+                    break;
+                }
                 let fits = reads
                     .iter()
                     .filter(|(l, _)| *l == loc)
@@ -680,11 +687,14 @@ pub fn merge_conditions(f: &mut Function) {
     }
 }
 
-pub fn run(f: &mut Function) {
+pub fn run(f: &mut Function, deadline: Option<std::time::Instant>) {
     rebase_flags(f);
     copy_flags(f);
     let mut temps = 1u8;
     for _ in 0..64 {
+        if deadline.is_some_and(|d| std::time::Instant::now() > d) {
+            break;
+        }
         let mut changed = false;
         let live = liveness(f);
         for (b, block) in f.blocks.iter_mut().enumerate() {

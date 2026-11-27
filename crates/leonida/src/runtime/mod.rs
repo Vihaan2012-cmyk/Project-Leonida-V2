@@ -19,7 +19,7 @@ use config::{Config, Section};
 
 pub use plan::{RuntimePlan, Settings};
 
-/// Reads the four settings files. Missing files are written with their documented defaults only when
+/// Reads the settings files. Missing files are written with their documented defaults only when
 /// `write_missing` is set, so a dry run leaves the folder as it was.
 pub fn load_settings(dir: &Path, write_missing: bool) -> Result<Settings> {
     if write_missing {
@@ -39,6 +39,9 @@ pub fn load_settings(dir: &Path, write_missing: bool) -> Result<Settings> {
             graphics: one(dir)?,
             input: one(dir)?,
             mods: one(dir)?,
+            display: one(dir)?,
+            widescreen: one(dir)?,
+            upscaling: one(dir)?,
         })
     };
     read().with_context(|| format!("reading the settings in {}", dir.display()))
@@ -72,6 +75,11 @@ pub fn configure(plan: &RuntimePlan) -> Result<()> {
     }
     let line = content::configure(plan).context("setting up the nudity filter")?;
     println!("{line}");
+    // The title reserves its GPU-visible memory before it creates the device, so the device's address space and
+    // memory hooks must exist first.
+    shims::d3d12::prepare()
+        .map_err(|error| anyhow::anyhow!("{error}"))
+        .context("setting up the graphics device")?;
     Ok(())
 }
 

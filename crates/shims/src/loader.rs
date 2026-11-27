@@ -161,6 +161,24 @@ pub(crate) fn setting(name: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+/// Completes an `XAsyncBlock` with `result` on the block's queue, as a call that did its work at once.
+///
+/// # Safety
+/// `block` is a writable `XAsyncBlock` the program keeps alive until it completes.
+#[cfg(windows)]
+pub(crate) unsafe fn complete_async(
+    block: *mut std::ffi::c_void,
+    label: &'static str,
+    result: i32,
+) -> i32 {
+    // SAFETY: as the caller promises.
+    unsafe {
+        tasks::begin_one_shot(block as *mut tasks::AsyncBlock, label, move || {
+            (result, Vec::new())
+        })
+    }
+}
+
 /// Shims for the library functions and the GDK runtime's entry points.
 pub fn shims() -> Vec<Shim> {
     #[cfg(windows)]

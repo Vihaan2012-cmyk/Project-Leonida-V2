@@ -263,6 +263,34 @@ pub enum ExeCommand {
         #[arg(long, default_value_t = 0)]
         depth: usize,
     },
+    /// Write every function as source-like files with an index (never commit the output).
+    ExportSource {
+        /// Where to write the tree.
+        #[arg(long, default_value = "Output/decomp/src")]
+        out: PathBuf,
+        /// Functions decompiled at once.
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+        /// Leave files that an earlier run finished as they are.
+        #[arg(long)]
+        resume: bool,
+        /// Only the files holding these: an address (0x...), a function or class name, or part of a file path.
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        /// Functions larger than this many bytes are left as stubs.
+        #[arg(long, default_value_t = 0x2_0000)]
+        max_size: u32,
+        /// The program database to take names, classes and source files from. Built and saved there when missing.
+        /// Defaults to program.db next to the output folder.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Name functions from the executable's own tables only, without the program database.
+        #[arg(long)]
+        no_db: bool,
+        /// Functions per file for code with no known source file or class.
+        #[arg(long, default_value_t = 200)]
+        per_file: usize,
+    },
     /// Code that calls, jumps to or references an address, an import or a string.
     Xrefs {
         /// A hex RVA or virtual address.
@@ -314,6 +342,9 @@ pub enum ShadersCommand {
     Disasm(DisasmArgs),
     /// Check how much of every shader the translator handles, and list what it can't yet. Writes nothing.
     Report(ReportArgs),
+    /// Measure which user SGPRs each vertex, pixel, geometry, mesh and compute program reads first and how it
+    /// uses them. Reads only; --json also writes the result under the output folder.
+    Census(CensusArgs),
     /// Translate every shader and have the graphics driver build it into a pipeline. Writes nothing.
     Verify(VerifyArgs),
 }
@@ -372,6 +403,28 @@ pub struct DisasmArgs {
     /// The game folder. Searched for when omitted.
     #[arg(long)]
     pub game: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct CensusArgs {
+    /// The game folder. Searched for when omitted.
+    #[arg(long)]
+    pub game: Option<PathBuf>,
+    /// Only containers of these stages: ps, vs, gs, ms or cs. May be given more than once.
+    #[arg(long)]
+    pub stage: Vec<String>,
+    /// Stop after this many shader containers.
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Read every Nth container.
+    #[arg(long, default_value_t = 1)]
+    pub every: usize,
+    /// Also write the whole census, per program too, as census.json under --output.
+    #[arg(long)]
+    pub json: bool,
+    /// Where census.json goes.
+    #[arg(long, default_value = "Output")]
+    pub output: PathBuf,
 }
 
 #[derive(Debug, Args)]

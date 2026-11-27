@@ -6,10 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+config.workspace = true
 game-package.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-shader-container.workspace = true
+toml.workspace = true
+vfs.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 rfd = "0.18"
@@ -17,7 +19,6 @@ winsafe = { version = "0.0.29", features = ["gui"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-shader-container = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

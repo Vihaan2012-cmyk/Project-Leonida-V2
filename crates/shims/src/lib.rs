@@ -20,11 +20,13 @@ pub mod files;
 pub mod gameinput;
 pub mod loader;
 pub mod media;
+#[cfg(windows)]
+pub mod network;
 pub mod presentation;
 pub mod threads;
 pub mod trace;
 pub mod xg;
-mod xmem;
+pub mod xmem;
 
 /// A function we provide in place of a console one.
 #[derive(Debug, Clone, Copy)]
@@ -46,6 +48,8 @@ pub fn builtin() -> Vec<Shim> {
     shims.extend(gameinput::shims());
     shims.extend(loader::shims());
     shims.extend(media::shims());
+    #[cfg(windows)]
+    shims.extend(network::shims());
     shims.extend(threads::shims());
     shims.extend(xg::shims());
     shims
@@ -174,13 +178,14 @@ impl Binder {
             .map(|s| s.address)
     }
 
-    /// How an import would be bound, without binding it.
+    /// How an import would be bound, without binding it. An import the offline policy names is blocked even
+    /// where a shim answers it: the shim only refuses.
     pub fn classify(&self, import: &ImportRef<'_>) -> Binding {
-        if self.shim(import).is_some() {
-            return Binding::Shim;
-        }
         if let Some(reason) = offline::import(import.dll, import.name) {
             return Binding::Blocked(reason);
+        }
+        if self.shim(import).is_some() {
+            return Binding::Shim;
         }
         #[cfg(windows)]
         if host_allowed(import.dll) && host::find(import).is_some() {

@@ -6,18 +6,44 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::apu::ApuSpace;
+use super::hal::{Hal, HalCommand};
 use super::mixer::{Buffer, BufferId, Completion, Looping, Mixer, VoiceId, VoiceParams};
 use super::output::{Output, SharedMixer};
-use super::queue::CommandQueue;
-use super::xma::{self, DecodeError, XmaRequest};
+use super::xapu::XApu;
+use super::xma::{self, DecodeError, OwnedXmaRequest, XmaRequest};
+use super::xma_hw::{self, CONTEXT_BYTES as CTX_BYTES, XmaHw};
 
 /// Rate the mixer runs at until a device sets its own.
 pub const DEFAULT_RATE: u32 = 48_000;
 /// Longest stretch the silent clock renders in one catch-up.
 const MAX_CATCH_UP: Duration = Duration::from_secs(1);
 const CHUNK_FRAMES: usize = 2048;
+#[cfg(not(windows))]
 const ACP_BYTES: usize = 4096;
-const CONTEXT_BYTES: usize = 64 * 1024;
+const CONTEXT_BYTES: usize = 64;
+const MAX_CONTEXTS: usize = 4096;
+
+/// Least time between attempts to reopen a device that failed, so a missing device is not polled every frame.
+const REOPEN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Spaces out attempts to reopen the output device.
+#[derive(Debug, Default)]
+pub struct ReopenGate {
+    last: Option<Instant>,
+}
+
+impl ReopenGate {
+    /// True when an attempt is due at `now`; records it.
+    pub fn due(&mut self, now: Instant) -> bool {
+        match self.last {
+            Some(last) if now.duration_since(last) < REOPEN_INTERVAL => false,
+            _ => {
+                self.last = Some(now);
+                true
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
@@ -29,18 +55,24 @@ pub enum OutputMode {
 
 pub struct Engine {
     pub apu: ApuSpace,
-    pub queue: CommandQueue,
+    pub xapu: XApu,
+    hal: Hal,
+    xma_hw: XmaHw,
+    #[cfg(windows)]
+    hal_object: Option<Box<super::hal::object::Object>>,
     mixer: SharedMixer,
     output: Option<Output>,
     mode: OutputMode,
     active: bool,
     started: Option<Instant>,
     silent_frames: u64,
+    #[cfg(not(windows))]
     acp: Option<Box<[u64]>>,
     contexts: Option<Box<[u64]>>,
     next_buffer: BufferId,
     completions: Vec<Completion>,
     noted: HashSet<String>,
+    reopen: ReopenGate,
 }
 
 fn zeroed(bytes: usize) -> Box<[u64]> {
@@ -51,18 +83,24 @@ impl Engine {
     pub fn new(mode: OutputMode) -> Engine {
         Engine {
             apu: ApuSpace::new(),
-            queue: CommandQueue::default(),
+            xapu: XApu::default(),
+            hal: Hal::default(),
+            xma_hw: XmaHw::default(),
+            #[cfg(windows)]
+            hal_object: None,
             mixer: Arc::new(Mutex::new(Mixer::new(DEFAULT_RATE))),
             output: None,
             mode,
             active: false,
             started: None,
             silent_frames: 0,
+            #[cfg(not(windows))]
             acp: None,
             contexts: None,
             next_buffer: 1,
             completions: Vec::new(),
             noted: HashSet::new(),
+            reopen: ReopenGate::default(),
         }
     }
 
@@ -81,18 +119,100 @@ impl Engine {
         self.mixer.clone()
     }
 
-    /// The address of the hardware layer's handle block: allocated on first use, stable until reset.
-    pub fn acp_create(&mut self) -> usize {
-        self.acp.get_or_insert_with(|| zeroed(ACP_BYTES)).as_ptr() as usize
+    pub fn hal_mut(&mut self) -> &mut Hal {
+        &mut self.hal
     }
 
-    pub fn allocate_shape_contexts(&mut self) -> usize {
-        self.contexts
-            .get_or_insert_with(|| zeroed(CONTEXT_BYTES))
-            .as_ptr() as usize
+    /// Records a command the title sent through the hardware object and acts on it: an enabled XMA context starts
+    /// decoding on the worker, a disabled one stops, and blocks the title read free room in the ring.
+    pub fn apply_hal(&mut self, command: HalCommand) {
+        self.hal.submit(command);
+        let Some(base) = self.contexts.as_ref().map(|c| c.as_ptr() as usize) else {
+            return;
+        };
+        let total = self
+            .contexts
+            .as_ref()
+            .map_or(0, |c| c.len() * 8 / CTX_BYTES);
+        let address = |context: u32| {
+            ((context as usize) < total).then(|| base + context as usize * CTX_BYTES)
+        };
+        match command {
+            HalCommand::Enable { context } => {
+                if let Some(address) = address(context) {
+                    self.enable_xma_context(address);
+                }
+            }
+            HalCommand::Disable { context } => {
+                if let Some(address) = address(context) {
+                    self.xma_hw.disable(address);
+                }
+            }
+            HalCommand::OutputRead { context, blocks } => {
+                if let Some(address) = address(context) {
+                    xma_hw::output_read(address, blocks);
+                }
+            }
+            HalCommand::Configure | HalCommand::Other { .. } => {}
+        }
+    }
+
+    pub fn stop_hal(&mut self) {
+        self.xma_hw.shutdown();
+        self.hal.stop();
+    }
+
+    fn enable_xma_context(&mut self, context: usize) {
+        let word = |i: usize| {
+            // SAFETY: `context` lies inside the context block this engine owns.
+            unsafe { ((context + i * 4) as *const u32).read_volatile() }
+        };
+        let (packets, input_apu, ring_apu) = ((word(0) & 0xfff) as usize, word(5), word(7));
+        let (Some(input), Some(ring)) = (self.apu.map_apu(input_apu), self.apu.map_apu(ring_apu))
+        else {
+            self.note_once("xma-unmapped", || {
+                "an XMA context was enabled with an input or output address nothing mapped".into()
+            });
+            return;
+        };
+        if packets == 0 {
+            return;
+        }
+        // SAFETY: the title's input buffer holds `packets` 2048-byte packets, as it declared in the context.
+        let data =
+            unsafe { std::slice::from_raw_parts(input as *const u8, packets * 2048) }.to_vec();
+        match xma_hw::setup_from_context(context, data, ring) {
+            Ok(setup) => self.xma_hw.enable(context, setup),
+            Err(error) => {
+                self.note_once("xma-setup", || {
+                    format!("an XMA context could not start: {error}")
+                });
+            }
+        }
+    }
+
+    /// The address of the hardware layer's object: allocated on first use, stable until reset. On Windows it
+    /// starts with the vtable the title calls through; elsewhere it is a zeroed block.
+    pub fn acp_create(&mut self) -> usize {
+        #[cfg(windows)]
+        {
+            let object = self.hal_object.get_or_insert_with(super::hal::object::new);
+            &**object as *const super::hal::object::Object as usize
+        }
+        #[cfg(not(windows))]
+        {
+            self.acp.get_or_insert_with(|| zeroed(ACP_BYTES)).as_ptr() as usize
+        }
+    }
+
+    /// Zeroed coprocessor contexts: 64 bytes each, `count` of them.
+    pub fn allocate_shape_contexts(&mut self, count: usize) -> usize {
+        let bytes = count.clamp(1, MAX_CONTEXTS) * CONTEXT_BYTES;
+        self.contexts.get_or_insert_with(|| zeroed(bytes)).as_ptr() as usize
     }
 
     pub fn release_shape_contexts(&mut self) {
+        self.xma_hw.shutdown();
         self.contexts = None;
     }
 
@@ -108,6 +228,10 @@ impl Engine {
     pub fn activate(&mut self) {
         self.active = true;
         self.started.get_or_insert_with(Instant::now);
+        self.open_device();
+    }
+
+    fn open_device(&mut self) {
         if self.mode == OutputMode::Auto && self.output.is_none() {
             match Output::start(self.mixer.clone()) {
                 Ok(output) => self.output = Some(output),
@@ -120,6 +244,23 @@ impl Engine {
         }
     }
 
+    /// Drops a device that failed or was unplugged and, once the gate allows, opens the default one again. The
+    /// mixer keeps its voices, so sound resumes where it was.
+    pub fn check_device(&mut self, now: Instant) {
+        if !self.active || self.mode != OutputMode::Auto {
+            return;
+        }
+        if self.output.as_ref().is_some_and(Output::lost) {
+            self.output = None;
+            self.note_once("device-lost", || {
+                "the audio device failed: reopening the default device".into()
+            });
+        }
+        if self.output.is_none() && self.reopen.due(now) {
+            self.open_device();
+        }
+    }
+
     pub fn deactivate(&mut self) {
         self.active = false;
         self.output = None;
@@ -129,6 +270,7 @@ impl Engine {
 
     /// Without a device, renders the time that has passed into nothing so voices finish when they should.
     pub fn pump(&mut self) {
+        self.check_device(Instant::now());
         if let Some(started) = self.started {
             self.pump_to(started.elapsed());
         }
@@ -187,7 +329,35 @@ impl Engine {
             .unwrap_or(false)
     }
 
-    /// Decodes an XMA stream and starts it on a new voice; the buffer id comes back with the voice.
+    /// Starts an XMA stream on a new voice without decoding on the calling thread: a worker decodes and queues the
+    /// buffer, so the title's thread never waits for the decoder. The voice plays from when the buffer arrives.
+    pub fn play_xma_async(
+        &mut self,
+        request: OwnedXmaRequest,
+        looping: Looping,
+        gain: f32,
+    ) -> (VoiceId, BufferId) {
+        let id = self.new_buffer_id();
+        let mut params = VoiceParams::new(request.sample_rate);
+        params.gain = gain;
+        let voice = self.add_voice(params);
+        let mixer = self.mixer.clone();
+        let spawned = std::thread::Builder::new()
+            .name("leonida-xma".into())
+            .spawn(move || {
+                let decoded = xma::decode(&request.borrow());
+                if let (Ok(decoded), Ok(mut mixer)) = (decoded, mixer.lock()) {
+                    let buffer = Buffer::from_i16(id, &decoded.pcm, decoded.channels, looping);
+                    mixer.queue(voice, buffer);
+                }
+            });
+        if spawned.is_err() {
+            self.note_once("xma-thread", || "no thread for an XMA decode".into());
+        }
+        (voice, id)
+    }
+
+    /// Decodes an XMA stream on the calling thread and starts it on a new voice; the buffer id comes back with the voice.
     pub fn play_xma(
         &mut self,
         request: &XmaRequest<'_>,
@@ -214,13 +384,13 @@ mod tests {
         let mut e = Engine::new(OutputMode::Off);
         let a = e.acp_create();
         assert_eq!(a, e.acp_create());
-        let c = e.allocate_shape_contexts();
+        let c = e.allocate_shape_contexts(350);
         assert_ne!(a, c);
-        // SAFETY: the context block is CONTEXT_BYTES long and owned by the engine.
-        let bytes = unsafe { std::slice::from_raw_parts(c as *const u8, CONTEXT_BYTES) };
+        // SAFETY: the context block is 350 contexts long and owned by the engine.
+        let bytes = unsafe { std::slice::from_raw_parts(c as *const u8, 350 * CONTEXT_BYTES) };
         assert!(bytes.iter().all(|b| *b == 0));
         e.release_shape_contexts();
-        assert_ne!(e.allocate_shape_contexts(), 0);
+        assert_ne!(e.allocate_shape_contexts(1), 0);
     }
 
     #[test]
@@ -278,6 +448,77 @@ mod tests {
         let done = e.take_completions();
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].buffer, buffer);
+    }
+
+    #[test]
+    fn an_async_xma_stream_queues_when_the_worker_is_done_and_never_blocks_the_caller() {
+        let mut e = Engine::new(OutputMode::Off);
+        e.activate();
+        let request = OwnedXmaRequest {
+            data: vec![0; 64],
+            sample_rate: 24_000,
+            channels: 1,
+            frames: 12_000,
+        };
+        let (voice, buffer) = e.play_xma_async(request, Looping::Once, 1.0);
+        let until = Instant::now() + Duration::from_secs(5);
+        while e.mixer().lock().unwrap().queued_buffers(voice) == 0 {
+            assert!(Instant::now() < until, "worker never queued the buffer");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        e.pump_to(Duration::from_millis(501));
+        let done = e.take_completions();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].buffer, buffer);
+    }
+
+    #[test]
+    fn enabling_a_context_maps_its_buffers_and_output_reads_move_its_read_offset() {
+        let mut e = Engine::new(OutputMode::Off);
+        e.apu.create_heap(0, 0x226e00);
+        let (input, input_apu) = e.apu.alloc(2048 * 2, 0x800).unwrap();
+        let (ring, ring_apu) = e.apu.alloc(0x1700, 0x800).unwrap();
+        let contexts = e.allocate_shape_contexts(4);
+        let ctx = contexts + CTX_BYTES;
+        // SAFETY: context 1 lies inside the four contexts just allocated.
+        unsafe {
+            let w = ctx as *mut u32;
+            w.write(2 | (255 << 12) | (23 << 22));
+            w.add(1).write(3 << 27);
+            w.add(5).write(input_apu);
+            w.add(7).write(ring_apu);
+        }
+        assert_ne!((input, ring), (0, 0));
+        e.apply_hal(HalCommand::Enable { context: 1 });
+        assert!(e.hal_mut().is_enabled(1));
+        e.apply_hal(HalCommand::OutputRead {
+            context: 1,
+            blocks: 5,
+        });
+        // SAFETY: as above.
+        let read = unsafe { (ctx as *const u32).add(9).read() };
+        assert_eq!(read & 0x1f, 5);
+        e.apply_hal(HalCommand::Enable { context: 99 });
+        e.stop_hal();
+        e.release_shape_contexts();
+    }
+
+    #[test]
+    fn reopen_attempts_are_spaced() {
+        let mut gate = ReopenGate::default();
+        let t = Instant::now();
+        assert!(gate.due(t));
+        assert!(!gate.due(t + Duration::from_millis(500)));
+        assert!(!gate.due(t + Duration::from_millis(1999)));
+        assert!(gate.due(t + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn a_device_check_with_output_off_opens_nothing() {
+        let mut e = Engine::new(OutputMode::Off);
+        e.activate();
+        e.check_device(Instant::now());
+        assert!(!e.has_device());
     }
 
     #[test]

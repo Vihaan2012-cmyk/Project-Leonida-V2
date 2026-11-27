@@ -2,7 +2,7 @@
 #![cfg(windows)]
 #![allow(unsafe_code)]
 
-use enhancements::framerate::{self, STEP_FLOOR};
+use enhancements::framerate::{self, CLOCK_FLOOR, STEP_FLOOR};
 use enhancements::patch::{
     Buffer, CodeMemory, Finder, Mapped, PatchError, Pattern, apply, apply_all, revert_all, test,
 };
@@ -19,6 +19,11 @@ const PDATA: u32 = 0x3000;
 const RELOC: u32 = 0x4000;
 const DECOY: u32 = TEXT + 0x80;
 const POINTER: u32 = TEXT + 0x100;
+const SETUP: u32 = TEXT + 0x140;
+const SETTINGS: u32 = TEXT + 0x1A0;
+const FLOOR_A: u32 = DATA + 0x30;
+const LIMIT_FLOOR: u32 = DATA + 0x34;
+const FLAG: u32 = DATA + 0x38;
 
 const DT: f32 = 0.007;
 const ONE_THIRTIETH: f32 = 1.0 / 30.0;
@@ -74,6 +79,31 @@ fn pointer_function() -> Vec<u8> {
     code
 }
 
+fn disp(next: u32, target: u32) -> [u8; 4] {
+    (target.wrapping_sub(next) as i32).to_le_bytes()
+}
+
+/// The floor setup of the timer initialiser: both floors stored, then the flag set from the flags of an earlier test.
+fn setup_function() -> Vec<u8> {
+    let mut code = vec![0xC7, 0x05];
+    code.extend_from_slice(&disp(SETUP + 10, FLOOR_A));
+    code.extend_from_slice(&0x39AE_C33Eu32.to_le_bytes());
+    code.extend_from_slice(&[0xC5, 0xFA, 0x11, 0x05]);
+    code.extend_from_slice(&disp(SETUP + 18, LIMIT_FLOOR));
+    code.extend_from_slice(&[0x0F, 0x94, 0x05]);
+    code.extend_from_slice(&disp(SETUP + 25, FLAG));
+    code.push(0xC3);
+    code
+}
+
+/// `1 / limit` computed after a settings change and stored.
+fn settings_function() -> Vec<u8> {
+    let mut code = vec![0xC5, 0xF2, 0x5E, 0xC0, 0xC5, 0xFA, 0x11, 0x05];
+    code.extend_from_slice(&disp(SETTINGS + 12, LIMIT_FLOOR));
+    code.push(0xC3);
+    code
+}
+
 fn put(file: &mut [u8], at: usize, bytes: &[u8]) {
     file[at..at + bytes.len()].copy_from_slice(bytes);
 }
@@ -103,7 +133,7 @@ fn image() -> Vec<u8> {
     put(&mut file, optional + 68, &3u16.to_le_bytes());
     put(&mut file, optional + 70, &0x160u16.to_le_bytes());
     put(&mut file, optional + 108, &16u32.to_le_bytes());
-    for (index, (rva, size)) in [(3, (PDATA, 36)), (5, (RELOC, 24))] {
+    for (index, (rva, size)) in [(3, (PDATA, 60)), (5, (RELOC, 24))] {
         put(&mut file, optional + 112 + 8 * index, &rva.to_le_bytes());
         put(
             &mut file,
@@ -135,6 +165,10 @@ fn image() -> Vec<u8> {
     put(&mut file, 0x400, &floor);
     put(&mut file, 0x400 + 0x80, &decoy);
     put(&mut file, 0x400 + 0x100, &pointer);
+    let setup = setup_function();
+    let settings = settings_function();
+    put(&mut file, 0x400 + 0x140, &setup);
+    put(&mut file, 0x400 + 0x1A0, &settings);
     put(&mut file, 0x620, &ONE_THIRTIETH.to_le_bytes());
     put(&mut file, 0x624, &ONE_THREE_THOUSANDTH.to_le_bytes());
     put(&mut file, 0x628, &DT.to_le_bytes());
@@ -143,6 +177,8 @@ fn image() -> Vec<u8> {
         (TEXT, TEXT + floor.len() as u32),
         (DECOY, DECOY + decoy.len() as u32),
         (POINTER, POINTER + pointer.len() as u32),
+        (SETUP, SETUP + setup.len() as u32),
+        (SETTINGS, SETTINGS + settings.len() as u32),
     ];
     for (index, (begin, end)) in entries.iter().enumerate() {
         let entry = [*begin, *end, PDATA + 0x80]
@@ -239,7 +275,9 @@ fn the_floor_patch_redirects_one_displacement() {
         i64::from(DATA + 0x24) - next
     );
     assert_eq!(framerate::select(&finder, false, &[]).unwrap(), Vec::new());
-    assert_eq!(framerate::select(&finder, true, &[]).unwrap(), patches);
+    let mut all = patches;
+    all.extend(CLOCK_FLOOR.patches(&finder).unwrap());
+    assert_eq!(framerate::select(&finder, true, &[]).unwrap(), all);
 }
 
 #[test]
@@ -379,5 +417,76 @@ fn a_mapped_image_runs_patched_and_reverted_without_ever_being_writable_and_exec
     assert!(matches!(
         memory.write(0x4FFF, &[0; 2]),
         Err(PatchError::Outside { .. })
+    ));
+}
+
+fn decode(bytes: &[u8], at: u32) -> Vec<iced_x86::Instruction> {
+    use iced_x86::{Decoder, DecoderOptions};
+    let mut decoder = Decoder::with_ip(64, bytes, BASE + u64::from(at), DecoderOptions::NONE);
+    let mut out = Vec::new();
+    while decoder.can_decode() {
+        out.push(decoder.decode());
+    }
+    out
+}
+
+#[test]
+fn the_clock_floor_stores_become_stores_of_the_first_floor() {
+    use iced_x86::{Mnemonic, Register};
+    let bytes = image();
+    let parsed = Image::parse(&bytes).unwrap();
+    let finder = Finder::new(&parsed);
+    let patches = CLOCK_FLOOR.patches(&finder).unwrap();
+    assert_eq!(patches.len(), 2);
+
+    let setup = &patches[0];
+    assert_eq!(setup.rva, SETUP);
+    assert_eq!(setup.original.len(), 18);
+    assert_eq!(setup.replacement.len(), 18);
+    let code = decode(&setup.replacement, SETUP);
+    assert_eq!(code[0].mnemonic(), Mnemonic::Mov);
+    assert_eq!(code[0].op0_register(), Register::EAX);
+    assert_eq!(code[0].immediate32(), 0x39AE_C33E);
+    for (instruction, target) in [(code[1], FLOOR_A), (code[2], LIMIT_FLOOR)] {
+        assert_eq!(instruction.mnemonic(), Mnemonic::Mov);
+        assert_eq!(instruction.op1_register(), Register::EAX);
+        assert_eq!(
+            instruction.ip_rel_memory_address(),
+            BASE + u64::from(target)
+        );
+    }
+    assert_eq!(code[3].mnemonic(), Mnemonic::Nop);
+
+    let settings = &patches[1];
+    assert_eq!(settings.rva, SETTINGS);
+    assert_eq!(settings.original.len(), 12);
+    let code = decode(&settings.replacement, SETTINGS);
+    assert_eq!(code[0].mnemonic(), Mnemonic::Mov);
+    assert_eq!(code[0].immediate32(), 0x39AE_C33E);
+    assert_eq!(
+        code[0].ip_rel_memory_address(),
+        BASE + u64::from(LIMIT_FLOOR)
+    );
+    assert_eq!(code[1].mnemonic(), Mnemonic::Nop);
+    assert_eq!(code[0].len() + code[1].len(), 12);
+
+    let mut memory = text_buffer(&bytes);
+    let before = memory.0.clone();
+    let applied = apply_all(&mut memory, &patches).unwrap();
+    assert_ne!(memory.0, before);
+    revert_all(&mut memory, applied);
+    assert_eq!(memory.0, before);
+}
+
+#[test]
+fn the_settings_store_is_matched_on_the_address_the_setup_stores_to() {
+    let mut bytes = image();
+    let at = 0x400 + 0x1A0 + 8;
+    bytes[at..at + 4].copy_from_slice(&disp(SETTINGS + 12, FLAG));
+    let parsed = Image::parse(&bytes).unwrap();
+    let finder = Finder::new(&parsed);
+    assert!(matches!(
+        CLOCK_FLOOR.patches(&finder),
+        Err(PatchError::NotFound { .. })
     ));
 }

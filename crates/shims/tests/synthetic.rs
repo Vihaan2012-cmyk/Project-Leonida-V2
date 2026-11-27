@@ -22,7 +22,7 @@ const RELOC: u32 = 0x5000;
 const IMPORTS: [(&str, &str); 5] = [
     ("test.dll", "Triple"),
     ("missing.dll", "Nothing"),
-    ("WS2_32.dll", "connect"),
+    ("WININET.dll", "InternetOpenW"),
     ("kernel32.dll", "GetCurrentProcessId"),
     ("kernel32.dll", "GetFileAttributesW"),
 ];
@@ -225,9 +225,9 @@ fn run(mut binder: Binder) -> Binder {
                 blocked: None,
             },
             Trap {
-                dll: "WS2_32.dll".into(),
-                function: "connect".into(),
-                blocked: Some(offline::Reason::Sockets),
+                dll: "WININET.dll".into(),
+                function: "InternetOpenW".into(),
+                blocked: Some(offline::Reason::WebRequests),
             },
         ]
     );
@@ -275,8 +275,12 @@ fn imports_are_classified_without_loading() {
         Binding::Host
     );
     assert_eq!(
-        classify("api-ms-win-core-synch-l1-1-0.dll", "Sleep"),
+        classify("api-ms-win-core-synch-l1-1-0.dll", "WaitForSingleObject"),
         Binding::Host
+    );
+    assert_eq!(
+        classify("api-ms-win-core-synch-l1-2-0.dll", "Sleep"),
+        Binding::Shim
     );
     assert_eq!(
         classify("WINHTTP.dll", "WinHttpOpen"),

@@ -52,3 +52,20 @@ fn the_step_floor_pattern_is_unique_in_the_whole_image() {
     let patches = STEP_FLOOR.patches(&finder).unwrap();
     assert_eq!(patches.len(), 1);
 }
+
+/// Decodes every function: slow in a debug build, so run with `--release -- --ignored`.
+#[test]
+#[ignore]
+fn the_clock_floor_stores_are_where_the_notes_say() {
+    let Some(bytes) = executable() else {
+        return;
+    };
+    let image = Image::parse(&bytes).unwrap();
+    let finder = Finder::new(&image);
+    let patches = framerate::CLOCK_FLOOR.patches(&finder).unwrap();
+    assert_eq!(patches.len(), 2);
+    assert_eq!(patches[0].rva, 0x0222_6190);
+    assert_eq!(patches[0].original.len(), 18);
+    assert_eq!(patches[1].rva, 0x0224_35e6);
+    assert_eq!(patches[1].original.len(), 12);
+}
