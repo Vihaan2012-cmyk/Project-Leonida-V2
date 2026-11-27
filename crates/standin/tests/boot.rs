@@ -49,6 +49,24 @@ fn run_script(script: &Script, environment: &Environment) -> Report {
 fn child(name: &str) {
     let environment = environment();
     match name {
+        "selftest" => {
+            let script = Script::new()
+                .step(Stage::Memory, "passes", |_| Ok(()))
+                .step(Stage::Files, "fails with a value", |e| {
+                    e.asm.mov(iced_x86::code_asm::rax, 0x1234u64)?;
+                    e.fail()
+                })
+                .step(Stage::Audio, "never runs", |_| Ok(()));
+            let built = script.build().expect("assembles");
+            let report = standin::run(&built, &environment, &RunOptions::default()).unwrap();
+            let failure = report.failed.clone().expect("the second step failed");
+            assert_eq!(failure.id, (Stage::Files as u32) << 8 | 1);
+            assert_eq!(failure.detail, 0x1234);
+            assert_eq!(failure.name, Some("fails with a value"));
+            assert_eq!(report.completed, 1);
+            assert_eq!(report.exit, standin::FAILED | failure.id);
+            assert!(!report.passed());
+        }
         "boot-to-device" => {
             let report = run_script(&steps::boot_until(Stage::Device), &environment);
             for stage in Stage::ALL {
@@ -192,6 +210,11 @@ fn device() {
 #[ignore = "needs the assembled device"]
 fn present() {
     in_child("present");
+}
+
+#[test]
+fn a_failed_check_names_its_step() {
+    in_child("selftest");
 }
 
 #[test]
