@@ -11,6 +11,8 @@ pub mod audio;
 pub mod bvh_builder;
 #[cfg(windows)]
 mod code;
+#[cfg(windows)]
+pub mod constants;
 pub mod d3d12;
 pub mod dstorage;
 pub mod fidelityfx;
@@ -18,6 +20,7 @@ pub mod files;
 pub mod gameinput;
 pub mod loader;
 pub mod media;
+pub mod presentation;
 pub mod threads;
 pub mod trace;
 pub mod xg;

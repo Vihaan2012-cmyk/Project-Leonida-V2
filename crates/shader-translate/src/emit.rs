@@ -19,6 +19,8 @@ mod image;
 mod memory;
 mod merged;
 mod pixel;
+#[cfg(test)]
+mod push_layout;
 mod typed;
 
 pub const STATE_SCC: u32 = 128;
@@ -57,9 +59,18 @@ pub struct FloatMode {
     pub preserve_denormals: bool,
 }
 
-pub const PUSH_WORDS: u32 = 36;
+/// The push-constant block, in words: s0-s31 (the user data every stage of a pipeline shares), the heap base,
+/// then one code base per stage kind, each a low word and a high word. A stage declares the block only as far
+/// as its own code base, so a stage never reads another kind's words.
 pub const PUSH_HEAP: u32 = 32;
+/// The code base of compute, vertex, mesh and the first half of a merged vertex-and-geometry shader.
 pub const PUSH_CODE: u32 = 34;
+/// The code base of a geometry shader, the second half of a merged shader.
+pub const PUSH_CODE_GEOMETRY: u32 = 36;
+/// The code base of a pixel shader.
+pub const PUSH_CODE_PIXEL: u32 = 38;
+/// The size of the whole block; a pipeline's push range covers this many words.
+pub const PUSH_WORDS: u32 = 40;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ComputeOptions {
@@ -97,6 +108,16 @@ enum Entry<'a> {
     Mesh(&'a MeshOptions),
     Es(&'a EsOptions),
     Gs(&'a GsOptions),
+}
+
+impl Entry<'_> {
+    fn code_word(&self) -> u32 {
+        match self {
+            Entry::Gs(_) => PUSH_CODE_GEOMETRY,
+            Entry::Pixel(_) => PUSH_CODE_PIXEL,
+            _ => PUSH_CODE,
+        }
+    }
 }
 
 /// One fetched vertex attribute: the input-signature register, read as four components of `number`.
@@ -274,6 +295,7 @@ struct Emitter {
     scalar_loads: HashMap<Word, (u32, Word)>,
     descriptor_lookups: HashMap<(usize, Vec<Word>), (u32, Word)>,
     code_base: u64,
+    code_word: u32,
     heap: Option<Word>,
     code: Option<Word>,
     push: Word,
@@ -510,7 +532,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     let (mut state, mut memory, mut lds_image, mut exports, mut push) = (0, 0, 0, 0, 0);
     let mut storage_block = None;
     if heap_mode {
-        let count = b.constant_bit32(u32_, PUSH_WORDS);
+        let count = b.constant_bit32(u32_, entry.code_word() + 2);
         let array = b.type_array(u32_, count);
         b.decorate(array, Decoration::ArrayStride, [Operand::LiteralBit32(4)]);
         let block = b.type_struct([array]);
@@ -714,6 +736,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         scalar_loads: HashMap::new(),
         descriptor_lookups: HashMap::new(),
         code_base,
+        code_word: entry.code_word(),
         heap: None,
         code: None,
         push,
@@ -1377,8 +1400,8 @@ impl Emitter {
         let low = self.push_word(PUSH_HEAP)?;
         let high = self.push_word(PUSH_HEAP + 1)?;
         self.heap = Some(self.pack(low, high)?);
-        let low = self.push_word(PUSH_CODE)?;
-        let high = self.push_word(PUSH_CODE + 1)?;
+        let low = self.push_word(self.code_word)?;
+        let high = self.push_word(self.code_word + 1)?;
         self.code = Some(self.pack(low, high)?);
         let mut group_slots = Vec::new();
         for (axis, enabled) in options.workgroup_ids.iter().enumerate() {

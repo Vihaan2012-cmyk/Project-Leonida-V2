@@ -17,6 +17,7 @@ ruzstd.workspace = true
 serde.workspace = true
 sha2.workspace = true
 shader-container.workspace = true
+name-hash.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

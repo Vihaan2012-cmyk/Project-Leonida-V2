@@ -200,9 +200,16 @@ pub struct RunArgs {
     /// OUTPUT/boot.
     #[arg(long)]
     pub trace: bool,
-    /// Where Leonida writes what it makes while running.
-    #[arg(long, default_value = "Output")]
-    pub output: PathBuf,
+    /// Where Leonida writes what it makes while running. Defaults to `output_folder` in Config/leonida.toml.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    /// The folder with leonida.toml, graphics.toml, input.toml and mods.toml.
+    #[arg(long, default_value = config::DEFAULT_DIR)]
+    pub config: PathBuf,
+    /// Hold the frame rate to console, uncapped, vsync or a number of frames per second, instead of what
+    /// graphics.toml says.
+    #[arg(long)]
+    pub frame_limit: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -273,6 +280,13 @@ pub enum ExeCommand {
         /// Functions larger than this many bytes are left as stubs.
         #[arg(long, default_value_t = 0x2_0000)]
         max_size: u32,
+        /// The program database to take names, classes and source files from. Built and saved there when missing.
+        /// Defaults to program.db next to the output folder.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Name functions from the executable's own tables only, without the program database.
+        #[arg(long)]
+        no_db: bool,
         /// Functions per file for code with no known source file or class.
         #[arg(long, default_value_t = 200)]
         per_file: usize,
@@ -290,6 +304,15 @@ pub enum ExeCommand {
         /// Most references to print.
         #[arg(long, default_value_t = 100)]
         limit: usize,
+    },
+    /// Build the whole-program database (functions, call graph, RTTI classes, evidence-based names) and save it.
+    Analyze {
+        /// Where to write the database.
+        #[arg(long, default_value = "Output/decomp/program.db")]
+        out: PathBuf,
+        /// Worker threads for the scan.
+        #[arg(long, default_value_t = 4)]
+        threads: usize,
     },
     /// Readable text in the executable's data sections.
     Strings {

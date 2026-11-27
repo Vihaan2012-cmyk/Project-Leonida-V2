@@ -4,8 +4,8 @@
 
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::sync::Once;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, Once};
 
 const CLASSES: &str = include_str!("../src/loader/classes.txt");
 
@@ -83,8 +83,12 @@ fn configure() {
 }
 
 /// The object a class serves for its own id.
+/// Held while a test reads a runtime object's reference count, and by every query, which adds a reference.
+static REFERENCES: Mutex<()> = Mutex::new(());
+
 fn object(class: &str) -> usize {
     configure();
+    let _queries = REFERENCES.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = 0usize;
     let hr = shims::loader::query_api(&class_id(class), &class_id(class), &mut out);
     assert_eq!(hr, 0, "{class}");
@@ -94,6 +98,7 @@ fn object(class: &str) -> usize {
 
 fn object_as(class: &str, interface: &str) -> usize {
     configure();
+    let _queries = REFERENCES.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = 0usize;
     let hr = shims::loader::query_api(&class_id(class), &interface_id(interface), &mut out);
     assert_eq!(hr, 0, "{class} as {interface}");
@@ -184,10 +189,15 @@ fn module_handles_answer_for_console_dlls_and_the_other_load_variants() {
         assert_eq!(handle_ex(1, wide("d3d12_xs").as_ptr(), &mut again), 1);
         assert_eq!(again, loaded);
         assert_eq!(disable(loaded), 1);
-        assert_eq!(
+        assert_ne!(
             handle(wide("bink2scarlett.dll").as_ptr()),
             0,
-            "package DLLs are not loaded"
+            "the media shim makes Bink a console DLL"
+        );
+        assert_eq!(
+            handle(wide("some_package_library.dll").as_ptr()),
+            0,
+            "DLLs with no shim are not loaded"
         );
         assert_eq!(last_error(), 126);
         assert_ne!(handle(std::ptr::null()), 0, "this process");
@@ -356,8 +366,10 @@ fn derived_interfaces_answer_with_the_same_object_and_a_second_family_is_its_own
     unsafe {
         let add_ref: unsafe extern "win64" fn(usize) -> u32 = slot(user, 1);
         let release: unsafe extern "win64" fn(usize) -> u32 = slot(user, 2);
+        let counting = REFERENCES.lock().unwrap_or_else(|e| e.into_inner());
         let before = add_ref(user);
         assert_eq!(release(user), before - 1);
+        drop(counting);
         let query: unsafe extern "win64" fn(usize, *const [u8; 16], *mut usize) -> i32 =
             slot(user, 0);
         let mut again = 0usize;

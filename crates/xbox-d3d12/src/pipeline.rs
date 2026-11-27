@@ -43,8 +43,6 @@ pub enum PipelineError {
     NoFeature(&'static str),
     #[error("DXGI format {0} is not one a pipeline can use here")]
     Format(u32),
-    #[error("{0}")]
-    CodeBase(&'static str),
     #[error("root signature: {0}")]
     Root(#[from] RootError),
     #[error("Vulkan: {0}")]
@@ -280,9 +278,6 @@ pub struct Pipeline {
     pub has_geometry: bool,
     /// The thread-group size of a compute or mesh shader.
     pub threads: Option<[u32; 3]>,
-    /// The console VA the pipeline's code base words carry: the program of the one stage that reads its own
-    /// address.
-    pub code_base: u64,
     pub key: [u8; 32],
 }
 
@@ -303,7 +298,8 @@ impl fmt::Debug for Pipeline {
 }
 
 impl Pipeline {
-    /// The push-constant block of this pipeline's stages: the user data, then the heap base and the code base.
+    /// The push-constant block of this pipeline's stages: the user data, the heap base, then each stage's own
+    /// code base in the words of its kind (see `shader_translate::PUSH_CODE`).
     pub fn push_words(
         &self,
         user: &UserData,
@@ -314,9 +310,17 @@ impl Pipeline {
         let heap = shader_translate::PUSH_HEAP as usize;
         words[heap] = heap_base as u32;
         words[heap + 1] = (heap_base >> 32) as u32;
-        let code = shader_translate::PUSH_CODE as usize;
-        words[code] = self.code_base as u32;
-        words[code + 1] = (self.code_base >> 32) as u32;
+        for stage in &self.stages {
+            let code = match stage.user {
+                UserStage::Pixel => shader_translate::PUSH_CODE_PIXEL,
+                UserStage::Geometry => shader_translate::PUSH_CODE_GEOMETRY,
+                UserStage::Compute | UserStage::Vertex | UserStage::Mesh => {
+                    shader_translate::PUSH_CODE
+                }
+            } as usize;
+            words[code] = stage.code_va as u32;
+            words[code + 1] = (stage.code_va >> 32) as u32;
+        }
         words
     }
 
@@ -455,22 +459,6 @@ impl PipelineEnv {
         })
     }
 
-    /// Chooses the one code base the block carries, or says two stages need different ones. The translator
-    /// reads a single code base for every stage of a pipeline.
-    fn code_base(&self, stages: &[StageInfo]) -> Result<u64, PipelineError> {
-        let mut using = stages.iter().filter(|s| s.translated.uses_code_base);
-        let Some(first) = using.next() else {
-            return Ok(0);
-        };
-        if using.any(|s| s.translated.hash != first.translated.hash) {
-            self.note("two stages of one pipeline read constants through their own address");
-            return Err(PipelineError::CodeBase(
-                "two stages read constants through their own address, and the push block has one code base",
-            ));
-        }
-        Ok(first.code_va)
-    }
-
     pub fn create_graphics(&self, desc: &GraphicsPsoDesc) -> Result<Arc<Pipeline>, PipelineError> {
         let features = &self.ctx.features;
         let mesh = !desc.ms.is_empty();
@@ -544,7 +532,6 @@ impl PipelineEnv {
             &RootArguments::new(&desc.root),
             Default::default(),
         )?;
-        let code_base = self.code_base(&stages)?;
         for stage in &stages {
             if !stage.user.base_measured() {
                 self.note(&format!(
@@ -609,7 +596,6 @@ impl PipelineEnv {
             sample_count: desc.sample_count.max(1),
             has_geometry,
             threads,
-            code_base,
             key: desc.key(),
         }))
     }
@@ -924,11 +910,6 @@ impl PipelineEnv {
         let mut hash = Sha256::new();
         hash.update(root.fingerprint());
         hash.update(translated.hash);
-        let code_base = if translated.uses_code_base {
-            stage.code_va
-        } else {
-            0
-        };
         Ok(Arc::new(Pipeline {
             device: self.ctx.device.clone(),
             handle,
@@ -943,7 +924,6 @@ impl PipelineEnv {
             depth_format: vk::Format::UNDEFINED,
             sample_count: 1,
             has_geometry: false,
-            code_base,
             key: hash.finalize().into(),
         }))
     }

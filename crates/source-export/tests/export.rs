@@ -233,3 +233,21 @@ fn image_symbols_name_thunks_and_exports() {
     assert!(unsorted.contains("// callees (1): sub_00001040"));
     assert!(unsorted.contains("// callees (2): sub_00001040, sub_000010c0"));
 }
+
+#[test]
+fn program_database_names_and_notes_reach_the_files() {
+    let bytes = support::image();
+    let image = Image::parse(&bytes).unwrap();
+    let db = exe_analysis::ProgramDb::build(&image);
+    let symbols = source_export::DbSymbols::new(&db);
+    assert_eq!(symbols.function_name(F1), "ExportedStart");
+    let dir = tempfile::tempdir().unwrap();
+    let summary = export(&image, &symbols, &options(dir.path())).unwrap();
+    assert_eq!(summary.failed, 0, "{summary:?}");
+    let all = fs::read_dir(dir.path().join("unsorted"))
+        .unwrap()
+        .map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect::<String>();
+    assert!(all.contains("// ---- ExportedStart  rva 0x00001000"));
+    assert!(all.contains("// note: named from export ordinal 1"));
+}

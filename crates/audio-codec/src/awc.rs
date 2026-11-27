@@ -17,18 +17,7 @@ const FLAG_TABLE_4: u32 = 0x0040_0000;
 const FLAG_TABLE_N2: u32 = 0x0001_0000;
 const FLAG_TABLE_N1X4: u32 = 0x0020_0000;
 
-/// Jenkins one-at-a-time hash of the lowercased text, the game's name hash.
-pub fn joaat(text: &str) -> u32 {
-    let mut h: u32 = 0;
-    for b in text.bytes() {
-        h = h.wrapping_add(u32::from(b.to_ascii_lowercase()));
-        h = h.wrapping_add(h << 10);
-        h ^= h >> 6;
-    }
-    h = h.wrapping_add(h << 3);
-    h ^= h >> 11;
-    h.wrapping_add(h << 15)
-}
+pub use name_hash::joaat_lower as joaat;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AwcTag {

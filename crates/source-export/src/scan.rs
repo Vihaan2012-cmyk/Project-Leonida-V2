@@ -215,6 +215,14 @@ pub fn analyze(
     entries.dedup_by_key(|e| e.rva);
 
     let mut leaves: Vec<u32> = raws.iter().flat_map(|r| r.leaves.iter().copied()).collect();
+    let extras: std::collections::HashMap<u32, u32> =
+        symbols.extra_functions().into_iter().collect();
+    leaves.extend(
+        extras
+            .keys()
+            .copied()
+            .filter(|&rva| ctx.executable(rva) && ctx.pdata_index(rva).is_none()),
+    );
     leaves.sort_unstable();
     leaves.dedup();
     leaves.retain(|rva| entries.binary_search_by_key(rva, |e| e.rva).is_err());
@@ -226,12 +234,20 @@ pub fn analyze(
             let pdata_next = functions
                 .get(functions.partition_point(|f| f.begin <= rva))
                 .map_or(u32::MAX, |f| f.begin);
-            let extent = LEAF_EXTENT.min(next.min(pdata_next) - rva);
-            ctx.scan(rva, rva, extent as usize, true)
+            match extras.get(&rva).copied().filter(|size| *size > 0) {
+                Some(size) => ctx.scan(rva, rva, size as usize, false),
+                None => {
+                    let extent = LEAF_EXTENT.min(next.min(pdata_next) - rva);
+                    ctx.scan(rva, rva, extent as usize, true)
+                }
+            }
         })
         .collect();
 
-    entries.extend(leaves.iter().map(|&rva| Entry { rva, size: 0 }));
+    entries.extend(leaves.iter().map(|&rva| Entry {
+        rva,
+        size: extras.get(&rva).copied().unwrap_or(0),
+    }));
     entries.sort_by_key(|e| e.rva);
     let index_of = |rva: u32| entries.binary_search_by_key(&rva, |e| e.rva).ok();
 

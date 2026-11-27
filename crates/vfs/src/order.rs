@@ -16,7 +16,7 @@ use crate::path::fold;
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModsConfig {
-    #[serde(default)]
+    #[serde(default, alias = "load_order")]
     pub order: Vec<String>,
     #[serde(default)]
     pub disabled: Vec<String>,

@@ -7,6 +7,7 @@ use crate::buffer::{Buffer, BufferDesc, MemoryLocation};
 use crate::device::{Device, Queue, lock};
 use crate::error::{RenderError, Result};
 use crate::format::{Format, level_extent};
+use crate::staging::align_up;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageKind {
@@ -130,10 +131,6 @@ pub(crate) fn image_type(kind: ImageKind) -> vk::ImageType {
         ImageKind::D2 => vk::ImageType::TYPE_2D,
         ImageKind::D3 => vk::ImageType::TYPE_3D,
     }
-}
-
-fn align_up(value: u64, align: u64) -> u64 {
-    value.div_ceil(align) * align
 }
 
 impl Image {

@@ -151,7 +151,9 @@ name = "assets"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "name-hash",
  "png",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -174,6 +176,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "audio-codec"
 version = "0.1.0"
 dependencies = [
+ "name-hash",
  "thiserror 2.0.21",
 ]
 
@@ -437,6 +440,7 @@ dependencies = [
  "flate2",
  "game-package",
  "memchr",
+ "name-hash",
  "serde",
  "serde_json",
  "sha2",
@@ -712,6 +716,20 @@ checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "exe-analysis"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+ "memchr",
+ "pe-image",
+ "postcard",
+ "rayon",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1134,6 +1152,8 @@ dependencies = [
  "content-filter",
  "decompile",
  "embed-manifest",
+ "enhancements",
+ "exe-analysis",
  "game-package",
  "gpu",
  "iced-x86",
@@ -1153,7 +1173,9 @@ dependencies = [
  "source-export",
  "systems",
  "tempfile",
+ "upscale",
  "vfs",
+ "xbox-d3d12",
 ]
 
 [[package]]
@@ -1318,6 +1340,10 @@ dependencies = [
  "rustc-hash",
  "thiserror 2.0.21",
 ]
+
+[[package]]
+name = "name-hash"
+version = "0.1.0"
 
 [[package]]
 name = "ndk"
@@ -2099,6 +2125,7 @@ dependencies = [
  "game-package",
  "memchr",
  "memmap2",
+ "name-hash",
  "postcard",
  "rayon",
  "redb",
@@ -2328,13 +2355,16 @@ dependencies = [
 name = "shims"
 version = "0.1.0"
 dependencies = [
+ "audio-codec",
  "bvh-build",
+ "config",
  "cpal",
  "gilrs",
  "offline",
  "pe-loader",
  "tempfile",
  "thiserror 2.0.21",
+ "upscale",
  "windows-sys 0.61.2",
  "xbox-d3d12",
 ]
@@ -2418,6 +2448,7 @@ name = "source-export"
 version = "0.1.0"
 dependencies = [
  "decompile",
+ "exe-analysis",
  "iced-x86",
  "pe-image",
  "rayon",
@@ -2711,6 +2742,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vfs"
 version = "0.1.0"
 dependencies = [
+ "name-hash",
  "offline",
  "serde",
  "serde_json",

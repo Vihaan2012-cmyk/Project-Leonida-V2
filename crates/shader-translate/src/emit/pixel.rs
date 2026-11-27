@@ -3,9 +3,7 @@ use std::collections::HashMap;
 use rspirv::dr::Operand;
 use rspirv::spirv::{BuiltIn, Capability, Decoration, StorageClass, Word};
 
-use super::{
-    DepthOutput, EXEC, EmitError, Emitter, PUSH_CODE, PUSH_HEAP, PixelOptions, PixelOutput, ok,
-};
+use super::{DepthOutput, EXEC, EmitError, Emitter, PUSH_HEAP, PixelOptions, PixelOutput, ok};
 use crate::images::Number;
 
 const PERSP_CENTER: u32 = 1 << 1;
@@ -120,8 +118,8 @@ impl Emitter {
         let low = self.push_word(PUSH_HEAP)?;
         let high = self.push_word(PUSH_HEAP + 1)?;
         self.heap = Some(self.pack(low, high)?);
-        let low = self.push_word(PUSH_CODE)?;
-        let high = self.push_word(PUSH_CODE + 1)?;
+        let low = self.push_word(self.code_word)?;
+        let high = self.push_word(self.code_word + 1)?;
         self.code = Some(self.pack(low, high)?);
         let is_helper = ok(self.b.load(bool_, None, helper, None, []))?;
         let live = ok(self.b.logical_not(bool_, None, is_helper))?;

@@ -45,9 +45,15 @@ pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
             resume,
             only,
             max_size,
+            db,
+            no_db,
             per_file,
         } => export_source(
             &image,
+            (!*no_db).then(|| {
+                db.clone()
+                    .unwrap_or_else(|| out.parent().unwrap_or(Path::new("")).join("program.db"))
+            }),
             source_export::Options {
                 out: out.clone(),
                 jobs: *jobs,
@@ -62,6 +68,7 @@ pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
         ExeCommand::Network => network(&image),
         ExeCommand::Functions { top } => functions(&image, *top),
         ExeCommand::Disasm { address, limit } => disasm(&image, address, *limit)?,
+        ExeCommand::Analyze { out, threads } => analyze(&image, out, *threads)?,
         ExeCommand::Strings { find, min, limit } => strings(&image, find.as_deref(), *min, *limit),
         ExeCommand::Xrefs {
             address,
@@ -79,10 +86,38 @@ pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn export_source(image: &Image<'_>, options: source_export::Options) -> Result<()> {
-    let symbols = source_export::ImageSymbols::new(image);
+fn export_source(
+    image: &Image<'_>,
+    db_path: Option<PathBuf>,
+    options: source_export::Options,
+) -> Result<()> {
     let out = options.out.clone();
-    let summary = source_export::export(image, &symbols, &options)?;
+    let summary = match db_path {
+        Some(path) => {
+            let db = match exe_analysis::ProgramDb::load(&path) {
+                Ok(db) if db.image_base() == image.image_base => {
+                    println!("using {}", path.display());
+                    db
+                }
+                _ => {
+                    println!(
+                        "building the program database (saved to {})",
+                        path.display()
+                    );
+                    let build = exe_analysis::BuildOptions {
+                        threads: options.jobs,
+                    };
+                    let db = exe_analysis::ProgramDb::build_with(image, &build);
+                    db.save(&path)
+                        .with_context(|| format!("writing {}", path.display()))?;
+                    println!("{}", db.summary());
+                    db
+                }
+            };
+            source_export::export(image, &source_export::DbSymbols::new(&db), &options)?
+        }
+        None => source_export::export(image, &source_export::ImageSymbols::new(image), &options)?,
+    };
     println!(
         "{} functions, {} failed, {} stubbed, {} files written ({} kept from an earlier run), {:.1}s",
         summary.functions,
@@ -93,6 +128,16 @@ fn export_source(image: &Image<'_>, options: source_export::Options) -> Result<(
         summary.elapsed.as_secs_f64()
     );
     println!("see {}", out.join("index.md").display());
+    Ok(())
+}
+
+fn analyze(image: &Image<'_>, out: &Path, threads: usize) -> Result<()> {
+    let options = exe_analysis::BuildOptions { threads };
+    let db = exe_analysis::ProgramDb::build_with(image, &options);
+    db.save(out)
+        .with_context(|| format!("writing {}", out.display()))?;
+    println!("{}", db.summary());
+    println!("saved to {}", out.display());
     Ok(())
 }
 
@@ -376,6 +421,29 @@ fn strings(image: &Image<'_>, find: Option<&str>, min: usize, limit: usize) {
     }
 }
 
+/// Stubs of the form `jmp qword ptr [rip+x]` through one of the IAT slots in `slots`. Most lie
+/// outside the exception table, so the whole code section is searched for them.
+fn import_thunks(image: &Image<'_>, slots: &HashSet<u32>) -> Vec<u32> {
+    let mut thunks = Vec::new();
+    for section in image.sections.iter().filter(|s| s.executable()) {
+        let Some(bytes) = image.read(section.virtual_address, section.raw_size as usize) else {
+            continue;
+        };
+        for (offset, window) in bytes.windows(6).enumerate() {
+            if window[0] != 0xFF || window[1] != 0x25 {
+                continue;
+            }
+            let rva = section.virtual_address + offset as u32;
+            let displacement = i32::from_le_bytes([window[2], window[3], window[4], window[5]]);
+            let slot = i64::from(rva) + 6 + i64::from(displacement);
+            if u32::try_from(slot).is_ok_and(|slot| slots.contains(&slot)) {
+                thunks.push(rva);
+            }
+        }
+    }
+    thunks
+}
+
 fn xrefs(
     image: &Image<'_>,
     address: Option<&str>,
@@ -412,12 +480,7 @@ fn xrefs(
         bail!("nothing to look for: give an address, --import or --string");
     }
     let functions = image.functions();
-    let thunks: Vec<u32> = functions
-        .iter()
-        .filter(|f| f.end - f.begin <= 16)
-        .filter(|f| thunk_target(image, f.begin).is_some_and(|slot| targets.contains(&slot)))
-        .map(|f| f.begin)
-        .collect();
+    let thunks = import_thunks(image, &targets);
     targets.extend(thunks);
     let base = image.image_base;
     let rva = |va: u64| va.wrapping_sub(base) as u32;

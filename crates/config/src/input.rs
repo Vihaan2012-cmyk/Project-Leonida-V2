@@ -95,7 +95,8 @@ impl Action {
     }
 }
 
-const KEYBOARD_KEYS: &[&str] = &[
+/// Every key and mouse button name a keyboard binding may use.
+pub const KEYBOARD_KEYS: &[&str] = &[
     "A",
     "B",
     "C",
@@ -186,7 +187,8 @@ const KEYBOARD_KEYS: &[&str] = &[
     "WheelDown",
 ];
 
-const GAMEPAD_BUTTONS: &[&str] = &[
+/// Every gamepad button name a gamepad binding may use.
+pub const GAMEPAD_BUTTONS: &[&str] = &[
     "A",
     "B",
     "X",

@@ -28,6 +28,11 @@ pub trait Symbols: Sync {
     fn classes(&self) -> Vec<ClassInfo> {
         Vec::new()
     }
+    /// `(rva, size)` of functions that are not in the exception table and that calls alone do not reveal; size 0
+    /// when unknown.
+    fn extra_functions(&self) -> Vec<(u32, u32)> {
+        Vec::new()
+    }
 }
 
 pub fn default_name(rva: u32) -> String {

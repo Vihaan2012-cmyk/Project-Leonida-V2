@@ -11,6 +11,8 @@ clap.workspace = true
 config.workspace = true
 content-filter.workspace = true
 decompile.workspace = true
+enhancements.workspace = true
+exe-analysis.workspace = true
 game-package.workspace = true
 gpu.workspace = true
 iced-x86.workspace = true
@@ -23,6 +25,7 @@ sha2.workspace = true
 shims.workspace = true
 source-export.workspace = true
 systems.workspace = true
+upscale.workspace = true
 rdna.workspace = true
 rpf9.workspace = true
 shader-container.workspace = true
@@ -30,6 +33,7 @@ shader-ir.workspace = true
 shader-store.workspace = true
 shader-translate.workspace = true
 vfs.workspace = true
+xbox-d3d12.workspace = true
 
 [build-dependencies]
 embed-manifest = "1.5"

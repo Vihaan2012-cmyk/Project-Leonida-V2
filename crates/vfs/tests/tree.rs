@@ -525,3 +525,9 @@ fn a_package_cannot_bring_back_what_the_filter_hides() {
         .unwrap();
     assert!(!vfs.exists("a/x.dds").unwrap());
 }
+
+#[test]
+fn the_settings_files_load_order_is_read_as_the_order() {
+    let config = vfs::ModsConfig::from_toml("load_order = [\"first\", \"second\"]").unwrap();
+    assert_eq!(config.order, ["first", "second"]);
+}
