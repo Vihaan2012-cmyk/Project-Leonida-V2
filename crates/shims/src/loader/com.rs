@@ -225,7 +225,12 @@ pub(super) use method;
 fn impls() -> &'static [ClassImpl] {
     static IMPLS: OnceLock<Vec<ClassImpl>> = OnceLock::new();
     IMPLS.get_or_init(|| {
-        let all: Vec<ClassImpl> = Vec::new();
+        let mut all = super::system::impls();
+        all.extend(super::package::impls());
+        all.extend(super::devices::impls());
+        all.extend(super::save::impls());
+        all.extend(super::store::impls());
+        all.extend(super::user::impls());
         all
     })
 }
