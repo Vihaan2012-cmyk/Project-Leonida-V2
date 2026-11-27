@@ -20,6 +20,8 @@ pub mod config;
 mod device;
 pub mod hub;
 pub mod mapping;
+#[cfg(test)]
+mod tests;
 
 pub use config::InputConfig;
 pub use hub::{Hub, RawInput};
