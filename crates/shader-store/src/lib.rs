@@ -1,10 +1,15 @@
 //! Translated shaders, kept in a `redb` database so each game shader is translated once.
 
 mod error;
+mod program;
 mod record;
 pub mod translate;
 
 pub use error::StoreError;
+pub use program::{
+    Failure, Key, Source, Translated, container_programs, key_hex, key_of, record_of, translate_built,
+    translate_program,
+};
 pub use record::{
     Exactness, Options, PipelineOutcome, Record, Role, SCHEMA_VERSION, stage_kind,
     translator_version,
