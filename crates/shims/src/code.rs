@@ -96,15 +96,6 @@ impl Code {
         self.emit(&code)
     }
 
-    /// A COM method that hands `this`, its slot and its caller's return address to `handler`.
-    pub fn method_trap(&mut self, slot: usize, handler: usize) -> Option<usize> {
-        let mut code = vec![0x48, 0xBA];
-        code.extend_from_slice(&(slot as u64).to_le_bytes());
-        code.extend_from_slice(&[0x4C, 0x8B, 0x04, 0x24]);
-        jump_to(&mut code, handler);
-        self.emit(&code)
-    }
-
     pub fn seal(&mut self) -> Result<(), String> {
         for (page, _, sealed) in self.pages.iter_mut().filter(|p| !p.2) {
             let mut old = 0;
