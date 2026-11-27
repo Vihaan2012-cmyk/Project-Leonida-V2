@@ -373,3 +373,14 @@ impl ShaderSource for StoreSource {
         Ok(made)
     }
 }
+
+/// The store keeps the bytecode of the pipelines the game created, for the next session's replay.
+impl xbox_d3d12::compile_queue::BytecodeStore for Store {
+    fn put(&self, hash: &Key, bytes: &[u8]) {
+        let _ = self.put_bytecode(hash, bytes);
+    }
+
+    fn get(&self, hash: &Key) -> Option<Vec<u8>> {
+        self.bytecode(hash).ok().flatten()
+    }
+}
