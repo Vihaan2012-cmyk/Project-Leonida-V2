@@ -12,7 +12,8 @@
 //! - **Mirrored**: NVIDIA's sparse buffers accept only device-local memory, so the window is bound to device-local
 //!   memory and the imported host buffer is copied to it before the GPU reads (`record_uploads`) and back after
 //!   the GPU writes (`record_downloads`). Writes the CPU made are found by `GetWriteWatch`, by the caller's
-//!   `mark_dirty`, or by copying the whole region.
+//!   `mark_dirty`, or by copying the whole region. The `sync` module says how uploads, the transfer queue
+//!   (`submit_uploads`) and the copies back (`note_gpu_write`, `HostAccess`, `read_back`) keep neither side stale.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, c_void};
@@ -20,6 +21,14 @@ use std::sync::{Arc, Mutex};
 
 use ash::ext::external_memory_host;
 use ash::vk;
+
+mod dirty;
+mod sync;
+mod transfer;
+
+use dirty::Tiles;
+pub use sync::HostAccess;
+pub use transfer::{TimelineWait, TransferQueue, pick_transfer_family};
 
 /// The unit the console maps physical memory in, and the granule sparse binding works at.
 pub const PAGE: u64 = 64 * 1024;
@@ -66,6 +75,8 @@ pub struct Support {
     pub host_import: bool,
     pub buffer_address: bool,
     pub shader_int64: bool,
+    /// Timeline semaphores, which a transfer queue's uploads are ordered with.
+    pub timeline_semaphores: bool,
     /// `minImportedHostPointerAlignment`.
     pub host_alignment: u64,
     /// The largest window: the smaller of `maxBufferSize` and the sparse address space.
@@ -105,6 +116,7 @@ impl Support {
                 host_import,
                 buffer_address: v12.buffer_device_address == vk::TRUE,
                 shader_int64: base.shader_int64 == vk::TRUE,
+                timeline_semaphores: v12.timeline_semaphore == vk::TRUE,
                 host_alignment: host.min_imported_host_pointer_alignment.max(1),
                 max_window: v13.max_buffer_size.min(limits.sparse_address_space_size),
                 max_allocation: v11.max_memory_allocation_size,
@@ -253,52 +265,6 @@ impl Extents {
     }
 }
 
-/// Disjoint half-open address ranges.
-#[derive(Default, Debug, PartialEq, Eq)]
-struct RangeSet(BTreeMap<u64, u64>);
-
-impl RangeSet {
-    fn add(&mut self, lo: u64, hi: u64) {
-        if lo >= hi {
-            return;
-        }
-        let (mut lo, mut hi) = (lo, hi);
-        if let Some((&s, &e)) = self.0.range(..=lo).next_back()
-            && e >= lo
-        {
-            lo = s;
-            hi = hi.max(e);
-        }
-        let inside: Vec<u64> = self.0.range(lo..=hi).map(|(s, _)| *s).collect();
-        for s in inside {
-            hi = hi.max(self.0.remove(&s).expect("listed above"));
-        }
-        self.0.insert(lo, hi);
-    }
-
-    fn remove(&mut self, lo: u64, hi: u64) {
-        let hits: Vec<(u64, u64)> = self
-            .0
-            .iter()
-            .filter(|(s, e)| **s < hi && **e > lo)
-            .map(|(s, e)| (*s, *e))
-            .collect();
-        for (s, e) in hits {
-            self.0.remove(&s);
-            if s < lo {
-                self.0.insert(s, lo);
-            }
-            if e > hi {
-                self.0.insert(hi, e);
-            }
-        }
-    }
-
-    fn take(&mut self) -> Vec<(u64, u64)> {
-        std::mem::take(&mut self.0).into_iter().collect()
-    }
-}
-
 struct Window {
     base: u64,
     size: u64,
@@ -319,6 +285,9 @@ struct Memory {
     live: u64,
     mirror: Option<Mirror>,
     policy: SyncPolicy,
+    /// Where the imported host memory is. It equals the window address except for runs seen at another address.
+    host: u64,
+    tiles: Tiles,
 }
 
 struct Bind {
@@ -340,12 +309,28 @@ pub struct AddressSpace {
     extents: Extents,
     memories: HashMap<u64, Memory>,
     next_memory: u64,
-    dirty: RangeSet,
+    sync: sync::SyncState,
     pending: Vec<Bind>,
     batching: bool,
     retired_buffers: Vec<vk::Buffer>,
     retired_memory: Vec<vk::DeviceMemory>,
     generation: u64,
+    transfer: Option<transfer::Transfer>,
+    /// The families the window and the copy buffers are shared by: more than one when a transfer queue of another
+    /// family is in use.
+    families: Vec<u32>,
+}
+
+fn sharing(families: &[u32]) -> vk::SharingMode {
+    if families.len() > 1 {
+        vk::SharingMode::CONCURRENT
+    } else {
+        vk::SharingMode::EXCLUSIVE
+    }
+}
+
+fn families_for(families: &[u32]) -> &[u32] {
+    if families.len() > 1 { families } else { &[] }
 }
 
 fn align_down(value: u64, to: u64) -> u64 {
@@ -369,14 +354,34 @@ const WINDOW_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
 
 impl AddressSpace {
     pub fn new(handles: Handles, config: Config) -> Result<AddressSpace, MemoryError> {
+        Self::new_with_transfer(handles, config, None)
+    }
+
+    /// Like `new`, with a queue of its own for copying uploads (`submit_uploads`): when it is a family other
+    /// than `handles.queue_family`, the window is shared between the two. See `pick_transfer_family` and
+    /// `Support::timeline_semaphores` for what the device needs.
+    pub fn new_with_transfer(
+        handles: Handles,
+        config: Config,
+        transfer: Option<TransferQueue>,
+    ) -> Result<AddressSpace, MemoryError> {
         let support = Support::query(&handles.instance, handles.physical);
         support.check()?;
+        if transfer.is_some() && !support.timeline_semaphores {
+            return Err(MemoryError::Unsupported("timeline semaphores"));
+        }
+        let mut families = vec![handles.queue_family];
+        if let Some(t) = &transfer
+            && t.family != handles.queue_family
+        {
+            families.push(t.family);
+        }
         let size = config
             .size
             .unwrap_or(support.max_window)
             .min(support.max_window);
         let host = external_memory_host::Device::new(&handles.instance, &handles.device);
-        let window = Self::make_window(&handles, config.base, size, false)?;
+        let window = Self::make_window(&handles, config.base, size, false, &families)?;
         // SAFETY: `physical` came from `instance`.
         let types = unsafe {
             handles
@@ -394,16 +399,18 @@ impl AddressSpace {
             extents: Extents::default(),
             memories: HashMap::new(),
             next_memory: 1,
-            dirty: RangeSet::default(),
+            sync: sync::SyncState::default(),
             pending: Vec::new(),
             batching: false,
             retired_buffers: Vec::new(),
             retired_memory: Vec::new(),
             generation: 0,
+            transfer: None,
+            families,
         };
         space.backing = space.choose_backing()?;
         if space.backing == Backing::Direct {
-            let external = Self::make_window(&space.h, config.base, size, true)?;
+            let external = Self::make_window(&space.h, config.base, size, true, &space.families)?;
             let host = space.probe_host_bits()?;
             if host & external.type_bits != 0 {
                 let plain = std::mem::replace(&mut space.window, external);
@@ -414,6 +421,11 @@ impl AddressSpace {
                 unsafe { space.h.device.destroy_buffer(external.buffer, None) };
                 space.backing = Backing::Mirrored;
             }
+        }
+        if let Some(queue) = transfer
+            && space.backing == Backing::Mirrored
+        {
+            space.transfer = Some(transfer::Transfer::new(&space.h.device, queue)?);
         }
         Ok(space)
     }
@@ -464,6 +476,7 @@ impl AddressSpace {
         base: u64,
         size: u64,
         external: bool,
+        families: &[u32],
     ) -> Result<Window, MemoryError> {
         let mut host = vk::ExternalMemoryBufferCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
@@ -471,7 +484,8 @@ impl AddressSpace {
             .flags(vk::BufferCreateFlags::SPARSE_BINDING | vk::BufferCreateFlags::SPARSE_RESIDENCY)
             .size(size)
             .usage(WINDOW_USAGE)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            .sharing_mode(sharing(families))
+            .queue_family_indices(families_for(families));
         if external {
             info = info.push_next(&mut host);
         }
@@ -580,7 +594,13 @@ impl AddressSpace {
                 max: self.support.max_window,
             });
         }
-        let window = Self::make_window(&self.h, new_base, needed, self.backing == Backing::Direct)?;
+        let window = Self::make_window(
+            &self.h,
+            new_base,
+            needed,
+            self.backing == Backing::Direct,
+            &self.families,
+        )?;
         let old = std::mem::replace(&mut self.window, window);
         self.retired_buffers.push(old.buffer);
         self.generation += 1;
@@ -595,13 +615,7 @@ impl AddressSpace {
                 memory_offset: e.memory_offset,
             })
             .collect();
-        self.commit()?;
-        if self.backing == Backing::Mirrored {
-            for (va, e) in &self.extents.0 {
-                self.dirty.add(*va, *va + e.len);
-            }
-        }
-        Ok(())
+        self.commit()
     }
 
     /// Binds the host memory at `va..va + len`, which must stay mapped at that address until `unmap`, into the
@@ -612,8 +626,7 @@ impl AddressSpace {
     }
 
     /// Like `map_host`, for host memory at `host` that the GPU sees at `va`: a reserved resource's tiles are
-    /// mapped this way. Write watch only follows memory that is at its own address, so an aliased run is copied
-    /// whole each time instead.
+    /// mapped this way. Write watch follows the host memory, wherever the GPU sees it.
     pub fn map_host_at(
         &mut self,
         va: u64,
@@ -625,11 +638,6 @@ impl AddressSpace {
         self.check_aligned(host, len)?;
         self.ensure(va, va + len)?;
         self.unmap_range(va, len);
-        let policy = if host != va && policy == SyncPolicy::WriteWatch {
-            SyncPolicy::Always
-        } else {
-            policy
-        };
         let chunk = self.config.chunk.min(self.support.max_allocation);
         let chunk = align_down(chunk, PAGE.max(self.support.host_alignment)).max(PAGE);
         let count = len.div_ceil(chunk);
@@ -645,7 +653,7 @@ impl AddressSpace {
             done += part;
         }
         if self.backing == Backing::Mirrored {
-            self.dirty.add(va, va + len);
+            self.sync.dirty.add(va, va + len);
         }
         self.finish()
     }
@@ -765,6 +773,8 @@ impl AddressSpace {
                 live: len,
                 mirror,
                 policy,
+                host,
+                tiles: Tiles::default(),
             },
         );
         self.extents.insert(
@@ -799,6 +809,8 @@ impl AddressSpace {
                 &vk::BufferCreateInfo::default()
                     .size(len)
                     .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+                    .sharing_mode(sharing(&self.families))
+                    .queue_family_indices(families_for(&self.families))
                     .push_next(&mut host),
                 None,
             )?;
@@ -858,7 +870,7 @@ impl AddressSpace {
     }
 
     fn unmap_range(&mut self, va: u64, len: u64) {
-        self.dirty.remove(va, va + len);
+        self.sync.forget(va, va + len);
         for cut in self.extents.remove(va, len) {
             self.pending.push(Bind {
                 offset: cut.va - self.window.base,
@@ -929,150 +941,6 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Tells a mirrored window the CPU wrote `va..va + len`.
-    pub fn mark_dirty(&mut self, va: u64, len: u64) {
-        if self.backing == Backing::Mirrored {
-            self.dirty.add(va, va + len);
-        }
-    }
-
-    /// Copies to the window what the CPU wrote since the last call, so the commands recorded after these see it.
-    /// Nothing is recorded when the window is direct. Returns the bytes copied.
-    pub fn record_uploads(&mut self, command: vk::CommandBuffer) -> u64 {
-        if self.backing == Backing::Direct {
-            return 0;
-        }
-        let by_policy = |policy: SyncPolicy| -> Vec<(u64, u64)> {
-            self.extents
-                .0
-                .iter()
-                .filter(|(_, e)| self.memories[&e.memory].policy == policy)
-                .map(|(va, e)| (*va, *va + e.len))
-                .collect()
-        };
-        for (lo, hi) in by_policy(SyncPolicy::WriteWatch) {
-            match write_watch(lo, hi - lo) {
-                Some(pages) => {
-                    for page in pages {
-                        self.dirty.add(page, page + WATCH_PAGE);
-                    }
-                }
-                None => self.dirty.add(lo, hi),
-            }
-        }
-        for (lo, hi) in by_policy(SyncPolicy::Always) {
-            self.dirty.add(lo, hi);
-        }
-        let wanted = self.dirty.take();
-        let bytes = self.record_copies(command, &wanted, true);
-        if bytes > 0 {
-            self.barrier(
-                command,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-            );
-        }
-        bytes
-    }
-
-    /// Copies what the GPU wrote in `va..va + len` back to the host memory. The CPU may read it once the commands
-    /// have finished. Nothing is recorded when the window is direct. Returns the bytes copied.
-    pub fn record_downloads(&mut self, command: vk::CommandBuffer, va: u64, len: u64) -> u64 {
-        if self.backing == Backing::Direct {
-            return 0;
-        }
-        self.barrier(
-            command,
-            vk::AccessFlags::MEMORY_WRITE,
-            vk::AccessFlags::TRANSFER_READ,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::PipelineStageFlags::TRANSFER,
-        );
-        let bytes = self.record_copies(command, &[(va, va + len)], false);
-        self.barrier(
-            command,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::HOST_READ,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::HOST,
-        );
-        bytes
-    }
-
-    fn barrier(
-        &self,
-        command: vk::CommandBuffer,
-        from: vk::AccessFlags,
-        to: vk::AccessFlags,
-        src: vk::PipelineStageFlags,
-        dst: vk::PipelineStageFlags,
-    ) {
-        let barrier = [vk::MemoryBarrier::default()
-            .src_access_mask(from)
-            .dst_access_mask(to)];
-        // SAFETY: the command buffer is in the recording state, as the caller promises.
-        unsafe {
-            self.h.device.cmd_pipeline_barrier(
-                command,
-                src,
-                dst,
-                vk::DependencyFlags::empty(),
-                &barrier,
-                &[],
-                &[],
-            );
-        }
-    }
-
-    fn record_copies(
-        &self,
-        command: vk::CommandBuffer,
-        ranges: &[(u64, u64)],
-        upload: bool,
-    ) -> u64 {
-        let mut by_buffer: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
-        let mut bytes = 0;
-        for &(lo, hi) in ranges {
-            for (start, extent, from, to) in self.extents.overlapping(lo, hi) {
-                let Some(mirror) = self
-                    .memories
-                    .get(&extent.memory)
-                    .and_then(|m| m.mirror.as_ref())
-                else {
-                    continue;
-                };
-                let host_offset = extent.memory_offset + (from - start);
-                let window_offset = from - self.window.base;
-                let (src, dst) = if upload {
-                    (host_offset, window_offset)
-                } else {
-                    (window_offset, host_offset)
-                };
-                let copy = vk::BufferCopy::default()
-                    .src_offset(src)
-                    .dst_offset(dst)
-                    .size(to - from);
-                bytes += to - from;
-                match by_buffer.iter_mut().find(|(b, _)| *b == mirror.buffer) {
-                    Some((_, copies)) => copies.push(copy),
-                    None => by_buffer.push((mirror.buffer, vec![copy])),
-                }
-            }
-        }
-        for (host, copies) in by_buffer {
-            let (src, dst) = if upload {
-                (host, self.window.buffer)
-            } else {
-                (self.window.buffer, host)
-            };
-            // SAFETY: the command buffer is recording; both buffers are alive and the offsets are in range.
-            unsafe { self.h.device.cmd_copy_buffer(command, src, dst, &copies) };
-        }
-        bytes
-    }
-
     /// Frees what unbinding and rebuilding retired. Call it when the GPU is done with all work submitted before
     /// the unmapping, for instance after a frame's fence.
     pub fn reclaim(&mut self) {
@@ -1094,6 +962,10 @@ impl Drop for AddressSpace {
         // SAFETY: the owner drops the address space only once the GPU is idle.
         unsafe {
             let _ = self.h.device.device_wait_idle();
+            if let Some(transfer) = self.transfer.take() {
+                transfer.destroy(&self.h.device);
+            }
+            self.sync.destroy(&self.h.device);
             self.h.device.destroy_buffer(self.window.buffer, None);
             for memory in self.memories.drain().map(|(_, m)| m) {
                 self.h.device.free_memory(memory.handle, None);
@@ -1107,40 +979,11 @@ impl Drop for AddressSpace {
     }
 }
 
-const WATCH_PAGE: u64 = 4096;
-
-/// `WRITE_WATCH_FLAG_RESET`, which windows-sys does not carry.
-#[cfg(windows)]
-const WRITE_WATCH_FLAG_RESET: u32 = 1;
-
-/// The pages written since the last call, for a region reserved with `MEM_WRITE_WATCH`; `None` where the system
-/// cannot say.
-#[cfg(windows)]
-fn write_watch(va: u64, len: u64) -> Option<Vec<u64>> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    let mut addresses = vec![std::ptr::null_mut::<c_void>(); (len / WATCH_PAGE) as usize];
-    let mut count = addresses.len();
-    let mut granularity = 0u32;
-    // SAFETY: `addresses` has room for `count` entries; the call only reads the system's write-watch table.
-    let status = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            va as usize as *const c_void,
-            len as usize,
-            addresses.as_mut_ptr(),
-            &mut count,
-            &mut granularity,
-        )
-    };
-    (status == 0).then(|| addresses[..count].iter().map(|a| *a as u64).collect())
-}
-
-#[cfg(not(windows))]
-fn write_watch(_va: u64, _len: u64) -> Option<Vec<u64>> {
-    None
-}
-
+#[cfg(test)]
+mod bench;
 pub mod hooks;
+#[cfg(test)]
+mod sync_tests;
 #[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
