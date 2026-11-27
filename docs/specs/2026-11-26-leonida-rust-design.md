@@ -184,7 +184,8 @@ slot by looking its descriptor up:
   sampler array, then one sampled-image array per dimension and number type: 2D (also 1D) at 3/4/5, 2D array (also
   1D array and cube, as six layers) at 6/7/8, 3D at 9/10/11, for float, unsigned and signed formats. Bindings
   12-20 repeat the same layout as storage images for writes, and binding 21 holds each sampler again with depth
-  comparison on (the S#'s DEPTH_COMPARE_FUNC), all at the same indices.
+  comparison on (the S#'s DEPTH_COMPARE_FUNC), all at the same indices. Atomics need a fixed format: bindings 22-24
+  hold the textures as R32_UINT storage images and 25-27 as R64_UINT (2D, 2D array, 3D), again at the same indices.
 - Image loads still read through the sampled views. A texture the same shader also writes would need its reads to
   go through the storage view instead; a spare bit in the slot word is reserved to flag those.
 - A table is `mask` followed by `mask + 1` entries of ten words: the descriptor (S# padded with zeros), the slot,

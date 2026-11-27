@@ -53,6 +53,12 @@ pub fn storage_binding(view: View, number: Number) -> u32 {
 /// Each sampler again with depth comparison on, at the same index, for the compare instructions.
 pub const COMPARE_SAMPLERS: u32 = 21;
 
+/// The same textures as single-channel 32-bit (or, with `wide`, 64-bit) unsigned storage images, which
+/// atomics need a fixed format for.
+pub fn atomic_binding(view: View, wide: bool) -> u32 {
+    22 + 3 * u32::from(wide) + view as u32
+}
+
 /// Which array a texture with this T# belongs in, from the FORMAT field (word 1, bits 20-28).
 pub fn number(descriptor: &[u32; 8]) -> Number {
     match rdna::format::number((descriptor[1] >> 20) & 0x1FF) {

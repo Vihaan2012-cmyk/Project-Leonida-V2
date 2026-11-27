@@ -939,3 +939,171 @@ fn stores_write_storage_textures() {
         }
     }
 }
+
+fn storage_scene(width: TextureFormat, initial: impl Fn(u32) -> u64) -> Vec<(u32, Resource)> {
+    let mut resources = Vec::new();
+    let mut entries = Vec::new();
+    for view in VIEWS {
+        for number in NUMBERS {
+            let dummy = vec![gpu_texture(view, number, 1, 1, 1, &[vec![DEFAULT]])];
+            resources.push((images::binding(view, number), Resource::Textures(dummy)));
+        }
+        for wide in [false, true] {
+            let format = if wide {
+                TextureFormat::R64Uint
+            } else {
+                TextureFormat::R32Uint
+            };
+            let texel = |value: u64| -> Vec<u8> {
+                if wide {
+                    value.to_le_bytes().to_vec()
+                } else {
+                    (value as u32).to_le_bytes().to_vec()
+                }
+            };
+            let single = |data: Vec<u8>, width: u32, height: u32| Texture {
+                view: match view {
+                    View::D2 => TextureView::D2,
+                    View::D2Array => TextureView::D2Array,
+                    View::D3 => TextureView::D3,
+                },
+                format,
+                width,
+                height,
+                depth: 1,
+                mips: 1,
+                data,
+            };
+            let mut list = vec![single(texel(0), 1, 1)];
+            if view == View::D2 && (format == width) {
+                entries.push((descriptor(30, UINT_FORMAT), images::slot(1, Number::Uint)));
+                list.push(single(
+                    (0..16).flat_map(|i| texel(initial(i))).collect(),
+                    4,
+                    4,
+                ));
+            }
+            resources.push((
+                images::atomic_binding(view, wide),
+                Resource::StorageTextures(list),
+            ));
+        }
+    }
+    resources.push((
+        images::TEXTURE_TABLE,
+        Resource::Buffer(images::table(&entries).unwrap()),
+    ));
+    resources.push((
+        images::SAMPLER_TABLE,
+        Resource::Buffer(images::table(&[]).unwrap()),
+    ));
+    resources
+}
+
+#[test]
+fn image_atomics_update_each_active_lanes_texel() {
+    let Some(gpu) = image_gpu() else { return };
+    if !gpu.info.image_int64_atomics {
+        eprintln!("skipping: {} lacks 64-bit image atomics", gpu.info.name);
+        return;
+    }
+    let initial = |i: u32| u64::from(100 + i);
+    type Expect = Box<dyn Fn(u32) -> (u64, Option<u32>)>;
+    let cases: [(&str, TextureFormat, Expect); 4] = [
+        (
+            "image_atomic_add v12, v[10:11], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm",
+            TextureFormat::R32Uint,
+            Box::new(move |i| (initial(i) + 2 * 5, None)),
+        ),
+        (
+            "v_cmpx_gt_u32_e32 16, v0\nimage_atomic_add v12, v[10:11], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm glc",
+            TextureFormat::R32Uint,
+            Box::new(move |i| (initial(i) + 5, Some(initial(i) as u32))),
+        ),
+        (
+            "image_atomic_umax v[12:13], v[10:11], s[0:7] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm",
+            TextureFormat::R64Uint,
+            Box::new(move |i| ((u64::from(16 + i) << 32) | 7, None)),
+        ),
+        (
+            "v_cmpx_gt_u32_e32 16, v0\nimage_atomic_cmpswap v[12:13], v[10:11], s[0:7] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm glc",
+            TextureFormat::R32Uint,
+            Box::new(move |i| (u64::from(0xC000 + i), Some(initial(i) as u32))),
+        ),
+    ];
+    for (instruction, format, expect) in &cases {
+        let source = format!(
+            "v_and_b32_e32 v10, 3, v0
+             v_bfe_u32 v11, v0, 2, 2
+             v_lshlrev_b32_e32 v20, 4, v0
+             global_load_dwordx4 v[12:15], v20, s[16:17]
+             s_waitcnt vmcnt(0)
+             {instruction}
+             s_mov_b32 exec_lo, -1
+             global_store_dword v20, v12, s[18:19]
+             s_endpgm"
+        );
+        let spirv = compile(&source, 32, &gpu, false, "atomic");
+        let mut heap = vec![0u32; HEAP_WORDS];
+        for lane in 0..32u32 {
+            let texel = lane % 16;
+            let words = if instruction.contains("umax") {
+                [7, lane, 0, 0]
+            } else if instruction.contains("cmpswap") {
+                [0xC000 + texel, initial(texel) as u32, 0, 0]
+            } else {
+                [5, 0, 0, 0]
+            };
+            let at = (INPUT / 4 + lane * 4) as usize;
+            heap[at..at + 4].copy_from_slice(&words);
+        }
+        let mut resources = storage_scene(*format, initial);
+        let mut user = vec![0u32; 20];
+        user[..8].copy_from_slice(&descriptor(30, UINT_FORMAT));
+        user[16] = INPUT;
+        user[18] = OUTPUT;
+        gpu.dispatch_resources(
+            &spirv,
+            &mut [&mut heap],
+            |addresses| {
+                let mut push = vec![0u32; PUSH_WORDS as usize];
+                push[..user.len()].copy_from_slice(&user);
+                push[PUSH_HEAP as usize] = addresses[0] as u32;
+                push[PUSH_HEAP as usize + 1] = (addresses[0] >> 32) as u32;
+                push
+            },
+            [1, 1, 1],
+            Some(32),
+            &mut resources,
+        )
+        .unwrap();
+        assert_eq!(gpu::validation_errors(), 0);
+        let wide = *format == TextureFormat::R64Uint;
+        let binding = images::atomic_binding(View::D2, wide);
+        let Some((_, Resource::StorageTextures(list))) =
+            resources.iter().find(|(b, _)| *b == binding)
+        else {
+            panic!("no atomic list");
+        };
+        for texel in 0..16u32 {
+            let size = if wide { 8 } else { 4 };
+            let at = texel as usize * size;
+            let mut bytes = [0u8; 8];
+            bytes[..size].copy_from_slice(&list[1].data[at..at + size]);
+            let (value, returned) = expect(texel);
+            assert_eq!(
+                u64::from_le_bytes(bytes),
+                value,
+                "{instruction} texel {texel}"
+            );
+            if let Some(old) = returned {
+                let lane = texel as usize;
+                assert_eq!(
+                    heap[(OUTPUT / 4) as usize + lane * 4],
+                    old,
+                    "{instruction} lane {lane}"
+                );
+            }
+        }
+    }
+}

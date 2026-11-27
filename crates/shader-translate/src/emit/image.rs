@@ -3,7 +3,7 @@ use rspirv::spirv::{
     Capability, Decoration, Dim, FunctionControl, ImageFormat, ImageOperands, LoopControl,
     SelectionControl, StorageClass, Word,
 };
-use shader_ir::{Image, ImageDim, ImageOp};
+use shader_ir::{AtomicOp, Image, ImageDim, ImageOp};
 
 use super::{EmitError, Emitter, GLOp, ok};
 use crate::images::{self, NUMBERS, Number, View};
@@ -173,6 +173,128 @@ impl Emitter {
         };
         self.views.insert((view, number, storage), ids);
         ids
+    }
+
+    fn atomic_view(&mut self, view: View, wide: bool) -> ViewIds {
+        if let Some(ids) = self.atomic_views.get(&(view, wide)) {
+            return *ids;
+        }
+        self.image_types();
+        self.b
+            .capability(Capability::StorageImageArrayNonUniformIndexing);
+        let component = if wide {
+            self.b.capability(Capability::Int64ImageEXT);
+            self.b.capability(Capability::Int64Atomics);
+            self.b.extension("SPV_EXT_shader_image_int64");
+            self.t.u64_
+        } else {
+            self.t.u32_
+        };
+        let (dim, arrayed) = match view {
+            View::D2 => (Dim::Dim2D, 0),
+            View::D2Array => (Dim::Dim2D, 1),
+            View::D3 => (Dim::Dim3D, 0),
+        };
+        let format = if wide {
+            ImageFormat::R64ui
+        } else {
+            ImageFormat::R32ui
+        };
+        let image = self
+            .b
+            .type_image(component, dim, 0, arrayed, 0, 2, format, None);
+        let array = self.b.type_runtime_array(image);
+        let ptr_array = self
+            .b
+            .type_pointer(None, StorageClass::UniformConstant, array);
+        let var = self.global(
+            ptr_array,
+            StorageClass::UniformConstant,
+            images::atomic_binding(view, wide),
+        );
+        let ids = ViewIds {
+            var,
+            image,
+            ptr: self
+                .b
+                .type_pointer(None, StorageClass::UniformConstant, image),
+            sampled: 0,
+        };
+        self.atomic_views.insert((view, wide), ids);
+        ids
+    }
+
+    /// One atomic per active lane on the texel's word; inactive lanes read zero and change nothing.
+    fn image_atomic(&mut self, image: &Image, op: AtomicOp) -> Result<[Word; 4], EmitError> {
+        let (u32_, u64_) = (self.t.u32_, self.t.u64_);
+        let wide = image.data.len() == 2;
+        let view = View::of(image.dim);
+        let (index, _) = self.texture_slot(image)?;
+        let coordinates: Vec<Word> = image
+            .coordinates
+            .iter()
+            .map(|t| self.values[*t as usize])
+            .collect();
+        let coordinates = self.load_coordinates(image.dim, &coordinates)?;
+        let words: Vec<Word> = image
+            .data
+            .iter()
+            .map(|t| self.values[*t as usize])
+            .collect();
+        let value = if wide {
+            self.pack(words[0], words[1])?
+        } else {
+            words[0]
+        };
+        let compare = image.compare.map(|t| self.values[t as usize]);
+        let ty = if wide { u64_ } else { u32_ };
+        let active = self.active()?;
+        let before = self.label;
+        let (then, merge) = (self.b.id(), self.b.id());
+        ok(self.b.selection_merge(merge, SelectionControl::NONE))?;
+        ok(self.b.branch_conditional(active, then, merge, []))?;
+        self.begin(then)?;
+        let ids = self.atomic_view(view, wide);
+        let ptr = ok(self.b.access_chain(ids.ptr, None, ids.var, [index]))?;
+        let ptr = self.nonuniform(ptr);
+        let texel_type = self.b.type_pointer(None, StorageClass::Image, ty);
+        let zero = self.u32c(0);
+        let texel = ok(self
+            .b
+            .image_texel_pointer(texel_type, None, ptr, coordinates, zero))?;
+        let texel = self.nonuniform(texel);
+        let scope = self.u32c(1);
+        let relaxed = self.u32c(0);
+        let b = &mut self.b;
+        let old = ok(match op {
+            AtomicOp::Swap => b.atomic_exchange(ty, None, texel, scope, relaxed, value),
+            AtomicOp::CompareSwap => b.atomic_compare_exchange(
+                ty,
+                None,
+                texel,
+                scope,
+                relaxed,
+                relaxed,
+                value,
+                compare.expect("compare-swap has a compare value"),
+            ),
+            AtomicOp::Add => b.atomic_i_add(ty, None, texel, scope, relaxed, value),
+            AtomicOp::Sub => b.atomic_i_sub(ty, None, texel, scope, relaxed, value),
+            AtomicOp::MinS => b.atomic_s_min(ty, None, texel, scope, relaxed, value),
+            AtomicOp::MinU => b.atomic_u_min(ty, None, texel, scope, relaxed, value),
+            AtomicOp::MaxS => b.atomic_s_max(ty, None, texel, scope, relaxed, value),
+            AtomicOp::MaxU => b.atomic_u_max(ty, None, texel, scope, relaxed, value),
+            AtomicOp::And => b.atomic_and(ty, None, texel, scope, relaxed, value),
+            AtomicOp::Or => b.atomic_or(ty, None, texel, scope, relaxed, value),
+            AtomicOp::Xor => b.atomic_xor(ty, None, texel, scope, relaxed, value),
+        })?;
+        let end = self.label;
+        ok(self.b.branch(merge))?;
+        self.begin(merge)?;
+        let none = if wide { self.u64c(0) } else { zero };
+        let old = ok(self.b.phi(ty, None, [(old, end), (none, before)]))?;
+        let (low, high) = if wide { self.split(old)? } else { (old, zero) };
+        Ok([low, high, zero, zero])
     }
 
     fn compare_samplers(&mut self) -> Word {
@@ -375,6 +497,9 @@ impl Emitter {
     }
 
     fn image_words(&mut self, image: &Image) -> Result<[Word; 4], EmitError> {
+        if let ImageOp::Atomic(op) = image.op {
+            return self.image_atomic(image, op);
+        }
         if image.op.implicit() {
             return Err(EmitError::Unsupported(
                 "implicit-LOD sampling outside a pixel shader",

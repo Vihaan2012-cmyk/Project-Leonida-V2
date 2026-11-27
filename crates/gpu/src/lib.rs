@@ -66,6 +66,7 @@ pub struct DeviceInfo {
     pub storage_images: bool,
     pub min_lod: bool,
     pub gather_extended: bool,
+    pub image_int64_atomics: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,12 +76,15 @@ pub enum TextureFormat {
     Rgba32Sint,
     Rgba8Unorm,
     Depth32Float,
+    R32Uint,
+    R64Uint,
 }
 
 impl TextureFormat {
     pub fn texel_bytes(self) -> usize {
         match self {
-            TextureFormat::Rgba8Unorm | TextureFormat::Depth32Float => 4,
+            TextureFormat::Rgba8Unorm | TextureFormat::Depth32Float | TextureFormat::R32Uint => 4,
+            TextureFormat::R64Uint => 8,
             _ => 16,
         }
     }
@@ -92,6 +96,8 @@ impl TextureFormat {
             TextureFormat::Rgba32Sint => vk::Format::R32G32B32A32_SINT,
             TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
             TextureFormat::Depth32Float => vk::Format::D32_SFLOAT,
+            TextureFormat::R32Uint => vk::Format::R32_UINT,
+            TextureFormat::R64Uint => vk::Format::R64_UINT,
         }
     }
 
@@ -209,9 +215,18 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
         instance.get_physical_device_properties2(physical, &mut properties);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut atomics64 = vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT::default();
+        let has_atomics64 = instance
+            .enumerate_device_extension_properties(physical)
+            .unwrap_or_default()
+            .iter()
+            .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::shader_image_atomic_int64::NAME));
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut f13)
             .push_next(&mut f12);
+        if has_atomics64 {
+            features = features.push_next(&mut atomics64);
+        }
         instance.get_physical_device_features2(physical, &mut features);
         let int64 = features.features.shader_int64 == vk::TRUE;
         let float64 = features.features.shader_float64 == vk::TRUE;
@@ -219,6 +234,7 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
             features.features.shader_storage_image_write_without_format == vk::TRUE;
         let min_lod = features.features.shader_resource_min_lod == vk::TRUE;
         let gather_extended = features.features.shader_image_gather_extended == vk::TRUE;
+        let image_int64_atomics = has_atomics64 && atomics64.shader_image_int64_atomics == vk::TRUE;
         let descriptor_indexing = f12.runtime_descriptor_array == vk::TRUE
             && f12.shader_sampled_image_array_non_uniform_indexing == vk::TRUE;
         let storage_images = descriptor_indexing
@@ -259,6 +275,7 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
                 storage_images,
                 min_lod,
                 gather_extended,
+                image_int64_atomics,
             },
         })
     }
@@ -348,12 +365,20 @@ impl Gpu {
                 .shader_storage_image_write_without_format(storage)
                 .shader_resource_min_lod(chosen.info.min_lod)
                 .shader_image_gather_extended(chosen.info.gather_extended);
+            let mut atomics64 = vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT::default()
+                .shader_image_int64_atomics(true);
             let mut features = vk::PhysicalDeviceFeatures2::default()
                 .features(base)
                 .push_next(&mut f13)
                 .push_next(&mut f12);
+            let mut extensions = Vec::new();
+            if chosen.info.image_int64_atomics {
+                features = features.push_next(&mut atomics64);
+                extensions.push(ash::ext::shader_image_atomic_int64::NAME.as_ptr());
+            }
             let create = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queues)
+                .enabled_extension_names(&extensions)
                 .push_next(&mut features);
             let device = instance.create_device(chosen.physical, &create, None)?;
             let queue = device.get_device_queue(chosen.family, 0);

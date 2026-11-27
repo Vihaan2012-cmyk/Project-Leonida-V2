@@ -1155,6 +1155,32 @@ impl Lifter {
             None
         };
         let float = form.sampled;
+        let mut data_words = Vec::new();
+        let mut atomic_compare = None;
+        if let ImageOp::Atomic(op) = form.op {
+            let wide = if op == AtomicOp::CompareSwap {
+                if dmask != 0x3 {
+                    return Err(unsupported(inst));
+                }
+                false
+            } else {
+                match dmask {
+                    0x1 => false,
+                    0x3 => true,
+                    _ => return Err(unsupported(inst)),
+                }
+            };
+            if d16 || usize::from(count) < 1 + usize::from(wide || op == AtomicOp::CompareSwap) {
+                return Err(unsupported(inst));
+            }
+            data_words.push(self.value(Expr::Get(Reg::V(data))));
+            if wide {
+                data_words.push(self.value(Expr::Get(Reg::V(data + 1))));
+            }
+            if op == AtomicOp::CompareSwap {
+                atomic_compare = Some(self.value(Expr::Get(Reg::V(data + 1))));
+            }
+        }
         let offset = if form.offset {
             Some(addresses.word(self).ok_or_else(|| unsupported(inst))?)
         } else {
@@ -1214,14 +1240,31 @@ impl Lifter {
             sampler,
             coordinates: body[..coordinates].to_vec(),
             lod: level.or(bias),
-            compare,
+            compare: compare.or(atomic_compare),
             gradients,
             clamp,
             offset,
+            data: data_words.clone(),
             unnormalized: has("unorm"),
             d16,
             component: 0,
         };
+        if let ImageOp::Atomic(_) = form.op {
+            let results: Vec<Tmp> = (0..data_words.len() as u8)
+                .map(|component| {
+                    self.value(Expr::Image(Box::new(Image {
+                        component,
+                        ..image.clone()
+                    })))
+                })
+                .collect();
+            if has("glc") {
+                for (offset, value) in results.into_iter().enumerate() {
+                    self.stmts.push(Stmt::SetLane(data + offset as u8, value));
+                }
+            }
+            return Ok(());
+        }
         let components: Vec<u8> = match form.op {
             ImageOp::Gather { .. } => vec![0, 1, 2, 3],
             _ => (0..4).filter(|c| dmask >> c & 1 != 0).collect(),
@@ -3224,6 +3267,10 @@ fn image_form(name: &str, dmask: u32) -> Option<ImageForm> {
             return Some(form);
         }
         _ => {}
+    }
+    if let Some(op) = name.strip_prefix("image_atomic_") {
+        form.op = ImageOp::Atomic(buffer_atomic(op)?);
+        return Some(form);
     }
     let (rest, gather) = match name.strip_prefix("image_sample") {
         Some(rest) => (rest, false),

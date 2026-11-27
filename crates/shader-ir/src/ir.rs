@@ -216,10 +216,14 @@ pub enum ImageOp {
     SampleLod,
     SampleLodZero,
     SampleGrad,
-    Gather { channel: u8 },
+    Gather {
+        channel: u8,
+    },
     Size,
     QueryLod,
     Store,
+    /// Updates one texel of a storage image for each active lane; `data` holds one word, or two for 64 bits.
+    Atomic(AtomicOp),
 }
 
 impl ImageOp {
@@ -247,6 +251,7 @@ pub struct Image {
     pub gradients: Vec<Tmp>,
     pub clamp: Option<Tmp>,
     pub offset: Option<Tmp>,
+    pub data: Vec<Tmp>,
     pub unnormalized: bool,
     pub d16: bool,
     pub component: u8,
@@ -263,6 +268,7 @@ impl Image {
             .chain(&self.gradients)
             .chain(&self.clamp)
             .chain(&self.offset)
+            .chain(&self.data)
             .copied()
             .collect()
     }
