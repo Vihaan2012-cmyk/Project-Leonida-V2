@@ -412,3 +412,226 @@ fn decode_splits_joined_bytes() {
     assert!(decode(&joined, &bad).is_err());
 }
 
+// ---- glTF checks
+
+struct Glb {
+    doc: Value,
+    bin: Vec<u8>,
+}
+
+fn parse_glb(bytes: &[u8]) -> Glb {
+    assert_eq!(&bytes[0..4], b"glTF");
+    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 2);
+    assert_eq!(
+        u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize,
+        bytes.len()
+    );
+    let json_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    assert_eq!(&bytes[16..20], b"JSON");
+    assert_eq!(json_len % 4, 0);
+    let doc: Value = serde_json::from_slice(&bytes[20..20 + json_len]).unwrap();
+    let rest = &bytes[20 + json_len..];
+    let bin = if rest.is_empty() {
+        Vec::new()
+    } else {
+        let len = u32::from_le_bytes(rest[0..4].try_into().unwrap()) as usize;
+        assert_eq!(&rest[4..8], b"BIN\0");
+        assert_eq!(len % 4, 0);
+        assert_eq!(rest.len(), 8 + len);
+        rest[8..].to_vec()
+    };
+    Glb { doc, bin }
+}
+
+fn component_size(c: u64) -> usize {
+    match c {
+        5121 => 1,
+        5123 => 2,
+        5125 | 5126 => 4,
+        other => panic!("component {other}"),
+    }
+}
+
+fn element_count(kind: &str) -> usize {
+    match kind {
+        "SCALAR" => 1,
+        "VEC2" => 2,
+        "VEC3" => 3,
+        "VEC4" => 4,
+        "MAT4" => 16,
+        other => panic!("type {other}"),
+    }
+}
+
+impl Glb {
+    fn accessor_bytes(&self, i: usize) -> (&[u8], &Value) {
+        let a = &self.doc["accessors"][i];
+        let view = &self.doc["bufferViews"][a["bufferView"].as_u64().unwrap() as usize];
+        let offset = view["byteOffset"].as_u64().unwrap() as usize;
+        let length = view["byteLength"].as_u64().unwrap() as usize;
+        let need = a["count"].as_u64().unwrap() as usize
+            * component_size(a["componentType"].as_u64().unwrap())
+            * element_count(a["type"].as_str().unwrap());
+        assert!(need <= length, "accessor {i} needs {need} of {length}");
+        assert!(offset + length <= self.bin.len());
+        assert_eq!(offset % 4, 0, "view {i} alignment");
+        (&self.bin[offset..offset + need], a)
+    }
+
+    fn floats(&self, i: usize) -> Vec<f32> {
+        let (b, a) = self.accessor_bytes(i);
+        assert_eq!(a["componentType"], 5126);
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    fn uints(&self, i: usize) -> Vec<u32> {
+        let (b, a) = self.accessor_bytes(i);
+        match a["componentType"].as_u64().unwrap() {
+            5123 => b
+                .chunks_exact(2)
+                .map(|c| u32::from(u16::from_le_bytes(c.try_into().unwrap())))
+                .collect(),
+            5125 => b
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+            other => panic!("component {other}"),
+        }
+    }
+
+    /// Structural validation: no empty arrays, bounds, indices, skins, node tree.
+    fn validate(&self) {
+        for (key, v) in self.doc.as_object().unwrap() {
+            if let Some(a) = v.as_array() {
+                assert!(!a.is_empty(), "{key} is empty");
+            }
+        }
+        assert_eq!(
+            self.doc["buffers"][0]["byteLength"].as_u64().unwrap() as usize,
+            self.bin.len()
+        );
+        for i in 0..self.doc["accessors"].as_array().unwrap().len() {
+            self.accessor_bytes(i);
+        }
+        for mesh in self.doc["meshes"].as_array().unwrap() {
+            for prim in mesh["primitives"].as_array().unwrap() {
+                let attrs = prim["attributes"].as_object().unwrap();
+                let pos = attrs["POSITION"].as_u64().unwrap() as usize;
+                let count = self.doc["accessors"][pos]["count"].as_u64().unwrap();
+                let data = self.floats(pos);
+                let a = &self.doc["accessors"][pos];
+                for k in 0..3 {
+                    let lo = data
+                        .iter()
+                        .skip(k)
+                        .step_by(3)
+                        .copied()
+                        .fold(f32::INFINITY, f32::min);
+                    let hi = data
+                        .iter()
+                        .skip(k)
+                        .step_by(3)
+                        .copied()
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    assert_eq!(a["min"][k].as_f64().unwrap() as f32, lo);
+                    assert_eq!(a["max"][k].as_f64().unwrap() as f32, hi);
+                }
+                for (name, v) in attrs {
+                    assert_eq!(
+                        self.doc["accessors"][v.as_u64().unwrap() as usize]["count"]
+                            .as_u64()
+                            .unwrap(),
+                        count,
+                        "{name}"
+                    );
+                }
+                let idx = self.uints(prim["indices"].as_u64().unwrap() as usize);
+                assert_eq!(idx.len() % 3, 0);
+                assert!(idx.iter().all(|i| u64::from(*i) < count));
+                if let Some(m) = prim.get("material") {
+                    assert!(
+                        (m.as_u64().unwrap() as usize)
+                            < self.doc["materials"].as_array().unwrap().len()
+                    );
+                }
+            }
+        }
+        let nodes = self.doc["nodes"].as_array().unwrap();
+        let mut parent = vec![None; nodes.len()];
+        for (i, n) in nodes.iter().enumerate() {
+            for c in n["children"].as_array().into_iter().flatten() {
+                let c = c.as_u64().unwrap() as usize;
+                assert!(parent[c].is_none(), "node {c} has two parents");
+                parent[c] = Some(i);
+            }
+        }
+        for start in 0..nodes.len() {
+            let (mut at, mut steps) = (start, 0);
+            while let Some(p) = parent[at] {
+                at = p;
+                steps += 1;
+                assert!(steps <= nodes.len(), "cycle");
+            }
+        }
+        for s in self.doc["scenes"][0]["nodes"].as_array().unwrap() {
+            assert!(
+                parent[s.as_u64().unwrap() as usize].is_none(),
+                "scene lists a child node"
+            );
+        }
+        for skin in self.doc["skins"].as_array().into_iter().flatten() {
+            let joints = skin["joints"].as_array().unwrap().len();
+            let ibm =
+                &self.doc["accessors"][skin["inverseBindMatrices"].as_u64().unwrap() as usize];
+            assert_eq!(ibm["count"].as_u64().unwrap() as usize, joints);
+            assert_eq!(ibm["type"], "MAT4");
+        }
+        for n in nodes {
+            if n.get("skin").is_some() {
+                for prim in self.doc["meshes"][n["mesh"].as_u64().unwrap() as usize]["primitives"]
+                    .as_array()
+                    .unwrap()
+                {
+                    let attrs = prim["attributes"].as_object().unwrap();
+                    let skin = &self.doc["skins"][n["skin"].as_u64().unwrap() as usize];
+                    let joint_count = skin["joints"].as_array().unwrap().len() as u32;
+                    for set in 0..2 {
+                        let (Some(j), Some(w)) = (
+                            attrs.get(&format!("JOINTS_{set}")),
+                            attrs.get(&format!("WEIGHTS_{set}")),
+                        ) else {
+                            continue;
+                        };
+                        assert!(
+                            self.uints(j.as_u64().unwrap() as usize)
+                                .iter()
+                                .all(|v| *v < joint_count)
+                        );
+                        let _ = self.floats(w.as_u64().unwrap() as usize);
+                    }
+                    let first = self.floats(attrs["WEIGHTS_0"].as_u64().unwrap() as usize);
+                    let second = attrs
+                        .get("WEIGHTS_1")
+                        .map(|w| self.floats(w.as_u64().unwrap() as usize));
+                    for v in 0..first.len() / 4 {
+                        let mut sum: f32 = first[4 * v..4 * v + 4].iter().sum();
+                        if let Some(s) = &second {
+                            sum += s[4 * v..4 * v + 4].iter().sum::<f32>();
+                        }
+                        assert!(close(sum, 1.0, 1e-5), "vertex {v} weights sum to {sum}");
+                    }
+                }
+            } else if let Some(m) = n.get("mesh") {
+                for prim in self.doc["meshes"][m.as_u64().unwrap() as usize]["primitives"]
+                    .as_array()
+                    .unwrap()
+                {
+                    assert!(prim["attributes"].get("JOINTS_0").is_none());
+                }
+            }
+        }
+    }
+}
+
