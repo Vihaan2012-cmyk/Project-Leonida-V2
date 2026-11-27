@@ -15,7 +15,15 @@
 //!
 //! Buffer layouts: key pass `[depth, motion, key, params]`, field pass `[depth, motion, key, field, params]`,
 //! interpolation `[colour, previous colour, depth, previous depth, key, field, destination, params]`; params
-//! `[w, h, render w, render h, phase, flags (1 reversed depth), depth tolerance, near / far, mv scale x, mv scale y]`.
+//! `[w, h, render w, render h, phase, flags (1 reversed depth), depth tolerance, near / far, mv scale x, mv scale y,
+//! HUD threshold]`.
+//!
+//! The game composes its HUD into the image it presents, and the upscaler's output (the only image before the HUD)
+//! is not readable when the frame is presented, so the HUD is found from the images themselves: a texel that did not
+//! change between the two real frames, where the scene moves, and whose two reprojected samples disagree is an overlay,
+//! and the generated frame takes the newest real frame's colour there (`fg_interp.wgsl`, `overlay`). Where the motion
+//! is zero nothing is flagged, and an overlay that itself animates is warped with the scene. `hud_threshold` is the
+//! largest colour step in encoded values that counts as "the same"; 0 turns the test off.
 //!
 //! Optional DLSS frame generation is not offered: NVIDIA ships it through Streamline's swap-chain proxy, which cannot
 //! be driven from public documentation alone and is not loaded here.
@@ -105,6 +113,7 @@ impl FrameGenerator for InterpolatingFrameGenerator {
                     k.to_bits(),
                     inputs.motion_vector_scale[0].to_bits(),
                     inputs.motion_vector_scale[1].to_bits(),
+                    inputs.hud_threshold.max(0.0).to_bits(),
                 ];
                 let texels = (w * h) as usize;
                 let groups = groups_for(w, h);
