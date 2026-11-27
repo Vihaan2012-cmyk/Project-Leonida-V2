@@ -1,5 +1,6 @@
 //! Replaying recorded command lists on Vulkan: draws, dispatches, copies, barriers.
 
+pub mod barrier;
 mod command;
 mod context;
 
