@@ -22,6 +22,12 @@
 
 use std::time::Duration;
 
+mod gate;
+mod inputs;
+
+pub use gate::{Gate, Hold, Verdict};
+pub use inputs::{FrameInputs, InputResource, clear_inputs, submit_inputs, take_inputs};
+
 use crate::compute::{SharedCompute, floats, groups_for, words};
 use crate::{FrameGenInputs, FrameGenerator, Image, UpscaleError, shaders};
 
