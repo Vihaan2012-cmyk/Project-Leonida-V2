@@ -416,3 +416,40 @@ fn garbage_bytes_never_panic() {
         let _ = decompile(&Image::new(code), START);
     }
 }
+
+#[test]
+fn a_counted_loop_with_a_guard_is_a_for_loop() {
+    // for (i = 0; i < a2; i += 1) *(a1 + i * 4) = 0
+    let text = run(|a| {
+        let mut done = a.create_label();
+        let mut top = a.create_label();
+        a.xor(eax, eax)?;
+        a.cmp(eax, edx)?;
+        a.jae(done)?;
+        a.set_label(&mut top)?;
+        a.mov(dword_ptr(rcx + rax * 4), 0)?;
+        a.inc(eax)?;
+        a.cmp(eax, edx)?;
+        a.jb(top)?;
+        a.set_label(&mut done)?;
+        a.ret()
+    });
+    assert!(text.contains("for (v1 = 0; v1 < a2; v1 += 1) {"), "{text}");
+    assert!(!text.contains("do {"), "{text}");
+}
+
+#[test]
+fn packed_float_math_and_intrinsics_read_as_such() {
+    let text = run(|a| {
+        a.movaps(xmm0, xmmword_ptr(rcx))?;
+        a.mulps(xmm0, xmmword_ptr(rdx))?;
+        a.addps(xmm0, xmm0)?;
+        a.sqrtps(xmm0, xmm0)?;
+        a.vhaddps(ymm1, ymm0, ymm0)?;
+        a.vmovaps(ymmword_ptr(r8), ymm1)?;
+        a.ret()
+    });
+    assert!(text.contains("_mm_sqrt_ps("), "{text}");
+    assert!(text.contains("_mm256_hadd_ps("), "{text}");
+    assert!(text.contains(" * "), "{text}");
+}

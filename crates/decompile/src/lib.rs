@@ -290,8 +290,46 @@ impl<'f> Writer<'f> {
         })
     }
 
+    /// `init; while (c) { body; step }` as the parts of a `for`, when the loop is driven by one variable.
+    fn for_parts(&self, nodes: &[Node], k: usize) -> Option<(String, String, String)> {
+        let (Node::Stmt(init @ Stmt::Def(loc, ..)), Some(Node::While(c, body))) =
+            (&nodes[k], nodes.get(k + 1))
+        else {
+            return None;
+        };
+        let Some(Node::Stmt(step @ Stmt::Def(step_loc, ..))) = body.last() else {
+            return None;
+        };
+        if step_loc != loc
+            || !c.reads().iter().any(|(l, _)| l == loc)
+            || body[..body.len() - 1]
+                .iter()
+                .any(|n| structure::has_continue(std::slice::from_ref(n)))
+            || matches!(loc, Loc::Flags)
+        {
+            return None;
+        }
+        let text = |s: &Stmt| self.stmt(s).map(|t| t.trim_end_matches(';').to_string());
+        Some((text(init)?, self.expr(c), text(step)?))
+    }
+
     fn nodes(&mut self, nodes: &[Node]) {
-        for node in nodes {
+        let mut k = 0;
+        while k < nodes.len() {
+            let node = &nodes[k];
+            k += 1;
+            if let Some((init, cond, step)) = self.for_parts(nodes, k - 1) {
+                let Some(Node::While(_, body)) = nodes.get(k) else {
+                    unreachable!()
+                };
+                k += 1;
+                self.line(&format!("for ({init}; {cond}; {step}) {{"));
+                self.depth += 1;
+                self.nodes(&body[..body.len() - 1]);
+                self.depth -= 1;
+                self.line("}");
+                continue;
+            }
             match node {
                 Node::Stmt(stmt) => {
                     if let Some(text) = self.stmt(stmt) {
