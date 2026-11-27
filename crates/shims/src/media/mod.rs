@@ -1,22 +1,65 @@
-//! Video: Bink2Scarlett.dll, and the Media Foundation calls the game makes.
+//! Video: `Bink2Scarlett.dll`, and the Media Foundation calls the game makes.
 //!
-//! Bink 2 is proprietary and is not decoded. The 23 functions the executable imports are answered so that
-//! every movie behaves as one whose frames are all due at once and show black: `BinkWait` never makes the
-//! caller wait, `BinkDoFrame` draws nothing, and `BinkNextFrame` walks the frame counter to the last frame, which
-//! is how a play loop ends. A title that skips movies is never stalled, and one that waits for the last frame
-//! sees it at once.
+//! The 23 functions the executable imports play movies for real when a decoder is installed
+//! ([`set_decoder_factory`]) and show black frames that end at once when none is (every frame due at once,
+//! `BinkNextFrame` walking the counter to the last frame, which is how a play loop ends).
 //!
-//! What the docs measured of the handle (`movies.md`, "ABI over the archive") is mirrored in the 32-bit words
-//! a caller may read straight from it: width at +0x00, height at +0x04, frame count at +0x08, the 1-based
-//! current frame at +0x0c, the last decoded frame at +0x10, the frame rate numerator and denominator at
-//! +0x14 and +0x18, and the audio track count at +0x38. Frame counts and sizes come from the stream's own
-//! header when the name is a readable file or the bytes of a stream in memory; otherwise the movie is one
-//! 1920x1080 frame, which also ends at once.
+//! - Opening reads the stream header through the executable's own file callbacks (`BinkSetOSFileCallbacks`),
+//!   from a stream in memory, or from a host file. The decode thread ([`worker`]) reads the rest and decodes a
+//!   few frames ahead only once a frame is asked for, so opening a movie just to measure it (the game does) is cheap.
+//! - [`player`] holds one movie's state: `BinkWait` follows the movie's frame rate on a media clock that stops
+//!   while paused, `BinkShouldSkip` is true when the next frame is a whole period late, `BinkGoto` seeks the
+//!   decoder (unless the frame is queued), `BinkSetWillLoop` wraps. A decoder error ends the movie: the frame
+//!   counter jumps to the last frame and a trace note says why.
+//! - Frames go into the game's own mapped textures in the layout [`layout`] documents.
+//! - Audio goes to voices on the shared mixer ([`sound`]), one per selected track, paced by the frames played.
 //!
-//! Unmeasured, so answered with a trace note and no write: `BinkGetFrameBuffersInfo` (the layout of the
-//! frame buffer description), `BinkRegisterFrameBuffers`, the options structure `BinkOpenWithOptions` takes,
-//! and the callback shapes `BinkSetOSFileCallbacks` and `BinkSetMemory` take. Media Foundation (`MFPlat.DLL`,
-//! `MFReadWrite.dll`) is Windows' own and is bound to the host.
+//! # What the executable does with Bink (RVAs of game build 1.0.2.1, read statically)
+//!
+//! - `BinkSetOSFileCallbacks` is called once, from `015e3c10`, with four functions: open `01946220`
+//!   `(file*, name, flags) -> bool` (writes the game's file object into `*file`), read `0092ebc0`
+//!   `(file*, dest, size) -> bytes` (sequential from position 0; short at the end), a position setter
+//!   `0442e890 (file*, position)` and close `01a400f0 (file*)`. `name` is not a string but the game's own block:
+//!   `+0x00` raw path, `+0x08` u32, `+0x10` resolved path, `+0x18` the player. The game tries `<name>`, then
+//!   `<name>.bk2`, then `<name>.bik`, and holds at most 8 movie files open. Only the first word of `file` is used.
+//! - The same function calls `BinkSetMemory(03a1a170, 0169c4d0)` (a 0x20-aligned allocator and its free; unused here),
+//!   `BinkStartAsyncThread(i, 0)` for up to 4 threads, and `BinkSetSoundSystem(05f172c0, 0)`.
+//! - `BinkOpenWithOptions(name_block_or_stream, options, flags)` is called from `0442ea70` (a probe that opens,
+//!   reads `BinkGetFrameBuffersInfo`, and closes at once) and `0442efe0` (the real open, from `0199ef20`).
+//!   `flags` is `0x440 | 0x4000`, plus `0x8` when the descriptor's byte `+0x251` is 1, plus `0x08204000` when `+0x250`
+//!   is 1, plus `0x04000000` (from memory) when the descriptor holds a stream pointer at `+0x298`. `options`
+//!   (built by `0442ed40`) is a zeroed block of at least 0x28 bytes where only `+0x1c` (a u32, 1 when the game
+//!   wants audio) and `+0x20` (a pointer to that many u32 track ids, the id being the descriptor's word at `+0x218`)
+//!   are set. Audio tracks are therefore picked by id.
+//! - Handle words the game reads (`002ef0e0`, `0442f340`, `0442f580`, `0442f6e0`, `0442f9e0`, `0442fa20`, `018bea90`):
+//!   `+0x08` frames, `+0x0c` current frame, `+0x10` last decoded frame (the game treats all ones as "none yet"),
+//!   `+0x14`/`+0x18` frame rate, `+0x38` audio track count, `+0x11c` paused (nonzero makes the game call `BinkPause(0)`).
+//! - Playing: `BinkPause(h, 1)` right after opening (`05536e00`); `BinkSetWillLoop`; then per tick `BinkWait(h) != 0`
+//!   means not due, else `BinkNextFrame`, `BinkDoFrameAsyncMulti(h, thread_ids, count)` and
+//!   `BinkDoFrameAsyncWait(h, -1)`; when `BinkShouldSkip` the same three run in a loop; `BinkGoto(h, n, 0)` plus the
+//!   same two calls seeks; `BinkDoFrame` follows `BinkNextFrame` after a seek (`002ef309`). `BinkGetKeyFrame(h, f, 2)`
+//!   (`0442f580`) picks restart frames, and `BinkSetVolume(h, track, v)` (`018bea90`) is called for each track with
+//!   `v` clamped to 0x10000 by the game (`018beb30`), so 0x10000 is full scale. `BinkGetPlatformInfo(0x400 + i, &id)`
+//!   is expected to give a Bink thread's id; answering 0 makes the game use no Bink threads (`0577fa20`).
+//! - Video reaches the GPU as planar 8-bit textures per frame buffer set, written through the CPU: `0442f760` maps
+//!   each texture (`05121690`) and hands its address and pitch over in the frame buffer description, and after each
+//!   decode `0532f140` only flushes the cache lines of the current set. The textures are made by `01bc2de0` from
+//!   the description: one per plane that has its `Allocate` word set, sized from the description, with a 256-byte
+//!   aligned pitch. The description is 0x108 bytes (`0442f170` copies exactly that); `0442ec02` and `0442ec11`
+//!   read the alpha and fifth plane words of set 0.
+//!
+//! # Not measured, and what is done instead
+//!
+//! - Whether the game crops by the movie size or by the buffer size: the description reports the exact movie size,
+//!   not a padded one.
+//! - Whether a movie has alpha: taken from bit `0x00100000` of the header word at `+0x24`.
+//! - How many frame buffer sets Bink itself reports: three here (the game's fence array holds three).
+//! - The game's own sound system (`BinkSetSoundSystem`: a `BINKSND` of 0x1c0 bytes filled by `01a9b300`, with ready,
+//!   lock, unlock, pause, on/off and close functions at `+0x170..+0x1b0`) is measured but not driven: audio goes to
+//!   the shared mixer instead.
+//! - The plane order and audio contract of the decoder behind [`MovieDecoder`] are assumed (Y, Cr, Cb, alpha; the
+//!   audio of the frame just decoded).
+//! - The decode thread calls the game's read callback from a thread the game did not start.
 
 mod decoder;
 mod header;
@@ -36,345 +79,73 @@ pub use header::{
     HEADER_BYTES, MediaError, MovieHeader, PREFIX_BYTES, parse_audio_tracks, parse_header,
 };
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use crate::Shim;
-
-const WORDS: usize = 64;
-const WIDTH: usize = 0;
-const HEIGHT: usize = 1;
-const FRAMES: usize = 2;
-const FRAME_NUM: usize = 3;
-const LAST_FRAME_NUM: usize = 4;
-const RATE: usize = 5;
-const RATE_DIV: usize = 6;
-const AUDIO_TRACKS: usize = 0x38 / 4;
 
 /// `BinkOpen`'s flag for a stream inside a larger file (`movies.md`).
 pub const FLAG_FILE_OFFSET: u32 = 0x20;
 
 #[cfg(windows)]
-mod imp {
-    use std::collections::BTreeMap;
-    use std::ffi::c_void;
-    use std::io::Read;
-    use std::sync::Mutex;
-
-    use super::*;
-    use crate::trace::note;
-
-    struct Movie {
-        will_loop: bool,
-        paused: bool,
-    }
-
-    static MOVIES: Mutex<BTreeMap<usize, Movie>> = Mutex::new(BTreeMap::new());
-
-    static NOTED: [AtomicBool; 6] = [const { AtomicBool::new(false) }; 6];
-
-    fn note_once(slot: usize, text: &str) {
-        if !NOTED[slot].swap(true, Ordering::Relaxed) {
-            note(text.to_string());
-        }
-    }
-
-    fn word(handle: usize, index: usize) -> u32 {
-        // SAFETY: only handles this module made are looked up, and each is a live image of `WORDS` words.
-        unsafe { (handle as *const u32).add(index).read_volatile() }
-    }
-
-    fn set_word(handle: usize, index: usize, value: u32) {
-        // SAFETY: as in `word`.
-        unsafe { (handle as *mut u32).add(index).write_volatile(value) }
-    }
-
-    /// Reads the name or the stream bytes the caller handed to `BinkOpenWithOptions`.
-    fn read_header(source: *const u8) -> Option<MovieHeader> {
-        if source.is_null() {
-            return None;
-        }
-        let mut stream = true;
-        for at in 0..4 {
-            // SAFETY: a name is NUL-terminated, so a byte is read only after every byte before it matched
-            // `KB2` and a revision letter, which no name starts with.
-            let byte = unsafe { source.add(at).read() };
-            let wanted = b"KB2"[..]
-                .get(at)
-                .map_or(byte.is_ascii_lowercase(), |&w| byte == w);
-            if !wanted {
-                stream = false;
-                break;
-            }
-        }
-        if stream {
-            let mut head = [0u8; HEADER_BYTES];
-            // SAFETY: a stream in memory holds at least its fixed header.
-            unsafe { std::ptr::copy_nonoverlapping(source, head.as_mut_ptr(), HEADER_BYTES) };
-            return parse_header(&head).ok();
-        }
-        let mut name = Vec::new();
-        for at in 0..1024 {
-            // SAFETY: bounded read of a NUL-terminated string.
-            let byte = unsafe { source.add(at).read() };
-            if byte == 0 {
-                break;
-            }
-            name.push(byte);
-        }
-        let path = String::from_utf8(name).ok()?;
-        let mut head = [0u8; HEADER_BYTES];
-        std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
-        parse_header(&head).ok()
-    }
-
-    /// `HBINK BinkOpenWithOptions(name_or_stream, options, flags)`
-    pub extern "win64" fn open_with_options(
-        source: *const u8,
-        _options: *const c_void,
-        _flags: u32,
-    ) -> usize {
-        let header = read_header(source).unwrap_or_else(|| {
-            note_once(
-                0,
-                "Bink: a movie's header could not be read (a name the host cannot open, or a stream behind \
-                 the title's own file callbacks); it is treated as one 1920x1080 frame",
-            );
-            MovieHeader::FALLBACK
-        });
-        let image = Box::into_raw(Box::new([0u32; WORDS]));
-        let handle = image as usize;
-        set_word(handle, WIDTH, header.width);
-        set_word(handle, HEIGHT, header.height);
-        set_word(handle, FRAMES, header.frames);
-        set_word(handle, FRAME_NUM, 1);
-        set_word(handle, RATE, header.rate);
-        set_word(handle, RATE_DIV, header.rate_divisor);
-        set_word(handle, AUDIO_TRACKS, header.audio_tracks);
-        if let Ok(mut movies) = MOVIES.lock() {
-            movies.insert(
-                handle,
-                Movie {
-                    will_loop: false,
-                    paused: false,
-                },
-            );
-        }
-        handle
-    }
-
-    fn live(handle: usize) -> bool {
-        MOVIES.lock().is_ok_and(|m| m.contains_key(&handle))
-    }
-
-    pub extern "win64" fn close(handle: usize) {
-        let known = MOVIES.lock().ok().and_then(|mut m| m.remove(&handle));
-        if known.is_some() {
-            // SAFETY: the image `open_with_options` boxed, removed from the table so it is freed once.
-            drop(unsafe { Box::from_raw(handle as *mut [u32; WORDS]) });
-        }
-    }
-
-    pub extern "win64" fn do_frame(handle: usize) -> i32 {
-        if live(handle) {
-            set_word(handle, LAST_FRAME_NUM, word(handle, FRAME_NUM));
-        }
-        0
-    }
-
-    pub extern "win64" fn do_frame_async_multi(
-        _binks: *const usize,
-        _threads: *const u32,
-        _count: u32,
-    ) -> i32 {
-        1
-    }
-
-    pub extern "win64" fn do_frame_async_wait(_handle: usize, _microseconds: i32) -> i32 {
-        1
-    }
-
-    pub extern "win64" fn free_globals() {}
-
-    pub extern "win64" fn get_frame_buffers_info(_handle: usize, _info: *mut c_void) {
-        note_once(
-            1,
-            "Bink: BinkGetFrameBuffersInfo left the frame buffer description alone (its layout is unmeasured)",
-        );
-    }
-
-    pub extern "win64" fn get_key_frame(handle: usize, frame: u32, _flags: i32) -> u32 {
-        if !live(handle) {
-            return 0;
-        }
-        let frames = word(handle, FRAMES);
-        match frame {
-            0 => word(handle, FRAME_NUM),
-            f => f.min(frames),
-        }
-    }
-
-    pub extern "win64" fn get_platform_info(_which: i32, _out: *mut c_void) -> i32 {
-        0
-    }
-
-    pub extern "win64" fn goto(handle: usize, frame: u32, _flags: i32) {
-        if live(handle) {
-            set_word(
-                handle,
-                FRAME_NUM,
-                frame.clamp(1, word(handle, FRAMES).max(1)),
-            );
-        }
-    }
-
-    pub extern "win64" fn next_frame(handle: usize) {
-        let Some(will_loop) = MOVIES
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&handle).map(|m| m.will_loop))
-        else {
-            return;
-        };
-        let (at, frames) = (word(handle, FRAME_NUM), word(handle, FRAMES));
-        if at < frames {
-            set_word(handle, FRAME_NUM, at + 1);
-        } else if will_loop {
-            set_word(handle, FRAME_NUM, 1);
-        }
-    }
-
-    pub extern "win64" fn pause(handle: usize, pause: i32) -> i32 {
-        if let Ok(mut movies) = MOVIES.lock()
-            && let Some(movie) = movies.get_mut(&handle)
-        {
-            movie.paused = pause != 0;
-            return i32::from(movie.paused);
-        }
-        0
-    }
-
-    pub extern "win64" fn register_frame_buffers(_handle: usize, _buffers: *const c_void) {
-        note_once(
-            2,
-            "Bink: BinkRegisterFrameBuffers took no buffers (nothing is decoded into them)",
-        );
-    }
-
-    pub extern "win64" fn request_stop_async_threads_multi(_count: u32) -> i32 {
-        1
-    }
-
-    pub extern "win64" fn set_memory(_alloc: *const c_void, _free: *const c_void) -> i32 {
-        note_once(
-            3,
-            "Bink: BinkSetMemory's allocators are not used (the shim allocates its own handles)",
-        );
-        1
-    }
-
-    pub extern "win64" fn set_os_file_callbacks(
-        _callbacks: *const c_void,
-        _more: *const c_void,
-    ) -> i32 {
-        note_once(
-            4,
-            "Bink: BinkSetOSFileCallbacks' callbacks are not called (their shape is unmeasured)",
-        );
-        1
-    }
-
-    pub extern "win64" fn set_sound_system(_open: *const c_void, _parameter: usize) -> i32 {
-        1
-    }
-
-    pub extern "win64" fn set_volume(_handle: usize, _track: u32, _volume: i32) -> i32 {
-        1
-    }
-
-    pub extern "win64" fn set_will_loop(handle: usize, on: i32) {
-        if let Ok(mut movies) = MOVIES.lock()
-            && let Some(movie) = movies.get_mut(&handle)
-        {
-            movie.will_loop = on != 0;
-        }
-    }
-
-    pub extern "win64" fn should_skip(_handle: usize) -> i32 {
-        0
-    }
-
-    pub extern "win64" fn start_async_thread(_thread: i32, _parameter: *const c_void) -> i32 {
-        1
-    }
-
-    pub extern "win64" fn wait(_handle: usize) -> i32 {
-        0
-    }
-
-    pub extern "win64" fn wait_stop_async_threads_multi(_count: u32) -> i32 {
-        1
-    }
-}
+mod ffi;
 
 pub fn shims() -> Vec<Shim> {
     #[cfg(windows)]
     {
         let list: [(&str, usize); 23] = [
-            ("BinkClose", imp::close as *const () as usize),
-            ("BinkDoFrame", imp::do_frame as *const () as usize),
+            ("BinkClose", ffi::close as *const () as usize),
+            ("BinkDoFrame", ffi::do_frame as *const () as usize),
             (
                 "BinkDoFrameAsyncMulti",
-                imp::do_frame_async_multi as *const () as usize,
+                ffi::do_frame_async_multi as *const () as usize,
             ),
             (
                 "BinkDoFrameAsyncWait",
-                imp::do_frame_async_wait as *const () as usize,
+                ffi::do_frame_async_wait as *const () as usize,
             ),
-            ("BinkFreeGlobals", imp::free_globals as *const () as usize),
+            ("BinkFreeGlobals", ffi::free_globals as *const () as usize),
             (
                 "BinkGetFrameBuffersInfo",
-                imp::get_frame_buffers_info as *const () as usize,
+                ffi::get_frame_buffers_info as *const () as usize,
             ),
-            ("BinkGetKeyFrame", imp::get_key_frame as *const () as usize),
+            ("BinkGetKeyFrame", ffi::get_key_frame as *const () as usize),
             (
                 "BinkGetPlatformInfo",
-                imp::get_platform_info as *const () as usize,
+                ffi::get_platform_info as *const () as usize,
             ),
-            ("BinkGoto", imp::goto as *const () as usize),
-            ("BinkNextFrame", imp::next_frame as *const () as usize),
+            ("BinkGoto", ffi::goto as *const () as usize),
+            ("BinkNextFrame", ffi::next_frame as *const () as usize),
             (
                 "BinkOpenWithOptions",
-                imp::open_with_options as *const () as usize,
+                ffi::open_with_options as *const () as usize,
             ),
-            ("BinkPause", imp::pause as *const () as usize),
+            ("BinkPause", ffi::pause as *const () as usize),
             (
                 "BinkRegisterFrameBuffers",
-                imp::register_frame_buffers as *const () as usize,
+                ffi::register_frame_buffers as *const () as usize,
             ),
             (
                 "BinkRequestStopAsyncThreadsMulti",
-                imp::request_stop_async_threads_multi as *const () as usize,
+                ffi::request_stop_async_threads_multi as *const () as usize,
             ),
-            ("BinkSetMemory", imp::set_memory as *const () as usize),
+            ("BinkSetMemory", ffi::set_memory as *const () as usize),
             (
                 "BinkSetOSFileCallbacks",
-                imp::set_os_file_callbacks as *const () as usize,
+                ffi::set_os_file_callbacks as *const () as usize,
             ),
             (
                 "BinkSetSoundSystem",
-                imp::set_sound_system as *const () as usize,
+                ffi::set_sound_system as *const () as usize,
             ),
-            ("BinkSetVolume", imp::set_volume as *const () as usize),
-            ("BinkSetWillLoop", imp::set_will_loop as *const () as usize),
-            ("BinkShouldSkip", imp::should_skip as *const () as usize),
+            ("BinkSetVolume", ffi::set_volume as *const () as usize),
+            ("BinkSetWillLoop", ffi::set_will_loop as *const () as usize),
+            ("BinkShouldSkip", ffi::should_skip as *const () as usize),
             (
                 "BinkStartAsyncThread",
-                imp::start_async_thread as *const () as usize,
+                ffi::start_async_thread as *const () as usize,
             ),
-            ("BinkWait", imp::wait as *const () as usize),
+            ("BinkWait", ffi::wait as *const () as usize),
             (
                 "BinkWaitStopAsyncThreadsMulti",
-                imp::wait_stop_async_threads_multi as *const () as usize,
+                ffi::wait_stop_async_threads_multi as *const () as usize,
             ),
         ];
         list.into_iter()

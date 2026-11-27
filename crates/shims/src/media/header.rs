@@ -23,6 +23,8 @@ pub struct MovieHeader {
     pub rate: u32,
     pub rate_divisor: u32,
     pub audio_tracks: u32,
+    /// The word at +0x24; its 0x00100000 bit is taken to be Bink's alpha flag.
+    pub video_flags: u32,
     /// Bytes of the whole stream: the word at +0x04 plus 8.
     pub stream_bytes: u64,
 }
@@ -42,6 +44,7 @@ impl MovieHeader {
         rate: 30,
         rate_divisor: 1,
         audio_tracks: 0,
+        video_flags: 0,
         stream_bytes: 0,
     };
 }
@@ -65,6 +68,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<MovieHeader, MediaError> {
         rate: word(bytes, 0x1C),
         rate_divisor: word(bytes, 0x20),
         audio_tracks: word(bytes, 0x28),
+        video_flags: word(bytes, 0x24),
         stream_bytes: u64::from(word(bytes, 0x04)) + 8,
     };
     let sane = |v: u32| (16..=8192).contains(&v);

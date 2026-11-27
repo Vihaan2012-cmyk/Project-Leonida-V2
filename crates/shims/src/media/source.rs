@@ -9,6 +9,8 @@ use super::worker::Loader;
 pub trait ByteSource: Send {
     /// Fills as much of `buf` as the source has left; fewer bytes than asked for means the end.
     fn read(&mut self, buf: &mut [u8]) -> usize;
+    /// Tells a source held in memory how long the stream turned out to be.
+    fn set_limit(&mut self, _bytes: usize) {}
 }
 
 pub fn read_fully(source: &mut dyn ByteSource, buf: &mut [u8]) -> usize {
@@ -51,6 +53,10 @@ impl MemorySource {
 }
 
 impl ByteSource for MemorySource {
+    fn set_limit(&mut self, bytes: usize) {
+        self.len = bytes;
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> usize {
         let n = buf.len().min(self.len - self.pos);
         // SAFETY: `new`'s guarantee covers `len` bytes.

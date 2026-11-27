@@ -14,6 +14,11 @@
 //!         +0x0C u32 Pitch      row pitch in bytes of Buffer (the game sets it)
 //! ```
 //! The whole description is 0x108 bytes. Every plane is one byte per pixel.
+//!
+//! Evidence: `0442f760` loops `TotalFrames` sets at 0x50 bytes, per plane tests the u32 at +8, maps the game's
+//! texture and stores its address at +0 and its row pitch at +0xc; `01bc2de0` sizes the Y, alpha and fifth planes
+//! from +4/+8 and the chroma planes from +0xc/+0x10; `0532f140` reads `FrameNum` at +0x14 to find the set to
+//! flush; `0442f170` copies 0x108 bytes of it; `0442ec02` reads +4/+8, +0x50 (alpha, set 0) and +0x60 (fifth plane).
 
 use super::decoder::{DecodedFrame, StreamInfo};
 
@@ -22,6 +27,7 @@ pub const TOTAL_FRAMES: u32 = 3;
 const SETS: usize = 0x18;
 const SET_BYTES: usize = 0x50;
 const PLANE_BYTES: usize = 0x10;
+#[cfg(test)]
 const PLANES: usize = 5;
 
 const Y: usize = 0;
