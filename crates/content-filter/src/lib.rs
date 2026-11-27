@@ -24,6 +24,7 @@
 
 pub mod archive;
 pub mod blocklist;
+pub mod filter;
 pub mod hash;
 pub mod names;
 pub mod rules;
