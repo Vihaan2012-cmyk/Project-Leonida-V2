@@ -138,7 +138,7 @@ pub fn write_xma2_riff(
     fmt.extend_from_slice(&(PACKET_SIZE as u16).to_le_bytes());
     fmt.extend_from_slice(&16u16.to_le_bytes());
     fmt.extend_from_slice(&(EXTRA_SIZE as u16).to_le_bytes());
-    fmt.extend_from_slice(&u16::from(channels).div_ceil(2).to_le_bytes());
+    fmt.extend_from_slice(&channels.div_ceil(2).to_le_bytes());
     fmt.extend_from_slice(&0u32.to_le_bytes());
     fmt.extend_from_slice(&samples_encoded.to_le_bytes());
     fmt.extend_from_slice(&(PACKET_SIZE as u32).to_le_bytes());

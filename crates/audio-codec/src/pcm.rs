@@ -18,6 +18,10 @@ impl Pcm {
     }
 }
 
+pub fn f32_to_i16(v: f32) -> i16 {
+    (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,8 +47,4 @@ mod tests {
         assert_eq!(p.frames(), 5);
         assert_eq!(p.to_i16().len(), 10);
     }
-}
-
-pub fn f32_to_i16(v: f32) -> i16 {
-    (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16
 }
