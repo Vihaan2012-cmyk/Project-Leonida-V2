@@ -381,7 +381,7 @@ impl Verify {
 
 pub fn verify_command(args: &VerifyArgs) -> Result<ExitCode> {
     let gpu = Gpu::new().context("opening the GPU")?;
-    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+    let workers = args.jobs.max(1);
     let started = Instant::now();
     let (sender, receiver) = mpsc::sync_channel::<CarvedShader>(4 * workers);
     let receiver = Mutex::new(receiver);

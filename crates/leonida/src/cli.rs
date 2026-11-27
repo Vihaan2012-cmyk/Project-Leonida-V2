@@ -133,6 +133,9 @@ pub struct VerifyArgs {
     /// Print each shader with its size and how long the driver took.
     #[arg(long)]
     pub each: bool,
+    /// How many shaders the driver builds at once. Each large shader can take several gigabytes to build.
+    #[arg(long, default_value_t = 1)]
+    pub jobs: usize,
 }
 
 #[derive(Debug, Args)]
