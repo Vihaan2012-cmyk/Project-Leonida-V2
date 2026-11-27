@@ -499,13 +499,24 @@ Further rules:
 
 ### 9.5 Where it stands
 
-`pe-loader` maps, relocates, binds and protects 64-bit images and registers their exception tables; images with
-thread-local storage are refused until the TLS mechanism above exists. `shims` binds each import to a shim (the
-`XMem` allocator so far), an allowed Windows DLL, or a stand-in that records the call and returns 0, which is also
-what every import the `offline` crate names gets. Tests build small executables byte by byte and run them through
-all three. `leonida run --dry-run` reads the executable's imports and runs nothing: of its 587 imports, 430 come
-from Windows, 78 are blocked as offline play requires, 4 are shims and 75 are missing (the console graphics,
-memory, audio, video and input libraries). Running without `--dry-run` is refused for now.
+- **Loading.** `pe-loader` maps, relocates, binds and protects 64-bit images and registers their exception tables.
+  Thread-local storage works through a helper DLL written for each image (`Output/runtime/`): its TLS directory
+  carries the image's template and its callbacks are a stub that copies the slot number into the image's index
+  variable, followed by the image's own callbacks. Windows sets up TLS only for DLLs that have an entry point and
+  import at least one function, so the helper has both.
+- **Imports.** `shims` binds each import to a shim, an allowed Windows DLL, or a stand-in that records the call and
+  returns 0, which is also what every import the `offline` crate names gets. Shims so far: the whole `XMem` family
+  that the executable imports except `XMemGetWorkingSetStatistics` and `XMemTransferMemory` (physical pages are
+  64 KiB page-file sections mapped into placeholder reservations), and `D3D12XboxCreateDevice`.
+- **Graphics.** Until the renderer exists, `D3D12XboxCreateDevice` returns a trapping device: every method is noted
+  by interface, slot and name (`crates/shims/src/d3d12_slots.txt`, measured slots marked) with its caller, and fails
+  with `E_NOTIMPL`; `QueryInterface` gives another trapping object.
+- **Tracing.** `leonida run --trace` writes `Output/boot/imports.txt` (calls per import and the last one called),
+  `files.txt` (every file name handed to Windows), `notes.txt` (missing graphics methods, failed allocations) and,
+  on a crash, `crash.txt` with the exception and its offset in the image.
+- **Status.** Of the executable's 587 imports, 437 come from Windows, 78 are blocked as offline play requires, 11 are
+  shims and 61 are missing (audio, video, input, the rest of the console graphics libraries). Tests build small
+  executables byte by byte and run them through every path above.
 
 ### 9.4 First-boot kit
 

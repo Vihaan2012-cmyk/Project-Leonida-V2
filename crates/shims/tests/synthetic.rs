@@ -19,12 +19,16 @@ const DATA: u32 = 0x3000;
 const PDATA: u32 = 0x4000;
 const RELOC: u32 = 0x5000;
 
-const IMPORTS: [(&str, &str); 4] = [
+const IMPORTS: [(&str, &str); 5] = [
     ("test.dll", "Triple"),
     ("missing.dll", "Nothing"),
     ("WS2_32.dll", "connect"),
     ("kernel32.dll", "GetCurrentProcessId"),
+    ("kernel32.dll", "GetFileAttributesW"),
 ];
+
+const PROBE_FILE: &str = "leonida-trace-probe.txt";
+const PROBE_AT: u32 = DATA + 0x40;
 
 fn iat(index: usize) -> u32 {
     RDATA + 0x200 + 0x20 * index as u32
@@ -50,11 +54,14 @@ impl Code {
     }
 }
 
-/// Reads a pointer to 7 that needs relocating, triples it through a shim, calls a missing import and a blocked
-/// one (both give 0), stores the process id from the host at DATA + 0x20, and returns the sum.
+/// Asks for the attributes of a file that does not exist, reads a pointer to 7 that needs relocating, triples
+/// it through a shim, calls a missing import and a blocked one (both give 0), stores the process id from the
+/// host at DATA + 0x20, and returns the sum.
 fn program() -> Vec<u8> {
     let mut code = Code(Vec::new());
     code.bytes(&[0x48, 0x83, 0xEC, 0x28]);
+    code.relative(&[0x48, 0x8D, 0x0D], PROBE_AT, &[]);
+    code.relative(&[0xFF, 0x15], iat(4), &[]);
     code.relative(&[0x48, 0x8B, 0x05], DATA, &[]);
     code.bytes(&[0x8B, 0x08]);
     code.relative(&[0xFF, 0x15], iat(0), &[]);
@@ -100,7 +107,7 @@ fn image(text_characteristics: u32) -> Vec<u8> {
     put(&mut file, optional + 68, &3u16.to_le_bytes());
     put(&mut file, optional + 70, &0x160u16.to_le_bytes());
     put(&mut file, optional + 108, &16u32.to_le_bytes());
-    for (index, (rva, size)) in [(1, (RDATA, 100)), (3, (PDATA, 12)), (5, (RELOC, 12))] {
+    for (index, (rva, size)) in [(1, (RDATA, 120)), (3, (PDATA, 12)), (5, (RELOC, 12))] {
         put(&mut file, optional + 112 + 8 * index, &rva.to_le_bytes());
         put(
             &mut file,
@@ -154,6 +161,11 @@ fn image(text_characteristics: u32) -> Vec<u8> {
         &(BASE + u64::from(DATA) + 0x10).to_le_bytes(),
     );
     put(&mut file, 0xC10, &7u32.to_le_bytes());
+    let wide: Vec<u8> = PROBE_FILE
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+    put(&mut file, 0xC00 + (PROBE_AT - DATA) as usize, &wide);
     let function = [TEXT, TEXT + code.len() as u32, PDATA + 0x10];
     put(
         &mut file,
@@ -186,11 +198,11 @@ fn test_shims() -> Vec<Shim> {
     }]
 }
 
-#[test]
-fn a_synthetic_executable_runs_through_shims_host_functions_and_stand_ins() {
+fn run(mut binder: Binder) -> Binder {
     let bytes = image(0x6000_0020);
-    let mut binder = Binder::new(&test_shims());
     let module = load(&bytes, &mut binder, &anywhere()).expect("loads");
+    let watched = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("trace");
+    shims::trace::watch_crashes(watched, module.base(), module.size());
     assert_ne!(
         module.base() as u64,
         BASE,
@@ -219,6 +231,24 @@ fn a_synthetic_executable_runs_through_shims_host_functions_and_stand_ins() {
             },
         ]
     );
+    binder
+}
+
+#[test]
+fn a_synthetic_executable_runs_through_shims_host_functions_and_stand_ins() {
+    let plain = run(Binder::new(&test_shims()));
+    assert!(plain.trace().is_none());
+    let traced = run(Binder::new(&test_shims()).traced());
+    let trace = traced.trace().expect("tracing");
+    assert_eq!(trace.calls("test.dll!Triple"), 1);
+    assert_eq!(trace.calls("missing.dll!Nothing"), 1);
+    assert_eq!(trace.last(), Some("kernel32.dll!GetCurrentProcessId"));
+    assert!(
+        shims::trace::files().iter().any(|f| f == PROBE_FILE),
+        "{:?}",
+        shims::trace::files()
+    );
+    assert!(trace.report().contains("5 of 5 imports called"));
 }
 
 #[test]

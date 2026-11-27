@@ -20,7 +20,7 @@ pub enum Command {
     Exe(ExeArgs),
     /// Check that every game file is there and the right size; with --full, that its contents are right too.
     Check(CheckArgs),
-    /// Run the game. Only --dry-run works so far: it reads the imports and runs nothing.
+    /// Run the game executable, or with --dry-run only show how its imports would be provided.
     Run(RunArgs),
 }
 
@@ -38,6 +38,13 @@ pub struct RunArgs {
     /// With --dry-run, also list every function each DLL provides.
     #[arg(long)]
     pub all: bool,
+    /// Record every import called, every file named, every graphics method missing and any crash, in
+    /// OUTPUT/boot.
+    #[arg(long)]
+    pub trace: bool,
+    /// Where Leonida writes what it makes while running.
+    #[arg(long, default_value = "Output")]
+    pub output: PathBuf,
 }
 
 #[derive(Debug, Args)]

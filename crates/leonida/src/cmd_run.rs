@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use game_package::{Manifest, map_file};
 use pe_image::Image;
-use pe_loader::ImportRef;
+use pe_loader::{ImportRef, LoadOptions, Placement};
 use shims::{Binder, Binding};
 
 use crate::cli::RunArgs;
@@ -13,12 +15,6 @@ use crate::cmd_exe::executable;
 use crate::game::resolve_game;
 
 pub fn run_command(args: &RunArgs) -> Result<ExitCode> {
-    if !args.dry_run {
-        bail!(
-            "running the game is not ready yet: thread-local storage and the console's graphics interface are \
-             still missing. Use --dry-run to see how its imports would be provided."
-        );
-    }
     let game = resolve_game(args.game.as_ref(), &Manifest::builtin())?;
     let path = match &args.file {
         Some(name) if name.contains(['/', '\\']) || name.contains("..") => {
@@ -27,6 +23,9 @@ pub fn run_command(args: &RunArgs) -> Result<ExitCode> {
         Some(name) => game.join(name),
         None => executable(&game)?,
     };
+    if !args.dry_run {
+        return run(&path, args);
+    }
     let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     let bytes = map_file(&file).context("mapping the file")?;
     let image = Image::parse(&bytes)?;
@@ -79,5 +78,43 @@ pub fn run_command(args: &RunArgs) -> Result<ExitCode> {
             println!("    {function}");
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Loads the executable with its imports bound and calls its entry point, which normally ends the process.
+#[allow(unsafe_code)]
+fn run(path: &Path, args: &RunArgs) -> Result<ExitCode> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut binder = Binder::new(&[]);
+    if args.trace {
+        binder = binder.traced();
+    }
+    let options = LoadOptions {
+        placement: Placement::Preferred,
+        helpers: Some(args.output.join("runtime")),
+    };
+    let module = pe_loader::load(&bytes, &mut binder, &options)
+        .with_context(|| format!("loading {}", path.display()))?;
+    binder.seal().map_err(|e| anyhow!(e))?;
+    shims::trace::set_image(module.base(), module.size());
+    let binder: &'static Binder = Box::leak(Box::new(binder));
+    let boot = args.output.join("boot");
+    if let Some(trace) = binder.trace() {
+        shims::trace::watch_crashes(boot.clone(), module.base(), module.size());
+        let folder = boot.clone();
+        std::thread::spawn(move || {
+            loop {
+                let _ = trace.write(&folder);
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+    }
+    println!("starting {} at {:#x}", path.display(), module.entry());
+    // SAFETY: the player asked to run this executable; its imports are bound and its pages protected.
+    let code = unsafe { module.call_entry() };
+    if let Some(trace) = binder.trace() {
+        trace.write(&boot)?;
+    }
+    println!("the entry point returned {code:#x}");
     Ok(ExitCode::SUCCESS)
 }

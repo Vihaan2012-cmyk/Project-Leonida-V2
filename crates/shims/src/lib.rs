@@ -1,12 +1,16 @@
 //! What each import of a loaded executable is bound to: one of our shims, the same function in an allowed
 //! Windows DLL, or a stand-in that records the call and fails, for everything the offline policy blocks and
-//! everything nobody provides yet.
+//! everything nobody provides yet. With tracing on, every import also counts its calls.
 #![allow(unsafe_code)]
 
 use std::sync::Mutex;
 
 use pe_loader::{ImportRef, Resolver};
 
+#[cfg(windows)]
+mod code;
+pub mod d3d12;
+pub mod trace;
 mod xmem;
 
 /// A function we provide in place of a console one.
@@ -19,7 +23,9 @@ pub struct Shim {
 
 /// The shims built into Leonida.
 pub fn builtin() -> Vec<Shim> {
-    xmem::shims()
+    let mut shims = xmem::shims();
+    shims.extend(d3d12::shims());
+    shims
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,11 +104,20 @@ extern "win64" fn trapped(index: usize) -> usize {
     0
 }
 
+fn function_name(import: &ImportRef<'_>) -> String {
+    match (import.name, import.ordinal) {
+        (Some(name), _) => name.to_string(),
+        (None, Some(ordinal)) => format!("#{ordinal}"),
+        (None, None) => "?".to_string(),
+    }
+}
+
 /// Binds imports for one loaded image.
 pub struct Binder {
     shims: Vec<Shim>,
+    trace: Option<trace::Trace>,
     #[cfg(windows)]
-    stubs: host::Stubs,
+    code: code::Code,
 }
 
 impl Binder {
@@ -111,9 +126,20 @@ impl Binder {
         shims.extend_from_slice(extra);
         Binder {
             shims,
+            trace: None,
             #[cfg(windows)]
-            stubs: host::Stubs::default(),
+            code: code::Code::default(),
         }
+    }
+
+    /// Counts every import's calls and records the files the program names; see [`trace`].
+    pub fn traced(mut self) -> Binder {
+        self.trace = Some(trace::Trace::new());
+        self
+    }
+
+    pub fn trace(&self) -> Option<&trace::Trace> {
+        self.trace.as_ref()
     }
 
     fn shim(&self, import: &ImportRef<'_>) -> Option<usize> {
@@ -140,21 +166,19 @@ impl Binder {
         Binding::Missing
     }
 
-    /// Makes the stand-ins callable. Call after loading and before running anything.
+    /// Makes the stand-ins and trace counters callable. Call after loading and before running anything.
     pub fn seal(&mut self) -> Result<(), String> {
         #[cfg(windows)]
         {
-            self.stubs.seal()
+            self.code.seal()
         }
         #[cfg(not(windows))]
         {
             Ok(())
         }
     }
-}
 
-impl Resolver for Binder {
-    fn resolve(&mut self, import: &ImportRef<'_>) -> usize {
+    fn bind(&mut self, import: &ImportRef<'_>) -> usize {
         if let Some(address) = self.shim(import) {
             return address;
         }
@@ -164,24 +188,22 @@ impl Resolver for Binder {
             && host_allowed(import.dll)
             && let Some(address) = host::find(import)
         {
-            return address;
+            return match (&self.trace, trace::path_argument(import)) {
+                (Some(_), Some(wide)) => self.code.recorder(address, wide).unwrap_or(address),
+                _ => address,
+            };
         }
-        let function = match (import.name, import.ordinal) {
-            (Some(name), _) => name.to_string(),
-            (None, Some(ordinal)) => format!("#{ordinal}"),
-            (None, None) => "?".to_string(),
-        };
         let mut traps = TRAPS.lock().expect("no panic while held");
         let index = traps.len();
         traps.push(Trap {
             dll: import.dll.to_string(),
-            function,
+            function: function_name(import),
             blocked,
         });
         drop(traps);
         #[cfg(windows)]
         {
-            self.stubs.stub(index).unwrap_or(0)
+            self.code.trap(index).unwrap_or(0)
         }
         #[cfg(not(windows))]
         {
@@ -191,15 +213,26 @@ impl Resolver for Binder {
     }
 }
 
+impl Resolver for Binder {
+    fn resolve(&mut self, import: &ImportRef<'_>) -> usize {
+        let address = self.bind(import);
+        #[cfg(windows)]
+        if let Some(trace) = &mut self.trace
+            && let Some((index, counter, last)) = trace.add(import)
+        {
+            return self
+                .code
+                .counter(index, counter, last, address)
+                .unwrap_or(address);
+        }
+        address
+    }
+}
+
 #[cfg(windows)]
 mod host {
-    use std::ffi::c_void;
-
     use pe_loader::ImportRef;
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
-    };
 
     pub fn find(import: &ImportRef<'_>) -> Option<usize> {
         let wide: Vec<u16> = import.dll.encode_utf16().chain([0]).collect();
@@ -218,72 +251,6 @@ mod host {
                 (None, None) => None,
             };
             found.map(|f| f as usize)
-        }
-    }
-
-    const STUB_BYTES: usize = 22;
-    const PAGE_BYTES: usize = 64 * 1024;
-
-    /// Pages of `mov rcx, index; mov rax, trapped; jmp rax`, written while read-write and then sealed
-    /// read-execute, never both.
-    #[derive(Default)]
-    pub struct Stubs {
-        pages: Vec<(usize, usize, bool)>,
-    }
-
-    impl Stubs {
-        pub fn stub(&mut self, index: usize) -> Option<usize> {
-            let needs_page = self
-                .pages
-                .last()
-                .is_none_or(|(_, used, sealed)| *sealed || used + STUB_BYTES > PAGE_BYTES);
-            if needs_page {
-                // SAFETY: a fresh read-write allocation.
-                let page = unsafe {
-                    VirtualAlloc(
-                        std::ptr::null(),
-                        PAGE_BYTES,
-                        MEM_RESERVE | MEM_COMMIT,
-                        PAGE_READWRITE,
-                    )
-                };
-                if page.is_null() {
-                    return None;
-                }
-                self.pages.push((page as usize, 0, false));
-            }
-            let (page, used, _) = self.pages.last_mut()?;
-            let at = *page + *used;
-            let mut code = Vec::with_capacity(STUB_BYTES);
-            code.extend_from_slice(&[0x48, 0xB9]);
-            code.extend_from_slice(&(index as u64).to_le_bytes());
-            code.extend_from_slice(&[0x48, 0xB8]);
-            code.extend_from_slice(&(super::trapped as *const () as usize as u64).to_le_bytes());
-            code.extend_from_slice(&[0xFF, 0xE0]);
-            // SAFETY: `at..at + STUB_BYTES` is inside an unsealed read-write page.
-            unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, code.len()) };
-            *used += STUB_BYTES;
-            Some(at)
-        }
-
-        pub fn seal(&mut self) -> Result<(), String> {
-            for (page, _, sealed) in self.pages.iter_mut().filter(|p| !p.2) {
-                let mut old = 0;
-                // SAFETY: a page this struct allocated.
-                let done = unsafe {
-                    VirtualProtect(
-                        *page as *const c_void,
-                        PAGE_BYTES,
-                        PAGE_EXECUTE_READ,
-                        &mut old,
-                    )
-                };
-                if done == 0 {
-                    return Err("could not make the stand-in calls executable".into());
-                }
-                *sealed = true;
-            }
-            Ok(())
         }
     }
 }
