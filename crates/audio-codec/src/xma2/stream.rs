@@ -4,6 +4,7 @@
 use std::collections::VecDeque;
 
 use super::frame::{FrameDecoder, FrameInfo, MAX_CHANNELS, SAMPLES_PER_FRAME};
+use crate::pcm::{Pcm, f32_to_i16};
 use crate::{Error, Result};
 
 pub const PACKET_SIZE: usize = 2048;
@@ -392,26 +393,4 @@ impl Xma2Decoder {
             samples,
         })
     }
-}
-
-/// Decoded interleaved PCM.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Pcm {
-    pub sample_rate: u32,
-    pub channels: usize,
-    pub samples: Vec<f32>,
-}
-
-impl Pcm {
-    pub fn frames(&self) -> usize {
-        self.samples.len() / self.channels.max(1)
-    }
-
-    pub fn to_i16(&self) -> Vec<i16> {
-        self.samples.iter().map(|&v| f32_to_i16(v)).collect()
-    }
-}
-
-pub fn f32_to_i16(v: f32) -> i16 {
-    (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16
 }

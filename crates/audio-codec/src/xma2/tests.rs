@@ -174,7 +174,7 @@ fn pull_in_small_pieces_and_i16_conversion() {
     }
     assert_eq!(got.len(), 1000);
     for (g, f) in got.iter().zip(&all) {
-        assert_eq!(*g, super::f32_to_i16(*f));
+        assert_eq!(*g, crate::f32_to_i16(*f));
     }
 }
 
