@@ -75,6 +75,11 @@ pub fn configure(plan: &RuntimePlan) -> Result<()> {
     }
     let line = content::configure(plan).context("setting up the nudity filter")?;
     println!("{line}");
+    // DirectStorage requests name a BCPack mode in bits 1-3 of their options, so mode m arrives as format m << 1.
+    #[cfg(windows)]
+    for mode in 1..=7u8 {
+        shims::dstorage::set_bcpack_format(mode << 1, mode);
+    }
     // The title reserves its GPU-visible memory before it creates the device, so the device's address space and
     // memory hooks must exist first.
     shims::d3d12::prepare()
