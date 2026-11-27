@@ -164,3 +164,12 @@ fn array_subresources_do_not_share_bytes_and_round_trip() {
     }
     assert!(array.block_offset(3, 0, 0, 0).is_none());
 }
+
+#[test]
+fn a_mip_has_the_blocks_of_its_halved_texel_size() {
+    let layout = compact_layout(TileMode::Sw64kD, 100, 60, 7, 4, 1).unwrap();
+    assert_eq!((layout.mips[3].blocks_w, layout.mips[3].blocks_h), (12, 7));
+    let bc = compact_layout(TileMode::Sw64kD, 100, 100, 7, 8, 4).unwrap();
+    assert_eq!((bc.mips[3].blocks_w, bc.mips[3].blocks_h), (3, 3));
+    assert_eq!((bc.mips[6].blocks_w, bc.mips[6].blocks_h), (1, 1));
+}

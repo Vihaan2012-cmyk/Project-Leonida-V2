@@ -23,6 +23,7 @@ pub enum LayoutError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MipLayout {
     pub index: u32,
+    /// What the image has: the mip's texel size, in blocks.
     pub blocks_w: u32,
     pub blocks_h: u32,
     /// The size of the stored surface: a whole number of micro-tiles each way.
@@ -51,6 +52,12 @@ pub struct CompactLayout {
 /// Tail mip origins in a tile, in blocks: the x and y step by element size (1, 2, 4, 8, 16 bytes).
 const TILE_ORIGIN: [(u32, u32); 5] = [(16, 16), (16, 8), (8, 8), (8, 4), (4, 4)];
 
+/// Blocks across a mip of a surface `texels` wide: what the image has, from the halved texel size.
+fn true_blocks(texels: u32, mip: u32, block: u32) -> u32 {
+    (texels >> mip).max(1).div_ceil(block)
+}
+
+/// The count the stored layout is sized by: half the previous mip, rounded up.
 fn blocks_at(count: u32, mip: u32) -> u32 {
     ((count + (1 << mip) - 1) >> mip).max(1)
 }
@@ -111,8 +118,8 @@ pub fn compact_layout(
         );
         out.push(MipLayout {
             index: i,
-            blocks_w: wc,
-            blocks_h: hc,
+            blocks_w: true_blocks(width, i, block),
+            blocks_h: true_blocks(height, i, block),
             padded_w: pw,
             padded_h: ph,
             offset: 0,
@@ -141,8 +148,8 @@ pub fn compact_layout(
         }
         out.push(MipLayout {
             index: i,
-            blocks_w: blocks_at(ew, i),
-            blocks_h: blocks_at(eh, i),
+            blocks_w: true_blocks(width, i, block),
+            blocks_h: true_blocks(height, i, block),
             padded_w: micro_w,
             padded_h: micro_h,
             offset: 0,
