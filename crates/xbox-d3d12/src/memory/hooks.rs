@@ -45,6 +45,11 @@ pub trait GpuMemoryHooks: Send + Sync {
         Ok(())
     }
 
+    /// The host wrote `va..va + len` of memory already reported as mapped, outside the game's own code (a
+    /// DirectStorage read landing in physical pages). Mirrored windows take the host's bytes over the GPU's
+    /// results there.
+    fn host_written(&self, _va: u64, _len: u64) {}
+
     /// The first address and the length of the range GPU-visible memory must be placed in.
     fn window(&self) -> (u64, u64);
 }
@@ -125,6 +130,10 @@ impl GpuMemoryHooks for AddressSpaceHooks {
         }
         let ended = space.end_batch();
         result.and(ended)
+    }
+
+    fn host_written(&self, va: u64, len: u64) {
+        self.space().mark_dirty(va, len);
     }
 
     fn window(&self) -> (u64, u64) {
