@@ -3,12 +3,13 @@ mod cmd_check;
 mod cmd_config;
 mod cmd_exe;
 mod cmd_package;
+mod cmd_pipelines;
 mod cmd_run;
 mod cmd_shaders;
 mod cmd_systems;
 mod cmd_verify;
 mod game;
-mod shader_build;
+mod pipeline_work;
 
 use std::process::ExitCode;
 
@@ -35,6 +36,7 @@ fn main() -> ExitCode {
         Some(Command::Run(args)) => cmd_run::run_command(args),
         Some(Command::Triage(args)) => cmd_package::triage_command(args),
         Some(Command::Systems(systems)) => cmd_systems::systems_command(systems),
+        Some(Command::Pipelines(args)) => cmd_pipelines::pipelines_command(args),
     };
     result.unwrap_or_else(|error| {
         eprintln!("error: {error:#}");

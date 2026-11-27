@@ -23,6 +23,7 @@ systems.workspace = true
 rdna.workspace = true
 shader-container.workspace = true
 shader-ir.workspace = true
+shader-store.workspace = true
 shader-translate.workspace = true
 
 [build-dependencies]

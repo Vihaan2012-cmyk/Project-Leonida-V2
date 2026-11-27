@@ -6,8 +6,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use ash::vk;
 
 mod check;
+mod pipeline_cache;
 
 pub use check::{BindingKind, Check};
+pub use pipeline_cache::CacheLoad;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GpuError {
@@ -15,6 +17,8 @@ pub enum GpuError {
     Loader(String),
     #[error("Vulkan call failed: {0}")]
     Vulkan(#[from] vk::Result),
+    #[error("pipeline cache file: {0}")]
+    CacheFile(#[from] std::io::Error),
     #[error("no Vulkan 1.3 GPU with a compute queue was found")]
     NoDevice,
     #[error("no host-visible memory for a buffer")]
@@ -282,6 +286,8 @@ pub struct Gpu {
     queue: vk::Queue,
     family: u32,
     memory: vk::PhysicalDeviceMemoryProperties,
+    cache: vk::PipelineCache,
+    cache_identity: [u8; 24],
     pub info: DeviceInfo,
 }
 
@@ -553,6 +559,13 @@ impl Gpu {
             {
                 info.subgroup_size_control = false;
             }
+            let properties = instance.get_physical_device_properties(chosen.physical);
+            let mut cache_identity = [0u8; 24];
+            cache_identity[..4].copy_from_slice(&properties.vendor_id.to_le_bytes());
+            cache_identity[4..8].copy_from_slice(&properties.device_id.to_le_bytes());
+            cache_identity[8..].copy_from_slice(&properties.pipeline_cache_uuid);
+            let cache =
+                device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)?;
             Ok(Gpu {
                 _entry: entry,
                 instance,
@@ -561,6 +574,8 @@ impl Gpu {
                 queue,
                 family: chosen.family,
                 memory,
+                cache,
+                cache_identity,
                 info,
             })
         }
@@ -1120,7 +1135,7 @@ impl Gpu {
                 .stage(stage)
                 .layout(scratch.pipeline_layout);
             scratch.pipeline = device
-                .create_compute_pipelines(vk::PipelineCache::null(), &[create], None)
+                .create_compute_pipelines(self.cache, &[create], None)
                 .map_err(|(_, error)| error)?[0];
         }
         Ok(())
@@ -1357,7 +1372,7 @@ impl Gpu {
                     .input_assembly_state(&assembly);
             }
             scratch.pipeline = device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[create], None)
+                .create_graphics_pipelines(self.cache, &[create], None)
                 .map_err(|(_, error)| error)?[0];
         }
         Ok(())
@@ -1757,6 +1772,7 @@ impl Drop for Gpu {
         // SAFETY: all work was waited for in `dispatch`; handles are destroyed child-first.
         unsafe {
             let _ = self.device.device_wait_idle();
+            self.device.destroy_pipeline_cache(self.cache, None);
             self.device.destroy_device(None);
             if let Some((utils, messenger)) = &self.debug {
                 utils.destroy_debug_utils_messenger(*messenger, None);
