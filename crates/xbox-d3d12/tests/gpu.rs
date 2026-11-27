@@ -8,7 +8,8 @@ use ash::vk;
 use shader_container::testutil;
 use shader_translate::FloatMode;
 use xbox_d3d12::execute::{
-    self, Arena, BindPoint, Command, ImageRef, ReplayEnv, TargetView, VkContext, barrier,
+    self, Arena, BindPoint, Command, ImageRef, ReplayEnv, SpillAllocator, TargetView, VkContext,
+    barrier,
 };
 use xbox_d3d12::pipeline::shaders::{Link, ShaderSource, TranslatedStage};
 use xbox_d3d12::pipeline::{
@@ -686,4 +687,195 @@ fn a_draw_replays_through_a_graphics_pipeline_and_fills_the_target() {
         d.destroy_image(image, None);
         d.free_memory(memory, None);
     }
+}
+
+fn run_commands<'a>(
+    setup: &'a Setup,
+    spill: Option<&'a mut dyn SpillAllocator>,
+    commands: &[Command],
+) {
+    let env = ReplayEnv {
+        spill,
+        ..replay(setup)
+    };
+    execute::run(&setup.ctx, env, commands).unwrap();
+}
+
+fn constants_param(values: u32) -> RootParameter {
+    RootParameter {
+        kind: ParameterKind::Constants {
+            register: 0,
+            space: 0,
+            values,
+        },
+        visibility: Visibility::All,
+    }
+}
+
+fn compute_container(source: &str, user_sgprs: u32) -> Bytecode {
+    let mut blob = fssm_compute(source);
+    blob[0x138..0x13C].copy_from_slice(&(user_sgprs << 1).to_le_bytes());
+    Bytecode(testutil::container(5, &[blob]))
+}
+
+#[test]
+fn root_constants_an_indirect_dispatch_fills_and_copies_run_in_order() {
+    let Some(setup) = setup(translation(), None) else {
+        return;
+    };
+    // Two constants at s4 and s5, a root UAV at s6: one thread stores their sum.
+    let root = root_with(vec![
+        constants_param(2),
+        RootParameter {
+            kind: ParameterKind::Uav {
+                register: 0,
+                space: 0,
+                flags: 0,
+            },
+            visibility: Visibility::All,
+        },
+    ]);
+    let desc = ComputePsoDesc {
+        root: Some(root.clone()),
+        cs: compute_container(
+            "s_add_u32 s10, s4, s5
+             v_mov_b32_e32 v1, s10
+             v_mov_b32_e32 v2, 0
+             global_store_dword v2, v1, s[6:7]
+             s_endpgm",
+            8,
+        ),
+    };
+    let pipeline = setup.env.create_compute(&desc).unwrap();
+    let (args, out, copy) = (0x3000u64, 0x3100u64, 0x3200u64);
+    // The indirect arguments: one group of 64 threads, written by a fill and a copy of the constants below.
+    let commands = [
+        Command::FillBuffer {
+            va: args,
+            bytes: 12,
+            value: 1,
+        },
+        Command::FillBuffer {
+            va: out,
+            bytes: 16,
+            value: 0xDEAD_BEEF,
+        },
+        Command::Barriers(vec![execute::Barrier::Uav]),
+        Command::SetRootSignature {
+            bind: BindPoint::Compute,
+            root,
+        },
+        Command::SetPipeline(pipeline),
+        Command::SetRootConstants {
+            bind: BindPoint::Compute,
+            param: 0,
+            first: 0,
+            values: vec![40, 2],
+        },
+        Command::SetRootView {
+            bind: BindPoint::Compute,
+            param: 1,
+            va: out,
+        },
+        Command::ExecuteIndirect {
+            kind: execute::IndirectKind::Dispatch,
+            max_count: 1,
+            args,
+            stride: 12,
+            count: None,
+        },
+        Command::Barriers(vec![execute::Barrier::Uav]),
+        Command::CopyBuffer {
+            dst: copy,
+            src: out,
+            bytes: 16,
+        },
+    ];
+    run_commands(&setup, None, &commands);
+    assert_eq!(
+        setup.arena.words(out, 4),
+        [42, 0xDEAD_BEEF, 0xDEAD_BEEF, 0xDEAD_BEEF]
+    );
+    assert_eq!(
+        setup.arena.words(copy, 4),
+        [42, 0xDEAD_BEEF, 0xDEAD_BEEF, 0xDEAD_BEEF]
+    );
+}
+
+struct Spill {
+    arena: Arc<TestArena>,
+    next: u64,
+}
+
+impl SpillAllocator for Spill {
+    fn store(&mut self, bytes: &[u8]) -> Option<u64> {
+        let at = self.next;
+        self.next += 256;
+        // SAFETY: the copy stays inside the mapped arena.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (self.arena.ptr + at as usize) as *mut u8,
+                bytes.len(),
+            );
+        }
+        Some(at)
+    }
+}
+
+#[test]
+fn a_root_argument_that_spills_reaches_the_shader_through_the_pointer_in_s0() {
+    let Some(setup) = setup(translation(), None) else {
+        return;
+    };
+    // 27 constants fill s4 to s30, so the UAV spills; the shader reads its address from the array at s[0:1].
+    let root = root_with(vec![constants_param(27), {
+        let mut uav = uav_root().parameters[0].clone();
+        uav.visibility = Visibility::All;
+        uav
+    }]);
+    let desc = ComputePsoDesc {
+        root: Some(root.clone()),
+        cs: compute_container(
+            "s_load_dwordx2 s[40:41], s[0:1], 0x0
+             s_waitcnt lgkmcnt(0)
+             v_mov_b32_e32 v1, s4
+             v_mov_b32_e32 v2, 0
+             global_store_dword v2, v1, s[40:41]
+             s_endpgm",
+            31,
+        ),
+    };
+    let pipeline = setup.env.create_compute(&desc).unwrap();
+    assert!(pipeline.layouts[0].spills());
+    let out = 0x5000;
+    let commands = [
+        Command::SetRootSignature {
+            bind: BindPoint::Compute,
+            root,
+        },
+        Command::SetPipeline(pipeline),
+        Command::SetRootConstants {
+            bind: BindPoint::Compute,
+            param: 0,
+            first: 0,
+            values: vec![77],
+        },
+        Command::SetRootView {
+            bind: BindPoint::Compute,
+            param: 1,
+            va: out,
+        },
+        Command::Dispatch([1, 1, 1]),
+    ];
+    let mut spill = Spill {
+        arena: setup.arena.clone(),
+        next: 0x6000,
+    };
+    run_commands(&setup, Some(&mut spill), &commands);
+    assert_eq!(setup.arena.words(out, 1), [77]);
+    // Without anywhere to put the array the replay says so rather than running with a bad pointer.
+    let env = replay(&setup);
+    let error = execute::run(&setup.ctx, env, &commands).unwrap_err();
+    assert!(matches!(error, execute::ReplayError::NoSpillSpace));
 }
