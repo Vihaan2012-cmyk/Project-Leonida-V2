@@ -92,11 +92,11 @@ pub fn source_path(raw: &str) -> Option<String> {
     let keep = parts.len().saturating_sub(5);
     parts.drain(..keep);
     parts.insert(0, "sources".to_string());
-    parts.push(format!("{stem}.c"));
+    parts.push(stem.to_string());
     Some(parts.join("/"))
 }
 
-/// `rage::fwEntity<int>` becomes `classes/rage/fwEntity_int_` (no extension).
+/// `rage::fwEntity<int>` becomes `classes/rage/fwEntity_int_` (the file gets `.c` or `.h`).
 pub fn class_path(name: &str) -> Option<String> {
     let mut parts = Vec::new();
     let (mut depth, mut start) = (0usize, 0usize);
@@ -315,13 +315,13 @@ mod tests {
     fn source_paths_lose_drive_and_dots() {
         assert_eq!(
             source_path(r"X:\game\..\src\Ped.cpp").as_deref(),
-            Some("sources/game/src/Ped.c")
+            Some("sources/game/src/Ped")
         );
         assert_eq!(
             source_path("a/b/util.h").as_deref(),
-            Some("sources/a/b/util.h.c")
+            Some("sources/a/b/util.h")
         );
-        assert_eq!(source_path("con.c").as_deref(), Some("sources/_con.c"));
+        assert_eq!(source_path("con.c").as_deref(), Some("sources/_con"));
         assert_eq!(source_path(r"\\").as_deref(), None);
     }
 
@@ -352,7 +352,7 @@ mod tests {
             paths,
             vec![
                 "classes/Foo",
-                "sources/src/a.c",
+                "sources/src/a",
                 "unsorted/0x000010c0",
                 "unsorted/0x00001140"
             ]
