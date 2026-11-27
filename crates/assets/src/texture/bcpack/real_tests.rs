@@ -239,10 +239,6 @@ fn decode_speed_on_real_chunks() {
             let raw = &file[c.src as usize..(c.src + c.packed) as usize];
             let t = Instant::now();
             let ok = decode_with(codec, raw, c.size as usize, &opts).is_ok();
-            let l = Instant::now();
-            let _ =
-                super::lanes::decode_slice(raw, codec.lane_widths().unwrap(), c.size as usize / 8);
-            lane_secs += l.elapsed().as_secs_f64();
             let e = per.entry(c.codec).or_default();
             if ok {
                 e.0 += 1;
