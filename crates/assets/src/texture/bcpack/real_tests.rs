@@ -234,7 +234,6 @@ fn decode_speed_on_real_chunks() {
             allow_provisional: true,
         };
         let mut per: BTreeMap<u8, (usize, usize, f64)> = BTreeMap::new();
-        let mut lane_secs = 0.0;
         for c in pool.chunks().iter().filter(|c| (1..=5).contains(&c.codec)) {
             let codec = BcPackCodec::from_chunk_codec(c.codec).unwrap();
             let raw = &file[c.src as usize..(c.src + c.packed) as usize];
@@ -251,7 +250,6 @@ fn decode_speed_on_real_chunks() {
                 e.2 += t.elapsed().as_secs_f64();
             }
         }
-        eprintln!("lane stage alone: {lane_secs:.2} s");
         for (codec, (n, bytes, secs)) in per {
             eprintln!(
                 "{rel} codec {codec}: {n} chunks, {:.1} MB decoded in {secs:.2} s = {:.1} MB/s",
