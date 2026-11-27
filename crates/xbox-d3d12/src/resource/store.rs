@@ -9,6 +9,7 @@
 //! address from a range no memory is mapped at.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::desc::{AllocationInfo, DescError, ResourceDesc};
 use super::image::{GpuImage, ImageError};
@@ -17,7 +18,7 @@ use super::va::{VaAllocator, commit_host, release_host};
 use crate::descriptor::format::Kind;
 use crate::descriptor::gfx10;
 use crate::descriptor::vulkan::{ViewInfo, view_info};
-use crate::memory::{AddressSpace, LOW_LIMIT, MemoryError, PAGE, SyncPolicy};
+use crate::memory::{AddressSpace, Handles, LOW_LIMIT, MemoryError, PAGE, SyncPolicy};
 
 pub type ResourceId = u32;
 
@@ -94,7 +95,7 @@ const KEY_END: u64 = 1 << 45;
 const LOW_SIZE: u64 = 256 << 20;
 
 pub struct Resources {
-    space: AddressSpace,
+    space: Arc<Mutex<AddressSpace>>,
     low: VaAllocator,
     general: VaAllocator,
     keys: VaAllocator,
@@ -105,7 +106,16 @@ pub struct Resources {
 
 impl Resources {
     pub fn new(space: AddressSpace) -> Resources {
-        let (base, size) = space.window();
+        Resources::shared(Arc::new(Mutex::new(space)))
+    }
+
+    /// Resources over an address space that others (the `XMem*` shims, through `memory::hooks`) also use: every
+    /// use here takes the same lock, briefly.
+    pub fn shared(space: Arc<Mutex<AddressSpace>>) -> Resources {
+        let (base, size) = space
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .window();
         let end = base + size;
         let start = base.max(PAGE);
         let low_end = (start + LOW_SIZE).min(LOW_LIMIT).min(end);
@@ -120,17 +130,25 @@ impl Resources {
         }
     }
 
-    pub fn space(&self) -> &AddressSpace {
-        &self.space
+    pub fn space(&self) -> MutexGuard<'_, AddressSpace> {
+        self.space.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub fn space_mut(&mut self) -> &mut AddressSpace {
-        &mut self.space
+    pub fn space_mut(&mut self) -> MutexGuard<'_, AddressSpace> {
+        self.space()
+    }
+
+    fn handles(&self) -> Handles {
+        self.space().handles().clone()
+    }
+
+    pub fn shared_space(&self) -> &Arc<Mutex<AddressSpace>> {
+        &self.space
     }
 
     /// The value of the shaders' `heap_base` push constants.
     pub fn heap_base(&self) -> u64 {
-        self.space.heap_base()
+        self.space().heap_base()
     }
 
     /// Committed host memory under 4 GiB, bound into the address space and zeroed, for descriptor heaps: nearly
@@ -142,7 +160,7 @@ impl Resources {
 
     pub fn free_low(&mut self, va: u64, len: u64) {
         let len = len.next_multiple_of(PAGE);
-        let _ = self.space.unmap(va, len);
+        let _ = self.space().unmap(va, len);
         release_host(va);
         self.free_va(va, len);
     }
@@ -192,7 +210,7 @@ impl Resources {
     }
 
     fn low_end(&self) -> u64 {
-        let (base, size) = self.space.window();
+        let (base, size) = self.space().window();
         (base.max(PAGE) + LOW_SIZE).min(LOW_LIMIT).min(base + size)
     }
 
@@ -206,7 +224,7 @@ impl Resources {
         if !commit_host(va, len, write_watch) {
             return Err(ResourceError::HostMemory(len, va));
         }
-        if let Err(e) = self.space.map_host(va, len, policy) {
+        if let Err(e) = self.space().map_host(va, len, policy) {
             release_host(va);
             return Err(e.into());
         }
@@ -260,7 +278,7 @@ impl Resources {
             .keys
             .alloc(size, PAGE)
             .ok_or(ResourceError::OutOfAddresses(size))?;
-        match GpuImage::create(self.space.handles(), desc) {
+        match GpuImage::create(&self.handles(), desc) {
             Ok(image) => Ok(self.insert(
                 *desc,
                 Origin::Committed(heap),
@@ -297,20 +315,20 @@ impl Resources {
             self.note_game_range(va, size);
             let mut at = va;
             while at < va + size {
-                if self.space.is_bound(at) {
+                if self.space().is_bound(at) {
                     at += PAGE;
                     continue;
                 }
                 let mut end = at + PAGE;
-                while end < va + size && !self.space.is_bound(end) {
+                while end < va + size && !self.space().is_bound(end) {
                     end += PAGE;
                 }
-                self.space.map_host(at, end - at, SyncPolicy::Always)?;
+                self.space().map_host(at, end - at, SyncPolicy::Always)?;
                 at = end;
             }
             return Ok(self.insert(*desc, Origin::Placed, (va, va, size), None, false));
         }
-        let image = GpuImage::create(self.space.handles(), desc)?;
+        let image = GpuImage::create(&self.handles(), desc)?;
         let (address, keyed) = if self.by_address.contains_key(&va) {
             let key = self
                 .keys
@@ -349,7 +367,7 @@ impl Resources {
             .keys
             .alloc(size, PAGE)
             .ok_or(ResourceError::OutOfAddresses(size))?;
-        match GpuImage::create(self.space.handles(), desc) {
+        match GpuImage::create(&self.handles(), desc) {
             Ok(image) => Ok(self.insert(
                 *desc,
                 Origin::Reserved,
@@ -374,7 +392,9 @@ impl Resources {
     ) -> Result<(), ResourceError> {
         let r = self.items.get(&id).ok_or(ResourceError::Unknown(id))?;
         let va = r.address + offset;
-        Ok(self.space.map_host_at(va, host, len, SyncPolicy::Always)?)
+        Ok(self
+            .space()
+            .map_host_at(va, host, len, SyncPolicy::Always)?)
     }
 
     /// A tile range back to nothing.
@@ -385,7 +405,7 @@ impl Resources {
         len: u64,
     ) -> Result<(), ResourceError> {
         let r = self.items.get(&id).ok_or(ResourceError::Unknown(id))?;
-        Ok(self.space.unmap(r.address + offset, len)?)
+        Ok(self.space().unmap(r.address + offset, len)?)
     }
 
     pub fn destroy(&mut self, id: ResourceId) -> Result<(), ResourceError> {
@@ -393,18 +413,18 @@ impl Resources {
         self.by_address.remove(&r.address);
         let key = r.image.is_some() && (r.origin != Origin::Placed || r.keyed);
         if let Some(image) = r.image {
-            image.destroy(self.space.handles());
+            image.destroy(&self.handles());
         } else if r.desc.is_buffer() {
             match r.origin {
                 Origin::Committed(_) => {
-                    let _ = self.space.unmap(r.address, r.size);
+                    let _ = self.space().unmap(r.address, r.size);
                     if r.owns_host {
                         release_host(r.address);
                     }
                     self.free_va(r.address, r.size);
                 }
                 Origin::Reserved => {
-                    let _ = self.space.unmap(r.address, r.size);
+                    let _ = self.space().unmap(r.address, r.size);
                     self.free_va(r.address, r.size);
                 }
                 Origin::Placed => {}
@@ -463,7 +483,7 @@ impl Resources {
         }
         // SAFETY: a placed texture's memory is host memory the game mapped at its address, `size` bytes long.
         let memory = unsafe { std::slice::from_raw_parts(r.memory as *const u8, r.size as usize) };
-        let handles = self.space.handles();
+        let handles = self.handles();
         if desc.is_tiled() {
             let array = desc.array_layout()?;
             for slice in 0..desc.array_size() {
@@ -471,7 +491,7 @@ impl Resources {
                     let rows = array
                         .detile(slice, mip, memory)
                         .ok_or(ResourceError::NoGuestMemory(id))?;
-                    image.upload(handles, mip, slice, &rows)?;
+                    image.upload(&handles, mip, slice, &rows)?;
                 }
             }
         } else {
@@ -492,7 +512,7 @@ impl Resources {
                     let at = (f.offset + row * f.row_pitch) as usize;
                     rows.extend_from_slice(&memory[at..at + f.row_bytes as usize]);
                 }
-                image.upload(handles, mip, slice, &rows)?;
+                image.upload(&handles, mip, slice, &rows)?;
             }
         }
         Ok(())
@@ -512,14 +532,14 @@ impl Resources {
         // SAFETY: as in `upload_texture`; the game does not write the texture while it is being read back.
         let memory =
             unsafe { std::slice::from_raw_parts_mut(r.memory as *mut u8, r.size as usize) };
-        let handles = self.space.handles();
+        let handles = self.handles();
         if desc.is_tiled() {
             let array = desc.array_layout()?;
             for slice in 0..desc.array_size() {
                 for mip in 0..desc.mips() {
                     let m = &array.slice.mips[mip as usize];
                     let bytes = (m.blocks_w * m.blocks_h * info.bytes) as usize;
-                    let rows = image.download(handles, mip, slice, bytes)?;
+                    let rows = image.download(&handles, mip, slice, bytes)?;
                     array
                         .tile(slice, mip, &rows, memory)
                         .ok_or(ResourceError::NoGuestMemory(id))?;
@@ -538,7 +558,7 @@ impl Resources {
             for (index, f) in footprints.iter().enumerate() {
                 let (slice, mip) = (index as u32 / desc.mips(), index as u32 % desc.mips());
                 let total = (f.row_bytes * u64::from(f.rows * f.depth)) as usize;
-                let rows = image.download(handles, mip, slice, total)?;
+                let rows = image.download(&handles, mip, slice, total)?;
                 for row in 0..u64::from(f.rows * f.depth) {
                     let at = (f.offset + row * f.row_pitch) as usize;
                     let from = (row * f.row_bytes) as usize;

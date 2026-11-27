@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 ash.workspace = true
+content-filter.workspace = true
 sha2.workspace = true
 shader-container.workspace = true
 shader-ir.workspace = true
@@ -16,7 +17,7 @@ thiserror.workspace = true
 winit.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = ["Win32_UI_Input_KeyboardAndMouse"] }
 
 [dev-dependencies]
 rdna.workspace = true
