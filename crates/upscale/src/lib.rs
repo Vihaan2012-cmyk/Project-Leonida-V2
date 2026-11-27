@@ -211,6 +211,23 @@ pub trait FrameGenerator {
     fn reset(&mut self);
 }
 
+/// Builds the upscaler of a kind. DLSS fails with [`UpscaleError::Unavailable`] or [`UpscaleError::Unimplemented`];
+/// the caller then falls back to another kind.
+pub fn create_upscaler(
+    kind: UpscalerKind,
+    compute: SharedCompute,
+    dlss_config: &dlss::DlssConfig,
+) -> Result<Box<dyn Upscaler>, UpscaleError> {
+    Ok(match kind {
+        UpscalerKind::Fsr1 => Box::new(fsr1::Fsr1Upscaler::new(compute)),
+        UpscalerKind::Temporal => Box::new(temporal::TemporalUpscaler::new(
+            compute,
+            temporal::TemporalConfig::default(),
+        )),
+        UpscalerKind::Dlss => Box::new(dlss::DlssUpscaler::new(dlss_config)?),
+    })
+}
+
 /// Render-resolution divisors of the usual quality presets (the values AMD's upscalers use).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QualityMode {
