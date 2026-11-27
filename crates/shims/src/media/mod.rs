@@ -18,80 +18,22 @@
 //! and the callback shapes `BinkSetOSFileCallbacks` and `BinkSetMemory` take. Media Foundation (`MFPlat.DLL`,
 //! `MFReadWrite.dll`) is Windows' own and is bound to the host.
 
+mod decoder;
+mod header;
+#[doc(hidden)]
+pub mod testing;
+
+pub use decoder::{
+    AudioTrackInfo, DecodeError, DecodedFrame, DecoderFactory, MovieDecoder, Plane, StreamInfo,
+    decoder_factory, set_decoder_factory,
+};
+pub use header::{
+    HEADER_BYTES, MediaError, MovieHeader, PREFIX_BYTES, parse_audio_tracks, parse_header,
+};
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use thiserror::Error;
-
 use crate::Shim;
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum MediaError {
-    #[error("not a Bink 2 stream")]
-    NotBink,
-    #[error("the Bink 2 header is shorter than its fixed part")]
-    Short,
-    #[error("the Bink 2 header holds an impossible size or frame count")]
-    Implausible,
-}
-
-/// The fixed part of a Bink 2 stream header (`movies.md`, section 2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MovieHeader {
-    pub revision: u8,
-    pub frames: u32,
-    pub width: u32,
-    pub height: u32,
-    pub rate: u32,
-    pub rate_divisor: u32,
-    pub audio_tracks: u32,
-}
-
-pub const HEADER_BYTES: usize = 0x2C;
-
-impl MovieHeader {
-    /// What a movie whose header cannot be read looks like: one frame that ends it at once.
-    pub const FALLBACK: MovieHeader = MovieHeader {
-        revision: b'n',
-        frames: 1,
-        width: 1920,
-        height: 1080,
-        rate: 30,
-        rate_divisor: 1,
-        audio_tracks: 0,
-    };
-}
-
-pub fn parse_header(bytes: &[u8]) -> Result<MovieHeader, MediaError> {
-    if bytes.len() < 3 || &bytes[..3] != b"KB2" {
-        return Err(MediaError::NotBink);
-    }
-    if bytes.len() < HEADER_BYTES {
-        return Err(MediaError::Short);
-    }
-    let word =
-        |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
-    let header = MovieHeader {
-        revision: bytes[3],
-        frames: word(0x08),
-        width: word(0x14),
-        height: word(0x18),
-        rate: word(0x1C),
-        rate_divisor: word(0x20),
-        audio_tracks: word(0x28),
-    };
-    let sane = |v: u32| (16..=8192).contains(&v);
-    if header.frames == 0
-        || word(0x10) != header.frames
-        || !sane(header.width)
-        || !sane(header.height)
-        || header.rate == 0
-        || header.rate_divisor == 0
-        || header.audio_tracks > 32
-    {
-        return Err(MediaError::Implausible);
-    }
-    Ok(header)
-}
 
 const WORDS: usize = 64;
 const WIDTH: usize = 0;
