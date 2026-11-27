@@ -191,6 +191,10 @@ fn unary(op: Un, a: u64, mode: Mode) -> u64 {
         Un::F16ToF32 => u64::from(rdna::format::f16_to_f32(x & 0xFFFF, true)),
         Un::F32ToF16(round) => u64::from(rdna::format::f32_to_f16_round(x, round)),
         Un::FCanonical => bits(f(a)),
+        Un::CvtF32F64 => match f64::from_bits(a) {
+            double if double.is_nan() => 0x7FC0_0000,
+            double => bits(double as f32),
+        },
         Un::Bfrev => u64::from(x.reverse_bits()),
         Un::Ffbl => u64::from(if x == 0 { u32::MAX } else { x.trailing_zeros() }),
         Un::Ffbh => u64::from(if x == 0 { u32::MAX } else { x.leading_zeros() }),
@@ -222,6 +226,14 @@ fn unary(op: Un, a: u64, mode: Mode) -> u64 {
     }
 }
 
+fn double_bits(value: f64) -> u64 {
+    if value.is_nan() {
+        0x7FF8_0000_0000_0000
+    } else {
+        value.to_bits()
+    }
+}
+
 fn binary(op: Bin, a: u64, b: u64, mode: Mode) -> u64 {
     let f = |x: u64| load(x, mode);
     let bits = |v: f32| store(v, mode);
@@ -247,6 +259,7 @@ fn binary(op: Bin, a: u64, b: u64, mode: Mode) -> u64 {
         Bin::FMin => return bits(nan_rule(fmin(f(a), f(b)), &[f(a), f(b)])),
         Bin::FMax => return bits(nan_rule(fmax(f(a), f(b)), &[f(a), f(b)])),
         Bin::Add64 => return a.wrapping_add(b),
+        Bin::DAdd => return double_bits(f64::from_bits(a) + f64::from_bits(b)),
         Bin::Sub64 => return a.wrapping_sub(b),
         Bin::And64 => return a & b,
         Bin::Or64 => return a | b,

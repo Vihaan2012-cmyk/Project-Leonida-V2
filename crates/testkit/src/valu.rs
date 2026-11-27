@@ -193,6 +193,28 @@ pub fn nan_rule(result: f32, inputs: &[f32]) -> f32 {
         })
 }
 
+/// A double-precision source: register pairs, inline constants as doubles, a literal as the high half.
+fn read_double(wave: &Wave, arg: &Arg, lane: usize, inst: &Inst) -> Result<f64> {
+    let bits = match &arg.operand {
+        Operand::Vgpr { reg, .. } => {
+            let reg = usize::from(*reg);
+            u64::from(wave.vgpr[reg][lane]) | (u64::from(wave.vgpr[reg + 1][lane]) << 32)
+        }
+        Operand::Float(name) if *name == "0.15915494" => (1.0 / std::f64::consts::TAU).to_bits(),
+        Operand::Float(name) => f64::from(name.parse::<f32>().map_err(|_| bad(inst))?).to_bits(),
+        Operand::Literal(value) => u64::from(*value) << 32,
+        _ => wave.read_scalar64(arg, inst)?,
+    };
+    let mut value = f64::from_bits(bits);
+    if arg.abs {
+        value = value.abs();
+    }
+    if arg.neg {
+        value = -value;
+    }
+    Ok(value)
+}
+
 fn output_modifiers(wave: &Wave, inst: &Inst, value: f32) -> f32 {
     let mut value = wave.flush(value);
     for modifier in &inst.mods {
@@ -447,6 +469,37 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
                 let old = wave.read_lane(arg(inst, 3)?, lane, inst)?;
                 let value = (old & !(0xFF << shift)) | (byte << shift);
                 wave.write_lane(arg(inst, 0)?, lane, value, inst)?;
+            }
+            return Ok(true);
+        }
+        "v_add_f64" => {
+            let Operand::Vgpr { reg, .. } = arg(inst, 0)?.operand else {
+                return Err(bad(inst));
+            };
+            for lane in wave.active_lanes() {
+                let a = read_double(wave, arg(inst, 1)?, lane, inst)?;
+                let b = read_double(wave, arg(inst, 2)?, lane, inst)?;
+                let sum = a + b;
+                let bits = if sum.is_nan() {
+                    0x7FF8_0000_0000_0000
+                } else {
+                    sum.to_bits()
+                };
+                wave.vgpr[usize::from(reg)][lane] = bits as u32;
+                wave.vgpr[usize::from(reg) + 1][lane] = (bits >> 32) as u32;
+            }
+            return Ok(true);
+        }
+        "v_cvt_f32_f64" => {
+            for lane in wave.active_lanes() {
+                let value = read_double(wave, arg(inst, 1)?, lane, inst)?;
+                let single = output_modifiers(wave, inst, value as f32);
+                let bits = if single.is_nan() {
+                    0x7FC0_0000
+                } else {
+                    single.to_bits()
+                };
+                wave.write_lane(arg(inst, 0)?, lane, bits, inst)?;
             }
             return Ok(true);
         }

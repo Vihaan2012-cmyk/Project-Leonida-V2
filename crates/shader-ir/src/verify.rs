@@ -40,7 +40,7 @@ fn reg_type(reg: Reg) -> Ty {
 
 fn unary(op: Un) -> (Ty, Ty) {
     match op {
-        Un::Popcount64 => (Ty::U64, Ty::U32),
+        Un::Popcount64 | Un::CvtF32F64 => (Ty::U64, Ty::U32),
         Un::Not64 => (Ty::U64, Ty::U64),
         Un::Lo | Un::Hi => (Ty::U64, Ty::U32),
         Un::Zext => (Ty::U32, Ty::U64),
@@ -52,6 +52,7 @@ fn unary(op: Un) -> (Ty, Ty) {
 fn binary(op: Bin) -> (Ty, Ty, Ty) {
     match op {
         Bin::Add64
+        | Bin::DAdd
         | Bin::Sub64
         | Bin::And64
         | Bin::Or64

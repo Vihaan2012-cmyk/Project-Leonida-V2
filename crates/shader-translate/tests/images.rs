@@ -642,6 +642,8 @@ fn compare_gradient_size_and_sixteen_bit_forms() {
         "image_load v[4:5], v[10:11], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16",
         "image_load v[4:5], v[10:11], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16",
         "image_gather4_lz_o v[4:7], v[10:12], s[0:7], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_2D",
+        "v_mov_b32_e32 v9, 0x3f01
+image_sample_lz_o v[4:7], v[9:11], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
     ]
     .iter()
     .map(|i| format!("{CLEAR}{i}"))
@@ -804,6 +806,20 @@ fn compare_gradient_size_and_sixteen_bit_forms() {
             expect: Box::new(move |lane| {
                 let (x, y) = (1 + lane % 2, 1 + lane / 2 % 3);
                 [red(x, y), red(x + 1, y), red(x + 1, y - 1), red(x, y - 1)]
+            }),
+        },
+        Case {
+            name: "sample_constant_offset",
+            instruction: &instructions[12],
+            texture: t(0).descriptor,
+            sampler: scene.nearest,
+            input: four(|lane| {
+                let (x, y) = grid(lane, 4);
+                [center(x, 4), center(y, 4), 0, 0]
+            }),
+            expect: Box::new(move |lane| {
+                let (x, y) = grid(lane, 4);
+                texel(t(0), 0, (x + 1).min(3), y.saturating_sub(1), 0)
             }),
         },
     ];

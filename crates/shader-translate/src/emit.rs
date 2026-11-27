@@ -609,8 +609,18 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         pixel: None,
         geometry: None,
     };
+    if function.ordered && pixel_options.is_none() {
+        return Err(EmitError::Unsupported(
+            "ordered pixel shading outside a pixel shader",
+        ));
+    }
     if let Some(options) = pixel_options.clone() {
         e.pixel_prologue(options, alive)?;
+        if function.ordered {
+            e.b.capability(Capability::FragmentShaderPixelInterlockEXT);
+            e.b.extension("SPV_EXT_fragment_shader_interlock");
+            ok(e.b.begin_invocation_interlock_ext())?;
+        }
     } else if let Some(options) = vertex_options.clone() {
         e.vertex_prologue(options)?;
     } else if let Some(options) = mesh_options {
@@ -645,6 +655,9 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         e.epilogue()?;
     }
     if pixel_options.is_some() {
+        if function.ordered {
+            ok(e.b.end_invocation_interlock_ext())?;
+        }
         e.pixel_epilogue()?;
     }
     ok(e.b.ret())?;
@@ -683,6 +696,9 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         interface.extend(state.interface());
         e.b.entry_point(ExecutionModel::Fragment, main, "main", interface);
         e.b.execution_mode(main, ExecutionMode::OriginUpperLeft, []);
+        if function.ordered {
+            e.b.execution_mode(main, ExecutionMode::PixelInterlockOrderedEXT, []);
+        }
         if let Some(depth) = pixel_options.as_ref().and_then(|o| o.depth) {
             e.b.execution_mode(main, ExecutionMode::DepthReplacing, []);
             match depth {
@@ -2111,6 +2127,14 @@ impl Emitter {
                 self.float_binary(Bin::FMul, a, one)?
             }
             Un::Not64 => ok(self.b.not(u64_, None, a))?,
+            Un::CvtF32F64 => {
+                self.b.capability(Capability::Float64);
+                let f64_ = self.b.type_float(64, None);
+                let double = ok(self.b.bitcast(f64_, None, a))?;
+                let single = ok(self.b.f_convert(f32_, None, double))?;
+                let single = self.exact(single);
+                self.bits(single)?
+            }
             Un::Bfrev => ok(self.b.bit_reverse(u32_, None, a))?,
             Un::Ffbl => self.glsl(u32_, GLOp::FindILsb, &[a])?,
             Un::Ffbh => {
@@ -2244,6 +2268,15 @@ impl Emitter {
                 self.float_binary(op, a, b)?
             }
             Bin::Add64 => ok(self.b.i_add(u64_, None, a, b))?,
+            Bin::DAdd => {
+                self.b.capability(Capability::Float64);
+                let f64_ = self.b.type_float(64, None);
+                let x = ok(self.b.bitcast(f64_, None, a))?;
+                let y = ok(self.b.bitcast(f64_, None, b))?;
+                let sum = ok(self.b.f_add(f64_, None, x, y))?;
+                let sum = self.exact(sum);
+                ok(self.b.bitcast(u64_, None, sum))?
+            }
             Bin::Sub64 => ok(self.b.i_sub(u64_, None, a, b))?,
             Bin::And64 => ok(self.b.bitwise_and(u64_, None, a, b))?,
             Bin::Or64 => ok(self.b.bitwise_or(u64_, None, a, b))?,

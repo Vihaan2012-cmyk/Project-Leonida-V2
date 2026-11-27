@@ -106,6 +106,7 @@ pub fn lift(code: &[u8], wave64: bool) -> Result<Function, LiftError> {
         wave64,
         blocks,
         temps: lifter.next,
+        ordered: lifter.ordered,
     })
 }
 
@@ -222,6 +223,7 @@ struct Lifter {
     destination: Option<(Select, Select)>,
     write_when: Option<Tmp>,
     f16_round: Option<Round>,
+    ordered: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +284,7 @@ impl Lifter {
             destination: None,
             write_when: None,
             f16_round: Some(Round::Even),
+            ordered: false,
         }
     }
 
@@ -290,6 +293,27 @@ impl Lifter {
         self.next += 1;
         self.stmts.push(Stmt::Let(tmp, expr));
         tmp
+    }
+
+    /// The bit position of a `bytes`-wide value at byte `address` within its word.
+    fn sub_word_shift(&mut self, address: Tmp, bytes: u32) -> Tmp {
+        let mask = self.c(4 - bytes);
+        let within = self.bin(Bin::And, address, mask);
+        let three = self.c(3);
+        self.bin(Bin::Shl, within, three)
+    }
+
+    /// The value this block last wrote to VGPR `reg`, when that was a constant.
+    fn constant_lane(&self, reg: u8) -> Option<u32> {
+        let written = self.stmts.iter().rev().find_map(|stmt| match stmt {
+            Stmt::SetLane(r, t) if *r == reg => Some(Some(*t)),
+            Stmt::WriteLane(r, _, _) if *r == reg => Some(None),
+            _ => None,
+        })??;
+        self.stmts.iter().find_map(|stmt| match stmt {
+            Stmt::Let(t, Expr::Const(value)) if *t == written => Some(*value),
+            _ => None,
+        })
     }
 
     fn c(&mut self, value: u32) -> Tmp {
@@ -341,6 +365,10 @@ impl Lifter {
                 }
                 "m0" => self.value(Expr::Get(Reg::M0)),
                 "null" => self.c(0),
+                "src_239" => {
+                    self.ordered = true;
+                    self.c(0)
+                }
                 "src_scc" => {
                     let scc = self.value(Expr::Get(Reg::Scc));
                     self.un(Un::BoolToU32, scc)
@@ -1187,7 +1215,15 @@ impl Lifter {
             }
         }
         let offset = if form.offset {
-            Some(addresses.word(self).ok_or_else(|| unsupported(inst))?)
+            let known = addresses
+                .regs
+                .get(addresses.at)
+                .and_then(|reg| self.constant_lane(*reg));
+            let word = addresses.word(self).ok_or_else(|| unsupported(inst))?;
+            Some(match known {
+                Some(value) => self.c(value),
+                None => word,
+            })
         } else {
             None
         };
@@ -1345,6 +1381,12 @@ impl Lifter {
     }
     fn setreg(&mut self, inst: &Inst) -> Result<(), LiftError> {
         if inst.text().contains("HW_REG_FLAT_SCR") {
+            return Ok(());
+        }
+        if let Some(Operand::Named(reg)) = inst.args.first().map(|a| &a.operand)
+            && rdna::parse_hwreg(reg).is_some_and(|code| code & 63 == POPS_PACKER)
+        {
+            self.ordered = true;
             return Ok(());
         }
         let (mask, bits) = rounding_write(inst).ok_or_else(|| unsupported(inst))?;
@@ -1854,6 +1896,36 @@ impl Lifter {
             }
             _ => self.scalar64(arg, inst),
         }
+    }
+
+    /// A double-precision source as its 64 bits: inline float constants are doubles and a literal is the
+    /// high half.
+    fn double(&mut self, arg: &Arg, inst: &Inst) -> Result<Tmp, LiftError> {
+        let value = match &arg.operand {
+            Operand::Float(name) => {
+                let single: f32 = name.parse().map_err(|_| unsupported(inst))?;
+                let double = if *name == "0.15915494" {
+                    1.0 / std::f64::consts::TAU
+                } else {
+                    f64::from(single)
+                };
+                self.c64(double.to_bits())
+            }
+            Operand::Literal(value) => self.c64(u64::from(*value) << 32),
+            _ => self.lane64(arg, inst)?,
+        };
+        let value = if arg.abs {
+            let mask = self.c64(!(1 << 63));
+            self.bin(Bin::And64, value, mask)
+        } else {
+            value
+        };
+        Ok(if arg.neg {
+            let sign = self.c64(1 << 63);
+            self.bin(Bin::Xor64, value, sign)
+        } else {
+            value
+        })
     }
 
     fn either(&mut self, a: Tmp, b: Tmp) -> Tmp {
@@ -2406,6 +2478,29 @@ impl Lifter {
                 let placed = self.bin(Bin::Shl, byte, shift);
                 self.bin(Bin::Or, kept, placed)
             }
+            "v_add_f64" => {
+                if has_output_modifiers(inst) {
+                    return Err(unsupported(inst));
+                }
+                let (target, _) = vgprs(arg(0)?, inst)?;
+                let a = self.double(arg(1)?, inst)?;
+                let b = self.double(arg(2)?, inst)?;
+                let sum = self.bin(Bin::DAdd, a, b);
+                let low = self.un(Un::Lo, sum);
+                let high = self.un(Un::Hi, sum);
+                self.stmts.push(Stmt::SetLane(target, low));
+                self.stmts.push(Stmt::SetLane(target + 1, high));
+                return Ok(true);
+            }
+            "v_cvt_f32_f64" => {
+                if has_output_modifiers(inst) {
+                    return Err(unsupported(inst));
+                }
+                let value = self.double(arg(1)?, inst)?;
+                let single = self.un(Un::CvtF32F64, value);
+                self.set_lane(arg(0)?, single, inst)?;
+                return Ok(true);
+            }
             "v_lshlrev_b64" => {
                 let (target, _) = vgprs(arg(0)?, inst)?;
                 let shift = self.lane(arg(1)?, inst)?;
@@ -2948,6 +3043,104 @@ impl Lifter {
                 });
                 Ok(true)
             }
+            "ds_read_u16" | "ds_read_u16_d16" | "ds_read_u16_d16_hi" => {
+                let base = self.lane(arg(1)?, inst)?;
+                let immediate = self.c(offset as u32);
+                let address = self.bin(Bin::Add, base, immediate);
+                let align = self.c(!3);
+                let aligned = self.bin(Bin::And, address, align);
+                let word = self.value(Expr::LdsLoad(aligned));
+                let shift = self.sub_word_shift(address, 2);
+                let moved = self.bin(Bin::ShrU, word, shift);
+                let mask = self.c(0xFFFF);
+                let half = self.bin(Bin::And, moved, mask);
+                let value = match name {
+                    "ds_read_u16" => half,
+                    _ => {
+                        let high = name.ends_with("_hi");
+                        let (target, _) = vgprs(arg(0)?, inst)?;
+                        let old = self.value(Expr::Get(Reg::V(target)));
+                        let keep = self.c(if high { 0xFFFF } else { 0xFFFF_0000 });
+                        let kept = self.bin(Bin::And, old, keep);
+                        let placed = if high {
+                            let sixteen = self.c(16);
+                            self.bin(Bin::Shl, half, sixteen)
+                        } else {
+                            half
+                        };
+                        self.bin(Bin::Or, kept, placed)
+                    }
+                };
+                self.set_lane(arg(0)?, value, inst)?;
+                Ok(true)
+            }
+            "ds_write_b16" | "ds_write_b16_d16_hi" => {
+                let base = self.lane(arg(0)?, inst)?;
+                let immediate = self.c(offset as u32);
+                let address = self.bin(Bin::Add, base, immediate);
+                let data = self.lane(arg(1)?, inst)?;
+                let data = if name.ends_with("_hi") {
+                    let sixteen = self.c(16);
+                    self.bin(Bin::ShrU, data, sixteen)
+                } else {
+                    data
+                };
+                let mask = self.c(0xFFFF);
+                let half = self.bin(Bin::And, data, mask);
+                let shift = self.sub_word_shift(address, 2);
+                let field = self.bin(Bin::Shl, mask, shift);
+                let keep = self.un(Un::Not, field);
+                let placed = self.bin(Bin::Shl, half, shift);
+                for (op, value) in [(AtomicOp::And, keep), (AtomicOp::Or, placed)] {
+                    self.value(Expr::Atomic {
+                        space: Space::Lds,
+                        op,
+                        address,
+                        value,
+                        compare: None,
+                        when: None,
+                    });
+                }
+                Ok(true)
+            }
+            "global_load_ubyte" | "global_load_sbyte" | "global_load_ushort"
+            | "global_load_sshort" => {
+                let (data, _) = vgprs(arg(0)?, inst)?;
+                let (areg, _) = vgprs(arg(1)?, inst)?;
+                let low = self.value(Expr::Get(Reg::V(areg)));
+                let base = match &arg(2)?.operand {
+                    Operand::Named(off) if off == "off" => {
+                        let high = self.value(Expr::Get(Reg::V(areg + 1)));
+                        self.bin(Bin::Pack64, low, high)
+                    }
+                    _ => {
+                        let base = self.scalar64(arg(2)?, inst)?;
+                        let low = self.un(Un::Zext, low);
+                        self.bin(Bin::Add64, base, low)
+                    }
+                };
+                let displacement = self.c64(offset as u64);
+                let address = self.bin(Bin::Add64, base, displacement);
+                let align = self.c64(!3);
+                let aligned = self.bin(Bin::And64, address, align);
+                let word = self.value(Expr::Load {
+                    when: None,
+                    address: aligned,
+                });
+                let bytes = if name.ends_with("short") { 2 } else { 1 };
+                let position = self.un(Un::Lo, address);
+                let shift = self.sub_word_shift(position, bytes);
+                let moved = self.bin(Bin::ShrU, word, shift);
+                let width = self.c(32 - 8 * bytes);
+                let raised = self.bin(Bin::Shl, moved, width);
+                let value = if name.contains("_s") {
+                    self.bin(Bin::ShrS, raised, width)
+                } else {
+                    self.bin(Bin::ShrU, raised, width)
+                };
+                self.stmts.push(Stmt::SetLane(data, value));
+                Ok(true)
+            }
             "ds_write_b32" | "ds_read_b32" => {
                 let address_arg = if name == "ds_read_b32" {
                     arg(1)?
@@ -3034,8 +3227,11 @@ impl Lifter {
                 Ok(true)
             }
             _ if name.starts_with("s_load_dword") || name.starts_with("s_buffer_load_dword") => {
-                let Operand::Sgpr { reg: target, count } = arg(0)?.operand else {
-                    return Err(unsupported(inst));
+                let (target, count) = match arg(0)?.operand {
+                    Operand::Sgpr { reg, count } => (Some(reg), count),
+                    Operand::Named(_) if name.ends_with("dword") => (None, 1),
+                    Operand::Named(_) if name.ends_with("dwordx2") => (None, 2),
+                    _ => return Err(unsupported(inst)),
                 };
                 let base = if name.starts_with("s_buffer") {
                     self.descriptor(arg(1)?, inst)?.0
@@ -3054,11 +3250,25 @@ impl Lifter {
                     }
                 };
                 let start = self.bin(Bin::Add64, base, displacement);
+                let mut words = Vec::new();
                 for dword in 0..count {
                     let step = self.c64(4 * u64::from(dword));
                     let address = self.bin(Bin::Add64, start, step);
-                    let value = self.value(Expr::ScalarLoad(address));
-                    self.stmts.push(Stmt::Set(Reg::S(target + dword), value));
+                    words.push(self.value(Expr::ScalarLoad(address)));
+                }
+                match (target, words.as_slice()) {
+                    (Some(target), _) => {
+                        for (dword, value) in words.iter().enumerate() {
+                            self.stmts
+                                .push(Stmt::Set(Reg::S(target + dword as u8), *value));
+                        }
+                    }
+                    (None, [value]) => self.set_scalar(arg(0)?, *value, inst)?,
+                    (None, [low, high]) => {
+                        let pair = self.bin(Bin::Pack64, *low, *high);
+                        self.set_scalar64(arg(0)?, pair, inst)?;
+                    }
+                    _ => return Err(unsupported(inst)),
                 }
                 Ok(true)
             }
@@ -3131,6 +3341,8 @@ pub fn export_target(name: &str) -> Option<u8> {
         }
     })
 }
+
+const POPS_PACKER: u32 = 25;
 
 /// The bits an immediate MODE write sets among the four rounding bits, as (mask, bits).
 fn rounding_write(inst: &Inst) -> Option<(u32, u32)> {
@@ -3314,7 +3526,7 @@ fn image_form(name: &str, dmask: u32) -> Option<ImageForm> {
         }
         _ => return None,
     };
-    if (form.g16 && !form.gradients) || (form.offset && !gather) {
+    if form.g16 && !form.gradients {
         return None;
     }
     Some(form)

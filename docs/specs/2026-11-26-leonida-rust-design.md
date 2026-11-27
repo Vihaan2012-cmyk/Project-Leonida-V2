@@ -203,6 +203,12 @@ with exec holding only the lanes that carry its threads. Implicit-LOD sampling o
 derivatives the way the hardware does: across each quad of lanes, from the first lane to the second horizontally and
 to the third vertically, with a bias scaling both by 2^bias, then samples with those gradients.
 
+**Ordered pixel shading.** Shaders that use the hardware's ordered pixel shading set the packer register and spin on
+the exiting-wave ID until the waves they overlap have finished. The translator runs the whole fragment entry inside a
+pixel interlock instead: the packer write does nothing, the exiting-wave ID reads as zero, and with no overlap
+reported in the input SGPRs the wait is skipped. Sample offsets must be constants the same block wrote to the address
+register, since Vulkan only takes computed offsets on gathers.
+
 **Images and samplers.** A shader names a texture by its 8-word T# and a sampler by its 4-word S#, both in SGPRs.
 The runtime registers every texture and sampler it creates in two lookup tables, and the shader finds the bindless
 slot by looking its descriptor up:

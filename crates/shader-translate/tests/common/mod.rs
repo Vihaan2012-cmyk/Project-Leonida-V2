@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gpu::Gpu;
 
@@ -31,7 +32,10 @@ pub fn spirv_val(words: &[u32], name: &str) {
     if !output.status.success() {
         return;
     }
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.spv"));
+    static WRITTEN: AtomicUsize = AtomicUsize::new(0);
+    let serial = WRITTEN.fetch_add(1, Ordering::Relaxed);
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("{name}_{}_{serial}.spv", std::process::id()));
     let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     std::fs::write(&path, bytes).unwrap();
     let result = Command::new("spirv-val")
@@ -40,6 +44,7 @@ pub fn spirv_val(words: &[u32], name: &str) {
         .arg(&path)
         .output()
         .unwrap();
+    let _ = std::fs::remove_file(&path);
     assert!(
         result.status.success(),
         "spirv-val: {}{}",

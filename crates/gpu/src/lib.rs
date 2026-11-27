@@ -76,6 +76,7 @@ pub struct DeviceInfo {
     pub pixel_shaders: bool,
     pub mesh_shaders: bool,
     pub quad_operations: bool,
+    pub pixel_interlock: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,6 +309,7 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
         let mut atomics64 = vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT::default();
         let mut barycentric = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();
         let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
+        let mut interlock = vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT::default();
         let extensions = instance
             .enumerate_device_extension_properties(physical)
             .unwrap_or_default();
@@ -319,6 +321,7 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
         let has_atomics64 = has(ash::ext::shader_image_atomic_int64::NAME);
         let has_barycentric = has(ash::khr::fragment_shader_barycentric::NAME);
         let has_mesh = has(ash::ext::mesh_shader::NAME);
+        let has_interlock = has(ash::ext::fragment_shader_interlock::NAME);
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut f13)
             .push_next(&mut f12)
@@ -331,6 +334,9 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
         }
         if has_mesh {
             features = features.push_next(&mut mesh);
+        }
+        if has_interlock {
+            features = features.push_next(&mut interlock);
         }
         instance.get_physical_device_features2(physical, &mut features);
         let int64 = features.features.shader_int64 == vk::TRUE;
@@ -346,6 +352,8 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
             && fragment_stores
             && f11.shader_draw_parameters == vk::TRUE;
         let mesh_shaders = has_mesh && mesh.mesh_shader == vk::TRUE;
+        let pixel_interlock =
+            has_interlock && interlock.fragment_shader_pixel_interlock == vk::TRUE;
         let descriptor_indexing = f12.runtime_descriptor_array == vk::TRUE
             && f12.shader_sampled_image_array_non_uniform_indexing == vk::TRUE;
         let storage_images = descriptor_indexing
@@ -392,6 +400,7 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
                 quad_operations: v11
                     .subgroup_supported_operations
                     .contains(vk::SubgroupFeatureFlags::QUAD),
+                pixel_interlock,
             },
         })
     }
@@ -507,6 +516,12 @@ impl Gpu {
             if chosen.info.mesh_shaders {
                 features = features.push_next(&mut mesh);
                 extensions.push(ash::ext::mesh_shader::NAME.as_ptr());
+            }
+            let mut interlock = vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT::default()
+                .fragment_shader_pixel_interlock(true);
+            if chosen.info.pixel_interlock {
+                features = features.push_next(&mut interlock);
+                extensions.push(ash::ext::fragment_shader_interlock::NAME.as_ptr());
             }
             let create = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queues)

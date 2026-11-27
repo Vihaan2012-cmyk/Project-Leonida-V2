@@ -469,5 +469,70 @@ fn pixel_shaders_sample_with_screen_derivatives() {
             close: false,
         };
         run(&gpu, &case, wave64, &[], &user, &mut resources);
+        let case = Case {
+            name: "implicit_lod_offset",
+            source: "v_mov_b32_e32 v10, 0x3f01
+                 v_mul_f32_e32 v11, 0x3e000000, v2
+                 v_mul_f32_e32 v12, 0x3e000000, v3
+                 image_sample_o v[6:9], v[10:12], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+                 s_waitcnt vmcnt(0)
+                 exp mrt0 v6, v7, v8, v9 done vm
+                 s_endpgm",
+            inputs: 0x302,
+            user_sgprs: 12,
+            number: Number::Float,
+            depth: None,
+            expect: Box::new(|x, y| mip(1, (x + 1).min(7), y.saturating_sub(1))),
+            expect_depth: None,
+            close: false,
+        };
+        run(&gpu, &case, wave64, &[], &user, &mut resources);
+    }
+}
+
+#[test]
+fn ordered_pixel_shaders_run_inside_an_interlock() {
+    let Some(gpu) = pixel_gpu() else { return };
+    if !gpu.info.pixel_interlock {
+        eprintln!("skipping: {} lacks pixel interlock", gpu.info.name);
+        return;
+    }
+    let case = Case {
+        name: "ordered",
+        source: "s_mov_b32 s18, s15
+             s_bfe_u32 s1, s18, 0x2001c
+             s_bfe_u32 s2, s18, 0xa0000
+             s_lshl_b32 s1, s1, 1
+             s_bfe_u32 s5, s18, 0xa0010
+             s_not_b32 s4, s2
+             s_lshr_b32 s0, s18, 31
+             s_or_b32 s1, s1, 1
+             s_add_i32 s5, s5, s4
+             s_cmp_eq_u32 s0, 0
+             s_setreg_b32 hwreg(25, 0, 3), s1
+             s_cselect_b64 s[0:1], exec, 0
+             s_add_i32 s2, src_239, s4
+             s_cmp_gt_u32 s2, s5
+             s_cselect_b64 s[2:3], exec, 0
+             s_or_b64 s[0:1], s[0:1], s[2:3]
+             s_and_b64 vcc, exec, s[0:1]
+             s_cbranch_vccnz 4
+             s_sleep 0xffff
+             s_add_i32 s0, src_239, s4
+             s_cmp_lt_u32 s5, s0
+             s_cbranch_scc0 -4
+             v_mov_b32_e32 v4, 1.0
+             exp mrt0 v2, v3, v4, v4 done vm
+             s_endpgm",
+        inputs: 0x302,
+        user_sgprs: 0,
+        number: Number::Float,
+        depth: None,
+        expect: Box::new(|x, y| [f(centre(x)), f(centre(y)), f(1.0), f(1.0)]),
+        expect_depth: None,
+        close: false,
+    };
+    for wave64 in [false, true] {
+        run(&gpu, &case, wave64, &[], &[], &mut []);
     }
 }

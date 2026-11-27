@@ -885,6 +885,7 @@ impl Generator {
                     format!("v_swap_b32 {}, {}", self.fdst(), self.fdst())
                 }
             }
+            7 if !self.gpu && self.rng.chance(2) => self.double(),
             _ => {
                 let op = self
                     .rng
@@ -897,6 +898,42 @@ impl Generator {
                     format!("v_cmp_{op}_{ty}_e64 {}, {a}, {b}", self.mask_reg())
                 }
             }
+        }
+    }
+
+    fn double_source(&mut self) -> String {
+        match self.rng.below(7) {
+            0 => self
+                .rng
+                .pick(&["0.5", "-1.0", "2.0", "-4.0", "0.15915494"])
+                .to_string(),
+            1 => format!("{}", self.rng.below(65)),
+            2 => self.rng.pick(&["0x40400000", "0xc0b00000"]).to_string(),
+            _ => {
+                let register = if self.rng.chance(3) {
+                    self.pair()
+                } else {
+                    self.vreg_pair()
+                };
+                match self.rng.below(4) {
+                    0 => format!("-{register}"),
+                    1 => format!("|{register}|"),
+                    _ => register,
+                }
+            }
+        }
+    }
+
+    fn double(&mut self) -> String {
+        if self.rng.chance(2) {
+            let (a, b) = (self.double_source(), self.double_source());
+            format!("v_add_f64 {}, {a}, {b}", self.vreg_pair())
+        } else {
+            format!(
+                "v_cvt_f32_f64_e64 {}, {}",
+                self.vdst(),
+                self.double_source()
+            )
         }
     }
 
@@ -1507,6 +1544,43 @@ impl Generator {
         }
     }
 
+    /// 16-bit LDS accesses and sub-dword global loads; 16-bit writes use one word per lane, since lanes
+    /// writing the same half of a word would race.
+    fn small_memory(&mut self, address: String, offset: usize) -> String {
+        let half = offset + 2 * self.rng.below(2);
+        match self.rng.below(4) {
+            0 => {
+                let op = self.rng.pick(&["ds_write_b16", "ds_write_b16_d16_hi"]);
+                format!(
+                    "v_lshl_add_u32 v9, v0, 2, {}
+{op} v9, {} offset:{half}",
+                    64 * self.rng.below(2),
+                    self.vreg()
+                )
+            }
+            1 => {
+                let op = self
+                    .rng
+                    .pick(&["ds_read_u16", "ds_read_u16_d16", "ds_read_u16_d16_hi"]);
+                format!("{address}{op} {}, v9 offset:{half}", self.vdst())
+            }
+            _ => {
+                let op = self.rng.pick(&[
+                    "global_load_ubyte",
+                    "global_load_sbyte",
+                    "global_load_ushort",
+                    "global_load_sshort",
+                ]);
+                let at = if op.ends_with("short") {
+                    half
+                } else {
+                    offset + self.rng.below(4)
+                };
+                format!("{address}{op} {}, v9, s[24:25] offset:{at}", self.vdst())
+            }
+        }
+    }
+
     fn memory_op(&mut self) -> String {
         let address = if self.gpu {
             format!("v_lshl_add_u32 v9, v0, 2, {}\n", 64 * self.rng.below(2))
@@ -1522,6 +1596,9 @@ impl Generator {
         }
         if self.rng.chance(4) {
             return address + &self.atomic(offset);
+        }
+        if self.rng.chance(6) {
+            return self.small_memory(address, offset);
         }
         let op = match self.rng.below(7) {
             0 if self.rng.chance(2) => {

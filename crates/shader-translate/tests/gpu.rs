@@ -250,6 +250,18 @@ fn hand_written_programs_match_on_the_gpu() {
          v_fmac_f32_e32 v6, v1, v2
          v_cvt_u32_f32_e32 v7, v6
          s_endpgm",
+        "v_cvt_f32_u32_e32 v1, v0
+         v_mov_b32_e32 v2, 0
+         v_lshlrev_b32_e32 v3, 20, v0
+         v_add_nc_u32_e32 v3, 0x3ff00000, v3
+         s_mov_b32 s10, 0x55555555
+         s_mov_b32 s11, 0x3fd55555
+         v_add_f64 v[4:5], v[2:3], s[10:11]
+         v_add_f64 v[6:7], -v[4:5], 0.5
+         v_add_f64 v[4:5], |v[6:7]|, 0x40080000
+         v_cvt_f32_f64_e32 v8, v[4:5]
+         v_cvt_f32_f64_e64 v1, -s[10:11]
+         s_endpgm",
     ];
     for (index, source) in programs.iter().enumerate() {
         let (wave, memory) = prepared(index as u64 + 11, false);

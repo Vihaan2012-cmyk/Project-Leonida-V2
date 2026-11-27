@@ -57,6 +57,8 @@ pub enum Un {
     F16ToF32,
     F32ToF16(Round),
     FCanonical,
+    /// A double, as its 64 bits, to the nearest single.
+    CvtF32F64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +83,8 @@ pub enum Bin {
     FMin,
     FMax,
     Add64,
+    /// Double-precision add on 64-bit patterns.
+    DAdd,
     Sub64,
     And64,
     Or64,
@@ -387,6 +391,8 @@ pub struct Function {
     pub wave64: bool,
     pub blocks: Vec<Block>,
     pub temps: u32,
+    /// Uses the hardware's ordered pixel shading: overlapping pixels must run one after another, in order.
+    pub ordered: bool,
 }
 
 impl Expr {

@@ -64,6 +64,13 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave, memory: &mut Memory) ->
         global(name, inst, wave, memory)?;
         return Ok(true);
     }
+    if matches!(
+        name,
+        "global_load_ubyte" | "global_load_sbyte" | "global_load_ushort" | "global_load_sshort"
+    ) {
+        global_small(name, inst, wave, memory)?;
+        return Ok(true);
+    }
     Ok(false)
 }
 
@@ -168,6 +175,34 @@ fn lds(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
             "ds_write_b32" => {
                 let data = wave.read_lane(arg(inst, first + 1)?, lane, inst)?;
                 lds_write(wave, address, data)?;
+            }
+            "ds_write_b16" | "ds_write_b16_d16_hi" => {
+                let data = wave.read_lane(arg(inst, first + 1)?, lane, inst)?;
+                let half = if name.ends_with("_hi") {
+                    data >> 16
+                } else {
+                    data
+                } as u16;
+                let at = address as usize;
+                wave.lds
+                    .get_mut(at..at + 2)
+                    .ok_or(ExecError::OutOfBounds { address })?
+                    .copy_from_slice(&half.to_le_bytes());
+            }
+            "ds_read_u16" | "ds_read_u16_d16" | "ds_read_u16_d16_hi" => {
+                let at = address as usize;
+                let bytes = wave
+                    .lds
+                    .get(at..at + 2)
+                    .ok_or(ExecError::OutOfBounds { address })?;
+                let half = u32::from(u16::from_le_bytes(bytes.try_into().expect("2 bytes")));
+                let old = wave.read_lane(arg(inst, 0)?, lane, inst)?;
+                let value = match name {
+                    "ds_read_u16" => half,
+                    "ds_read_u16_d16" => (old & 0xFFFF_0000) | half,
+                    _ => (old & 0xFFFF) | (half << 16),
+                };
+                wave.write_lane(arg(inst, 0)?, lane, value, inst)?;
             }
             "ds_read_b32" => {
                 let value = lds_read(wave, address)?;
@@ -487,6 +522,36 @@ fn scalar_load(name: &str, inst: &Inst, wave: &mut Wave, memory: &Memory) -> Res
     };
     for dword in 0..count(target) {
         wave.sgpr[slot + dword] = memory.read(base.wrapping_add(offset) + 4 * dword as u64)?;
+    }
+    Ok(())
+}
+
+fn global_small(name: &str, inst: &Inst, wave: &mut Wave, memory: &mut Memory) -> Result<()> {
+    let immediate = offset_mod(inst, "offset");
+    let saddr = arg(inst, 2)?;
+    let scalar_base = match saddr.operand {
+        Operand::Named(ref off) if off == "off" => None,
+        _ => Some(wave.read_scalar64(saddr, inst)?),
+    };
+    let reg = vreg(arg(inst, 0)?, inst)?;
+    let address_reg = vreg(arg(inst, 1)?, inst)?;
+    let bits = if name.ends_with("short") { 16 } else { 8 };
+    for lane in wave.active_lanes() {
+        let address = match scalar_base {
+            Some(base) => base + u64::from(wave.vgpr[address_reg][lane]),
+            None => {
+                u64::from(wave.vgpr[address_reg][lane])
+                    | (u64::from(wave.vgpr[address_reg + 1][lane]) << 32)
+            }
+        }
+        .wrapping_add(immediate as u64);
+        let word = memory.read(address & !3)?;
+        let raised = (word >> (8 * (address & 3))) << (32 - bits);
+        wave.vgpr[reg][lane] = if name.contains("_s") {
+            ((raised as i32) >> (32 - bits)) as u32
+        } else {
+            raised >> (32 - bits)
+        };
     }
     Ok(())
 }

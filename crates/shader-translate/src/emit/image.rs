@@ -601,7 +601,26 @@ impl Emitter {
         } else {
             gradients
         };
+        let gather = matches!(image.op, ImageOp::Gather { .. });
         let offset = match image.offset {
+            Some(t) if !gather => {
+                let word = self.values[t as usize];
+                let packed = self
+                    .constants
+                    .iter()
+                    .find_map(|((kind, bits), id)| (*kind == 0 && *id == word).then_some(*bits))
+                    .ok_or(EmitError::Unsupported(
+                        "sampling with an offset that is not a constant",
+                    ))? as u32;
+                let parts: Vec<Word> = [0, 8]
+                    .iter()
+                    .map(|shift| {
+                        let field = ((packed >> shift) << 26) as i32 >> 26;
+                        self.i32c(field)
+                    })
+                    .collect();
+                Some(self.b.constant_composite(types.ints[2], parts))
+            }
             Some(t) => {
                 let packed = self.values[t as usize];
                 let u32_ = self.t.u32_;
@@ -743,7 +762,15 @@ impl Emitter {
                     return ok(self.b.composite_construct(self.t.uvec4, None, words));
                 }
                 let level = |e: &mut Self| -> Result<Level, EmitError> {
-                    let with_clamp = |mut mask: ImageOperands, mut operands: Vec<Operand>| {
+                    let with_offset = |mut mask: ImageOperands, mut operands: Vec<Operand>| {
+                        if let Some(offset) = extras.offset {
+                            mask |= ImageOperands::CONST_OFFSET;
+                            operands.push(Operand::IdRef(offset));
+                        }
+                        (mask, operands)
+                    };
+                    let with_clamp = |mask: ImageOperands, operands: Vec<Operand>| {
+                        let (mut mask, mut operands) = with_offset(mask, operands);
                         if let Some(clamp) = extras.clamp {
                             mask |= ImageOperands::MIN_LOD;
                             operands.push(Operand::IdRef(clamp));
@@ -779,7 +806,9 @@ impl Emitter {
                                 Some(level) if op == ImageOp::SampleLod => e.float(level)?,
                                 _ => e.f32c(0.0),
                             };
-                            Level::Explicit(ImageOperands::LOD, vec![Operand::IdRef(level)])
+                            let (mask, operands) =
+                                with_offset(ImageOperands::LOD, vec![Operand::IdRef(level)]);
+                            Level::Explicit(mask, operands)
                         }
                     })
                 };
