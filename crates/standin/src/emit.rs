@@ -721,6 +721,30 @@ impl Emitter {
         Ok(())
     }
 
+    /// Fails the step when `rax` differs from the eight bytes at `cell`. Clobbers `rdx`.
+    pub fn fail_if_rax_ne_cell(&mut self, cell: impl Into<Place>) -> Res {
+        self.load64(Register::RDX, cell)?;
+        self.fail_if_rax_ne_rdx()
+    }
+
+    /// Fails the step when `rax` differs from `rdx`.
+    pub fn fail_if_rax_ne_rdx(&mut self) -> Res {
+        let fail = self.fail_label();
+        self.asm.cmp(rax, rdx)?;
+        self.asm.jne(fail)?;
+        Ok(())
+    }
+
+    /// Writes `value` eight bytes at `offset` into the memory a stored pointer names, reads it back and fails the
+    /// step if it is not what was written.
+    pub fn touch(&mut self, pointer: impl Into<Place>, offset: i32, value: u64) -> Res {
+        self.load64(Register::RCX, pointer)?;
+        self.asm.mov(rdx, value)?;
+        self.asm.mov(qword_ptr(rcx + offset), rdx)?;
+        self.asm.mov(rax, qword_ptr(rcx + offset))?;
+        self.fail_if_rax_ne_rdx()
+    }
+
     /// Leaves the address of the next instruction in `rcx`.
     pub fn current_address(&mut self) -> Res {
         let mut here = self.asm.create_label();

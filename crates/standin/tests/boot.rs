@@ -32,3 +32,8 @@ fn run_stage(stage: Stage) -> Report {
 fn loader() {
     run_stage(Stage::Loader);
 }
+
+#[test]
+fn memory() {
+    run_stage(Stage::Memory);
+}
