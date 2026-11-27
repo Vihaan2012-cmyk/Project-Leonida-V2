@@ -12,6 +12,7 @@ mod command;
 mod staging;
 mod bindless;
 mod swapchain;
+mod window;
 
 pub use error::{RenderError, Result};
 pub use format::{Format, level_extent, mip_count};
@@ -32,6 +33,8 @@ pub use swapchain::{
     ColorSpace, Frame, HdrSupport, PresentMode, PresentOutcome, Swapchain, SwapchainDesc,
     WindowTarget, choose_extent, hdr_support, pick_format,
 };
+pub use window::{RenderWindow, WindowDesc};
+pub use winit;
 
 /// SPIR-V compiled from the WGSL files in `shaders/` by `naga` at build time.
 pub mod shaders {
