@@ -720,3 +720,48 @@ mod mapped {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced_x86::{Decoder, DecoderOptions};
+
+    #[test]
+    fn nop_padding_decodes_as_nops_of_the_right_size() {
+        for len in 1..=40 {
+            let mut bytes = Vec::new();
+            nop_fill(&mut bytes, len);
+            assert_eq!(bytes.len(), len);
+            let mut decoder = Decoder::new(64, &bytes, DecoderOptions::NONE);
+            let mut total = 0;
+            while decoder.can_decode() {
+                let ins = decoder.decode();
+                assert_eq!(ins.mnemonic(), Mnemonic::Nop, "length {len}");
+                total += ins.len();
+            }
+            assert_eq!(total, len);
+        }
+    }
+
+    #[test]
+    fn padding_keeps_the_replacement_in_front() {
+        let mut bytes = vec![0xC3];
+        nop_fill(&mut bytes, 4);
+        assert_eq!(bytes, vec![0xC3, 0x0F, 0x1F, 0x00]);
+    }
+
+    #[test]
+    fn a_buffer_refuses_writes_outside_itself() {
+        let mut buffer = Buffer(vec![0; 8]);
+        assert_eq!(
+            buffer.write(6, &[1, 2, 3]),
+            Err(PatchError::Outside { rva: 6 })
+        );
+        assert_eq!(
+            buffer.read(u32::MAX, 4),
+            Err(PatchError::Outside { rva: u32::MAX })
+        );
+        buffer.write(6, &[1, 2]).unwrap();
+        assert_eq!(buffer.read(5, 3).unwrap(), vec![0, 1, 2]);
+    }
+}
