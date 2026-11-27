@@ -6,6 +6,7 @@ mod cmd_run;
 mod cmd_shaders;
 mod cmd_verify;
 mod game;
+mod pipeline_work;
 
 use std::process::ExitCode;
 
