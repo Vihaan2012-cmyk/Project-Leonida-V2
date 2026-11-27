@@ -1,4 +1,5 @@
 mod cli;
+mod cmd_assets;
 mod cmd_check;
 mod cmd_config;
 mod cmd_content;
@@ -43,6 +44,7 @@ fn main() -> ExitCode {
             ContentCommand::Scan(args) => cmd_content::scan_command(args),
         },
         Some(Command::Mods(args)) => cmd_mods::mods_command(args),
+        Some(Command::Assets(assets)) => cmd_assets::assets_command(assets),
     };
     result.unwrap_or_else(|error| {
         eprintln!("error: {error:#}");

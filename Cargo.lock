@@ -1120,6 +1120,7 @@ dependencies = [
  "pe-image",
  "pe-loader",
  "rdna",
+ "rpf9",
  "serde_json",
  "sha2",
  "shader-container",
@@ -2065,6 +2066,25 @@ dependencies = [
  "wayland-protocols",
  "web-sys",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rpf9"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "game-package",
+ "memchr",
+ "memmap2",
+ "postcard",
+ "rayon",
+ "redb",
+ "ruzstd",
+ "serde",
+ "sha2",
+ "shader-container",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

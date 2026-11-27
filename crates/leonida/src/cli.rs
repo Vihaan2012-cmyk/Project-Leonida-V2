@@ -34,6 +34,8 @@ pub enum Command {
     Content(ContentArgs),
     /// List the packages in Mods/ and the contested files between them.
     Mods(ModsArgs),
+    /// Index and look up the resources inside the game's archives.
+    Assets(AssetsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -121,6 +123,50 @@ pub enum ModsCommand {
         #[arg(long)]
         game: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct AssetsArgs {
+    /// Where Leonida keeps what it makes; the index is `leonida.db` in this folder.
+    #[arg(long, global = true, default_value = "Output")]
+    pub output: PathBuf,
+    #[command(subcommand)]
+    pub command: AssetsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AssetsCommand {
+    /// Find every resource in the game's archives and write the index. Reads the whole game: it takes a long time.
+    Index(IndexArgs),
+    /// List resources from the index.
+    List(ListArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct IndexArgs {
+    /// The game folder. Searched for when omitted.
+    #[arg(long)]
+    pub game: Option<PathBuf>,
+    /// Only archives whose path contains this text.
+    #[arg(long)]
+    pub only: Option<String>,
+    /// How many archives are read at once.
+    #[arg(long, default_value_t = 2)]
+    pub jobs: usize,
+}
+
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    /// Only this type: a name from the index summary or a magic such as 0DRP.
+    #[arg(long = "type")]
+    pub kind: Option<String>,
+    /// Only resources whose recovered name or archive path contains this text, or that have this name hash or
+    /// content hash.
+    #[arg(long)]
+    pub find: Option<String>,
+    /// Most resources to list.
+    #[arg(long, default_value_t = 100)]
+    pub limit: usize,
 }
 
 #[derive(Debug, Args)]
