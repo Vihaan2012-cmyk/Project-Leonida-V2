@@ -296,3 +296,7 @@ fn vtable() -> *const usize {
 #[cfg(test)]
 #[path = "heap/handles_tests.rs"]
 mod handles_tests;
+
+#[cfg(test)]
+#[path = "heap/window_tests.rs"]
+mod window_tests;

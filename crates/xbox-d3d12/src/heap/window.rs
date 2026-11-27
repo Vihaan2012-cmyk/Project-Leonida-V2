@@ -7,8 +7,9 @@ use super::console::{LowBlock, LowMemory};
 use super::{HeapPlacement, Placed};
 use crate::com;
 
-pub const WINDOW_START: usize = 0x3000_0000;
-pub const WINDOW_END: usize = 0x7000_0000;
+const WINDOW_START: usize = 0x3000_0000;
+#[cfg(windows)]
+const LOW_END: usize = 0xF000_0000;
 const WINDOW_ALIGN: usize = 64 << 10;
 
 /// Hands out heap addresses from a fixed window, in creation order, and falls back to any address when the
@@ -74,25 +75,30 @@ fn reserve(_at: usize, len: usize) -> Option<Block> {
 }
 
 impl FixedWindow {
+    /// The next free range of the window, or, when its address is taken, the first free range below 4 GiB
+    /// after it; only when none is left, memory anywhere.
+    #[cfg(windows)]
     fn block(&self, bytes: usize) -> Option<Block> {
         let len = bytes.max(1).div_ceil(WINDOW_ALIGN) * WINDOW_ALIGN;
         let mut next = self.next.lock().ok()?;
-        let block = if *next + len <= WINDOW_END {
-            let at = *next;
-            *next += len;
-            reserve(at, len).filter(|b| b.base == at)
-        } else {
-            None
-        };
-        match block {
-            Some(b) => Some(b),
-            None => {
-                com::note_once(
-                    "descriptor heap window address taken; the heap is placed elsewhere",
-                );
-                reserve(0, len)
+        let mut at = *next;
+        while at + len <= LOW_END {
+            if let Some(block) = reserve(at, len).filter(|b| b.base == at) {
+                *next = at + len;
+                return Some(block);
             }
+            at += len;
         }
+        com::note_once(
+            "no descriptor heap address under 4 GiB is free; the heap is placed elsewhere",
+        );
+        reserve(0, len)
+    }
+
+    #[cfg(not(windows))]
+    fn block(&self, bytes: usize) -> Option<Block> {
+        let _ = &self.next;
+        reserve(0, bytes.max(1).div_ceil(WINDOW_ALIGN) * WINDOW_ALIGN)
     }
 }
 
