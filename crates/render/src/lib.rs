@@ -5,6 +5,7 @@ mod error;
 mod format;
 mod device;
 mod sampler;
+mod buffer;
 
 pub use error::{RenderError, Result};
 pub use format::{Format, level_extent, mip_count};
@@ -15,6 +16,7 @@ pub use device::{
 pub use ash::vk;
 pub use gpu::DeviceInfo;
 pub use sampler::{Sampler, SamplerDesc};
+pub use buffer::{Buffer, BufferDesc, MemoryLocation};
 
 /// SPIR-V compiled from the WGSL files in `shaders/` by `naga` at build time.
 pub mod shaders {
