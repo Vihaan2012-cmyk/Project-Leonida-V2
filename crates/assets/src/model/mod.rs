@@ -1,6 +1,7 @@
 //! Models: drawables, fragments, skeletons and skinning, decoded from a resource's system and
 //! graphics pages and exported as binary glTF with a JSON sidecar.
 
+mod decode;
 mod pages;
 mod skeleton;
 mod types;
