@@ -10,6 +10,14 @@
 //! runs alone. A draw whose pipeline is not ready either [`waits`](CompileQueue::wait) for that one build or
 //! skips ([`DrawPolicy`]).
 
+mod seen;
+mod service;
+
+pub use seen::{BytecodeStore, MemoryBytecode, Pso, PsoKey, SeenEntry, SeenError, SeenLog};
+pub use service::{
+    PipelineBuilder, PipelineHandle, PipelineService, Resolved, ServiceConfig, ServiceStats,
+};
+
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::Hash;
 use std::io::Write as _;
