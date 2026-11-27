@@ -1,5 +1,6 @@
 //! Pipeline state objects built from the console shader bytecode through the translator.
 
+pub mod cache;
 pub mod shaders;
 pub mod state;
 
@@ -7,6 +8,7 @@ use ash::vk;
 
 use crate::root::RootError;
 
+pub use cache::PipelineCache;
 pub use shaders::{DirectTranslation, Link, ShaderSource, TranslatedStage};
 pub use state::{
     BlendState, DepthStencilState, InputElement, RasterizerState, RenderTargetBlend, StencilFace,
