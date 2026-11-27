@@ -8,7 +8,8 @@
 //! - [`Pacer::frame_presented`]: from `PresentX`, with the token the plane carries;
 //! - [`Pacer::suspend`] / [`Pacer::resume`]: from `SuspendX` / `ResumeX`;
 //! - [`Pacer::sync_hint`]: which present mode fits the policy;
-//! - [`Pacer::frame_record`] / [`Pacer::stats`]: for `GetFrameStatisticsX` and the overlay.
+//! - [`Pacer::frame_record`] / [`Pacer::stats`] / [`Pacer::latest_token`]: for `GetFrameStatisticsX`, the overlay and
+//!   the title's non-blocking poll of the origin event.
 //!
 //! Time comes from a [`Clock`], so the logic is tested with a fake one. [`SystemClock`] sleeps on a
 //! high-resolution waitable timer and spins for the last stretch.
@@ -533,6 +534,12 @@ impl<C: Clock> Pacer<C> {
         token
     }
 
+    /// The token the last successful wait returned, 0 before the first. For the title's polling wait, which
+    /// reads the current token without blocking.
+    pub fn latest_token(&self) -> u64 {
+        self.state().records.back().map_or(0, |r| r.token)
+    }
+
     /// `PresentX` was called for the frame with this token.
     pub fn frame_presented(&self, token: u64) {
         let now = self.clock.now();
@@ -816,6 +823,15 @@ mod tests {
         assert_eq!(pacer.sync_hint(), SyncHint::Immediate);
         pacer.set_limit(FrameLimit::VSync);
         assert_eq!(pacer.sync_hint(), SyncHint::Vsync);
+    }
+
+    #[test]
+    fn the_latest_token_follows_the_waits() {
+        let (pacer, _clock) = registered(FrameLimit::Uncapped, 0, 1);
+        assert_eq!(pacer.latest_token(), 0);
+        pacer.wait_frame_event(None).unwrap();
+        pacer.wait_frame_event(None).unwrap();
+        assert_eq!(pacer.latest_token(), 2);
     }
 
     #[test]
