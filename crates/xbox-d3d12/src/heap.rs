@@ -4,10 +4,10 @@
 //! with plain moves, so it must point at writable memory), and the handles come back from heap slots 9 and
 //! 10 in RAX, as the console does. On the console one address serves the CPU and the GPU, so a
 //! shader-visible heap's GPU handle is the same number as its CPU handle; a heap that is not shader
-//! visible has GPU handle 0. Where a heap lies is a `HeapPlacement`: the default hands out addresses from a
-//! fixed window in creation order, so the same boot gives the same handles every run, which is what a title
-//! comparing the handle with an address it worked out needs. What the title compares against at the first
-//! heap is not known; `placement` is where to change it.
+//! visible has GPU handle 0. Where a heap lies is a `HeapPlacement`. The title asserts that slot 9 returns
+//! the address it chose for its first heap, so a device that runs the title uses `ConsolePlacement`
+//! (`heap/console.rs` has the measurements); `FixedWindow` is the default for a device with no title behind
+//! it and hands out addresses under 4 GiB in creation order.
 //!
 //! The descriptor writers (`Create*View`, `CopyDescriptors`) belong to `descriptor.rs`; they write at
 //! `cpu_start + index * increment_size(type)`.
@@ -15,6 +15,14 @@
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
+
+pub mod console;
+mod low;
+mod window;
+
+pub use console::{ConsolePlacement, HeapAllocator, Hooked, LowBlock, LowMemory, PlacementNote};
+pub use low::ResourcesLow;
+pub use window::FixedWindow;
 
 use crate::com::{self, E_INVALIDARG, E_OUTOFMEMORY, E_POINTER, Kind, add_ref, release};
 use crate::device::DeviceCore;
@@ -90,108 +98,6 @@ pub struct Placed {
     pub gpu: u64,
     pub keep: Box<dyn Send + Sync>,
 }
-
-const WINDOW_START: usize = 0x3000_0000;
-const WINDOW_END: usize = 0x7000_0000;
-const WINDOW_ALIGN: usize = 64 << 10;
-
-/// Hands out heap addresses from a fixed window, in creation order, and falls back to any address when the
-/// window's address is taken.
-pub struct FixedWindow {
-    next: Mutex<usize>,
-}
-
-impl Default for FixedWindow {
-    fn default() -> Self {
-        FixedWindow {
-            next: Mutex::new(WINDOW_START),
-        }
-    }
-}
-
-struct Block {
-    base: usize,
-    len: usize,
-    #[cfg(not(windows))]
-    _own: Vec<u8>,
-}
-
-#[cfg(windows)]
-impl Drop for Block {
-    fn drop(&mut self) {
-        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
-        // SAFETY: `base` came from `VirtualAlloc` and is released once.
-        unsafe { VirtualFree(self.base as *mut c_void, 0, MEM_RELEASE) };
-        let _ = self.len;
-    }
-}
-
-#[cfg(windows)]
-fn reserve(at: usize, len: usize) -> Option<Block> {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
-    };
-    // SAFETY: a fresh allocation; `at` is a hint address that fails when taken.
-    let base = unsafe {
-        VirtualAlloc(
-            at as *const c_void,
-            len,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE,
-        )
-    };
-    (!base.is_null()).then_some(Block {
-        base: base as usize,
-        len,
-    })
-}
-
-#[cfg(not(windows))]
-fn reserve(_at: usize, len: usize) -> Option<Block> {
-    let own = vec![0u8; len + WINDOW_ALIGN];
-    let base = (own.as_ptr() as usize + WINDOW_ALIGN - 1) & !(WINDOW_ALIGN - 1);
-    Some(Block {
-        base,
-        len,
-        _own: own,
-    })
-}
-
-impl HeapPlacement for FixedWindow {
-    fn place(&self, bytes: usize, shader_visible: bool) -> Option<Placed> {
-        let len = bytes.max(1).div_ceil(WINDOW_ALIGN) * WINDOW_ALIGN;
-        let mut next = self.next.lock().ok()?;
-        let block = if *next + len <= WINDOW_END {
-            let at = *next;
-            *next += len;
-            reserve(at, len).filter(|b| b.base == at)
-        } else {
-            None
-        };
-        let block = match block {
-            Some(b) => b,
-            None => {
-                com::note_once(
-                    "descriptor heap window address taken; the heap is placed elsewhere",
-                );
-                reserve(0, len)?
-            }
-        };
-        let cpu = block.base as u64;
-        Some(Placed {
-            cpu,
-            gpu: if shader_visible { cpu } else { 0 },
-            keep: Box::new(BlockOwner(block)),
-        })
-    }
-}
-
-struct BlockOwner(#[allow(dead_code)] Block);
-
-/// SAFETY of these: a `Block` is an address range this heap alone owns.
-unsafe impl Send for BlockOwner {}
-// SAFETY: as above; nothing is read through the owner.
-unsafe impl Sync for BlockOwner {}
 
 pub struct DescriptorHeap {
     pub device: com::ComPtr,
@@ -386,3 +292,11 @@ fn vtable() -> *const usize {
     });
     table as *const usize
 }
+
+#[cfg(test)]
+#[path = "heap/handles_tests.rs"]
+mod handles_tests;
+
+#[cfg(test)]
+#[path = "heap/window_tests.rs"]
+mod window_tests;
