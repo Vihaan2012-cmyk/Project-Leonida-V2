@@ -802,5 +802,60 @@ impl From<StreamError> for PipelineError {
     }
 }
 
+/// One stage of the console description at device slot 57: a program and the record that describes it, each as
+/// a pointer and a size already resolved from the cache's tables (an absent stage is null and 0).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeStage {
+    pub code: Vec<u8>,
+    pub meta: Vec<u8>,
+}
+
+/// The 0x108-byte description the game hands device slot 57 (RVA 0x024774c0 calls it; 0x0248f680 builds the
+/// pieces from the 0x70-byte cache records): the root signature, two pointer/size pairs into the cache's meta
+/// blob (the stage record, then the input-layout record), then seven stages of four words each, `[code pointer,
+/// code size, meta pointer, meta size]`, in the order of the cache record's fields at +0x38 to +0x68.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeGraphicsDesc {
+    pub root_signature: u64,
+    pub stage_record: Vec<u8>,
+    pub input_layout_record: Vec<u8>,
+    pub stages: [NativeStage; 7],
+}
+
+impl NativeGraphicsDesc {
+    pub const SIZE: usize = 0x108;
+
+    pub fn parse(bytes: &[u8], memory: &dyn Memory) -> Result<NativeGraphicsDesc, StreamError> {
+        if bytes.len() < Self::SIZE {
+            return Err(StreamError::Truncated(57));
+        }
+        let mut c = Cursor { bytes, at: 0 };
+        let pair = |c: &mut Cursor<'_>| -> Result<Vec<u8>, StreamError> {
+            let pointer = c.u64();
+            let size = c.u64() as usize;
+            if pointer == 0 || size == 0 {
+                return Ok(Vec::new());
+            }
+            memory
+                .read(pointer, size)
+                .ok_or(StreamError::BadPointer(57))
+        };
+        let root_signature = c.u64();
+        let stage_record = pair(&mut c)?;
+        let input_layout_record = pair(&mut c)?;
+        let mut stages: [NativeStage; 7] = Default::default();
+        for stage in &mut stages {
+            stage.code = pair(&mut c)?;
+            stage.meta = pair(&mut c)?;
+        }
+        Ok(NativeGraphicsDesc {
+            root_signature,
+            stage_record,
+            input_layout_record,
+            stages,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests;

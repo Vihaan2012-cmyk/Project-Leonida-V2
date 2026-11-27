@@ -545,3 +545,32 @@ fn the_games_own_0x2b0_stream_parses() {
     assert_eq!(s.input_layout, Some(Vec::new()));
     assert!(s.validate().is_ok());
 }
+
+#[test]
+fn the_slot_57_description_resolves_its_pairs() {
+    let mut bytes = vec![0u8; NativeGraphicsDesc::SIZE];
+    let put = |bytes: &mut Vec<u8>, at: usize, value: u64| {
+        bytes[at..at + 8].copy_from_slice(&value.to_le_bytes())
+    };
+    put(&mut bytes, 0, 0xabcd);
+    put(&mut bytes, 0x08, 0x1000);
+    put(&mut bytes, 0x10, 4);
+    put(&mut bytes, 0x28, 0x2000);
+    put(&mut bytes, 0x30, 3);
+    put(&mut bytes, 0x38, 0x1000);
+    put(&mut bytes, 0x40, 2);
+    put(&mut bytes, 0xe8, 0x2000);
+    put(&mut bytes, 0xf0, 1);
+    let d = NativeGraphicsDesc::parse(&bytes, &memory_with_code()).unwrap();
+    assert_eq!(d.root_signature, 0xabcd);
+    assert_eq!(d.stage_record, [1, 2, 3, 4]);
+    assert!(d.input_layout_record.is_empty());
+    assert_eq!(d.stages[0].code, [9, 8, 7]);
+    assert_eq!(d.stages[0].meta, [1, 2]);
+    assert_eq!(d.stages[5].code, [] as [u8; 0]);
+    assert_eq!(d.stages[6].code, [9]);
+    assert_eq!(
+        NativeGraphicsDesc::parse(&bytes[..0x100], &memory_with_code()),
+        Err(StreamError::Truncated(57))
+    );
+}
