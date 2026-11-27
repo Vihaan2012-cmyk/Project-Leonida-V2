@@ -1146,6 +1146,7 @@ dependencies = [
  "rpf9",
  "serde_json",
  "sha2",
+ "shader-census",
  "shader-container",
  "shader-ir",
  "shader-store",

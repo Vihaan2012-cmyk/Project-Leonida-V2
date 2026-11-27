@@ -199,6 +199,9 @@ impl Techniques {
                 .iter()
                 .filter(|p| !p.first_half && p.stage == stage)
                 .collect();
+            if list.is_empty() {
+                continue;
+            }
             let mut count = ShiftCount {
                 shift: 0,
                 agree: 0,

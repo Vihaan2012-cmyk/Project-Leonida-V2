@@ -1,5 +1,6 @@
 mod cli;
 mod cmd_assets;
+mod cmd_census;
 mod cmd_check;
 mod cmd_config;
 mod cmd_content;
@@ -31,6 +32,7 @@ fn main() -> ExitCode {
             ShadersCommand::Scan(args) => cmd_shaders::scan_command(args),
             ShadersCommand::Disasm(args) => cmd_shaders::disasm_command(args),
             ShadersCommand::Report(args) => cmd_shaders::report_command(args),
+            ShadersCommand::Census(args) => cmd_census::census_command(args),
             ShadersCommand::Verify(args) => cmd_verify::verify_command(args),
         },
         Some(Command::Exe(exe)) => cmd_exe::exe_command(exe),
