@@ -147,3 +147,141 @@ impl Drop for Region {
         unsafe { VirtualFree(self.address as usize as *mut c_void, 0, MEM_RELEASE) };
     }
 }
+
+// SPIR-V of a compute shader (GLSL, buffer_reference) that stores `*(heap + src) + 1` at `heap + dst`, with
+// `heap`, `src` and `dst` three 64-bit push constants.
+const INCREMENT: &[u32] = include!("test_shader.in");
+
+pub struct Kernel {
+    module: vk::ShaderModule,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    pool: vk::CommandPool,
+}
+
+impl Kernel {
+    pub fn new(gpu: &TestGpu) -> Kernel {
+        let device = &gpu.handles.device;
+        // SAFETY: test-only Vulkan use; `finish` destroys everything.
+        unsafe {
+            let module = device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(INCREMENT), None)
+                .unwrap();
+            let range = [vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .size(24)];
+            let layout = device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&range),
+                    None,
+                )
+                .unwrap();
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main");
+            let pipeline = device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default()
+                        .stage(stage)
+                        .layout(layout)],
+                    None,
+                )
+                .unwrap()[0];
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(gpu.family),
+                    None,
+                )
+                .unwrap();
+            Kernel {
+                module,
+                layout,
+                pipeline,
+                pool,
+            }
+        }
+    }
+
+    /// One submission: uploads, then each `(src, dst)` increment, then downloads of `download`. Returns the
+    /// bytes the uploads copied.
+    pub fn run(
+        &self,
+        gpu: &TestGpu,
+        space: &mut AddressSpace,
+        jobs: &[(u64, u64)],
+        download: (u64, u64),
+    ) -> u64 {
+        let device = &gpu.handles.device;
+        // SAFETY: test-only Vulkan use; the command buffer completes before returning.
+        unsafe {
+            let command = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(self.pool)
+                        .command_buffer_count(1),
+                )
+                .unwrap()[0];
+            device
+                .begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
+                .unwrap();
+            let uploaded = space.record_uploads(command);
+            device.cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            for &(src, dst) in jobs {
+                let mut push = Vec::new();
+                for word in [space.heap_base(), src, dst] {
+                    push.extend_from_slice(&word.to_le_bytes());
+                }
+                device.cmd_push_constants(
+                    command,
+                    self.layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &push,
+                );
+                device.cmd_dispatch(command, 1, 1, 1);
+                let barrier = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+                device.cmd_pipeline_barrier(
+                    command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &barrier,
+                    &[],
+                    &[],
+                );
+            }
+            space.record_downloads(command, download.0, download.1);
+            device.end_command_buffer(command).unwrap();
+            let fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .unwrap();
+            let commands = [command];
+            device
+                .queue_submit(
+                    gpu.handles.queue,
+                    &[vk::SubmitInfo::default().command_buffers(&commands)],
+                    fence,
+                )
+                .unwrap();
+            device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            device.destroy_fence(fence, None);
+            device.free_command_buffers(self.pool, &commands);
+            uploaded
+        }
+    }
+
+    pub fn finish(self, gpu: &TestGpu) {
+        let device = &gpu.handles.device;
+        // SAFETY: nothing is in flight.
+        unsafe {
+            device.destroy_command_pool(self.pool, None);
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.layout, None);
+            device.destroy_shader_module(self.module, None);
+        }
+    }
+}
