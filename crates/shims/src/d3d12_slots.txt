@@ -1,33 +1,33 @@
 # Console D3D12 method slots: interface, slot, method, and where the number comes from.
 # "pc" assumes the PC header's order until the executable confirms it; "measured" was seen in the executable.
-ID3D12Device 0 QueryInterface pc
+ID3D12Device 0 QueryInterface pc sites=1
 ID3D12Device 1 AddRef pc
-ID3D12Device 2 Release pc
+ID3D12Device 2 Release pc sites=2
 ID3D12Device 3 GetPrivateData pc
 ID3D12Device 4 SetPrivateData pc
 ID3D12Device 5 SetPrivateDataInterface pc
 ID3D12Device 6 SetName pc
 ID3D12Device 7 GetNodeCount pc
-ID3D12Device 8 CreateCommandQueue measured
-ID3D12Device 9 CreateCommandAllocator measured
+ID3D12Device 8 CreateCommandQueue measured sites=2
+ID3D12Device 9 CreateCommandAllocator measured sites=5
 ID3D12Device 10 CreateGraphicsPipelineState pc
 ID3D12Device 11 CreateComputePipelineState pc
 ID3D12Device 12 CreateCommandList pc
 ID3D12Device 13 CheckFeatureSupport pc
-ID3D12Device 14 CreateDescriptorHeap measured
-ID3D12Device 15 GetDescriptorHandleIncrementSize pc
-ID3D12Device 16 CreateRootSignature pc
-ID3D12Device 17 CreateConstantBufferView pc
-ID3D12Device 18 CreateShaderResourceView pc
-ID3D12Device 19 CreateUnorderedAccessView pc
-ID3D12Device 20 CreateRenderTargetView pc
-ID3D12Device 21 CreateDepthStencilView pc
+ID3D12Device 14 CreateDescriptorHeap measured sites=3
+ID3D12Device 15 GetDescriptorHandleIncrementSize pc sites=10
+ID3D12Device 16 CreateRootSignature pc sites=1
+ID3D12Device 17 CreateConstantBufferView pc sites=1
+ID3D12Device 18 CreateShaderResourceView pc sites=1
+ID3D12Device 19 CreateUnorderedAccessView pc sites=1
+ID3D12Device 20 CreateRenderTargetView pc sites=1
+ID3D12Device 21 CreateDepthStencilView pc sites=1
 ID3D12Device 22 CreateSampler pc
 ID3D12Device 23 CopyDescriptors pc
-ID3D12Device 24 CopyDescriptorsSimple pc
-ID3D12Device 25 GetResourceAllocationInfo pc
-ID3D12Device 26 GetCustomHeapProperties pc
-ID3D12Device 27 CreateCommittedResource pc
+ID3D12Device 24 CopyDescriptorsSimple pc sites=5
+ID3D12Device 25 GetResourceAllocationInfo pc sites=3
+ID3D12Device 26 GetCustomHeapProperties pc sites=3
+ID3D12Device 27 CreateCommittedResource pc sites=1
 ID3D12Device 28 CreateHeap pc
 ID3D12Device 29 CreatePlacedResource pc
 ID3D12Device 30 CreateReservedResource pc
@@ -36,33 +36,33 @@ ID3D12Device 32 OpenSharedHandle measured
 ID3D12Device 33 OpenSharedHandleByName pc
 ID3D12Device 34 MakeResident pc
 ID3D12Device 35 Evict pc
-ID3D12Device 36 CreateFence measured
+ID3D12Device 36 CreateFence measured sites=1
 ID3D12Device 37 GetDeviceRemovedReason pc
 ID3D12Device 38 GetCopyableFootprints pc
-ID3D12Device 39 CreateQueryHeap pc
+ID3D12Device 39 CreateQueryHeap pc sites=1
 ID3D12Device 40 SetStablePowerState pc
-ID3D12Device 41 CreateCommandSignature pc
+ID3D12Device 41 CreateCommandSignature pc sites=5
 ID3D12Device 42 GetResourceTiling pc
 ID3D12Device 43 GetAdapterLuid pc
-ID3D12Device 48 CreateCommandQueueX measured
-ID3D12Device 62 CreateComputePipelineStateX measured
-ID3D12Device 67 CreateComputePipelineStateFromNativeCodeX measured
-ID3D12Device 73 CreateCommandListX measured
+ID3D12Device 48 CreateCommandQueueX measured sites=4
+ID3D12Device 62 CreateComputePipelineStateX measured sites=1
+ID3D12Device 67 CreateComputePipelineStateFromNativeCodeX measured sites=1
+ID3D12Device 73 CreateCommandListX measured sites=3
 ID3D12Device 76 CreateCommittedResourceX measured
-ID3D12Device 78 SetFrameIntervalX measured
-ID3D12Device 79 ScheduleFrameEventX measured
-ID3D12Device 80 WaitFrameEventX measured
-ID3D12Device 133 CreatePlacedResourceX measured
+ID3D12Device 78 SetFrameIntervalX measured sites=1
+ID3D12Device 79 ScheduleFrameEventX measured sites=3
+ID3D12Device 80 WaitFrameEventX measured sites=3
+ID3D12Device 133 CreatePlacedResourceX measured sites=5
 ID3D12Device 44 CreatePipelineLibrary pc
 ID3D12Device 45 SetEventOnMultipleFenceCompletion pc
 ID3D12Device 46 SetResidencyPriority pc
 ID3D12Device 47 CreatePipelineState pc
-ID3D12Device 81 GetFrameStatisticsX measured
+ID3D12Device 81 GetFrameStatisticsX measured sites=1
 # Device slot 57 is the PC's CreateLifetimeTracker; the console method there is not known and is called thousands of times.
 # Queue: PresentX is slot 30 (older console runtime layout) or 32 (newer), from public code; not decided for this title.
 ID3D12CommandQueue 0 QueryInterface pc
 ID3D12CommandQueue 1 AddRef pc
-ID3D12CommandQueue 2 Release pc
+ID3D12CommandQueue 2 Release pc sites=5
 ID3D12CommandQueue 3 GetPrivateData pc
 ID3D12CommandQueue 4 SetPrivateData pc
 ID3D12CommandQueue 5 SetPrivateDataInterface pc
@@ -76,7 +76,7 @@ ID3D12CommandQueue 12 BeginEvent pc
 ID3D12CommandQueue 13 EndEvent pc
 ID3D12CommandQueue 14 Signal pc
 ID3D12CommandQueue 15 Wait pc
-ID3D12CommandQueue 16 GetTimestampFrequency pc
+ID3D12CommandQueue 16 GetTimestampFrequency pc (the executable calls Signal at slot 16)
 ID3D12CommandQueue 17 GetClockCalibration pc
 ID3D12CommandQueue 18 GetDesc pc
 # Queue slots 28 to 32 are a guess: PresentX is 30 in the older console runtime layout and 32 in the newer; SuspendX and ResumeX are placed before the older PresentX. Both PresentX slots answer; a call to 29 or 31 names itself in the trace.
@@ -115,46 +115,46 @@ ID3D12GraphicsCommandList 8 GetType pc
 ID3D12GraphicsCommandList 9 Close pc
 ID3D12GraphicsCommandList 10 Reset pc
 ID3D12GraphicsCommandList 11 ClearState pc
-ID3D12GraphicsCommandList 12 DrawInstanced pc
-ID3D12GraphicsCommandList 13 DrawIndexedInstanced pc
+ID3D12GraphicsCommandList 12 DrawInstanced pc sites=1
+ID3D12GraphicsCommandList 13 DrawIndexedInstanced pc sites=3
 ID3D12GraphicsCommandList 14 Dispatch measured
 ID3D12GraphicsCommandList 15 CopyBufferRegion measured
 ID3D12GraphicsCommandList 17 CopyResource pc
 ID3D12GraphicsCommandList 18 CopyTiles pc
 ID3D12GraphicsCommandList 19 ResolveSubresource pc
-ID3D12GraphicsCommandList 20 IASetPrimitiveTopology pc
-ID3D12GraphicsCommandList 21 RSSetViewports pc
-ID3D12GraphicsCommandList 22 RSSetScissorRects pc
-ID3D12GraphicsCommandList 23 OMSetBlendFactor pc
-ID3D12GraphicsCommandList 24 OMSetStencilRef pc
-ID3D12GraphicsCommandList 25 SetPipelineState measured
+ID3D12GraphicsCommandList 20 IASetPrimitiveTopology pc sites=1
+ID3D12GraphicsCommandList 21 RSSetViewports pc sites=1
+ID3D12GraphicsCommandList 22 RSSetScissorRects pc sites=1
+ID3D12GraphicsCommandList 23 OMSetBlendFactor pc sites=1
+ID3D12GraphicsCommandList 24 OMSetStencilRef pc sites=1
+ID3D12GraphicsCommandList 25 SetPipelineState measured sites=3
 ID3D12GraphicsCommandList 26 ResourceBarrier measured
 ID3D12GraphicsCommandList 32 SetDescriptorHeaps measured
-ID3D12GraphicsCommandList 33 SetComputeRootSignature measured
-ID3D12GraphicsCommandList 34 SetGraphicsRootSignature inferred
-ID3D12GraphicsCommandList 35 SetComputeRootDescriptorTable measured
-ID3D12GraphicsCommandList 36 SetGraphicsRootDescriptorTable inferred
+ID3D12GraphicsCommandList 33 SetComputeRootSignature measured sites=2
+ID3D12GraphicsCommandList 34 SetGraphicsRootSignature inferred sites=1
+ID3D12GraphicsCommandList 35 SetComputeRootDescriptorTable measured sites=2
+ID3D12GraphicsCommandList 36 SetGraphicsRootDescriptorTable inferred sites=2
 ID3D12GraphicsCommandList 37 SetComputeRoot32BitConstant measured
 ID3D12GraphicsCommandList 38 SetGraphicsRoot32BitConstant inferred
-ID3D12GraphicsCommandList 39 SetComputeRoot32BitConstants measured
-ID3D12GraphicsCommandList 40 SetGraphicsRoot32BitConstants inferred
+ID3D12GraphicsCommandList 39 SetComputeRoot32BitConstants measured sites=2
+ID3D12GraphicsCommandList 40 SetGraphicsRoot32BitConstants inferred sites=1
 ID3D12GraphicsCommandList 41 SetComputeRootConstantBufferView inferred
 ID3D12GraphicsCommandList 42 SetGraphicsRootConstantBufferView inferred
-ID3D12GraphicsCommandList 43 SetComputeRootShaderResourceView measured
-ID3D12GraphicsCommandList 44 SetGraphicsRootShaderResourceView inferred
-ID3D12GraphicsCommandList 45 SetComputeRootUnorderedAccessView measured
-ID3D12GraphicsCommandList 46 SetGraphicsRootUnorderedAccessView inferred
-ID3D12GraphicsCommandList 47 IASetIndexBuffer inferred
-ID3D12GraphicsCommandList 48 IASetVertexBuffers inferred
+ID3D12GraphicsCommandList 43 SetComputeRootShaderResourceView measured sites=2
+ID3D12GraphicsCommandList 44 SetGraphicsRootShaderResourceView inferred sites=1
+ID3D12GraphicsCommandList 45 SetComputeRootUnorderedAccessView measured sites=2
+ID3D12GraphicsCommandList 46 SetGraphicsRootUnorderedAccessView inferred sites=1
+ID3D12GraphicsCommandList 47 IASetIndexBuffer inferred sites=1
+ID3D12GraphicsCommandList 48 IASetVertexBuffers inferred sites=1
 ID3D12GraphicsCommandList 49 SOSetTargets inferred
-ID3D12GraphicsCommandList 50 OMSetRenderTargets inferred
+ID3D12GraphicsCommandList 50 OMSetRenderTargets inferred sites=1
 ID3D12GraphicsCommandList 51 ClearDepthStencilView inferred
-ID3D12GraphicsCommandList 52 ClearRenderTargetView inferred
+ID3D12GraphicsCommandList 52 ClearRenderTargetView inferred sites=1
 ID3D12GraphicsCommandList 53 ClearUnorderedAccessViewUint measured
 ID3D12GraphicsCommandList 54 ClearUnorderedAccessViewFloat measured
 ID3D12GraphicsCommandList 55 DiscardResource measured
 ID3D12GraphicsCommandList 59 GpuEventX measured
-ID3D12GraphicsCommandList 61 ExecuteIndirect measured
+ID3D12GraphicsCommandList 61 ExecuteIndirect measured sites=10
 ID3D12GraphicsCommandList 71 WriteValueX inferred
 ID3D12GraphicsCommandList 73 WaitValueX inferred
 ID3D12GraphicsCommandList 80 DispatchX inferred
