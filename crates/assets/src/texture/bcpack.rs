@@ -14,6 +14,8 @@ mod codebooks;
 mod lane_tests;
 mod lanes;
 mod model;
+#[cfg(test)]
+mod real_tests;
 mod tables;
 #[cfg(test)]
 mod testenc;
