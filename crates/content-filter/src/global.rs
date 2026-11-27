@@ -11,12 +11,12 @@ use crate::filter::ContentFilter;
 static FILTER: OnceLock<ContentFilter> = OnceLock::new();
 
 /// Installs the filter for the rest of the process. A second call hands its filter back unused.
-pub fn install(filter: ContentFilter) -> Result<&'static ContentFilter, ContentFilter> {
+pub fn install(filter: ContentFilter) -> Result<&'static ContentFilter, Box<ContentFilter>> {
     let mut given = Some(filter);
     let installed = FILTER.get_or_init(|| given.take().unwrap_or_else(ContentFilter::disabled));
     match given {
         None => Ok(installed),
-        Some(unused) => Err(unused),
+        Some(unused) => Err(Box::new(unused)),
     }
 }
 
