@@ -17,9 +17,11 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 pub mod console;
+mod low;
 mod window;
 
 pub use console::{ConsolePlacement, HeapAllocator, Hooked, LowBlock, LowMemory, PlacementNote};
+pub use low::ResourcesLow;
 pub use window::FixedWindow;
 
 use crate::com::{self, E_INVALIDARG, E_OUTOFMEMORY, E_POINTER, Kind, add_ref, release};
