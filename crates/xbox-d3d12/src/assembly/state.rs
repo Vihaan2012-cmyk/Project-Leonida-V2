@@ -233,7 +233,7 @@ impl Assembly {
         };
         presentation.set_notes(Box::new(|text| com::note_once(text.to_string())));
         if let Some(window) = presentation.window() {
-            let translator = Mutex::new(Translator::default());
+            let translator = Mutex::new(Translator);
             window.set_motion_sink(Box::new(hooks::forward_motion));
             window.set_event_sink(Box::new(move |event| {
                 let translated = translator

@@ -104,11 +104,10 @@ fn scan_code(_key: PhysicalKey) -> Option<u32> {
     None
 }
 
-/// Tracks the cursor so its position becomes movement.
+/// Turns window events into input events. Mouse movement comes only from raw motion (the motion sink), so a
+/// cursor position never moves the camera twice.
 #[derive(Default)]
-pub struct Translator {
-    cursor: Option<(f64, f64)>,
-}
+pub struct Translator;
 
 impl Translator {
     pub fn translate(&mut self, event: &WindowEvent) -> Option<InputEvent> {
@@ -142,22 +141,7 @@ impl Translator {
                 };
                 Some(InputEvent::MouseWheel { dx, dy })
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                let now = (position.x, position.y);
-                let before = self.cursor.replace(now)?;
-                let (dx, dy) = ((now.0 - before.0) as i32, (now.1 - before.1) as i32);
-                (dx != 0 || dy != 0).then_some(InputEvent::MouseMove { dx, dy })
-            }
-            WindowEvent::CursorLeft { .. } => {
-                self.cursor = None;
-                None
-            }
-            WindowEvent::Focused(focus) => {
-                if !focus {
-                    self.cursor = None;
-                }
-                Some(InputEvent::Focus(*focus))
-            }
+            WindowEvent::Focused(focus) => Some(InputEvent::Focus(*focus)),
             _ => None,
         }
     }
@@ -224,25 +208,19 @@ mod tests {
     }
 
     #[test]
-    fn cursor_positions_become_movement_and_the_first_one_only_sets_the_origin() {
-        let mut t = Translator::default();
+    fn cursor_positions_never_become_movement() {
+        let mut t = Translator;
         let moved = |x, y| WindowEvent::CursorMoved {
             device_id: device(),
             position: PhysicalPosition::new(x, y),
         };
         assert_eq!(t.translate(&moved(10.0, 10.0)), None);
-        assert_eq!(
-            t.translate(&moved(15.0, 7.0)),
-            Some(InputEvent::MouseMove { dx: 5, dy: -3 })
-        );
         assert_eq!(t.translate(&moved(15.0, 7.0)), None);
-        t.translate(&WindowEvent::Focused(false));
-        assert_eq!(t.translate(&moved(100.0, 100.0)), None);
     }
 
     #[test]
     fn buttons_wheel_and_focus_translate() {
-        let mut t = Translator::default();
+        let mut t = Translator;
         let button = |b| WindowEvent::MouseInput {
             device_id: device(),
             state: ElementState::Pressed,
