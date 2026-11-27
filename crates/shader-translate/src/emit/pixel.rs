@@ -19,6 +19,7 @@ pub(super) struct PixelState {
     bary: Word,
     helper: Word,
     attributes: HashMap<u8, Word>,
+    locations: Vec<Option<u8>>,
     outputs: Vec<(PixelOutput, Word)>,
     depth: Option<Word>,
     alive: Word,
@@ -111,6 +112,7 @@ impl Emitter {
             bary,
             helper,
             attributes: HashMap::new(),
+            locations: options.attribute_locations.clone(),
             outputs,
             depth,
             alive,
@@ -186,8 +188,12 @@ impl Emitter {
         self.begin(done)
     }
 
-    fn pixel_attribute(&mut self, attr: u8) -> Word {
-        if let Some(var) = self.pixel.as_ref().and_then(|p| p.attributes.get(&attr)) {
+    fn pixel_attribute(&mut self, location: u8) -> Word {
+        if let Some(var) = self
+            .pixel
+            .as_ref()
+            .and_then(|p| p.attributes.get(&location))
+        {
             return *var;
         }
         let uvec4 = self.t.uvec4;
@@ -197,14 +203,14 @@ impl Emitter {
         self.b.decorate(
             var,
             Decoration::Location,
-            [Operand::LiteralBit32(u32::from(attr))],
+            [Operand::LiteralBit32(u32::from(location))],
         );
         self.b.decorate(var, Decoration::PerVertexKHR, []);
         self.pixel
             .as_mut()
             .expect("pixel mode")
             .attributes
-            .insert(attr, var);
+            .insert(location, var);
         var
     }
 
@@ -215,7 +221,13 @@ impl Emitter {
         channel: u8,
         vertex: u8,
     ) -> Result<Word, EmitError> {
-        let var = self.pixel_attribute(attr);
+        let state = self.pixel.as_ref().expect("pixel mode");
+        let location = match state.locations.get(usize::from(attr)) {
+            Some(Some(location)) => *location,
+            Some(None) => return Ok(self.u32c(0)),
+            None => attr,
+        };
+        let var = self.pixel_attribute(location);
         let u32_ = self.t.u32_;
         let ptr = self.b.type_pointer(None, StorageClass::Input, u32_);
         let (vertex, channel) = (self.u32c(u32::from(vertex)), self.u32c(u32::from(channel)));

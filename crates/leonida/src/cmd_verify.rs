@@ -71,6 +71,7 @@ impl Partners {
             user_sgprs: 0,
             inputs: 0x2,
             outputs: Vec::new(),
+            attribute_locations: Vec::new(),
             depth: None,
             float: FloatMode::default(),
         };

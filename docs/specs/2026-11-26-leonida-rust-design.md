@@ -184,8 +184,15 @@ fragment entry preloads v0-v1 from `BaryCoordKHR` (I = y, J = z) and the enabled
 them, and reads attribute N as the raw words of a `PerVertexKHR` input at location N, so interpolation runs the
 shader's own instructions. Colour target N is the output at location N, typed from the output signature; `mrtz`
 writes `FragDepth`. Exec starts as the non-helper invocations, and pixels outside exec at the last (`done`) export are
-discarded. Wave64 code runs on 32-wide subgroups: fragment shaders have no workgroup to emulate 64 lanes with. The
-vertex-side contract (which parameter export feeds which location) is the linker's job and still to come.
+discarded. Wave64 code runs on 32-wide subgroups: fragment shaders have no workgroup to emulate 64 lanes with.
+
+**Linking stages.** Vertex and mesh shaders write `paramN` to output location N, and the program header says which
+output-signature register each parameter carries: a count at 0x29C and six bytes per parameter from 0x1DC (kind,
+6 for ordinary values and 7 or 8 for system values; register; parameter number). Translated geometry shaders write
+each register to the location of its number. A pixel shader's attribute N reads the register its interpolant table
+names; `pixel_attribute_sources` follows that register's semantic and index to the earlier stage's output with the
+same semantic and index, and from there to its location. The pixel entry takes the result as
+`attribute_locations`: attribute N reads that location, or zero when no earlier output matches.
 
 **Vertex and mesh shaders.** Vertex shaders are the legacy kind: v0 is the vertex index, v3 the instance index less
 the base instance, user SGPRs start at s0, and an `s_swappc` at the first instruction calls the fetch shader. The

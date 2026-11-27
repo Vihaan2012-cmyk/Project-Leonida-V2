@@ -57,6 +57,19 @@ pub struct PixelSetup {
     pub interpolants: Vec<Interpolant>,
 }
 
+/// A vertex or mesh shader's parameter export: output-signature register `register` leaves as `paramN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParameterExport {
+    /// 6 for an ordinary value, 7 and 8 for system values passed on to the pixel shader.
+    pub kind: u8,
+    pub register: u8,
+    pub parameter: u8,
+}
+
+const PARAMETER_TABLE: usize = 0x1DC;
+const PARAMETER_COUNT: usize = 0x29C;
+const PARAMETER_LIMIT: usize = 32;
+
 const PIXEL_TABLE: usize = 0x138;
 const PIXEL_TABLE_END: usize = 0x238;
 const PIXEL_INPUTS: usize = 0x248;
@@ -112,6 +125,28 @@ impl<'a> Fssm<'a> {
     /// The user SGPR count, bits 16-21 of 0xD4.
     pub fn user_sgprs(&self) -> u32 {
         (u32_at(self.bytes, WAVE_FLAGS) >> 16) & 0x3F
+    }
+
+    /// A vertex or mesh shader's parameter exports: a count at 0x29C and six bytes each from 0x1DC (kind, output
+    /// register, parameter number, three more).
+    pub fn parameter_exports(&self) -> Vec<ParameterExport> {
+        let count = self
+            .bytes
+            .get(PARAMETER_COUNT..PARAMETER_COUNT + 4)
+            .map_or(0, |b| {
+                u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize
+            });
+        (0..count.min(PARAMETER_LIMIT))
+            .map_while(|k| {
+                let at = PARAMETER_TABLE + 6 * k;
+                let record = self.bytes.get(at..at + 3)?;
+                Some(ParameterExport {
+                    kind: record[0],
+                    register: record[1],
+                    parameter: record[2],
+                })
+            })
+            .collect()
     }
 
     /// A pixel shader's setup: input enables at 0x248, depth control and target mask after them, the user

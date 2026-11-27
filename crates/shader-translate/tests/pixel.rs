@@ -153,6 +153,7 @@ fn run(
     attributes: &[[[u32; 4]; 3]],
     user: &[u32],
     resources: &mut [(u32, Resource)],
+    locations: &[Option<u8>],
 ) {
     let source = if wave64 {
         case.source.to_string()
@@ -171,6 +172,7 @@ fn run(
             target: 0,
             number: case.number,
         }],
+        attribute_locations: locations.to_vec(),
         depth: case.depth,
         float: FloatMode {
             nan_preserve: gpu.info.nan_preserve_32,
@@ -368,7 +370,7 @@ fn pixel_shaders_read_inputs_and_write_targets() {
     ];
     for case in &cases {
         for wave64 in [false, true] {
-            run(&gpu, case, wave64, &attributes, &[], &mut []);
+            run(&gpu, case, wave64, &attributes, &[], &mut [], &[]);
         }
     }
 }
@@ -469,7 +471,7 @@ fn pixel_shaders_sample_with_screen_derivatives() {
             expect_depth: None,
             close: false,
         };
-        run(&gpu, &case, wave64, &[], &user, &mut resources);
+        run(&gpu, &case, wave64, &[], &user, &mut resources, &[]);
         let case = Case {
             name: "implicit_lod_offset",
             source: "v_mov_b32_e32 v10, 0x3f01
@@ -487,7 +489,7 @@ fn pixel_shaders_sample_with_screen_derivatives() {
             expect_depth: None,
             close: false,
         };
-        run(&gpu, &case, wave64, &[], &user, &mut resources);
+        run(&gpu, &case, wave64, &[], &user, &mut resources, &[]);
     }
 }
 
@@ -534,7 +536,7 @@ fn ordered_pixel_shaders_run_inside_an_interlock() {
         close: false,
     };
     for wave64 in [false, true] {
-        run(&gpu, &case, wave64, &[], &[], &mut []);
+        run(&gpu, &case, wave64, &[], &[], &mut [], &[]);
     }
 }
 
@@ -560,5 +562,49 @@ fn programs_reading_upper_lanes_see_an_empty_upper_half() {
         expect_depth: None,
         close: false,
     };
-    run(&gpu, &case, true, &[], &[], &mut []);
+    run(&gpu, &case, true, &[], &[], &mut [], &[]);
+}
+
+#[test]
+fn attributes_read_the_locations_linking_gives_them() {
+    let Some(gpu) = pixel_gpu() else { return };
+    let span = (2 * SIZE) as f32;
+    let unrelated = [[f(9.0); 4]; 3];
+    let attributes = [
+        unrelated,
+        unrelated,
+        [
+            [f(0.0), f(0.0), f(7.0), f(3.0)],
+            [f(span), f(0.0), f(7.0), f(5.0)],
+            [f(0.0), f(span), f(7.0), f(9.0)],
+        ],
+    ];
+    let case = Case {
+        name: "linked",
+        source: "s_mov_b32 m0, s0
+             v_interp_p1_f32 v4, v0, attr0.x
+             v_interp_p2_f32 v4, v1, attr0.x
+             v_interp_p1_f32 v5, v0, attr0.y
+             v_interp_p2_f32 v5, v1, attr0.y
+             v_interp_mov_f32 v6, p0, attr0.w
+             v_interp_mov_f32 v7, p0, attr1.x
+             exp mrt0 v4, v5, v6, v7 done vm
+             s_endpgm",
+        inputs: 0x2,
+        user_sgprs: 0,
+        number: Number::Float,
+        depth: None,
+        expect: Box::new(|x, y| [f(centre(x)), f(centre(y)), f(3.0), 0]),
+        expect_depth: None,
+        close: true,
+    };
+    run(
+        &gpu,
+        &case,
+        false,
+        &attributes,
+        &[],
+        &mut [],
+        &[Some(2), None],
+    );
 }

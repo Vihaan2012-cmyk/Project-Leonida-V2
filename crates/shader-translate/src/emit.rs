@@ -197,6 +197,9 @@ pub struct PixelOptions {
     pub inputs: u32,
     pub outputs: Vec<PixelOutput>,
     pub depth: Option<DepthOutput>,
+    /// The output location of the stage before that attribute N reads, or `None` for an attribute nothing
+    /// writes, which reads as zero; attributes past the list read the location of their own number.
+    pub attribute_locations: Vec<Option<u8>>,
     pub float: FloatMode,
 }
 

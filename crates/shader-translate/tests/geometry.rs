@@ -49,6 +49,7 @@ fn fragment(gpu: &Gpu) -> Vec<u32> {
             target: 0,
             number: Number::Float,
         }],
+        attribute_locations: Vec::new(),
         depth: None,
         float: float_mode(gpu),
     };

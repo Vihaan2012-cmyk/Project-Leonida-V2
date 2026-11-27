@@ -92,6 +92,7 @@ pub fn pixel_options(fssm: &Fssm, found: Option<&Interface>) -> Option<PixelOpti
         inputs: setup.inputs,
         outputs,
         depth: shader_translate::DepthOutput::from_control(setup.depth_control),
+        attribute_locations: Vec::new(),
         float: shader_translate::FloatMode::default(),
     })
 }
