@@ -2413,6 +2413,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "source-export"
+version = "0.1.0"
+dependencies = [
+ "decompile",
+ "iced-x86",
+ "pe-image",
+ "rayon",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

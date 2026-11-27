@@ -1,0 +1,19 @@
+[package]
+name = "source-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decompile.workspace = true
+iced-x86.workspace = true
+pe-image.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
