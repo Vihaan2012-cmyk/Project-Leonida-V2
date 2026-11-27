@@ -2,8 +2,10 @@
 //! graphics pages and exported as binary glTF with a JSON sidecar.
 
 mod pages;
+mod skeleton;
 mod types;
 
+pub use skeleton::joaat;
 pub use types::*;
 
 #[derive(Debug, thiserror::Error)]
