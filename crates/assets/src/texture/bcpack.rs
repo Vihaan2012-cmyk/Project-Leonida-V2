@@ -4,13 +4,18 @@
 //! block stage that turns the lane symbols into BCn blocks: endpoint deltas against an earlier block or a built-in
 //! history entry, and index codebooks. [`decode`] runs both. Codecs whose block stage is not covered by the
 //! measured facts return [`BcPackError::Unsupported`] so the caller keeps its placeholder; a chunk that needs a
-//! built-in history entry that is only provisional, or not recovered, returns [`BcPackError::History`].
+//! built-in history entry that is only provisional, or not recovered, returns [`BcPackError::History`]. BC7 has
+//! no recovered history at all, so only its self-contained chunks decode.
 
 use thiserror::Error;
 
+mod bc7;
+#[cfg(test)]
+mod bc7_tests;
 #[cfg(test)]
 mod block_tests;
 mod blocks;
+mod bptc;
 mod codebooks;
 #[cfg(test)]
 mod lane_tests;
@@ -143,6 +148,18 @@ pub enum BcPackError {
     Unsupported { codec: BcPackCodec },
     #[error("BCPack lane array: {0}")]
     Lanes(#[from] LaneError),
+    #[error(
+        "BCPack {codec:?} block {block}: lane-15 signature is outside the recovered table or unconfirmed"
+    )]
+    Signature { codec: BcPackCodec, block: usize },
+    #[error(
+        "BCPack {codec:?}: {blocks} blocks break the format's anchor or p-bit rules (first: block {block})"
+    )]
+    Inconsistent {
+        codec: BcPackCodec,
+        block: usize,
+        blocks: usize,
+    },
     #[error("BCPack {codec:?} lane {lane} is non-zero")]
     UnexpectedLane { codec: BcPackCodec, lane: usize },
     #[error("BCPack {codec:?} block {block} needs built-in history entry {entry} ({status:?})")]
@@ -161,17 +178,23 @@ impl BcPackError {
             BcPackError::BadSize { codec, .. }
             | BcPackError::Unsupported { codec }
             | BcPackError::UnexpectedLane { codec, .. }
+            | BcPackError::Signature { codec, .. }
+            | BcPackError::Inconsistent { codec, .. }
             | BcPackError::History { codec, .. } => *codec,
             BcPackError::Truncated | BcPackError::Lanes(_) => BcPackCodec::Bc1,
         }
     }
 
-    /// True when the chunk is a valid stream that this decoder cannot finish for lack of recovered constants,
-    /// as opposed to a corrupt one.
+    /// True when the chunk is a valid stream that this decoder cannot finish for lack of recovered constants
+    /// (including BC7 signatures and chunks outside what the self-contained BC7 stage covers), as opposed to a
+    /// corrupt one.
     pub fn is_missing_constants(&self) -> bool {
         matches!(
             self,
-            BcPackError::Unsupported { .. } | BcPackError::History { .. }
+            BcPackError::Unsupported { .. }
+                | BcPackError::History { .. }
+                | BcPackError::Signature { .. }
+                | BcPackError::Inconsistent { .. }
         )
     }
 }
@@ -206,7 +229,11 @@ pub struct Decoded {
 pub fn is_supported(codec: BcPackCodec) -> bool {
     matches!(
         codec,
-        BcPackCodec::Bc1 | BcPackCodec::Bc3 | BcPackCodec::Bc4 | BcPackCodec::Bc5
+        BcPackCodec::Bc1
+            | BcPackCodec::Bc3
+            | BcPackCodec::Bc4
+            | BcPackCodec::Bc5
+            | BcPackCodec::Bc7
     )
 }
 
@@ -235,6 +262,7 @@ pub fn decode_with(
         BcPackCodec::Bc3 => blocks::bc3,
         BcPackCodec::Bc4 => blocks::bc4,
         BcPackCodec::Bc5 => blocks::bc5,
+        BcPackCodec::Bc7 => bc7::bc7,
         _ => return Err(BcPackError::Unsupported { codec }),
     };
     let widths = codec.lane_widths().expect("supported codecs have lanes");
@@ -303,7 +331,7 @@ mod tests {
 
     #[test]
     fn codecs_without_a_block_stage_stay_unsupported() {
-        for codec in [BcPackCodec::Bc2, BcPackCodec::Bc6h, BcPackCodec::Bc7] {
+        for codec in [BcPackCodec::Bc2, BcPackCodec::Bc6h] {
             assert_eq!(
                 decode(codec, &[0; 64], 4096),
                 Err(BcPackError::Unsupported { codec })

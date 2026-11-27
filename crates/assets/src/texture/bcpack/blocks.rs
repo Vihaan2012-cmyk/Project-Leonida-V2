@@ -13,7 +13,7 @@ use super::lanes::LaneSymbols;
 use super::{BcPackCodec, BcPackError, DecodeOptions, HistoryStatus};
 
 #[inline(always)]
-fn unzig(v: u8) -> i32 {
+pub(super) fn unzig(v: u8) -> i32 {
     i32::from(v >> 1) ^ -i32::from(v & 1)
 }
 
@@ -346,4 +346,10 @@ pub fn bc5(
         }
     }
     Ok(taint.count())
+}
+
+/// Two nibbles bit-interleaved: `a` supplies the even bits and `b` the odd bits.
+#[inline(always)]
+pub(super) fn interleave4(a: u8, b: u8) -> u8 {
+    SPREAD[usize::from(a & 15)] | SPREAD[usize::from(b & 15)] << 1
 }

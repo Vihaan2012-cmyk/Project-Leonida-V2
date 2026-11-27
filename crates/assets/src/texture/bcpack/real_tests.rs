@@ -24,7 +24,7 @@ fn to_pixels(dxgi: u32, w: u32, h: u32, blocks: &[u8]) -> Option<Plane> {
     let (bw, bh) = (w.div_ceil(4) as usize, h.div_ceil(4) as usize);
     let (block_bytes, channels) = match dxgi {
         71 | 72 => (8, 4),
-        77 | 78 => (16, 4),
+        77 | 78 | 98 | 99 => (16, 4),
         80 => (8, 1),
         83 => (16, 2),
         _ => return None,
@@ -40,6 +40,7 @@ fn to_pixels(dxgi: u32, w: u32, h: u32, blocks: &[u8]) -> Option<Plane> {
                 match dxgi {
                     71 | 72 => px[o..o + 4].copy_from_slice(&bcn::bc1_block(b, false)[p]),
                     77 | 78 => px[o..o + 4].copy_from_slice(&bcn::bc3_block(b)[p]),
+                    98 | 99 => px[o..o + 4].copy_from_slice(&bcn::bc7_block(b)[p]),
                     80 => px[o] = bcn::bc4_block(b)[p],
                     _ => px[o..o + 2].copy_from_slice(&bcn::bc5_block(b)[p]),
                 }
@@ -103,8 +104,14 @@ fn median(v: &mut [f64]) -> f64 {
     v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
 }
 
-/// Self-consistency over the 2D BC1/BC3/BC4/BC5 textures of a pool.
-fn survey(file: &[u8], opts: DecodeOptions, per_codec: usize) -> BTreeMap<&'static str, Stats> {
+/// Self-consistency over the 2D BC1/BC3/BC4/BC5/BC7 textures of a pool, limited to the formats in `only` when
+/// it is not empty.
+fn survey(
+    file: &[u8],
+    opts: DecodeOptions,
+    per_codec: usize,
+    only: &[&str],
+) -> BTreeMap<&'static str, Stats> {
     let pool = Pool::parse(file).unwrap().with_bcpack_options(opts);
     let mut stats: BTreeMap<&'static str, Stats> = BTreeMap::new();
     let mut cache = ChunkCache::new();
@@ -126,8 +133,12 @@ fn survey(file: &[u8], opts: DecodeOptions, per_codec: usize) -> BTreeMap<&'stat
             77 | 78 => "BC3",
             80 => "BC4",
             83 => "BC5",
+            98 | 99 => "BC7",
             _ => continue,
         };
+        if !only.is_empty() && !only.contains(&name) {
+            continue;
+        }
         let (start, size) = (d.base, pool.span(index, d.base).unwrap_or(0));
         let Ok(set) = pool.codecs(start, size) else {
             continue;
@@ -206,7 +217,7 @@ fn mip_zero_downsamples_to_mip_one_on_real_pools() {
             let opts = DecodeOptions {
                 allow_provisional: allow,
             };
-            let mut stats = survey(&file, opts, 400);
+            let mut stats = survey(&file, opts, 400, &["BC1", "BC3", "BC4", "BC5"]);
             report(&format!("{rel} [{label}]"), &mut stats);
             for (codec, st) in stats.iter_mut() {
                 if st.errors.len() >= 10 {
@@ -253,5 +264,53 @@ fn decode_speed_on_real_chunks() {
                 bytes as f64 / 1e6 / secs
             );
         }
+    }
+}
+
+/// How many BC7 chunks decode without built-in history, and how the ones that decode compare with their mips.
+#[test]
+fn bc7_self_contained_chunks_on_real_pools() {
+    for rel in survey_pools() {
+        let Some(file) = pool_file(&rel) else {
+            continue;
+        };
+        let pool = Pool::parse(&file).unwrap();
+        let (mut total, mut ok, mut history, mut other) = (0usize, 0usize, 0usize, 0usize);
+        for c in pool.chunks().iter().filter(|c| c.codec == 7) {
+            total += 1;
+            let raw = &file[c.src as usize..(c.src + c.packed) as usize];
+            let opts = DecodeOptions {
+                allow_provisional: false,
+            };
+            match super::decode_with(BcPackCodec::Bc7, raw, c.size as usize, &opts) {
+                Ok(_) => ok += 1,
+                Err(super::BcPackError::History { block, entry, .. }) => {
+                    history += 1;
+                    if history <= 12 {
+                        eprintln!(
+                            "  chunk size {}: first history reference at block {block} entry {entry}",
+                            c.size
+                        );
+                    }
+                }
+                Err(e) => {
+                    other += 1;
+                    eprintln!("{rel}: BC7 chunk at {}: {e}", c.src);
+                }
+            }
+        }
+        eprintln!("{rel}: {total} BC7 chunks, {ok} decode, {history} need history, {other} other");
+        if ok == 0 {
+            continue;
+        }
+        let mut stats = survey(
+            &file,
+            DecodeOptions {
+                allow_provisional: true,
+            },
+            400,
+            &["BC7"],
+        );
+        report(&format!("{rel} [bc7]"), &mut stats);
     }
 }
