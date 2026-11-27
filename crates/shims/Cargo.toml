@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 audio-codec.workspace = true
+config.workspace = true
 cpal.workspace = true
 bvh-build.workspace = true
 offline.workspace = true
