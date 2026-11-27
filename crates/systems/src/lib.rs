@@ -2,5 +2,6 @@
 
 mod error;
 pub mod rbf0;
+pub mod xml;
 
 pub use error::{Error, Result};
