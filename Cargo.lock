@@ -3251,6 +3251,7 @@ dependencies = [
  "shader-ir",
  "shader-translate",
  "thiserror 2.0.21",
+ "upscale",
  "windows-sys 0.61.2",
  "winit",
 ]
