@@ -573,9 +573,28 @@ impl AddressSpace {
     /// window at the same address. A committed region of `XMemVirtualAlloc`, or a run of pages
     /// `XMemMapPhysicalPages` mapped; anything bound there before is replaced. `policy` matters when mirrored.
     pub fn map_host(&mut self, va: u64, len: u64, policy: SyncPolicy) -> Result<(), MemoryError> {
+        self.map_host_at(va, va, len, policy)
+    }
+
+    /// Like `map_host`, for host memory at `host` that the GPU sees at `va`: a reserved resource's tiles are
+    /// mapped this way. Write watch only follows memory that is at its own address, so an aliased run is copied
+    /// whole each time instead.
+    pub fn map_host_at(
+        &mut self,
+        va: u64,
+        host: u64,
+        len: u64,
+        policy: SyncPolicy,
+    ) -> Result<(), MemoryError> {
         self.check_aligned(va, len)?;
+        self.check_aligned(host, len)?;
         self.ensure(va, va + len)?;
         self.unmap_range(va, len);
+        let policy = if host != va && policy == SyncPolicy::WriteWatch {
+            SyncPolicy::Always
+        } else {
+            policy
+        };
         let chunk = self.config.chunk.min(self.support.max_allocation);
         let chunk = align_down(chunk, PAGE.max(self.support.host_alignment)).max(PAGE);
         let count = len.div_ceil(chunk);
@@ -584,11 +603,11 @@ impl AddressSpace {
                 self.support.max_allocation_count,
             ));
         }
-        let mut at = va;
-        while at < va + len {
-            let part = chunk.min(va + len - at);
-            self.import(at, part, policy)?;
-            at += part;
+        let mut done = 0;
+        while done < len {
+            let part = chunk.min(len - done);
+            self.import(va + done, host + done, part, policy)?;
+            done += part;
         }
         if self.backing == Backing::Mirrored {
             self.dirty.add(va, va + len);
@@ -678,11 +697,17 @@ impl AddressSpace {
         Ok((memory, bits))
     }
 
-    fn import(&mut self, va: u64, len: u64, policy: SyncPolicy) -> Result<(), MemoryError> {
+    fn import(
+        &mut self,
+        va: u64,
+        host: u64,
+        len: u64,
+        policy: SyncPolicy,
+    ) -> Result<(), MemoryError> {
         let (handle, mirror) = match self.backing {
             Backing::Direct => {
                 // SAFETY: the caller of `map_host` keeps the memory mapped until `unmap`.
-                let (memory, bits) = unsafe { self.import_memory(va, len, true)? };
+                let (memory, bits) = unsafe { self.import_memory(host, len, true)? };
                 if bits & self.window.type_bits == 0 {
                     // SAFETY: just made, never bound.
                     unsafe { self.h.device.free_memory(memory, None) };
@@ -694,7 +719,7 @@ impl AddressSpace {
                 }
                 (memory, None)
             }
-            Backing::Mirrored => self.import_mirrored(va, len)?,
+            Backing::Mirrored => self.import_mirrored(host, len)?,
         };
         let id = self.next_memory;
         self.next_memory += 1;
