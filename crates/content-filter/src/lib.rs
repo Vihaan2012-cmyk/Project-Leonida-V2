@@ -23,4 +23,5 @@
 //! the documentation, so there are no scene rules.
 
 pub mod hash;
+pub mod names;
 pub mod settings;
