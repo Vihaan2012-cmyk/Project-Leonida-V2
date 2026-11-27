@@ -3232,6 +3232,7 @@ name = "xbox-d3d12"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "naga",
  "rdna",
  "sha2",
  "shader-container",
@@ -3239,6 +3240,7 @@ dependencies = [
  "shader-translate",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
+ "winit",
 ]
 
 [[package]]
