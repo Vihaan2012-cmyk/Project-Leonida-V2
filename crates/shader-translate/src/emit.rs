@@ -16,6 +16,7 @@ use crate::images::{Number, View};
 mod flow;
 mod geometry;
 mod image;
+mod loads;
 mod memory;
 mod merged;
 mod pixel;
@@ -1793,9 +1794,17 @@ impl Emitter {
     /// One statement; with lane pairs, per-lane work runs for part 0 and then part 1, in program order, and
     /// wave-wide values come from both parts at once.
     fn block_stmts(&mut self, index: usize, block: &Block) -> Result<(), EmitError> {
-        for (at, stmt) in block.stmts.iter().enumerate() {
+        let mut at = 0;
+        while at < block.stmts.len() {
             self.free_write = self.free_writes[index][at];
-            self.stmt(stmt)?;
+            let run = self.load_run(block, at);
+            if run > 1 {
+                self.load_batch(&block.stmts[at..at + run])?;
+                at += run;
+                continue;
+            }
+            self.stmt(&block.stmts[at])?;
+            at += 1;
         }
         self.free_write = false;
         Ok(())
