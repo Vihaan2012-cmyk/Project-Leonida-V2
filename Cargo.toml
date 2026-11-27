@@ -32,6 +32,9 @@ pe-image = { path = "crates/pe-image" }
 pe-loader = { path = "crates/pe-loader" }
 shims = { path = "crates/shims" }
 xbox-d3d12 = { path = "crates/xbox-d3d12" }
+enhancements = { path = "crates/enhancements" }
+upscale = { path = "crates/upscale" }
+config = { path = "crates/config" }
 decompile = { path = "crates/decompile" }
 offline = { path = "crates/offline" }
 gpu = { path = "crates/gpu" }

@@ -18,6 +18,7 @@ pub mod files;
 pub mod gameinput;
 pub mod loader;
 pub mod media;
+pub mod threads;
 pub mod trace;
 pub mod xg;
 mod xmem;
@@ -42,6 +43,7 @@ pub fn builtin() -> Vec<Shim> {
     shims.extend(gameinput::shims());
     shims.extend(loader::shims());
     shims.extend(media::shims());
+    shims.extend(threads::shims());
     shims.extend(xg::shims());
     shims
 }
