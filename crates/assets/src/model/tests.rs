@@ -1017,3 +1017,23 @@ fn materials_carry_alpha_modes_textures_and_sidecar_links() {
     assert_eq!(mats[0]["render_bucket"], 1);
 }
 
+#[test]
+fn large_meshes_use_wide_indices() {
+    let n = 70_000usize;
+    let mut g = GeometrySpec::quad();
+    g.form = PositionForm::Float;
+    g.positions = (0..n)
+        .map(|i| [(i % 300) as f32, (i / 300) as f32, 0.0])
+        .collect();
+    g.triangles = (0..2000u32)
+        .map(|i| [i * 30, i * 30 + 1, i * 30 + 2])
+        .collect();
+    g.triangles.push([69_997, 69_998, 69_999]);
+    let set = decode_resource(&drawable_resource(&DrawableSpec::simple(g)), None).unwrap();
+    let (_, glb) = export_one(&set);
+    let idx = glb.doc["meshes"][0]["primitives"][0]["indices"]
+        .as_u64()
+        .unwrap() as usize;
+    assert_eq!(glb.doc["accessors"][idx]["componentType"], 5125);
+    assert_eq!(glb.uints(idx).last(), Some(&69_999));
+}
