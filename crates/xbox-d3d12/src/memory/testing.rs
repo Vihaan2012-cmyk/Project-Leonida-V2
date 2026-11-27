@@ -5,6 +5,10 @@ pub struct TestGpu {
     _entry: ash::Entry,
     pub handles: Handles,
     pub family: u32,
+    /// A queue of a transfer-only family, where the GPU has one.
+    pub dedicated: Option<TransferQueue>,
+    /// A second queue of the main family, where the GPU has one.
+    pub sibling: Option<TransferQueue>,
 }
 
 impl TestGpu {
@@ -33,16 +37,31 @@ impl TestGpu {
                 else {
                     continue;
                 };
-                let priorities = [1.0];
-                let queues = [vk::DeviceQueueCreateInfo::default()
-                    .queue_family_index(family as u32)
-                    .queue_priorities(&priorities)];
+                let priorities = [1.0, 1.0];
+                let main_count = families[family].queue_count.min(2);
+                let dedicated_family = pick_transfer_family(&instance, physical, family as u32)
+                    .filter(|pick| pick.family != family as u32)
+                    .map(|pick| pick.family);
+                let mut queues = vec![
+                    vk::DeviceQueueCreateInfo::default()
+                        .queue_family_index(family as u32)
+                        .queue_priorities(&priorities[..main_count as usize]),
+                ];
+                if let Some(other) = dedicated_family {
+                    queues.push(
+                        vk::DeviceQueueCreateInfo::default()
+                            .queue_family_index(other)
+                            .queue_priorities(&priorities[..1]),
+                    );
+                }
                 let base = vk::PhysicalDeviceFeatures::default()
                     .sparse_binding(true)
                     .sparse_residency_buffer(true)
                     .shader_int64(true);
-                let mut v12 =
-                    vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
+                let timeline = Support::query(&instance, physical).timeline_semaphores;
+                let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
+                    .buffer_device_address(true)
+                    .timeline_semaphore(timeline);
                 let mut features = vk::PhysicalDeviceFeatures2::default()
                     .features(base)
                     .push_next(&mut v12);
@@ -58,7 +77,22 @@ impl TestGpu {
                     continue;
                 };
                 let queue = device.get_device_queue(family as u32, 0);
+                let lock = Arc::new(Mutex::new(()));
+                let sibling = (timeline && main_count > 1).then(|| TransferQueue {
+                    queue: device.get_device_queue(family as u32, 1),
+                    family: family as u32,
+                    lock: Arc::new(Mutex::new(())),
+                });
+                let dedicated = dedicated_family
+                    .filter(|_| timeline)
+                    .map(|other| TransferQueue {
+                        queue: device.get_device_queue(other, 0),
+                        family: other,
+                        lock: Arc::new(Mutex::new(())),
+                    });
                 all.push(TestGpu {
+                    dedicated,
+                    sibling,
                     _entry: entry.clone(),
                     handles: Handles {
                         instance: instance.clone(),
@@ -66,7 +100,7 @@ impl TestGpu {
                         device,
                         queue,
                         queue_family: family as u32,
-                        queue_lock: Arc::new(Mutex::new(())),
+                        queue_lock: lock,
                     },
                     family: family as u32,
                 });
@@ -287,6 +321,87 @@ impl Kernel {
             device.destroy_fence(fence, None);
             device.free_command_buffers(self.pool, &commands);
             uploaded
+        }
+    }
+
+    /// One submission built from the layer's own calls: `submit_uploads`, `record_uploads`, each `(src, dst)`
+    /// increment with `note_gpu_write` for its destination word, then `record_pending_downloads`. Returns the
+    /// bytes the in-queue uploads copied and whether a transfer-queue submission was waited for.
+    pub fn run_tracked(
+        &self,
+        gpu: &TestGpu,
+        space: &mut AddressSpace,
+        jobs: &[(u64, u64)],
+    ) -> (u64, bool) {
+        let device = &gpu.handles.device;
+        let wait = space.submit_uploads().unwrap();
+        // SAFETY: test-only Vulkan use; the command buffer completes before returning.
+        unsafe {
+            let command = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(self.pool)
+                        .command_buffer_count(1),
+                )
+                .unwrap()[0];
+            device
+                .begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
+                .unwrap();
+            let uploaded = space.record_uploads(command);
+            device.cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            for &(src, dst) in jobs {
+                let mut push = Vec::new();
+                for word in [space.heap_base(), src, dst] {
+                    push.extend_from_slice(&word.to_le_bytes());
+                }
+                device.cmd_push_constants(
+                    command,
+                    self.layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &push,
+                );
+                device.cmd_dispatch(command, 1, 1, 1);
+                let barrier = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+                device.cmd_pipeline_barrier(
+                    command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &barrier,
+                    &[],
+                    &[],
+                );
+                space.note_gpu_write(dst, 4);
+            }
+            space.record_pending_downloads(command);
+            device.end_command_buffer(command).unwrap();
+            let fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .unwrap();
+            let commands = [command];
+            let semaphores: Vec<vk::Semaphore> = wait.iter().map(|w| w.semaphore).collect();
+            let values: Vec<u64> = wait.iter().map(|w| w.value).collect();
+            let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; semaphores.len()];
+            let mut timeline =
+                vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values);
+            device
+                .queue_submit(
+                    gpu.handles.queue,
+                    &[vk::SubmitInfo::default()
+                        .command_buffers(&commands)
+                        .wait_semaphores(&semaphores)
+                        .wait_dst_stage_mask(&stages)
+                        .push_next(&mut timeline)],
+                    fence,
+                )
+                .unwrap();
+            device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            device.destroy_fence(fence, None);
+            device.free_command_buffers(self.pool, &commands);
+            (uploaded, wait.is_some())
         }
     }
 
