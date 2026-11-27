@@ -336,16 +336,26 @@ fn build_glb(drawables: &[&Drawable], options: &ExportOptions<'_>) -> Result<Vec
         "asset": {"version": "2.0", "generator": "leonida assets"},
         "scene": 0,
     });
+    let mut scene_nodes: Vec<usize> = Vec::new();
+    let mut armature = None;
+    if !roots.is_empty() || !joints.helpers.is_empty() {
+        let children: Vec<usize> = roots.iter().chain(&joints.helpers).copied().collect();
+        nodes.push(json!({"name": "armature", "children": children}));
+        scene_nodes.push(nodes.len() - 1);
+        armature = Some(nodes.len() - 1);
+    }
     if !skinned_nodes.is_empty() && !joints.nodes.is_empty() {
         let ibm: Vec<f32> = joints.inverse_bind.iter().flatten().copied().collect();
         let accessor = b.floats(&ibm, joints.inverse_bind.len(), "MAT4", None);
-        doc["skins"] = json!([{"joints": joints.nodes, "inverseBindMatrices": accessor}]);
+        let mut skin = json!({"joints": joints.nodes, "inverseBindMatrices": accessor});
+        if let Some(root) = armature {
+            skin["skeleton"] = json!(root);
+        }
+        doc["skins"] = json!([skin]);
         for &n in &skinned_nodes {
             nodes[n]["skin"] = json!(0);
         }
     }
-    let mut scene_nodes: Vec<usize> = roots.clone();
-    scene_nodes.extend(joints.helpers.iter().copied());
     scene_nodes.extend(mesh_nodes);
     doc["scenes"] = json!([{"name": "scene", "nodes": scene_nodes}]);
     doc["nodes"] = json!(nodes);
