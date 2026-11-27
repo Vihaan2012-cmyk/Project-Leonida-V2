@@ -10,9 +10,10 @@ cpal.workspace = true
 offline.workspace = true
 thiserror.workspace = true
 pe-loader.workspace = true
+thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = ["Win32_System_ProcessStatus", "Win32_System_SystemInformation"] }
 
 [lints]
 workspace = true

@@ -117,3 +117,30 @@ fn ordinary_allocations_drop_console_bits() {
     // SAFETY: no arguments.
     assert_eq!(unsafe { tools() }, 0);
 }
+
+#[test]
+fn working_set_statistics_fill_the_size_the_callers_read() {
+    let stats: unsafe extern "win64" fn(u32, *mut u64) -> i32 = shim("XMemGetWorkingSetStatistics");
+    for kind in [0x2000_0001u32, 0x2000_000A] {
+        let mut buffer = [0xAAAA_AAAA_AAAA_AAAAu64; 16];
+        // SAFETY: a buffer of the 0x80 bytes the callers give.
+        assert_eq!(unsafe { stats(kind, buffer.as_mut_ptr()) }, 1);
+        assert!(buffer[0] >= 1 << 30, "the memory limit");
+        assert!(buffer[1] > 0 && buffer[1] <= buffer[0], "the working set");
+        assert_eq!(
+            buffer[2], 0xAAAA_AAAA_AAAA_AAAA,
+            "nothing past the measured words"
+        );
+    }
+    // SAFETY: null is refused.
+    assert_eq!(unsafe { stats(0x2000_0001, std::ptr::null_mut()) }, 0);
+}
+
+#[test]
+fn transferring_memory_succeeds_and_moves_nothing() {
+    let transfer: unsafe extern "win64" fn(u32, usize) -> i32 = shim("XMemTransferMemory");
+    for (direction, size) in [(1u32, 0x100_0000usize), (0, 0x20_0000), (7, 0)] {
+        // SAFETY: plain values.
+        assert_eq!(unsafe { transfer(direction, size) }, 1);
+    }
+}
