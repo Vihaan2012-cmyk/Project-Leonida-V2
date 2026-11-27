@@ -18,6 +18,8 @@ pub mod render;
 pub mod vulkan;
 pub mod window;
 
+#[cfg(test)]
+mod gpu_tests;
 
 pub use convert::{ScaleMode, SdrEotf};
 pub use frames::{
