@@ -532,3 +532,133 @@ fn translate_fssm(
     out.code = blob;
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shader_container::testutil::container;
+
+    fn fssm_compute(code: &[u8]) -> Vec<u8> {
+        let mut blob = vec![0u8; 0x228];
+        blob[..4].copy_from_slice(b"FSSM");
+        blob[0xC0..0xC4].copy_from_slice(&0x200u32.to_le_bytes());
+        blob[0xD4..0xD8].copy_from_slice(&0x20u32.to_le_bytes());
+        for (at, value) in [(0x138, 4u32 << 1), (0x13C, 32), (0x140, 2), (0x144, 1)] {
+            blob[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        blob.extend_from_slice(code);
+        blob
+    }
+
+    fn translate(bytes: &[u8], stage: Stage) -> Result<Arc<TranslatedStage>, PipelineError> {
+        DirectTranslation::new(FloatMode::default()).translate(bytes, stage, &Link::default())
+    }
+
+    #[test]
+    fn a_compute_container_translates_with_its_header_setup() {
+        let code = rdna::assemble("s_mov_b32 s20, 1\ns_endpgm", true).unwrap();
+        let bytes = container(5, &[fssm_compute(&code)]);
+        let stage = translate(&bytes, Stage::Compute).unwrap();
+        assert_eq!(stage.threads, Some([32, 2, 1]));
+        assert_eq!(stage.user_sgprs, 4);
+        assert_eq!(stage.code_start, 0x228);
+        assert!(!stage.wave64);
+        assert!(!stage.uses_code_base);
+        assert_eq!(stage.spirv[0], 0x0723_0203);
+        let again = translate(&bytes, Stage::Compute).unwrap();
+        assert_eq!(again.hash, stage.hash);
+    }
+
+    #[test]
+    fn a_bare_fssm_blob_is_a_program_too() {
+        let code = rdna::assemble("s_endpgm", true).unwrap();
+        let stage = translate(&fssm_compute(&code), Stage::Compute).unwrap();
+        assert_eq!(stage.threads, Some([32, 2, 1]));
+    }
+
+    #[test]
+    fn the_wrong_stage_or_a_missing_half_is_refused() {
+        let code = rdna::assemble("s_endpgm", true).unwrap();
+        let bytes = container(0, &[fssm_compute(&code)]);
+        assert!(matches!(
+            translate(&bytes, Stage::Compute),
+            Err(PipelineError::WrongStage { .. })
+        ));
+        let bytes = container(1, &[fssm_compute(&code)]);
+        let link = Link {
+            previous: None,
+            first_half: true,
+        };
+        let source = DirectTranslation::new(FloatMode::default());
+        assert!(matches!(
+            source.translate(&bytes, Stage::Vertex, &link),
+            Err(PipelineError::Bytecode(_))
+        ));
+    }
+
+    fn payload(parts: &[(u32, &[u8])]) -> Vec<u8> {
+        let directory = 16 + 16 * parts.len();
+        let mut out = Vec::new();
+        let total = directory + parts.iter().map(|p| p.1.len()).sum::<usize>();
+        for word in [
+            u32::from_le_bytes(*b"FSPX"),
+            1,
+            parts.len() as u32,
+            total as u32,
+        ] {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        let mut offset = directory;
+        for (kind, bytes) in parts {
+            for word in [*kind, offset as u32, bytes.len() as u32, 0] {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+            offset += bytes.len();
+        }
+        for (_, bytes) in parts {
+            out.extend_from_slice(bytes);
+        }
+        out
+    }
+
+    fn state(x: u32, wave32: bool, rsrc2: u32) -> Vec<u8> {
+        let mut state = vec![0u8; 28];
+        state[12..16].copy_from_slice(&(x | 1 << 16).to_le_bytes());
+        state[16..20].copy_from_slice(&(1 | u32::from(wave32) << 20).to_le_bytes());
+        state[24..28].copy_from_slice(&rsrc2.to_le_bytes());
+        state
+    }
+
+    #[test]
+    fn an_fspx_program_skips_its_prologue_and_takes_its_dispatch_state() {
+        let mut program = vec![0u8; FSPX_PROLOGUE];
+        program.extend(rdna::assemble("s_getpc_b64 s[10:11]\ns_endpgm", true).unwrap());
+        program.extend([0u8; 8]);
+        let bytes = payload(&[(0, &state(64, true, 8 << 1)), (6, &program)]);
+        let stage = translate(&bytes, Stage::Compute).unwrap();
+        assert_eq!(stage.threads, Some([64, 1, 1]));
+        assert_eq!(stage.user_sgprs, 8);
+        assert_eq!(stage.code_start, 36);
+        assert!(stage.uses_code_base);
+        assert_eq!(stage.code.len(), program.len());
+        // The same program inside a container's ACCC part is found the same way.
+        let wrapped = shader_container::testutil::dxbc(&[(b"ACCC", &bytes)]);
+        assert_eq!(
+            translate(&wrapped, Stage::Compute).unwrap().hash,
+            stage.hash
+        );
+        let other = translate(&bytes, Stage::Pixel);
+        assert!(matches!(other, Err(PipelineError::WrongStage { .. })));
+    }
+
+    #[test]
+    fn a_damaged_fspx_payload_is_refused() {
+        let state = state(64, true, 0);
+        assert!(translate(&payload(&[(0, &state)]), Stage::Compute).is_err());
+        assert!(translate(&payload(&[(6, &[0u8; 64])]), Stage::Compute).is_err());
+        let mut bytes = payload(&[(0, &state), (6, &[0u8; 64])]);
+        bytes[8] = 99;
+        assert!(translate(&bytes, Stage::Compute).is_err());
+        assert!(translate(&bytes[..10], Stage::Compute).is_err());
+    }
+}
