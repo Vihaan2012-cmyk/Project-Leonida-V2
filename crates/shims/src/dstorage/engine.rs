@@ -47,6 +47,12 @@ pub enum GpuDestination {
         resource: usize,
         first_subresource: u32,
     },
+    /// The console form: `table` is the address of the first 8-byte page entry of the physical pages the data
+    /// goes to (64 KiB each, entries consecutive), `offset` the byte offset into the first page.
+    Pages {
+        table: usize,
+        offset: u16,
+    },
     Tiles {
         resource: usize,
         /// X, Y, Z, subresource.
@@ -90,7 +96,7 @@ pub fn set_decompressor(format: u8, decompress: Decompress) {
     }
 }
 
-fn note_once(text: String) {
+pub fn note_once(text: String) {
     let fresh = NOTED
         .lock()
         .map(|mut seen| seen.get_or_insert_with(HashSet::new).insert(text.clone()))
@@ -289,6 +295,11 @@ fn decompress(request: &Request, input: &[u8]) -> Result<Vec<u8>, i32> {
         .lock()
         .ok()
         .and_then(|d| d.as_ref()?.get(&request.compression).copied());
+    let function = function.or(if request.compression == 1 {
+        Some(inflate as Decompress)
+    } else {
+        None
+    });
     let Some(function) = function else {
         note_once(format!(
             "DirectStorage compression format {} is not supported ({:?})",
@@ -581,31 +592,74 @@ impl Drop for Queue {
     }
 }
 
+/// Most requests of one batch that run at the same time. The title batches a whole streaming round between one
+/// status entry and the poll that follows it, so the requests in a run have no order among themselves.
+const PARALLEL_REQUESTS: usize = 4;
+
+/// Runs the requests collected since the last status, signal or event, side by side. Results are taken in order.
+fn run_group(shared: &Shared, group: &mut Vec<Request>, since_status: &mut i32) {
+    if group.is_empty() {
+        return;
+    }
+    let count = group.len();
+    let results: Vec<AtomicI32> = (0..count).map(|_| AtomicI32::new(S_OK)).collect();
+    let next = AtomicUsize::new(0);
+    let run = || {
+        loop {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            let Some(request) = group.get(index) else {
+                break;
+            };
+            if !shared.cancelled(request) {
+                results[index].store(execute(request), Ordering::Relaxed);
+            }
+        }
+    };
+    let workers = count.min(PARALLEL_REQUESTS);
+    if workers <= 1 {
+        run();
+    } else {
+        std::thread::scope(|scope| {
+            for _ in 1..workers {
+                scope.spawn(run);
+            }
+            run();
+        });
+    }
+    for (request, result) in group.iter().zip(&results) {
+        let result = result.load(Ordering::Relaxed);
+        if result < 0 {
+            note_once(format!(
+                "DirectStorage request {:?} failed with {:#010x}",
+                request.name, result as u32
+            ));
+            shared.fail(result);
+            if *since_status == S_OK {
+                *since_status = result;
+            }
+        }
+    }
+    shared.inflight.fetch_sub(count, Ordering::Relaxed);
+    group.clear();
+}
+
 fn work(shared: &Shared, receiver: Receiver<Vec<Item>>) {
     let mut since_status = S_OK;
+    let mut group: Vec<Request> = Vec::new();
     for batch in receiver {
         for item in batch {
             match item {
                 Item::Request(request) => {
-                    if !shared.cancelled(&request) {
-                        let result = execute(&request);
-                        if result < 0 {
-                            note_once(format!(
-                                "DirectStorage request {:?} failed with {:#010x}",
-                                request.name, result as u32
-                            ));
-                            shared.fail(result);
-                            if since_status == S_OK {
-                                since_status = result;
-                            }
-                        }
-                    }
+                    group.push(request);
+                    continue;
                 }
                 Item::Status { array, index } => {
+                    run_group(shared, &mut group, &mut since_status);
                     array.complete(index, since_status);
                     since_status = S_OK;
                 }
                 Item::Signal { fence, value } => {
+                    run_group(shared, &mut group, &mut since_status);
                     let signal = FENCE_SIGNAL.read().ok().and_then(|s| *s);
                     let result = match signal {
                         Some(signal) => signal(fence, value),
@@ -616,11 +670,27 @@ fn work(shared: &Shared, receiver: Receiver<Vec<Item>>) {
                     }
                 }
                 Item::Event(handle) => {
+                    run_group(shared, &mut group, &mut since_status);
                     // SAFETY: an event handle the program passed to `EnqueueSetEvent`.
                     unsafe { SetEvent(handle as HANDLE) };
                 }
             }
             shared.inflight.fetch_sub(1, Ordering::Relaxed);
         }
+        run_group(shared, &mut group, &mut since_status);
+    }
+}
+
+/// Deflate with or without the zlib wrapper; the title's chunks are zlib streams, and a raw stream is taken too.
+fn inflate(input: &[u8], output: &mut [u8]) -> Result<(), i32> {
+    use flate2::{Decompress, FlushDecompress, Status};
+    let zlib = input.len() > 2
+        && input[0] & 0x0F == 8
+        && (u16::from(input[0]) << 8 | u16::from(input[1])) % 31 == 0;
+    let mut stream = Decompress::new(zlib);
+    match stream.decompress(input, output, FlushDecompress::Finish) {
+        Ok(Status::StreamEnd) if stream.total_out() as usize == output.len() => Ok(()),
+        Ok(_) => Err(E_FAIL),
+        Err(_) => Err(E_FAIL),
     }
 }

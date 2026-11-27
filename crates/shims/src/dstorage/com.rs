@@ -15,7 +15,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use super::engine::{
     Destination, E_INVALIDARG, E_NOTIMPL, GpuDestination, Item, Queue, QueueDesc, Request, S_OK,
-    Source, StatusArray, win32_error,
+    Source, StatusArray, note_once, win32_error,
 };
 use crate::trace::{image_offset, note};
 
@@ -253,14 +253,15 @@ unsafe extern "win64" fn create_queue(
         return E_INVALIDARG;
     }
     check_requested(Kind::Queue, riid);
-    // SAFETY: `desc` is a `DSTORAGE_QUEUE_DESC`: source type (i32), capacity (u16), priority (i16), name, device.
+    // SAFETY: the console's queue description as the executable builds it (RVA 0x028c9460): a flag word, the
+    // capacity (u16) at 8, the priority byte (0 to 2) at 10, the name at 16 and a word that is always 1 at 24.
     let description = unsafe {
         QueueDesc {
-            source_type: std::ptr::read_unaligned(desc.cast::<i32>()),
-            capacity: std::ptr::read_unaligned(desc.add(4).cast::<u16>()),
-            priority: std::ptr::read_unaligned(desc.add(6).cast::<i16>()),
-            name: std::ptr::read_unaligned(desc.add(8).cast::<usize>()),
-            device: std::ptr::read_unaligned(desc.add(16).cast::<usize>()),
+            source_type: std::ptr::read_unaligned(desc.cast::<u64>()) as i32,
+            capacity: std::ptr::read_unaligned(desc.add(8).cast::<u16>()),
+            priority: i16::from(std::ptr::read_unaligned(desc.add(10))),
+            name: std::ptr::read_unaligned(desc.add(16).cast::<usize>()),
+            device: std::ptr::read_unaligned(desc.add(24).cast::<usize>()),
         }
     };
     let object = new_object(QueueObject {
@@ -326,8 +327,6 @@ unsafe extern "win64" fn create_status_array(
     unsafe { hand_out(object, out) }
 }
 
-unsafe extern "win64" fn set_debug_flags(_this: *mut Header, _flags: u32) {}
-
 unsafe extern "win64" fn set_staging_buffer_size(_this: *mut Header, _size: u32) -> i32 {
     S_OK
 }
@@ -371,15 +370,29 @@ fn word<T: Copy>(base: *const u8, offset: usize) -> T {
     unsafe { std::ptr::read_unaligned(base.add(offset).cast::<T>()) }
 }
 
-/// Parses a `DSTORAGE_REQUEST`: options (source type bit 0, destination type bits 1-7, compression byte 1),
-/// the source union at 8, the destination union at 32, the uncompressed size at 72, the tag at 80, the name at 88.
+/// Bytes the executable passes to `EnqueueRequest` (RVAs 0x028c9960 and 0x04ffd520).
+pub const REQUEST_SIZE: usize = 0x48;
+const _: () = assert!(0x38 + 8 <= REQUEST_SIZE);
+/// The destination is a run of physical pages named by a table of 8-byte page entries, not a plain address.
+pub const OPTION_PAGE_DESTINATION: u64 = 1 << 21;
+/// The source is memory at the source word rather than a file.
+pub const OPTION_MEMORY_SOURCE: u64 = 1 << 22;
+
+/// Parses the console's request. Measured from the two sites that build one: a 0x48-byte record of
+/// - 0x00 options: bit 0 deflate, bits 1-3 the BCPack mode (0 for none), bits 4-7 a further mode the format
+///   field of the title's chunk flags selects, bit 21 page destination, bit 22 memory source;
+/// - 0x08 destination address, or the address of the first page-table entry when bit 21 is set;
+/// - 0x10 u16 offset into that first page; 0x18 u32 size after decompression;
+/// - 0x20 source: the `IDStorageFile` we handed out, or a memory address; 0x28 u64 file offset;
+/// - 0x30 u32 stored size. 0x38 and 0x40 stay zero at both sites.
+///
+/// The request's `compression` byte is `options & 0xF`: bit 0 deflate, bits 1-3 the BCPack mode.
 unsafe fn parse_request(base: *const u8) -> Result<Request, String> {
     let options: u64 = word(base, 0);
-    let source_type = options & 1;
-    let destination_type = (options >> 1) & 0x7F;
-    let compression = ((options >> 8) & 0xFF) as u8;
-    let source = if source_type == 0 {
-        let file: usize = word(base, 8);
+    let compression = (options & 0xF) as u8;
+    let uncompressed: u32 = word(base, 0x18);
+    let source = if options & OPTION_MEMORY_SOURCE == 0 {
+        let file: usize = word(base, 0x20);
         if file == 0 {
             return Err("file request with no file".into());
         }
@@ -392,78 +405,44 @@ unsafe fn parse_request(base: *const u8) -> Result<Request, String> {
         let file = unsafe { (*(file as *const FileObject)).file.clone() };
         Source::File {
             file,
-            offset: word(base, 16),
-            size: word(base, 24),
+            offset: word(base, 0x28),
+            size: word(base, 0x30),
         }
     } else {
         Source::Memory {
-            address: word(base, 8),
-            size: word(base, 16),
+            address: word(base, 0x20),
+            size: word(base, 0x30),
         }
     };
-    let resource: usize = word(base, 32);
-    let gpu = |destination| Destination::Gpu(destination);
-    let destination = match destination_type {
-        0 => Destination::Memory {
-            address: word(base, 32),
-            size: word(base, 40),
-        },
-        1 => gpu(GpuDestination::Buffer {
-            resource,
-            offset: word(base, 40),
-        }),
-        2 => {
-            let mut region = [0u32; 6];
-            for (i, slot) in region.iter_mut().enumerate() {
-                *slot = word(base, 44 + 4 * i);
-            }
-            gpu(GpuDestination::TextureRegion {
-                resource,
-                subresource: word(base, 40),
-                region,
-            })
-        }
-        3 => gpu(GpuDestination::MultipleSubresources {
-            resource,
-            first_subresource: word(base, 40),
-        }),
-        4 => {
-            let mut coordinate = [0u32; 4];
-            let mut size = [0u32; 4];
-            for i in 0..4 {
-                coordinate[i] = word(base, 40 + 4 * i);
-                size[i] = word(base, 56 + 4 * i);
-            }
-            gpu(GpuDestination::Tiles {
-                resource,
-                coordinate,
-                size,
-            })
-        }
-        other => return Err(format!("destination type {other}")),
-    };
-    let name_pointer: usize = word(base, 88);
-    let name = if name_pointer == 0 {
-        String::new()
-    } else {
-        // SAFETY: a request name is a terminated 8-bit string.
-        let length = (0..256)
-            .take_while(|i| unsafe { *(name_pointer as *const u8).add(*i) } != 0)
-            .count();
-        // SAFETY: `length` bytes were just read.
-        String::from_utf8_lossy(unsafe {
-            std::slice::from_raw_parts(name_pointer as *const u8, length)
+    let destination = if options & OPTION_PAGE_DESTINATION != 0 {
+        Destination::Gpu(GpuDestination::Pages {
+            table: word(base, 8),
+            offset: word(base, 0x10),
         })
-        .into_owned()
+    } else {
+        Destination::Memory {
+            address: word(base, 8),
+            size: uncompressed,
+        }
     };
+    if options & 0xF0 != 0 {
+        note_extra_mode(options);
+    }
     Ok(Request::new(
         source,
         destination,
         compression,
-        word(base, 72),
-        word(base, 80),
-        name,
+        uncompressed,
+        word(base, 0x38),
+        String::new(),
     ))
+}
+
+fn note_extra_mode(options: u64) {
+    note_once(format!(
+        "DirectStorage request option bits 4-7 are {:#x} (the further mode of the chunk's format field); not applied",
+        (options >> 4) & 0xF
+    ));
 }
 
 unsafe extern "win64" fn enqueue_request(this: *mut QueueObject, request: *const u8) {
@@ -573,12 +552,18 @@ fn tables() -> [usize; 4] {
             release as *const () as usize,
         ];
         let methods: [Vec<usize>; 4] = [
+            // The console factory is not the public layout (0 marks a slot nothing calls): OpenFile 4 and
+            // CreateStatusArray 5 (RVAs 0x028c8be0, 0x028c9460), SetStagingBufferSize(0x2000000) 8 (0x01d8e4d0),
+            // CreateQueue 10 (0x028c9460).
             vec![
-                create_queue as *const () as usize,
+                0,
                 open_file as *const () as usize,
                 create_status_array as *const () as usize,
-                set_debug_flags as *const () as usize,
+                0,
+                0,
                 set_staging_buffer_size as *const () as usize,
+                0,
+                create_queue as *const () as usize,
             ],
             vec![
                 file_close as *const () as usize,
@@ -605,11 +590,15 @@ fn tables() -> [usize; 4] {
         for (kind, methods) in methods.iter().enumerate() {
             let mut entries: Vec<usize> = common.to_vec();
             entries.extend(methods);
-            for slot in entries.len()..TRAP_SLOTS {
-                entries.push(
-                    code.method_trap(slot, trapped_method as *const () as usize)
-                        .unwrap_or(0),
-                );
+            for slot in 0..TRAP_SLOTS {
+                if slot >= entries.len() {
+                    entries.push(0);
+                }
+                if entries[slot] == 0 {
+                    entries[slot] = code
+                        .method_trap(slot, trapped_method as *const () as usize)
+                        .unwrap_or(0);
+                }
             }
             addresses[kind] = Box::leak(entries.into_boxed_slice()).as_ptr() as usize;
         }

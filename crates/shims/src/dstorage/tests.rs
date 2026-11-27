@@ -35,9 +35,10 @@ struct Setup {
     status: *mut c_void,
 }
 
-fn desc() -> [u8; 24] {
-    let mut desc = [0u8; 24];
-    desc[4..6].copy_from_slice(&64u16.to_le_bytes());
+fn desc() -> [u8; 32] {
+    let mut desc = [0u8; 32];
+    desc[8..10].copy_from_slice(&64u16.to_le_bytes());
+    desc[24] = 1;
     desc
 }
 
@@ -48,7 +49,7 @@ fn setup() -> Setup {
     unsafe {
         assert_eq!(get_factory(IID_FACTORY.as_ptr(), &mut factory), 0);
         let mut queue = std::ptr::null_mut();
-        let create: Create = method(factory, 3);
+        let create: Create = method(factory, 10);
         assert_eq!(
             create(factory, desc().as_ptr(), IID_QUEUE.as_ptr(), &mut queue),
             0
@@ -118,33 +119,39 @@ impl Default for Spec {
     }
 }
 
-fn request(spec: &Spec) -> [u8; 96] {
-    let mut bytes = [0u8; 96];
-    let source = u64::from(!spec.memory_source.is_null());
-    let options = source | (u64::from(spec.destination) << 1) | (u64::from(spec.compression) << 8);
+fn request(spec: &Spec) -> [u8; REQUEST_SIZE] {
+    let mut bytes = [0u8; REQUEST_SIZE];
+    let memory = !spec.memory_source.is_null();
+    let mut options = u64::from(spec.compression & 0xF);
+    if memory {
+        options |= OPTION_MEMORY_SOURCE;
+    }
+    if spec.destination == 1 {
+        options |= OPTION_PAGE_DESTINATION;
+    }
     bytes[0..8].copy_from_slice(&options.to_le_bytes());
-    if source == 0 {
-        bytes[8..16].copy_from_slice(&(spec.file as u64).to_le_bytes());
-        bytes[16..24].copy_from_slice(&spec.offset.to_le_bytes());
-        bytes[24..28].copy_from_slice(&spec.size.to_le_bytes());
+    bytes[8..16].copy_from_slice(&(spec.target as u64).to_le_bytes());
+    bytes[16..18].copy_from_slice(&(spec.extra as u16).to_le_bytes());
+    let uncompressed = if spec.uncompressed != 0 {
+        spec.uncompressed
     } else {
-        bytes[8..16].copy_from_slice(&(spec.memory_source as u64).to_le_bytes());
-        bytes[16..20].copy_from_slice(&spec.size.to_le_bytes());
-    }
-    bytes[32..40].copy_from_slice(&(spec.target as u64).to_le_bytes());
-    if spec.destination == 0 {
-        bytes[40..44].copy_from_slice(&spec.target_size.to_le_bytes());
+        spec.target_size
+    };
+    bytes[0x18..0x1C].copy_from_slice(&uncompressed.to_le_bytes());
+    if memory {
+        bytes[0x20..0x28].copy_from_slice(&(spec.memory_source as u64).to_le_bytes());
     } else {
-        bytes[40..48].copy_from_slice(&spec.extra.to_le_bytes());
+        bytes[0x20..0x28].copy_from_slice(&(spec.file as u64).to_le_bytes());
+        bytes[0x28..0x30].copy_from_slice(&spec.offset.to_le_bytes());
     }
-    bytes[72..76].copy_from_slice(&spec.uncompressed.to_le_bytes());
-    bytes[80..88].copy_from_slice(&spec.tag.to_le_bytes());
+    bytes[0x30..0x34].copy_from_slice(&spec.size.to_le_bytes());
+    bytes[0x38..0x40].copy_from_slice(&spec.tag.to_le_bytes());
     bytes
 }
 
 fn enqueue(setup: &Setup, spec: &Spec) {
     let bytes = request(spec);
-    // SAFETY: a 96-byte request.
+    // SAFETY: a request of the console's size.
     unsafe {
         let enqueue: unsafe extern "win64" fn(*mut c_void, *const u8) = method(setup.queue, 3);
         enqueue(setup.queue, bytes.as_ptr());
@@ -290,7 +297,7 @@ fn memory_sources_and_decompressors() {
         }
         Ok(())
     }
-    set_decompressor(0x90, unxor);
+    set_decompressor(0xE, unxor);
     let packed: Vec<u8> = source.iter().map(|b| b ^ 0x5A).collect();
     let mut unpacked = vec![0u8; 64];
     enqueue(
@@ -298,7 +305,7 @@ fn memory_sources_and_decompressors() {
         &Spec {
             memory_source: packed.as_ptr(),
             size: 64,
-            compression: 0x90,
+            compression: 0xE,
             uncompressed: 64,
             target: unpacked.as_mut_ptr() as usize,
             target_size: 64,
@@ -320,7 +327,7 @@ fn an_unknown_compression_fails_the_status_and_the_queue_records_it() {
         &Spec {
             memory_source: source.as_ptr(),
             size: 16,
-            compression: 0x77,
+            compression: 0xC,
             uncompressed: 16,
             target: out.as_mut_ptr() as usize,
             target_size: 16,
@@ -333,7 +340,7 @@ fn an_unknown_compression_fails_the_status_and_the_queue_records_it() {
     assert!(
         crate::trace::notes()
             .iter()
-            .any(|n| n.contains("compression format 119"))
+            .any(|n| n.contains("compression format 12"))
     );
     let mut record = [0u8; 16];
     // SAFETY: our own queue and a record large enough for the fields written.
@@ -379,8 +386,8 @@ fn gpu_destinations_go_through_the_callback() {
     let (destination, bytes) = SEEN.lock().expect("lock").take().expect("called");
     assert_eq!(
         destination,
-        GpuDestination::Buffer {
-            resource: 0xABC0,
+        GpuDestination::Pages {
+            table: 0xABC0,
             offset: 256
         }
     );
@@ -471,4 +478,159 @@ fn an_unexpected_interface_id_still_gets_a_factory() {
     // SAFETY: valid pointers.
     assert_eq!(unsafe { get_factory(unknown.as_ptr(), &mut factory) }, 0);
     assert!(!factory.is_null());
+}
+
+#[test]
+fn the_factory_slots_follow_the_executable_not_the_public_header() {
+    let s = setup();
+    // SAFETY: our own factory; slot 8 is `SetStagingBufferSize(UINT32)`, 3 and 6 are never called by the title.
+    unsafe {
+        let staging: unsafe extern "win64" fn(*mut c_void, u32) -> i32 = method(s.factory, 8);
+        assert_eq!(staging(s.factory, 0x200_0000), 0);
+        for slot in [3, 6, 7, 9] {
+            let trapped: unsafe extern "win64" fn(*mut c_void) -> i32 = method(s.factory, slot);
+            assert_eq!(trapped(s.factory), E_NOTIMPL, "slot {slot}");
+        }
+    }
+}
+
+#[test]
+fn a_queue_description_reads_capacity_and_priority_where_the_console_puts_them() {
+    let s = setup();
+    let mut description = desc();
+    description[8..10].copy_from_slice(&0x1234u16.to_le_bytes());
+    description[10] = 2;
+    let mut queue = std::ptr::null_mut();
+    // SAFETY: our own factory and a console-sized description.
+    unsafe {
+        let create: Create = method(s.factory, 10);
+        assert_eq!(
+            create(
+                s.factory,
+                description.as_ptr(),
+                IID_QUEUE.as_ptr(),
+                &mut queue
+            ),
+            0
+        );
+        let mut info = [0u8; 32];
+        let query: unsafe extern "win64" fn(*mut c_void, *mut u8) = method(queue, 11);
+        query(queue, info.as_mut_ptr());
+        assert_eq!(u16::from_le_bytes([info[4], info[5]]), 0x1234);
+        assert_eq!(i16::from_le_bytes([info[6], info[7]]), 2);
+    }
+}
+
+#[test]
+fn deflate_requests_inflate_zlib_and_raw_streams() {
+    use flate2::Compression;
+    use flate2::write::{DeflateEncoder, ZlibEncoder};
+    use std::io::Write;
+    let s = setup();
+    let data = pattern(40_000);
+    let zlib = {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&data).expect("write");
+        encoder.finish().expect("finish")
+    };
+    let raw = {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&data).expect("write");
+        encoder.finish().expect("finish")
+    };
+    for (index, stream) in [zlib, raw].iter().enumerate() {
+        let mut out = vec![0u8; data.len()];
+        enqueue(
+            &s,
+            &Spec {
+                memory_source: stream.as_ptr(),
+                size: stream.len() as u32,
+                compression: 1,
+                uncompressed: data.len() as u32,
+                target: out.as_mut_ptr() as usize,
+                target_size: data.len() as u32,
+                ..Spec::default()
+            },
+        );
+        mark_and_submit(&s, index as u32);
+        assert_eq!(wait(&s, index as u32), 0);
+        assert_eq!(out, data);
+    }
+}
+
+#[test]
+fn a_corrupt_deflate_stream_fails_the_request() {
+    let s = setup();
+    let junk = vec![0x78u8, 0x9C, 1, 2, 3, 4, 5, 6, 7, 8];
+    let mut out = vec![0u8; 64];
+    enqueue(
+        &s,
+        &Spec {
+            memory_source: junk.as_ptr(),
+            size: junk.len() as u32,
+            compression: 1,
+            uncompressed: 64,
+            target: out.as_mut_ptr() as usize,
+            target_size: 64,
+            ..Spec::default()
+        },
+    );
+    mark_and_submit(&s, 0);
+    assert!(wait(&s, 0) < 0);
+}
+
+#[test]
+fn many_requests_between_two_status_marks_all_finish() {
+    let s = setup();
+    let data = pattern(300_000);
+    let (_dir, path) = temp_file(&data);
+    let file = open_file(&s, &path);
+    let mut buffers: Vec<Vec<u8>> = (0..24).map(|_| vec![0u8; 10_000]).collect();
+    for (i, buffer) in buffers.iter_mut().enumerate() {
+        enqueue(
+            &s,
+            &Spec {
+                file,
+                offset: (i * 10_000) as u64,
+                size: 10_000,
+                target: buffer.as_mut_ptr() as usize,
+                target_size: 10_000,
+                ..Spec::default()
+            },
+        );
+    }
+    mark_and_submit(&s, 0);
+    assert_eq!(wait(&s, 0), 0);
+    for (i, buffer) in buffers.iter().enumerate() {
+        assert_eq!(
+            buffer[..],
+            data[i * 10_000..(i + 1) * 10_000],
+            "request {i}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_request_in_a_group_gives_the_status_its_error() {
+    let s = setup();
+    let source = pattern(32);
+    let mut good = vec![0u8; 32];
+    let mut bad = vec![0u8; 32];
+    for (compression, out) in [(0u8, &mut good), (0xC, &mut bad)] {
+        enqueue(
+            &s,
+            &Spec {
+                memory_source: source.as_ptr(),
+                size: 32,
+                compression,
+                uncompressed: 32,
+                target: out.as_mut_ptr() as usize,
+                target_size: 32,
+                ..Spec::default()
+            },
+        );
+    }
+    mark_and_submit(&s, 0);
+    assert_eq!(wait(&s, 0), E_NOTIMPL);
+    assert_eq!(good, source);
 }
