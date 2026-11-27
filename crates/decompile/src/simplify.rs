@@ -470,6 +470,20 @@ fn propagate(
             };
             let count = reads.iter().filter(|(l, _)| *l == loc).count();
             if count > 0 {
+                let real = if j == len {
+                    count
+                } else {
+                    block.stmts[j]
+                        .exprs()
+                        .iter()
+                        .flat_map(|x| x.reads())
+                        .filter(|(l, _)| *l == loc)
+                        .count()
+                };
+                if real == 0 {
+                    blocked = true;
+                    break;
+                }
                 let fits = reads
                     .iter()
                     .filter(|(l, _)| *l == loc)
