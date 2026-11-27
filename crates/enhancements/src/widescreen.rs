@@ -122,6 +122,73 @@ pub fn fill_source(frame: Size, window: Size) -> Rect {
     }
 }
 
+/// What to render and how to put it in the window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Plan {
+    /// The resolution the game should render at (the size its display globals hold).
+    pub render: Size,
+    /// The part of the rendered frame that is shown.
+    pub source: Rect,
+    /// Where it lands in the window.
+    pub dest: Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlanOptions {
+    pub mode: FitMode,
+    /// Render at the window's own shape (needs the aspect patches) instead of presenting a 16:9 frame.
+    pub native: bool,
+    /// Most render lines the game is asked for in native mode.
+    pub max_render_height: u32,
+    /// Render sizes are rounded to a multiple of this (the game's effect buffers use 16).
+    pub align: u32,
+}
+
+impl Default for PlanOptions {
+    fn default() -> Self {
+        Self {
+            mode: FitMode::Fit,
+            native: false,
+            max_render_height: 2160,
+            align: 16,
+        }
+    }
+}
+
+/// A frame of the game's own size (`base`, normally 16:9) shown in `window`, or a frame of the window's shape when
+/// `options.native` is set.
+pub fn plan(base: Size, window: Size, options: PlanOptions) -> Plan {
+    let render = if options.native && !window.is_empty() {
+        native_render_size(window, options.max_render_height, options.align)
+    } else {
+        base
+    };
+    let whole = Rect::whole(render);
+    let (source, dest) = match options.mode {
+        FitMode::Fit => (whole, fit_rect(render, window)),
+        FitMode::Fill => (fill_source(render, window), Rect::whole(window)),
+        FitMode::Stretch => (whole, Rect::whole(window)),
+    };
+    Plan {
+        render,
+        source,
+        dest,
+    }
+}
+
+/// The render size for a window: its shape, no taller than `max_height`, each side rounded to `align` (at least one
+/// step), and the shape kept as closely as the rounding allows.
+pub fn native_render_size(window: Size, max_height: u32, align: u32) -> Size {
+    let align = align.max(1);
+    if window.is_empty() {
+        return Size::new(align, align);
+    }
+    let height = window.height.min(max_height.max(align));
+    let ideal_width = f64::from(height) * f64::from(window.width) / f64::from(window.height);
+    let round = |value: f64| ((value / f64::from(align)).round() as u32).max(1) * align;
+    Size::new(round(ideal_width), round(f64::from(height)))
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -199,6 +266,72 @@ mod tests {
         assert_eq!(source.y, 138);
         let source = fill_source(Size::FULL_HD, Size::new(1000, 1000));
         assert_eq!((source.width, source.height, source.x), (1080, 1080, 420));
+    }
+
+    #[test]
+    fn native_size_follows_the_window_in_steps() {
+        let size = native_render_size(Size::new(3440, 1440), 2160, 16);
+        assert_eq!(size, Size::new(3440, 1440));
+        let size = native_render_size(Size::new(5120, 1440), 1080, 16);
+        assert_eq!(size.height, 1088);
+        assert_eq!(size.width % 16, 0);
+        assert!((size.aspect() - 32.0 / 9.0).abs() < 0.03);
+        assert_eq!(
+            native_render_size(Size::new(0, 0), 1080, 16),
+            Size::new(16, 16)
+        );
+    }
+
+    #[test]
+    fn native_size_is_capped_by_the_height_limit() {
+        let size = native_render_size(Size::new(7680, 2160), 1080, 16);
+        assert!(size.height <= 1088);
+        assert!((size.aspect() - 7680.0 / 2160.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn plan_presents_sixteen_nine_with_bars_by_default() {
+        let plan = plan(Size::FULL_HD, Size::new(3440, 1440), PlanOptions::default());
+        assert_eq!(plan.render, Size::FULL_HD);
+        assert_eq!(plan.source, Rect::whole(Size::FULL_HD));
+        assert_eq!(plan.dest.width, 2560);
+    }
+
+    #[test]
+    fn plan_native_fills_the_window() {
+        let options = PlanOptions {
+            native: true,
+            max_render_height: 1440,
+            ..PlanOptions::default()
+        };
+        let plan = plan(Size::FULL_HD, Size::new(3440, 1440), options);
+        assert_eq!(plan.render, Size::new(3440, 1440));
+        assert_eq!(plan.dest, Rect::whole(Size::new(3440, 1440)));
+    }
+
+    #[test]
+    fn plan_stretch_and_fill() {
+        let window = Size::new(3440, 1440);
+        let stretch = plan(
+            Size::FULL_HD,
+            window,
+            PlanOptions {
+                mode: FitMode::Stretch,
+                ..PlanOptions::default()
+            },
+        );
+        assert_eq!(stretch.dest, Rect::whole(window));
+        assert_eq!(stretch.source, Rect::whole(Size::FULL_HD));
+        let fill = plan(
+            Size::FULL_HD,
+            window,
+            PlanOptions {
+                mode: FitMode::Fill,
+                ..PlanOptions::default()
+            },
+        );
+        assert_eq!(fill.dest, Rect::whole(window));
+        assert_eq!(fill.source.width, 1920);
     }
 
 }
