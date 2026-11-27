@@ -151,17 +151,20 @@ fn storage_factory(e: &mut Emitter) -> Res {
     let queue_id = e.guid("ds_queue_iid", IID_QUEUE);
     let factory = e.buffer("ds_factory", 8);
     let queue = e.buffer("ds_queue", 8);
-    // DSTORAGE_QUEUE_DESC: source type (file), capacity, priority, name, device.
-    let mut desc = [0u8; 24];
-    desc[4..6].copy_from_slice(&0x2000u16.to_le_bytes());
+    // The console's queue description: a flag word, capacity (u16) at 8, priority byte at 10, name at 0x10 and a
+    // word that is always 1 at 0x18.
+    let mut desc = [0u8; 32];
+    desc[8..10].copy_from_slice(&0x2000u16.to_le_bytes());
+    desc[0x18] = 1;
     let desc = e.bytes("ds_queue_desc", &desc);
     e.call(get, &[Arg::addr(factory_id), Arg::addr(factory)])?;
     e.fail_if_hresult_failed()?;
     e.load64(Register::RAX, factory)?;
     e.fail_if_zero64()?;
+    e.vcall(factory, 8, &[Arg::Imm(0x200_0000)])?;
     e.vcall(
         factory,
-        3,
+        10,
         &[Arg::addr(desc), Arg::addr(queue_id), Arg::addr(queue)],
     )?;
     e.fail_if_hresult_failed()?;
@@ -180,16 +183,15 @@ fn storage_request(e: &mut Emitter) -> Res {
     let status = e.buffer("ds_status", 8);
     let counter = e.buffer("ds_polls", 4);
     let destination = e.buffer("ds_destination", length() as usize);
-    // DSTORAGE_REQUEST: options 0 is a file source into memory, uncompressed. The destination pointer is an
-    // absolute address, so the field is relocated with the image.
-    let mut request = [0u8; 96];
-    request[24..32].copy_from_slice(&length().to_le_bytes());
-    request[40..48].copy_from_slice(&length().to_le_bytes());
-    request[72..76].copy_from_slice(&(length() as u32).to_le_bytes());
+    // The console's 0x48-byte record: options 0 is a file source into memory, uncompressed; the destination at 8
+    // is an absolute address, relocated with the image; size at 0x18, the file at 0x20, offset 0x28, stored size 0x30.
+    let mut request = [0u8; 0x48];
+    request[0x18..0x1c].copy_from_slice(&(length() as u32).to_le_bytes());
+    request[0x30..0x34].copy_from_slice(&(length() as u32).to_le_bytes());
     let request = e.bytes_with_pointers(
         "ds_request",
         &request,
-        vec![(32, Target::Place(destination.into()))],
+        vec![(8, Target::Place(destination.into()))],
     );
     e.vcall(
         factory,
@@ -209,7 +211,7 @@ fn storage_request(e: &mut Emitter) -> Res {
     )?;
     e.fail_if_hresult_failed()?;
     e.load64(Register::RAX, file)?;
-    e.store64(request.at(8), Register::RAX)?;
+    e.store64(request.at(0x20), Register::RAX)?;
     e.vcall(queue, 3, &[Arg::addr(request)])?;
     e.vcall(queue, 4, &[Arg::load64(status), Arg::Imm(0)])?;
     e.vcall(queue, 6, &[])?;
