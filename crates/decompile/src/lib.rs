@@ -45,10 +45,72 @@ pub enum Error {
     TooLarge,
 }
 
+/// Limits that keep one function from holding up a run over the whole executable.
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// Functions with more basic blocks than this become a stub.
+    pub max_blocks: usize,
+    /// Time after which simplification stops improving the function.
+    pub max_time: std::time::Duration,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            max_blocks: 4000,
+            max_time: std::time::Duration::from_secs(5),
+        }
+    }
+}
+
 pub fn decompile(program: &dyn Program, entry: u64) -> Result<String, Error> {
+    decompile_with(program, entry, &Options::default())
+}
+
+/// Like `decompile`, but with explicit limits. It never panics: an internal failure yields a stub.
+pub fn decompile_with(
+    program: &dyn Program,
+    entry: u64,
+    options: &Options,
+) -> Result<String, Error> {
+    let title = || {
+        program
+            .name(entry)
+            .unwrap_or_else(|| format!("sub_{:08x}", entry.wrapping_sub(program.image_base())))
+    };
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        decompile_inner(program, entry, options)
+    }));
+    match run {
+        Ok(result) => result,
+        Err(_) => Ok(format!(
+            "void {}() {{
+    /* the decompiler failed on this function */
+}}
+",
+            title()
+        )),
+    }
+}
+
+fn decompile_inner(program: &dyn Program, entry: u64, options: &Options) -> Result<String, Error> {
+    let started = std::time::Instant::now();
+    let deadline = started + options.max_time;
     let raw = cfg::discover(program, entry)?;
     if !raw.iter().any(|b| b.start == entry) {
         return Err(Error::NoCode);
+    }
+    if raw.len() > options.max_blocks {
+        let title = program
+            .name(entry)
+            .unwrap_or_else(|| format!("sub_{:08x}", entry - program.image_base()));
+        return Ok(format!(
+            "void {title}() {{
+    /* too large: {} blocks */
+}}
+",
+            raw.len()
+        ));
     }
     let mut function = lift::lift(program, entry, &raw);
     let registers = simplify::parameters(&mut function);
@@ -64,9 +126,9 @@ pub fn decompile(program: &dyn Program, entry: u64) -> Result<String, Error> {
         }
     };
     dump(&function, "lifted");
-    simplify::run(&mut function);
+    simplify::run(&mut function, Some(deadline));
     simplify::merge_conditions(&mut function);
-    let vars = vars::rename(&mut function, 20_000).unwrap_or_default();
+    let vars = vars::rename(&mut function, options.max_blocks).unwrap_or_default();
     dump(&function, "simplified");
     let (nodes, _) = structure::structure(&function);
     let title = program

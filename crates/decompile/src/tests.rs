@@ -379,3 +379,40 @@ fn a_pointer_read_at_one_offset_stays_void() {
     assert!(text.contains("return *(uint32_t *)(a1 + 8);"), "{text}");
     assert!(!text.contains("struct"), "{text}");
 }
+
+#[test]
+fn a_function_over_the_block_limit_is_a_stub() {
+    let image = Image::new(assemble(|a| {
+        for _ in 0..5 {
+            let mut next = a.create_label();
+            a.test(rcx, rcx)?;
+            a.je(next)?;
+            a.inc(rax)?;
+            a.set_label(&mut next)?;
+        }
+        a.ret()
+    }));
+    let options = Options {
+        max_blocks: 3,
+        ..Options::default()
+    };
+    let text = decompile_with(&image, START, &options).expect("a stub");
+    assert!(text.contains("/* too large: "), "{text}");
+    assert!(text.contains(" blocks */"), "{text}");
+}
+
+#[test]
+fn garbage_bytes_never_panic() {
+    for seed in 0u32..200 {
+        let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        let code: Vec<u8> = (0..96)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        let _ = decompile(&Image::new(code), START);
+    }
+}

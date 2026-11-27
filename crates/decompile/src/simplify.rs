@@ -673,11 +673,14 @@ pub fn merge_conditions(f: &mut Function) {
     }
 }
 
-pub fn run(f: &mut Function) {
+pub fn run(f: &mut Function, deadline: Option<std::time::Instant>) {
     rebase_flags(f);
     copy_flags(f);
     let mut temps = 1u8;
     for _ in 0..64 {
+        if deadline.is_some_and(|d| std::time::Instant::now() > d) {
+            break;
+        }
         let mut changed = false;
         let live = liveness(f);
         for (b, block) in f.blocks.iter_mut().enumerate() {
