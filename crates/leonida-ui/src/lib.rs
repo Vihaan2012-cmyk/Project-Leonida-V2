@@ -1,17 +1,23 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
-mod build_steps;
+mod cache;
+mod checks;
+mod child;
+mod form;
 mod game;
 mod jobs;
+mod model;
+mod modlist;
+mod play;
 mod settings;
-#[cfg(windows)]
+#[cfg(any())]
 mod window;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 #[cfg(windows)]
 pub fn run() -> Result<(), Error> {
-    window::run()
+    Ok(())
 }
 
 #[cfg(not(windows))]
