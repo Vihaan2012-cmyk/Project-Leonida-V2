@@ -728,7 +728,7 @@ impl PipelineEnv {
             let input = vk::PipelineVertexInputStateCreateInfo::default()
                 .vertex_binding_descriptions(bindings)
                 .vertex_attribute_descriptions(attributes);
-            let topology = state::default_topology(desc.topology, desc.gs.0.len() > 0);
+            let topology = state::default_topology(desc.topology, !desc.gs.is_empty());
             let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
                 .topology(topology)
                 .primitive_restart_enable(false);
@@ -881,12 +881,11 @@ impl PipelineEnv {
             UserStage::Compute,
             vk::ShaderStageFlags::COMPUTE,
         )?;
-        if layout.end
-            > translated
-                .user_sgprs
-                .max(layout.end.min(translated.user_sgprs))
-        {
-            self.note("the root signature places more user data than the shader's header counts");
+        if layout.end != translated.user_sgprs {
+            self.note(&format!(
+                "the root signature's user data ends at s{} and the shader's header counts {} user SGPRs",
+                layout.end, translated.user_sgprs
+            ));
         }
         let module = self.module(&translated.spirv)?;
         let features = &self.ctx.features;
