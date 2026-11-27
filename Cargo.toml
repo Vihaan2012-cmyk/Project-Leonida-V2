@@ -41,6 +41,7 @@ rpf9 = { path = "crates/rpf9" }
 audio-codec = { path = "crates/audio-codec" }
 shader-container = { path = "crates/shader-container" }
 leonida-ui = { path = "crates/leonida-ui" }
+exe-analysis = { path = "crates/exe-analysis" }
 pe-image = { path = "crates/pe-image" }
 pe-loader = { path = "crates/pe-loader" }
 shims = { path = "crates/shims" }
