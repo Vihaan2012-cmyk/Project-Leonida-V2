@@ -154,6 +154,43 @@ impl Buffer {
         }
     }
 
+    /// A device-local buffer holding `data`, uploaded on queue 0 and waited for.
+    pub fn with_data(
+        device: &Device,
+        name: &str,
+        usage: vk::BufferUsageFlags,
+        data: &[u8],
+    ) -> Result<Buffer> {
+        let buffer = Buffer::new(
+            device,
+            &BufferDesc {
+                name,
+                size: data.len() as u64,
+                usage,
+                location: MemoryLocation::GpuOnly,
+            },
+        )?;
+        let staging = Buffer::new(
+            device,
+            &BufferDesc {
+                name: "staging",
+                size: data.len() as u64,
+                usage: vk::BufferUsageFlags::empty(),
+                location: MemoryLocation::Upload,
+            },
+        )?;
+        staging.write(0, data)?;
+        device.queue(0).immediate(|cb| {
+            cb.copy_buffer(
+                &staging,
+                &buffer,
+                &[vk::BufferCopy::default().size(data.len() as u64)],
+            );
+            Ok(())
+        })?;
+        Ok(buffer)
+    }
+
     /// Makes a buffer over host memory with `VK_EXT_external_memory_host`, so the GPU reads and writes `ptr`
     /// itself.
     ///
