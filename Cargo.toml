@@ -31,6 +31,7 @@ rspirv = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
+toml_edit = "0.25"
 sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
