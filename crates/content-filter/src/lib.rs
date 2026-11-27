@@ -27,4 +27,5 @@ pub mod blocklist;
 pub mod hash;
 pub mod names;
 pub mod rules;
+pub mod scan;
 pub mod settings;
