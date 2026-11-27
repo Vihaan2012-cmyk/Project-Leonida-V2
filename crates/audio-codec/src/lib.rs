@@ -2,6 +2,7 @@
 
 pub mod awc;
 pub mod bits;
+pub mod decode;
 pub mod error;
 pub mod huffman;
 pub mod mdct;
