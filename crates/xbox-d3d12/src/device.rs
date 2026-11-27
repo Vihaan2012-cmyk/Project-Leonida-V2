@@ -209,7 +209,8 @@ pub unsafe fn create_device(
     let object = com::new_object(Kind::Device, device_vtable(&core), Device { core });
     // SAFETY: just allocated; the reference goes to the caller, `riid` decides what it sees.
     unsafe {
-        if riid.is_null() {
+        // An IID the layer does not know is the console's own device interface: the device itself answers.
+        if riid.is_null() || !com::is_known_iid(&Guid::read(riid)) {
             *out = object as *mut c_void;
             return S_OK;
         }
