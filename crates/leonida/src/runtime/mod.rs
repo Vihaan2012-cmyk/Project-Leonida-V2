@@ -80,6 +80,8 @@ pub fn configure(plan: &RuntimePlan) -> Result<()> {
     for mode in 1..=7u8 {
         shims::dstorage::set_bcpack_format(mode << 1, mode);
     }
+    #[cfg(windows)]
+    shims::dstorage::set_page_writer(Some(shims::xmem::write_physical_page));
     // The title reserves its GPU-visible memory before it creates the device, so the device's address space and
     // memory hooks must exist first.
     shims::d3d12::prepare()
