@@ -281,3 +281,39 @@ fn whole_surfaces_match_the_cpu() {
     }
 }
 
+#[test]
+fn a_surface_larger_than_one_grid_row_of_groups_works() {
+    let Some(ctx) = context() else { return };
+    let passes = Passes::new(&ctx.device, 4).unwrap();
+    let job = single(Swizzle::Sw64kbD, 4, [2048, 1100, 1], [0, 0]);
+    assert!(job.linear_bytes() / 4 > 32768 * 64);
+    let tiled_len = job.tiled_bytes().unwrap() as usize;
+    let linear_len = job.linear_bytes() as usize;
+    let tiled = noise(tiled_len, 3);
+    let mut want = vec![0u8; linear_len];
+    detile(&job, &tiled, &mut want).unwrap();
+    assert!(gpu_detile(&ctx, &passes, &tiled, linear_len, &[job]) == want);
+}
+
+#[test]
+fn the_descriptor_pool_runs_out_and_resets() {
+    let Some(ctx) = context() else { return };
+    let passes = Passes::new(&ctx.device, 1).unwrap();
+    let job = single(Swizzle::Sw4kbS, 4, [16, 16, 1], [0, 0]);
+    let tiled = ctx.buffer(&noise(4096, 1));
+    let linear = ctx.buffer(&[0u8; 1024]);
+    ctx.run(|cmd| {
+        // SAFETY: `cmd` is recording and the buffers outlive the submission.
+        unsafe {
+            passes
+                .record_detile(cmd, tiled.buffer, linear.buffer, &[job], Barrier::HOST_READ)
+                .unwrap();
+            let second =
+                passes.record_detile(cmd, tiled.buffer, linear.buffer, &[job], Barrier::HOST_READ);
+            assert!(matches!(second, Err(gpu_passes::PassError::PoolExhausted)));
+        }
+    });
+    passes.reset().unwrap();
+    ctx.free(tiled);
+    ctx.free(linear);
+}
