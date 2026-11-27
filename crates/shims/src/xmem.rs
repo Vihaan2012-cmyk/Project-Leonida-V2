@@ -40,6 +40,8 @@ mod title_hooks;
 mod virtual_free;
 
 #[cfg(windows)]
+pub use imp::write_physical_page;
+#[cfg(windows)]
 pub use title_hooks::{EXPORT_NAME, TitleHeapAllocator, title_heap_allocator};
 
 pub const PAGE: usize = 64 * 1024;
@@ -56,7 +58,8 @@ mod imp {
         MEM_EXTENDED_PARAMETER, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
         MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
         MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-        UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree,
+        FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2,
+        VirtualFree,
     };
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
@@ -72,6 +75,8 @@ mod imp {
 
     const TRUE: i32 = 1;
     const FALSE: i32 = 0;
+    const E_FAIL: i32 = 0x8000_4005u32 as i32;
+    const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
     const MEM_TOP_DOWN: u32 = 0x10_0000;
     const MEM_PHYSICAL: u32 = 0x40_0000;
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
@@ -824,6 +829,87 @@ mod imp {
             }
         }
         TRUE
+    }
+
+    /// The page a DirectStorage page-table entry names: a page number `XMemAllocatePhysicalPages` returned, or
+    /// the 64 KiB-aligned address of a view of one. The two cannot be told apart only for the value 0x10000,
+    /// which would need 65,536 live pages; the number wins.
+    fn page_of_entry(state: &State, entry: u64) -> Option<usize> {
+        if let Ok(number) = usize::try_from(entry)
+            && number >= 1
+            && matches!(state.pages.get(number - 1), Some(Some(_)))
+        {
+            return Some(number);
+        }
+        let at = usize::try_from(entry).ok().filter(|at| at % PAGE == 0)?;
+        state.views.get(&at).copied()
+    }
+
+    /// Writes `data` at `offset` into the physical page `entry` names (see `page_of_entry`), for DirectStorage
+    /// reads that land in physical pages. The write goes through a view of the page when one is mapped, else
+    /// through a temporary view of its section, so the CPU and every other view of the page see it. Views the
+    /// GPU reads are reported to the memory hooks as written by the host. Returns an `HRESULT`.
+    pub fn write_physical_page(entry: u64, offset: usize, data: &[u8]) -> i32 {
+        if offset > PAGE || data.len() > PAGE - offset {
+            return E_INVALIDARG;
+        }
+        if data.is_empty() {
+            return 0;
+        }
+        let Ok(state) = STATE.lock() else {
+            return E_FAIL;
+        };
+        let Some(page) = page_of_entry(&state, entry) else {
+            note(format!(
+                "page write: entry {entry:#x} is neither a live physical page number nor a mapped page address"
+            ));
+            return E_INVALIDARG;
+        };
+        let mut visible = Vec::new();
+        let mut through = None;
+        for (&at, &mapped) in &state.views {
+            if mapped == page {
+                through.get_or_insert(at);
+                if covers(&state.gpu_reserved, at, PAGE) {
+                    visible.push(at + offset);
+                }
+            }
+        }
+        match through {
+            // SAFETY: a view of this page mapped by `map_one` and kept mapped by the lock held here; the range
+            // is inside the 64 KiB page.
+            Some(at) => unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), (at + offset) as *mut u8, data.len());
+            },
+            None => {
+                let Some(Some(section)) = state.pages.get(page - 1).copied() else {
+                    return E_INVALIDARG;
+                };
+                // SAFETY: maps a section this module made, writes inside the view and unmaps it.
+                let view = unsafe { MapViewOfFile(section as HANDLE, FILE_MAP_WRITE, 0, 0, PAGE) };
+                if view.Value.is_null() {
+                    return E_FAIL;
+                }
+                // SAFETY: the view is 64 KiB and the range is inside it.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        view.Value.cast::<u8>().add(offset),
+                        data.len(),
+                    );
+                    UnmapViewOfFile(view);
+                }
+            }
+        }
+        drop(state);
+        if !visible.is_empty()
+            && let Some(hooks) = hooks::current()
+        {
+            for va in visible {
+                hooks.host_written(va as u64, data.len() as u64);
+            }
+        }
+        0
     }
 
     pub extern "win64" fn tools_memory_available() -> i32 {
