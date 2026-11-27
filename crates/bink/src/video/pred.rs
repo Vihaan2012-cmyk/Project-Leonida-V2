@@ -20,6 +20,7 @@ fn pred3(a: i32, b: i32, c: i32) -> i32 {
 /// Quantiser of the macroblock above, left and above-left. Each macroblock has two slots, intra then inter.
 pub struct QuantLine {
     slots: Vec<u8>,
+    #[allow(dead_code, reason = "kept for inter frames, which are not decoded yet")]
     stride: usize,
     cur: usize,
     prev: usize,
@@ -167,6 +168,7 @@ impl LumaDc {
     }
 
     /// Inter blocks predict from inside the block only.
+    #[allow(dead_code, reason = "kept for inter frames, which are not decoded yet")]
     pub fn predict_inter(&mut self, d: &[i32; 16], range: &DcRange) -> [i32; 16] {
         let c = |v: i32| v.clamp(range.lo, range.hi);
         let mut a = [0i32; 16];
@@ -191,6 +193,11 @@ impl LumaDc {
     }
 
     /// Values measured from the reconstructed pixels of a block that was not coded as intra.
+    #[allow(
+        dead_code,
+        clippy::too_many_arguments,
+        reason = "kept for inter frames, which are not decoded yet; one argument per measured DC value"
+    )]
     pub fn set_measured(
         &mut self,
         bx: usize,
@@ -272,6 +279,7 @@ impl ChromaDc {
         a
     }
 
+    #[allow(dead_code, reason = "kept for inter frames, which are not decoded yet")]
     pub fn predict_inter(&mut self, d: &[i32; 4], range: &DcRange) -> [i32; 4] {
         let c = |v: i32| v.clamp(range.lo, range.hi);
         let mut a = [0i32; 4];
@@ -283,6 +291,7 @@ impl ChromaDc {
         a
     }
 
+    #[allow(dead_code, reason = "kept for inter frames, which are not decoded yet")]
     pub fn set_measured(&mut self, bx: usize, dc1: i32, dc2: i32, dc3: i32) {
         self.left[1] = dc1;
         self.left[2] = dc2;

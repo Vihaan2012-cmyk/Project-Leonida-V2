@@ -7,6 +7,7 @@ use crate::vlc::Codebook;
 pub struct Codes {
     pub ac1: Codebook,
     pub ac2: Codebook,
+    #[allow(dead_code, reason = "kept for inter frames, which are not decoded yet")]
     pub mv: Codebook,
 }
 

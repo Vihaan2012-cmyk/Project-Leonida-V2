@@ -11,6 +11,7 @@ impl<'a> BitReader<'a> {
         Self { data, pos: 0 }
     }
 
+    #[allow(dead_code, reason = "kept for inter frames, which are not decoded yet")]
     pub fn pos(&self) -> usize {
         self.pos
     }
@@ -64,6 +65,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Count of consecutive one bits before a zero, at most `max`. A run of `max` ones stops without a terminating zero.
+    #[allow(dead_code, reason = "kept for inter frames, which are not decoded yet")]
     pub fn read_unary(&mut self, max: u32) -> u32 {
         let mut count = 0;
         while count < max {

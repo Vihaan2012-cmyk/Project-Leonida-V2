@@ -92,6 +92,7 @@ pub fn put_block(coefs: &mut [i32; 64], dst: &mut [u8], stride: usize) {
 }
 
 /// Adds the transformed block to the prediction already at `dst`.
+#[allow(dead_code, reason = "kept for inter frames, which are not decoded yet")]
 pub fn add_block(coefs: &mut [i32; 64], dst: &mut [u8], stride: usize) {
     idct(coefs);
     for y in 0..8 {
