@@ -167,6 +167,14 @@ ID3D12GraphicsCommandList 80 DispatchX inferred
 ID3D12GraphicsCommandList 85 CopyTextureRegion inferred
 ID3D12GraphicsCommandList 131 Unnamed131 measured (called as (a, b, c, mask) once per list before Close; meaning unknown, ignored)
 ID3D12GraphicsCommandList 132 Unnamed132 measured (called as (a, b, c, mask) once per list before Close; meaning unknown, ignored)
+ID3D12GraphicsCommandList 62 Unnamed62 measured (one site; meaning unknown, ignored)
+ID3D12GraphicsCommandList 70 Unnamed70 measured (two floats from the render context, in the graphics flush; depth-bounds shaped; ignored)
+ID3D12GraphicsCommandList 72 Unnamed72 measured (called as (addr, 0, 0, 1) at one site; meaning unknown, ignored)
+ID3D12GraphicsCommandList 75 Unnamed75 measured (a pipeline flag byte, in the graphics flush; meaning unknown, ignored)
+ID3D12GraphicsCommandList 126 Unnamed126 measured (in the graphics flush; meaning unknown, ignored)
+ID3D12GraphicsCommandList 127 Unnamed127 measured (one site; meaning unknown, ignored)
+ID3D12GraphicsCommandList 128 Unnamed128 measured (a pointer to 16 bytes at one site; meaning unknown, ignored)
+ID3D12GraphicsCommandList 142 Unnamed142 measured (a u64 kept beside the scratch buffer, in the graphics flush; ignored)
 ID3D12GraphicsCommandList 141 SetScratchBufferX measured
 ID3D12GraphicsCommandList 146 Barrier measured
 ID3D12GraphicsCommandList 148 AllocateUploadMemoryX measured
