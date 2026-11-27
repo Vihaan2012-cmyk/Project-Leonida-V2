@@ -14,12 +14,15 @@ use std::sync::{Arc, OnceLock};
 use crate::Shim;
 
 pub mod abi;
+pub mod analog;
 mod backend;
 mod com;
 pub mod config;
+pub mod curve;
 mod device;
 pub mod hub;
 pub mod mapping;
+pub mod settings;
 #[cfg(test)]
 mod tests;
 

@@ -858,10 +858,16 @@ fn mouse_readings_accumulate_movement_buttons_and_wheel() {
 
 #[test]
 fn input_while_the_window_is_unfocused_is_ignored_and_focus_loss_releases_everything() {
-    let (hub, _) = hub_with(InputConfig {
+    let (hub, clock) = hub_with(InputConfig {
         virtual_pad: VirtualPadMode::Always,
         ..InputConfig::default()
     });
+    let settle = || {
+        for _ in 0..30 {
+            clock.advance_ms(10);
+            hub.tick();
+        }
+    };
     let gi = Gi::new(&hub);
     let key = |vk, down| RawInput::Key {
         virtual_key: vk,
@@ -873,6 +879,7 @@ fn input_while_the_window_is_unfocused_is_ignored_and_focus_loss_releases_everyt
         button: MouseButton::Left,
         down: true,
     });
+    settle();
     let (_, r) = gi.current(kind::GAMEPAD, std::ptr::null_mut());
     let s = r.gamepad().unwrap();
     assert_eq!((s.left_y, s.right_trigger), (1.0, 1.0));
@@ -884,13 +891,17 @@ fn input_while_the_window_is_unfocused_is_ignored_and_focus_loss_releases_everyt
     assert_eq!(r.gamepad().unwrap(), GamepadState::default());
     hub.input(RawInput::Focus(true));
     hub.input(key(vk::W, true));
+    settle();
     let (_, r) = gi.current(kind::GAMEPAD, std::ptr::null_mut());
     assert_eq!(r.gamepad().unwrap().left_y, 1.0);
 }
 
 #[test]
 fn the_keyboard_pad_is_present_only_while_no_gamepad_is_in_auto_mode() {
-    let (hub, _) = hub_with(InputConfig::default());
+    let (hub, _) = hub_with(InputConfig {
+        virtual_pad: VirtualPadMode::Auto,
+        ..InputConfig::default()
+    });
     let gi = Gi::new(&hub);
     let (log, context) = Log::leak();
     let none = std::ptr::null_mut();
@@ -933,35 +944,140 @@ fn always_mode_keeps_the_keyboard_pad_beside_a_real_pad_and_newest_input_wins() 
 }
 
 #[test]
-fn mouse_movement_pushes_the_right_stick_and_it_decays_to_zero() {
-    let (hub, _) = hub_with(InputConfig {
-        virtual_pad: VirtualPadMode::Always,
-        ..InputConfig::default()
-    });
+fn mouse_movement_pushes_the_right_stick_past_the_dead_zone_and_it_returns_to_zero() {
+    let (hub, clock) = hub_with(InputConfig::default());
     let gi = Gi::new(&hub);
     let none = std::ptr::null_mut();
-    hub.input(RawInput::MouseMove { dx: 4, dy: 0 });
-    hub.tick();
-    let (_, r) = gi.current(kind::GAMEPAD, none);
-    let first = r.gamepad().unwrap().right_x;
-    assert!((first - 4096.0 / 32767.0).abs() < 1e-6);
-    hub.input(RawInput::MouseMove { dx: 100, dy: 0 });
-    hub.tick();
-    let (_, r) = gi.current(kind::GAMEPAD, none);
-    assert_eq!(r.gamepad().unwrap().right_x, 1.0);
-    let mut ticks = 0;
-    loop {
+    for _ in 0..40 {
+        clock.advance_ms(1);
+        hub.input(RawInput::MouseMove { dx: 1, dy: 0 });
         hub.tick();
-        ticks += 1;
-        let (_, r) = gi.current(kind::GAMEPAD, none);
-        if r.gamepad().unwrap().right_x == 0.0 {
-            break;
-        }
-        assert!(ticks < 200);
     }
-    assert_eq!(ticks, 67);
+    let (_, r) = gi.current(kind::GAMEPAD, none);
+    let moving = r.gamepad().unwrap().right_x;
+    assert!(moving > 0.25 && moving < 1.0, "{moving}");
+    for _ in 0..40 {
+        clock.advance_ms(1);
+        hub.tick();
+    }
+    let (_, r) = gi.current(kind::GAMEPAD, none);
+    assert_eq!(r.gamepad().unwrap().right_x, 0.0);
+    clock.advance_ms(1);
     hub.input(RawInput::MouseMove { dx: 0, dy: 3 });
     hub.tick();
     let (_, r) = gi.current(kind::GAMEPAD, none);
     assert!(r.gamepad().unwrap().right_y < 0.0);
+}
+
+fn merged() -> (Arc<Hub>, Clock) {
+    hub_with(InputConfig::default())
+}
+
+#[test]
+fn merged_mode_shows_one_pad_that_has_both_devices_in_it() {
+    let (hub, clock) = merged();
+    let gi = Gi::new(&hub);
+    let none = std::ptr::null_mut();
+    let (log, context) = Log::leak();
+    gi.register_device(
+        none,
+        kind::GAMEPAD,
+        status::CONNECTED,
+        2,
+        context,
+        on_device,
+    );
+    assert_eq!(log.lines().len(), 1);
+    hub.connect_pad(1, &pad("Pad", 1));
+    assert_eq!(
+        log.lines().len(),
+        1,
+        "the controller is not shown to the title"
+    );
+    hub.pad_state(1, state(buttons::Y, 0.0));
+    let (_, r) = gi.current(kind::GAMEPAD, none);
+    assert_eq!(r.gamepad().unwrap().buttons, buttons::Y);
+    hub.input(RawInput::Key {
+        virtual_key: vk::RETURN,
+        scan_code: 28,
+        down: true,
+    });
+    clock.advance_ms(5);
+    hub.tick();
+    let (_, r) = gi.current(kind::GAMEPAD, none);
+    assert_eq!(r.gamepad().unwrap().buttons, buttons::A | buttons::Y);
+    let physical = hub.find_device(&[0; 32]);
+    assert!(physical.is_none());
+}
+
+#[test]
+fn the_last_used_device_wins_a_stick_both_push_and_is_reported() {
+    let (hub, clock) = merged();
+    let gi = Gi::new(&hub);
+    let none = std::ptr::null_mut();
+    hub.connect_pad(1, &pad("Pad", 1));
+    hub.pad_state(1, state(0, -1.0));
+    assert_eq!(hub.last_used(), super::mapping::LastUsed::Pad);
+    hub.input(RawInput::Key {
+        virtual_key: vk::D,
+        scan_code: 32,
+        down: true,
+    });
+    for _ in 0..20 {
+        clock.advance_ms(10);
+        hub.tick();
+    }
+    assert_eq!(hub.last_used(), super::mapping::LastUsed::KeyboardMouse);
+    let (_, r) = gi.current(kind::GAMEPAD, none);
+    assert_eq!(r.gamepad().unwrap().left_x, 1.0);
+    hub.pad_state(1, state(0, -0.9));
+    assert_eq!(hub.last_used(), super::mapping::LastUsed::Pad);
+    let (_, r) = gi.current(kind::GAMEPAD, none);
+    assert_eq!(r.gamepad().unwrap().left_x, -0.9);
+}
+
+#[test]
+fn rumble_for_the_merged_pad_goes_to_the_connected_controllers() {
+    let (hub, _) = merged();
+    hub.connect_pad(7, &pad("Pad", 1));
+    hub.set_rumble(
+        super::hub::VIRTUAL_PAD,
+        RumbleParams {
+            low_frequency: 0.5,
+            ..RumbleParams::default()
+        },
+    );
+    let out = hub.take_rumble();
+    assert_eq!(out.len(), 1);
+    assert_eq!((out[0].0, out[0].1.low_frequency), (7, 0.5));
+    assert!(hub.take_rumble().is_empty());
+}
+
+#[test]
+fn wheel_notches_press_the_bound_button_once_each() {
+    let (hub, clock) = merged();
+    let gi = Gi::new(&hub);
+    let none = std::ptr::null_mut();
+    let wheel = hub.config().bindings.len();
+    assert!(wheel > 0);
+    let mut config = hub.config();
+    config.bindings.push(super::config::Binding {
+        source: super::config::Source::Wheel(super::config::WheelDir::Down),
+        control: super::config::Control::Button(buttons::DPAD_RIGHT),
+    });
+    hub.set_config(config);
+    hub.input(RawInput::MouseWheel { dx: 0, dy: -240 });
+    let mut presses = 0;
+    let mut was = false;
+    for _ in 0..300 {
+        clock.advance_ms(1);
+        hub.tick();
+        let (_, r) = gi.current(kind::GAMEPAD, none);
+        let down = r.gamepad().unwrap().buttons & buttons::DPAD_RIGHT != 0;
+        if down && !was {
+            presses += 1;
+        }
+        was = down;
+    }
+    assert_eq!(presses, 2);
 }

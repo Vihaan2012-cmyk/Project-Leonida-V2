@@ -1,6 +1,7 @@
 //! Improvements to the running game: frame-rate and widescreen changes applied as code patches.
 #![allow(unsafe_code)]
 
+pub mod camera;
 pub mod clock_floor;
 pub mod framerate;
 pub mod patch;

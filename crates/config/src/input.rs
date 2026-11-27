@@ -25,10 +25,14 @@ pub enum Action {
     WeaponWheel,
     Phone,
     Pause,
+    EnterVehicle,
+    CameraView,
+    WeaponNext,
+    WeaponPrevious,
 }
 
 impl Action {
-    pub const ALL: [Action; 16] = [
+    pub const ALL: [Action; 20] = [
         Action::MoveForward,
         Action::MoveBack,
         Action::MoveLeft,
@@ -45,6 +49,10 @@ impl Action {
         Action::WeaponWheel,
         Action::Phone,
         Action::Pause,
+        Action::EnterVehicle,
+        Action::CameraView,
+        Action::WeaponNext,
+        Action::WeaponPrevious,
     ];
 
     /// The name used in `input.toml`.
@@ -66,6 +74,10 @@ impl Action {
             Action::WeaponWheel => "weapon_wheel",
             Action::Phone => "phone",
             Action::Pause => "pause",
+            Action::EnterVehicle => "enter_vehicle",
+            Action::CameraView => "camera_view",
+            Action::WeaponNext => "weapon_next",
+            Action::WeaponPrevious => "weapon_previous",
         }
     }
 
@@ -91,6 +103,10 @@ impl Action {
             Action::WeaponWheel => (&["Tab"], &["LeftBumper"]),
             Action::Phone => (&["Up"], &["DPadUp"]),
             Action::Pause => (&["Escape"], &["Menu"]),
+            Action::EnterVehicle => (&["F"], &["Y"]),
+            Action::CameraView => (&["C"], &["View"]),
+            Action::WeaponNext => (&[], &["DPadRight"]),
+            Action::WeaponPrevious => (&[], &["DPadLeft"]),
         }
     }
 }
@@ -259,15 +275,72 @@ impl Default for DeadZones {
     }
 }
 
+/// How the keyboard stands in for the left stick.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Movement {
+    /// Stick deflection of the movement keys alone, 0.1 to 1.0.
+    pub level: f32,
+    /// Stick deflection while a walk key is held.
+    pub walk_level: f32,
+    /// Stick deflection while a run key is held.
+    pub run_level: f32,
+    /// Milliseconds the stick takes to go from rest to full, 0 for no ramp.
+    pub ramp_up_ms: u32,
+    /// Milliseconds the stick takes to fall back to rest, 0 for no ramp.
+    pub ramp_down_ms: u32,
+    pub walk_keys: Vec<String>,
+    pub run_keys: Vec<String>,
+}
+
+impl Default for Movement {
+    fn default() -> Self {
+        Self {
+            level: 1.0,
+            walk_level: 0.4,
+            run_level: 1.0,
+            ramp_up_ms: 80,
+            ramp_down_ms: 50,
+            walk_keys: vec!["LeftAlt".into()],
+            run_keys: vec!["LeftShift".into()],
+        }
+    }
+}
+
+/// What a turn of the mouse wheel does, as an action name; empty leaves the direction unbound.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MouseWheel {
+    pub up: String,
+    pub down: String,
+}
+
+impl Default for MouseWheel {
+    fn default() -> Self {
+        Self {
+            up: Action::WeaponPrevious.name().into(),
+            down: Action::WeaponNext.name().into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Input {
     pub mouse_sensitivity: f32,
+    /// Multiplies `mouse_sensitivity` for sideways movement.
+    pub mouse_sensitivity_x: f32,
+    /// Multiplies `mouse_sensitivity` for up and down movement.
+    pub mouse_sensitivity_y: f32,
+    /// 0 turns the camera by exactly what the mouse moved; up to 1 averages over about a tenth of a second.
+    pub mouse_smoothing: f32,
     pub mouse_invert_x: bool,
     pub mouse_invert_y: bool,
     pub gamepad_look_sensitivity: f32,
     pub gamepad_invert_y: bool,
     pub dead_zones: DeadZones,
+    pub movement: Movement,
+    pub mouse_wheel: MouseWheel,
     #[serde(deserialize_with = "merged_keyboard")]
     pub keyboard: Bindings,
     #[serde(deserialize_with = "merged_gamepad")]
@@ -278,11 +351,16 @@ impl Default for Input {
     fn default() -> Self {
         Self {
             mouse_sensitivity: 1.0,
+            mouse_sensitivity_x: 1.0,
+            mouse_sensitivity_y: 1.0,
+            mouse_smoothing: 0.0,
             mouse_invert_x: false,
             mouse_invert_y: false,
             gamepad_look_sensitivity: 1.0,
             gamepad_invert_y: false,
             dead_zones: DeadZones::default(),
+            movement: Movement::default(),
+            mouse_wheel: MouseWheel::default(),
             keyboard: default_bindings(true),
             gamepad: default_bindings(false),
         }
@@ -350,6 +428,32 @@ impl Section for Input {
 
     fn check(&self, problems: &mut Problems) {
         problems.range_f32("mouse_sensitivity", self.mouse_sensitivity, 0.05, 10.0);
+        problems.range_f32("mouse_sensitivity_x", self.mouse_sensitivity_x, 0.05, 10.0);
+        problems.range_f32("mouse_sensitivity_y", self.mouse_sensitivity_y, 0.05, 10.0);
+        problems.range_f32("mouse_smoothing", self.mouse_smoothing, 0.0, 1.0);
+        problems.range_f32("movement.level", self.movement.level, 0.1, 1.0);
+        problems.range_f32("movement.walk_level", self.movement.walk_level, 0.1, 1.0);
+        problems.range_f32("movement.run_level", self.movement.run_level, 0.1, 1.0);
+        problems.range_u32("movement.ramp_up_ms", self.movement.ramp_up_ms, 0, 1000);
+        problems.range_u32("movement.ramp_down_ms", self.movement.ramp_down_ms, 0, 1000);
+        for (field, names) in [
+            ("movement.walk_keys", &self.movement.walk_keys),
+            ("movement.run_keys", &self.movement.run_keys),
+        ] {
+            for name in names {
+                if !KEYBOARD_KEYS.contains(&name.as_str()) {
+                    problems.add(field, format!("\"{name}\" is not a known key"));
+                }
+            }
+        }
+        for (field, name) in [
+            ("mouse_wheel.up", &self.mouse_wheel.up),
+            ("mouse_wheel.down", &self.mouse_wheel.down),
+        ] {
+            if !name.is_empty() && Action::from_name(name).is_none() {
+                problems.add(field, format!("\"{name}\" is not an action"));
+            }
+        }
         problems.range_f32(
             "gamepad_look_sensitivity",
             self.gamepad_look_sensitivity,
@@ -381,8 +485,13 @@ fn documented_defaults() -> String {
         "\
 # Leonida input settings. Delete this file (or run `leonida config reset`) to get it back with the defaults.
 
-# How fast the mouse turns the camera. 0.05 to 10.0, 1.0 is the game's own speed.
+# How fast the mouse turns the camera. 0.05 to 10.0, 1.0 is the game's own speed. The two axis values
+# multiply it for sideways and up-and-down movement.
 mouse_sensitivity = 1.0
+mouse_sensitivity_x = 1.0
+mouse_sensitivity_y = 1.0
+# 0.0 turns the camera by exactly what the mouse moved; up to 1.0 averages over about a tenth of a second.
+mouse_smoothing = 0.0
 mouse_invert_x = false
 mouse_invert_y = false
 
@@ -395,6 +504,22 @@ gamepad_invert_y = false
 left_stick = 0.15
 right_stick = 0.15
 trigger = 0.05
+
+# The keyboard standing in for the left stick. A level is how far the stick is pushed (0.1 to 1.0); the ramps
+# are the milliseconds it takes to get there and back (0 for none); walk and run keys switch the level.
+[movement]
+level = 1.0
+walk_level = 0.4
+run_level = 1.0
+ramp_up_ms = 80
+ramp_down_ms = 50
+walk_keys = [\"LeftAlt\"]
+run_keys = [\"LeftShift\"]
+
+# What turning the mouse wheel does, as an action name (\"\" for nothing).
+[mouse_wheel]
+up = \"weapon_previous\"
+down = \"weapon_next\"
 
 # Each action lists the keys or buttons that trigger it; an empty list leaves it unbound, and an action left
 # out keeps its default. Moving and looking with the gamepad are on its sticks and cannot be rebound.
@@ -472,6 +597,68 @@ mouse_sensitivity = 0\n[dead_zones]\ntrigger = 1.5\n[keyboard]\njump = [\"Spaceb
         );
         assert!(
             error.contains("gamepad.fire: entry 1 \"Z\" is not a known button"),
+            "{error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod keyboard_mouse_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_layout_is_a_pc_open_world_one() {
+        let input = Input::default();
+        for (action, key) in [
+            (Action::Jump, "Space"),
+            (Action::Sprint, "LeftShift"),
+            (Action::Interact, "E"),
+            (Action::EnterVehicle, "F"),
+            (Action::WeaponWheel, "Tab"),
+            (Action::Fire, "Mouse1"),
+            (Action::Aim, "Mouse2"),
+            (Action::Pause, "Escape"),
+        ] {
+            assert_eq!(input.keys(action), [key], "{}", action.name());
+        }
+        assert_eq!(input.mouse_wheel.up, "weapon_previous");
+        assert_eq!(input.mouse_wheel.down, "weapon_next");
+        assert_eq!(input.movement.walk_keys, ["LeftAlt"]);
+    }
+
+    #[test]
+    fn mouse_and_movement_settings_remap_from_toml() {
+        let input = Input::parse(
+            "mouse_sensitivity_x = 2.0\nmouse_sensitivity_y = 0.5\nmouse_smoothing = 0.3\n\
+[movement]\nwalk_level = 0.25\nwalk_keys = [\"CapsLock\"]\nramp_up_ms = 0\n\
+[mouse_wheel]\nup = \"\"\ndown = \"jump\"\n[keyboard]\nfire = [\"Mouse4\"]\n",
+        )
+        .unwrap();
+        assert_eq!(input.mouse_sensitivity_x, 2.0);
+        assert_eq!(input.mouse_sensitivity_y, 0.5);
+        assert_eq!(input.mouse_smoothing, 0.3);
+        assert_eq!(input.movement.walk_level, 0.25);
+        assert_eq!(input.movement.walk_keys, ["CapsLock"]);
+        assert_eq!(input.movement.run_keys, ["LeftShift"]);
+        assert_eq!(input.movement.ramp_up_ms, 0);
+        assert_eq!(input.mouse_wheel.up, "");
+        assert_eq!(input.mouse_wheel.down, "jump");
+        assert_eq!(input.keys(Action::Fire), ["Mouse4"]);
+    }
+
+    #[test]
+    fn bad_movement_and_wheel_settings_are_reported() {
+        let text = "mouse_smoothing = 2.0\n[movement]\nlevel = 0.0\nrun_keys = [\"Hyper\"]\n\
+[mouse_wheel]\nup = \"fly\"\n";
+        let error = Input::parse(text).unwrap_err().to_string();
+        assert!(
+            error.contains("mouse_smoothing: must be between"),
+            "{error}"
+        );
+        assert!(error.contains("movement.level: must be between"), "{error}");
+        assert!(error.contains("movement.run_keys: \"Hyper\""), "{error}");
+        assert!(
+            error.contains("mouse_wheel.up: \"fly\" is not an action"),
             "{error}"
         );
     }

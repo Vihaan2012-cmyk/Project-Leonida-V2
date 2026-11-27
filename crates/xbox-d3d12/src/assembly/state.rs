@@ -85,6 +85,7 @@ impl From<&WindowOptionsConfig> for WindowOptions {
                 WindowMode::Windowed
             },
             hotkeys: c.hotkeys,
+            ..WindowOptions::default()
         }
     }
 }
