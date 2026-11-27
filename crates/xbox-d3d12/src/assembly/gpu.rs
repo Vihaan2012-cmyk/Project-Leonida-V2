@@ -221,6 +221,12 @@ impl Gpu {
         if v12.timeline_semaphore != vk::TRUE {
             return Err("no timeline semaphores".into());
         }
+        if v12.runtime_descriptor_array != vk::TRUE
+            || v12.descriptor_binding_partially_bound != vk::TRUE
+            || v12.shader_sampled_image_array_non_uniform_indexing != vk::TRUE
+        {
+            return Err("no descriptor indexing for the bindless image set".into());
+        }
         for name in memory::DEVICE_EXTENSIONS {
             if !has(&extensions, name) {
                 return Err(format!("no {}", name.to_string_lossy()));
@@ -469,7 +475,7 @@ impl Gpu {
                 image_array: (per_stage_images / 9)
                     .min(per_stage_storage / 15)
                     .clamp(0, 16384),
-                sampler_array: (per_stage_samplers / 2).clamp(0, 4096),
+                sampler_array: (per_stage_samplers / 2).clamp(0, 16384),
                 partially_bound: indexing,
                 sampler_min_max: min_max,
                 optional,
