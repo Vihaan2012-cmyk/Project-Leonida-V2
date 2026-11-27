@@ -9,3 +9,6 @@ pub use stream::{
     DEFAULT_LEAD_IN, FFMPEG_LEAD_IN, PACKET_SIZE, PacketHeader, Pcm, Xma2Config, Xma2Decoder,
     f32_to_i16,
 };
+
+#[cfg(test)]
+mod tests;

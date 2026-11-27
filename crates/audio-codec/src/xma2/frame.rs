@@ -22,16 +22,16 @@ const LOG2_FRAME_SIZE: u32 = 15;
 const OUT_LEN: usize = SAMPLES_PER_FRAME + SAMPLES_PER_FRAME / 2;
 const BASE_QUANT_STEP: i32 = 90;
 
-struct Tables {
-    sf: Vlc,
-    sf_rl: Vlc,
-    coef: [Vlc; 2],
-    vec4: Vlc,
-    vec2: Vlc,
-    vec1: Vlc,
+pub(super) struct Tables {
+    pub(super) sf: Vlc,
+    pub(super) sf_rl: Vlc,
+    pub(super) coef: [Vlc; 2],
+    pub(super) vec4: Vlc,
+    pub(super) vec2: Vlc,
+    pub(super) vec1: Vlc,
 }
 
-fn tables() -> &'static Tables {
+pub(super) fn tables() -> &'static Tables {
     static TABLES: OnceLock<Tables> = OnceLock::new();
     TABLES.get_or_init(|| {
         let pairs = |t: &[(u8, u8)], off: i32| {
@@ -240,6 +240,11 @@ impl FrameDecoder {
 
     pub fn channels(&self) -> usize {
         self.nb_channels
+    }
+
+    #[cfg(test)]
+    pub(super) fn band_count(&self, table_idx: usize) -> usize {
+        self.num_sfb[table_idx]
     }
 
     /// Forget the overlap state (after a seek or at stream start).
