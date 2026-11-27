@@ -9,6 +9,9 @@ mod skeleton;
 mod types;
 mod vertex;
 
+#[cfg(test)]
+mod testdata;
+
 pub use gltf::{ExportOptions, ExportedModel, LodSelection, export};
 pub use sidecar::parameter_name;
 pub use skeleton::joaat;
