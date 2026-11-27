@@ -439,6 +439,8 @@ impl<'p> Lifter<'p> {
             8,
             Expr::Call(Box::new(target), args),
         ));
+        // A float result comes back in xmm0; dead-code removal drops this when nothing reads it.
+        out.push(Stmt::Def(XMM0, 8, Expr::Var(Loc::Reg(RAX), 8)));
     }
 
     fn flags(&self, kind: FlagKind, a: Expr, b: Expr, w: u8, out: &mut Vec<Stmt>) {
@@ -1190,6 +1192,7 @@ const XMM0: Loc = Loc::Reg(VECTOR);
 fn last_result(block: &Block) -> Option<(Loc, u8)> {
     block.stmts.iter().rev().find_map(|s| match s {
         Stmt::Def(loc @ Loc::Reg(RAX), w, _) => Some((*loc, *w)),
+        Stmt::Def(Loc::Reg(VECTOR), _, Expr::Var(Loc::Reg(RAX), _)) => None,
         Stmt::Def(loc @ Loc::Reg(VECTOR), w, _) => Some((*loc, *w)),
         Stmt::Clobber(locs) => [Loc::Reg(RAX), XMM0]
             .into_iter()

@@ -144,9 +144,10 @@ fn counted_loop() {
         a.ret()
     });
     assert!(text.contains("do {"), "{text}");
-    assert!(text.contains("eax += ecx;"), "{text}");
-    assert!(text.contains("} while (ecx != 0);"), "{text}");
-    assert!(text.contains("return eax;"), "{text}");
+    assert!(text.contains("v1 += a1;"), "{text}");
+    assert!(text.contains("a1 -= 1;"), "{text}");
+    assert!(text.contains("} while (a1 != 0);"), "{text}");
+    assert!(text.contains("return v1;"), "{text}");
 }
 
 #[test]
@@ -232,4 +233,41 @@ fn float_result_comes_from_xmm0() {
         "{text}"
     );
     assert!(text.contains("return a1 * a2 + a3;"), "{text}");
+}
+
+#[test]
+fn one_register_holding_two_values_gives_two_variables() {
+    let text = run(|a| {
+        a.mov(rax, qword_ptr(rcx))?;
+        a.mov(qword_ptr(rcx + 8), rax)?;
+        a.mov(qword_ptr(rcx + 0x10), rax)?;
+        a.mov(rax, qword_ptr(rcx + 0x20))?;
+        a.mov(qword_ptr(rcx + 0x28), rax)?;
+        a.mov(qword_ptr(rcx + 0x30), rax)?;
+        a.ret()
+    });
+    assert!(text.contains("v1 = *(u64 *)a1;"), "{text}");
+    assert!(text.contains("v2 = *(u64 *)(a1 + 0x20);"), "{text}");
+    assert!(!text.contains("rax"), "{text}");
+}
+
+#[test]
+fn a_value_merged_at_a_join_is_one_variable() {
+    // if (a1 == 0) v = 1 else v = a2; return v * v
+    let text = run(|a| {
+        let mut zero = a.create_label();
+        let mut join = a.create_label();
+        a.test(rcx, rcx)?;
+        a.je(zero)?;
+        a.mov(rax, rdx)?;
+        a.jmp(join)?;
+        a.set_label(&mut zero)?;
+        a.mov(eax, 1)?;
+        a.set_label(&mut join)?;
+        a.imul_2(rax, rax)?;
+        a.ret()
+    });
+    assert!(text.contains("v1 = 1;"), "{text}");
+    assert!(text.contains("v1 = a2;"), "{text}");
+    assert!(text.contains("return v1 * v1;"), "{text}");
 }

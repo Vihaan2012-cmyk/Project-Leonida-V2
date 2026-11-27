@@ -3,12 +3,12 @@ use std::collections::HashSet;
 use crate::expr::*;
 use crate::lift::{Block, Exit, Function, Stmt, volatile};
 
-fn partial(loc: Loc, w: u8) -> bool {
+pub fn partial(loc: Loc, w: u8) -> bool {
     match loc {
         Loc::Reg(r) if r < VECTOR => w < 4,
         Loc::Reg(_) => false,
         Loc::Stack(_) => w < 4,
-        Loc::Flags => false,
+        Loc::Flags | Loc::Var(_) => false,
     }
 }
 
@@ -21,7 +21,7 @@ impl Stmt {
         }
     }
 
-    fn map_exprs(&mut self, f: &mut impl FnMut(Expr) -> Expr) {
+    pub fn map_exprs(&mut self, f: &mut impl FnMut(Expr) -> Expr) {
         let take = |e: &mut Expr, f: &mut dyn FnMut(Expr) -> Expr| {
             let old = std::mem::replace(e, Expr::Const(0, 1));
             *e = f(old);
@@ -95,7 +95,7 @@ impl Exit {
         }
     }
 
-    fn map_expr(&mut self, f: &mut impl FnMut(Expr) -> Expr) {
+    pub fn map_expr(&mut self, f: &mut impl FnMut(Expr) -> Expr) {
         match self {
             Exit::Branch(e, ..)
             | Exit::Switch(e, ..)

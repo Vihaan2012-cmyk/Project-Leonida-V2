@@ -6,6 +6,7 @@ mod expr;
 mod lift;
 mod simplify;
 mod structure;
+mod vars;
 
 use expr::{Expr, Loc, Printer, register_name, type_name};
 use lift::{Function, Stmt};
@@ -63,12 +64,13 @@ pub fn decompile(program: &dyn Program, entry: u64) -> Result<String, Error> {
     dump(&function, "lifted");
     simplify::run(&mut function);
     simplify::merge_conditions(&mut function);
+    let vars = vars::rename(&mut function, 20_000).unwrap_or_default();
     dump(&function, "simplified");
     let (nodes, _) = structure::structure(&function);
     let title = program
         .name(entry)
         .unwrap_or_else(|| format!("sub_{:08x}", entry - function.base));
-    Ok(Writer::new(&function).function(&title, registers, &nodes))
+    Ok(Writer::new(&function, &vars).function(&title, registers, &nodes))
 }
 
 fn stack_name(o: i64) -> String {
@@ -83,22 +85,33 @@ fn stack_name(o: i64) -> String {
 
 struct Writer<'f> {
     f: &'f Function,
+    vars: &'f [vars::VarInfo],
     text: String,
     depth: usize,
 }
 
 impl<'f> Writer<'f> {
-    fn new(f: &'f Function) -> Self {
+    fn new(f: &'f Function, vars: &'f [vars::VarInfo]) -> Self {
         Self {
             f,
+            vars,
             text: String::new(),
             depth: 0,
+        }
+    }
+
+    fn var_name(&self, n: u32) -> String {
+        match self.vars.get(n as usize) {
+            Some(v) if v.param != 0 => format!("a{}", v.param),
+            _ => format!("v{}", n + 1),
         }
     }
 
     fn expr(&self, e: &Expr) -> String {
         Printer {
             stack_name: &stack_name,
+            var_width: &|n| self.vars.get(n as usize).map_or(8, |v| v.width),
+            var_name: &|n| self.var_name(n),
         }
         .expr(e)
     }
@@ -133,7 +146,13 @@ impl<'f> Writer<'f> {
                 note(e);
             }
         }
-        let count = i64::from(registers).max(stack_params);
+        let named = self
+            .vars
+            .iter()
+            .map(|v| i64::from(v.param))
+            .max()
+            .unwrap_or(0);
+        let count = i64::from(registers).max(stack_params).max(named);
         let params: Vec<String> = (1..=count).map(|n| format!("u64 a{n}")).collect();
         let returns = match self.f.returns {
             None => "void".to_string(),
@@ -163,6 +182,7 @@ impl<'f> Writer<'f> {
                 let target = Expr::Var(*loc, *w);
                 let lhs = match loc {
                     Loc::Reg(r) => register_name(*r, *w),
+                    Loc::Var(n) => self.var_name(*n),
                     _ => self.expr(&target),
                 };
                 assign(lhs, e, &target)
