@@ -6,7 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+iced-x86.workspace = true
+pe-image.workspace = true
 thiserror.workspace = true
+windows-sys.workspace = true
+
+[dev-dependencies]
+pe-loader.workspace = true
 
 [lints]
 workspace = true
