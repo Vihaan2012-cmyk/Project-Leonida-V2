@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+content-filter.workspace = true
 decompile.workspace = true
 game-package.workspace = true
 gpu.workspace = true
@@ -16,6 +17,7 @@ leonida-ui.workspace = true
 offline.workspace = true
 pe-image.workspace = true
 pe-loader.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 shims.workspace = true
 rdna.workspace = true

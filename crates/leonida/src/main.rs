@@ -1,5 +1,6 @@
 mod cli;
 mod cmd_check;
+mod cmd_content;
 mod cmd_exe;
 mod cmd_package;
 mod cmd_run;
@@ -13,7 +14,7 @@ use std::process::ExitCode;
 use anyhow::anyhow;
 use clap::Parser;
 
-use cli::{Cli, Command, ShadersCommand};
+use cli::{Cli, Command, ContentCommand, ShadersCommand};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -31,6 +32,9 @@ fn main() -> ExitCode {
         Some(Command::Check(args)) => cmd_check::check_command(args),
         Some(Command::Run(args)) => cmd_run::run_command(args),
         Some(Command::Triage(args)) => cmd_package::triage_command(args),
+        Some(Command::Content(content)) => match &content.command {
+            ContentCommand::Scan(args) => cmd_content::scan_command(args),
+        },
     };
     result.unwrap_or_else(|error| {
         eprintln!("error: {error:#}");

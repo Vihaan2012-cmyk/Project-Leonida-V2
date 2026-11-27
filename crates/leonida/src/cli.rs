@@ -24,6 +24,43 @@ pub enum Command {
     Run(RunArgs),
     /// Look at every file in the game folder for signs of tampering, without running or loading anything.
     Triage(TriageArgs),
+    /// The nudity filter: find what to hide.
+    Content(ContentArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ContentArgs {
+    #[command(subcommand)]
+    pub command: ContentCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ContentCommand {
+    /// Find the resources that show nudity and write the blocklist to OUTPUT. Reads archives, changes nothing.
+    Scan(ContentScanArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ContentScanArgs {
+    /// The game folder. Searched for when omitted.
+    #[arg(long)]
+    pub game: Option<PathBuf>,
+    /// An archive to read, relative to the game folder. Repeat for several. Default: packs.rpf and
+    /// pack/core_restofworld/core_restofworld.rpf (levels.rpf adds the mannequins and takes much longer).
+    #[arg(long = "archive")]
+    pub archives: Vec<String>,
+    /// Only read this many bytes of each archive, for a quick sample.
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Decoded ped catalogues (JSON from a catalogue decoder) to derive replacements and texture rules from.
+    #[arg(long)]
+    pub catalogues: Option<PathBuf>,
+    /// Where Leonida writes what it makes. The blocklist goes to <OUTPUT>/content-blocklist.json.
+    #[arg(long, default_value = "Output")]
+    pub output: PathBuf,
+    /// Leonida.toml, to report whether nudity is set to block or allow.
+    #[arg(long, default_value = "Config/leonida.toml")]
+    pub config: PathBuf,
 }
 
 #[derive(Debug, Args)]
