@@ -113,7 +113,10 @@ fn scalar_float_width(name: &str, i: &Instruction) -> Option<u8> {
     if i.op_count() == 0 || i.op0_kind() != OpKind::Register || !i.op0_register().is_xmm() {
         return None;
     }
-    let name = name.to_ascii_lowercase();
+    scalar_suffix(&name.to_ascii_lowercase())
+}
+
+fn scalar_suffix(name: &str) -> Option<u8> {
     if name.starts_with('p') || name.starts_with("vp") || name.contains("broadcast") {
         return None;
     }
@@ -122,6 +125,51 @@ fn scalar_float_width(name: &str, i: &Instruction) -> Option<u8> {
         "sd" => Some(8),
         _ => None,
     }
+}
+
+/// The width of the scalar float an instruction reads from its xmm operands.
+fn scalar_float_source(name: &str, i: &Instruction) -> Option<u8> {
+    if !(0..i.op_count()).any(|op| i.op_kind(op) == OpKind::Register && i.op_register(op).is_xmm())
+    {
+        return None;
+    }
+    let name = name.to_ascii_lowercase();
+    if name.contains("ss2") {
+        Some(4)
+    } else if name.contains("sd2") {
+        Some(8)
+    } else {
+        scalar_suffix(&name)
+    }
+}
+
+/// `vmulps` on a ymm register becomes `_mm256_mul_ps`; mnemonics without a known intrinsic keep their name.
+fn intrinsic_name(mnemonic: &str, i: &Instruction) -> String {
+    let lower = mnemonic.to_ascii_lowercase();
+    let bare = lower.strip_prefix('v').unwrap_or(&lower);
+    let wide = (0..i.op_count()).any(|op| {
+        i.op_kind(op) == OpKind::Register
+            && (i.op_register(op).is_ymm() || i.op_register(op).is_zmm())
+    });
+    let prefix = if wide { "_mm256_" } else { "_mm_" };
+    let (stem, suffix) = match bare.len().checked_sub(2).map(|k| bare.split_at(k)) {
+        Some((stem, suffix @ ("ps" | "pd" | "ss" | "sd"))) => (stem, suffix),
+        _ => return lower,
+    };
+    let stem = match stem {
+        "unpckl" => "unpacklo",
+        "unpckh" => "unpackhi",
+        "shuf" => "shuffle",
+        "movmsk" => "movemask",
+        "blendv" => "blendv",
+        "permil" => "permute",
+        "sqrt" | "min" | "max" | "and" | "andn" | "or" | "xor" | "hadd" | "hsub" | "rcp"
+        | "rsqrt" | "dp" | "round" | "blend" | "cmp" | "addsub" | "broadcast" | "insert"
+        | "extract" | "fmadd213" | "fmadd231" | "fmadd132" | "fnmadd213" | "fnmadd231"
+        | "fmsub213" | "fmsub231" | "fnmsub231" | "fnmsub213" | "rcpps" => stem,
+        _ => return lower,
+    };
+    format!("{prefix}{stem}_{suffix}")
 }
 
 fn float_memory(i: &Instruction) -> bool {
@@ -222,6 +270,8 @@ pub struct Lifter<'p> {
     frame: Option<i64>,
     /// The width of the vector register an instruction writes when it is a scalar float operation.
     scalar: Option<u8>,
+    /// The width of the scalar float the instruction reads from vector registers.
+    scalar_source: Option<u8>,
 }
 
 impl<'p> Lifter<'p> {
@@ -234,6 +284,7 @@ impl<'p> Lifter<'p> {
             saves: HashMap::new(),
             frame: None,
             scalar: None,
+            scalar_source: None,
         }
     }
 
@@ -269,10 +320,16 @@ impl<'p> Lifter<'p> {
         }
         match reg(r) {
             Some((index, _, true)) => Expr::Cast(
-                "u8",
+                "uint8_t",
                 Box::new(bin(">>", Expr::Var(Loc::Reg(index), 2), Expr::Const(8, 1))),
             ),
-            Some((index, w, false)) => Expr::Var(Loc::Reg(index), w),
+            Some((index, w, false)) => {
+                let w = match self.scalar_source {
+                    Some(scalar) if index >= VECTOR => scalar,
+                    _ => w,
+                };
+                Expr::Var(Loc::Reg(index), w)
+            }
             None => Expr::Name(format!("{r:?}").to_lowercase()),
         }
     }
@@ -462,6 +519,7 @@ impl<'p> Lifter<'p> {
         let last = i.op_count().saturating_sub(1);
         let name = format!("{m:?}");
         self.scalar = scalar_float_width(&name, i);
+        self.scalar_source = scalar_float_source(&name, i);
         match m {
             M::Nop
             | M::Endbr64
@@ -785,7 +843,7 @@ impl<'p> Lifter<'p> {
                 4,
                 bin(
                     ">>",
-                    Expr::Cast("i32", Box::new(Expr::Var(Loc::Reg(RAX), 4))),
+                    Expr::Cast("int32_t", Box::new(Expr::Var(Loc::Reg(RAX), 4))),
                     Expr::Const(31, 1),
                 ),
             )),
@@ -794,20 +852,58 @@ impl<'p> Lifter<'p> {
                 8,
                 bin(
                     ">>",
-                    Expr::Cast("i64", Box::new(Expr::Var(Loc::Reg(RAX), 8))),
+                    Expr::Cast("int64_t", Box::new(Expr::Var(Loc::Reg(RAX), 8))),
                     Expr::Const(63, 1),
                 ),
             )),
-            M::Addss | M::Addsd | M::Vaddss | M::Vaddsd => self.scalar(i, "+", st, out),
-            M::Subss | M::Subsd | M::Vsubss | M::Vsubsd => self.scalar(i, "-", st, out),
-            M::Mulss | M::Mulsd | M::Vmulss | M::Vmulsd => self.scalar(i, "*", st, out),
-            M::Divss | M::Divsd | M::Vdivss | M::Vdivsd => self.scalar(i, "/", st, out),
+            M::Addss
+            | M::Addsd
+            | M::Vaddss
+            | M::Vaddsd
+            | M::Addps
+            | M::Addpd
+            | M::Vaddps
+            | M::Vaddpd => self.scalar(i, "+", st, out),
+            M::Subss
+            | M::Subsd
+            | M::Vsubss
+            | M::Vsubsd
+            | M::Subps
+            | M::Subpd
+            | M::Vsubps
+            | M::Vsubpd => self.scalar(i, "-", st, out),
+            M::Mulss
+            | M::Mulsd
+            | M::Vmulss
+            | M::Vmulsd
+            | M::Mulps
+            | M::Mulpd
+            | M::Vmulps
+            | M::Vmulpd => self.scalar(i, "*", st, out),
+            M::Divss
+            | M::Divsd
+            | M::Vdivss
+            | M::Vdivsd
+            | M::Divps
+            | M::Divpd
+            | M::Vdivps
+            | M::Vdivpd => self.scalar(i, "/", st, out),
+            M::Ptest | M::Vptest | M::Vtestps | M::Vtestpd => {
+                let (a, b) = (self.read(i, 0, st), self.read(i, 1, st));
+                self.flags(FlagKind::Test, a, b, 16, out);
+            }
+            M::Blsr | M::Blsi | M::Blsmsk => {
+                let value = Expr::Intrinsic(name.to_lowercase(), vec![self.read(i, 1, st)]);
+                self.write(i, 0, value, st, out);
+                let result = self.read(i, 0, st);
+                self.flags(FlagKind::Result, result, Expr::Const(0, w), w, out);
+            }
             M::Cvtsi2ss | M::Vcvtsi2ss | M::Cvtsd2ss | M::Vcvtsd2ss => {
-                let value = Expr::Cast("f32", Box::new(self.read(i, last, st)));
+                let value = Expr::Cast("float", Box::new(self.read(i, last, st)));
                 self.write(i, 0, value, st, out);
             }
             M::Cvtsi2sd | M::Vcvtsi2sd | M::Cvtss2sd | M::Vcvtss2sd => {
-                let value = Expr::Cast("f64", Box::new(self.read(i, last, st)));
+                let value = Expr::Cast("double", Box::new(self.read(i, last, st)));
                 self.write(i, 0, value, st, out);
             }
             M::Cvttss2si | M::Cvttsd2si | M::Vcvttss2si | M::Vcvttsd2si => {
@@ -894,7 +990,7 @@ impl<'p> Lifter<'p> {
             .filter(|&op| op > 0 || !writes || reads_destination)
             .map(|op| self.read(i, op, st))
             .collect();
-        let value = Expr::Intrinsic(format!("{:?}", i.mnemonic()).to_lowercase(), args);
+        let value = Expr::Intrinsic(intrinsic_name(&format!("{:?}", i.mnemonic()), i), args);
         if writes && matches!(i.op0_kind(), OpKind::Register | OpKind::Memory) {
             self.write(i, 0, value, st, out);
         } else {
@@ -1188,18 +1284,49 @@ fn absorb_defaults(blocks: &mut [Block]) {
 
 const XMM0: Loc = Loc::Reg(VECTOR);
 
-/// The last result register a block defines, and the width of that definition (0 for a clobber).
-fn last_result(block: &Block) -> Option<(Loc, u8)> {
-    block.stmts.iter().rev().find_map(|s| match s {
-        Stmt::Def(loc @ Loc::Reg(RAX), w, _) => Some((*loc, *w)),
-        Stmt::Def(Loc::Reg(VECTOR), _, Expr::Var(Loc::Reg(RAX), _)) => None,
-        Stmt::Def(loc @ Loc::Reg(VECTOR), w, _) => Some((*loc, *w)),
-        Stmt::Clobber(locs) => [Loc::Reg(RAX), XMM0]
-            .into_iter()
-            .find(|l| locs.contains(l))
-            .map(|l| (l, 0)),
-        _ => None,
-    })
+enum Result {
+    /// A register is defined last and nothing reads it afterwards: it carries the return value.
+    Value(Loc, u8),
+    /// Defined, but only as a scratch register.
+    Scratch,
+    Unknown,
+}
+
+fn last_result(block: &Block) -> Result {
+    let mut best: Option<(usize, Loc, u8)> = None;
+    let mut scratch = false;
+    for loc in [Loc::Reg(RAX), XMM0] {
+        let found = block
+            .stmts
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(k, s)| match s {
+                Stmt::Def(l, _, Expr::Var(Loc::Reg(RAX), _)) if *l == XMM0 && loc == XMM0 => None,
+                Stmt::Def(l, w, _) if *l == loc => Some((k, *w)),
+                Stmt::Clobber(locs) if locs.contains(&loc) => Some((k, 0)),
+                _ => None,
+            });
+        let Some((k, w)) = found else { continue };
+        let read_later = block.stmts[k + 1..].iter().any(|s| match s {
+            Stmt::Def(Loc::Flags, ..) => false,
+            Stmt::Def(l, _, Expr::Var(Loc::Reg(RAX), _)) if *l == XMM0 => false,
+            _ => s
+                .exprs()
+                .iter()
+                .any(|e| e.reads().iter().any(|(l, _)| *l == loc)),
+        });
+        if read_later {
+            scratch = true;
+        } else if best.is_none_or(|(at, ..)| k > at) {
+            best = Some((k, loc, w));
+        }
+    }
+    match best {
+        Some((_, loc, w)) => Result::Value(loc, w),
+        None if scratch => Result::Scratch,
+        None => Result::Unknown,
+    }
 }
 
 fn return_register(blocks: &[Block], pred: &[Vec<usize>]) -> Option<(Loc, u8)> {
@@ -1208,10 +1335,16 @@ fn return_register(blocks: &[Block], pred: &[Vec<usize>]) -> Option<(Loc, u8)> {
         if !matches!(block.exit, Exit::Return(_)) {
             continue;
         }
-        let mut found: Vec<(Loc, u8)> = last_result(block).into_iter().collect();
-        if found.is_empty() {
-            for &p in &pred[b] {
-                found.extend(last_result(&blocks[p]));
+        let mut found: Vec<(Loc, u8)> = Vec::new();
+        match last_result(block) {
+            Result::Value(loc, w) => found.push((loc, w)),
+            Result::Scratch => {}
+            Result::Unknown => {
+                for &p in &pred[b] {
+                    if let Result::Value(loc, w) = last_result(&blocks[p]) {
+                        found.push((loc, w));
+                    }
+                }
             }
         }
         for (loc, w) in found.into_iter().filter(|(_, w)| *w > 0) {
