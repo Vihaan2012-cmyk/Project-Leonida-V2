@@ -182,7 +182,11 @@ slot by looking its descriptor up:
 
 - Descriptor set 1: binding 0 is the texture table, binding 1 the sampler table (storage buffers), binding 2 the
   sampler array, then one sampled-image array per dimension and number type: 2D (also 1D) at 3/4/5, 2D array (also
-  1D array and cube, as six layers) at 6/7/8, 3D at 9/10/11, for float, unsigned and signed formats.
+  1D array and cube, as six layers) at 6/7/8, 3D at 9/10/11, for float, unsigned and signed formats. Bindings
+  12-20 repeat the same layout as storage images for writes, and binding 21 holds each sampler again with depth
+  comparison on (the S#'s DEPTH_COMPARE_FUNC), all at the same indices.
+- Image loads still read through the sampled views. A texture the same shader also writes would need its reads to
+  go through the storage view instead; a spare bit in the slot word is reserved to flag those.
 - A table is `mask` followed by `mask + 1` entries of ten words: the descriptor (S# padded with zeros), the slot,
   and a spare word. FNV-1a over the eight key words picks the first entry; up to 16 entries are probed in order. The
   slot's top two bits give the number type, so the shader never decodes the T# format. A descriptor that is not

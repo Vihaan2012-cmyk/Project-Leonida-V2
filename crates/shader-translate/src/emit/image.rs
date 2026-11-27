@@ -5,7 +5,7 @@ use rspirv::spirv::{
 };
 use shader_ir::{Image, ImageDim, ImageOp};
 
-use super::{EmitError, Emitter, ok};
+use super::{EmitError, Emitter, GLOp, ok};
 use crate::images::{self, NUMBERS, Number, View};
 
 #[derive(Debug, Clone, Copy)]
@@ -17,6 +17,14 @@ pub(super) struct ImageTypes {
     ptr_sampler: Word,
     samplers: Word,
     tables: [Word; 2],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Extras {
+    compare: Option<Word>,
+    clamp: Option<Word>,
+    gradients: Option<(Word, Word)>,
+    offset: Option<Word>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,11 +115,19 @@ impl Emitter {
         types
     }
 
-    fn view(&mut self, view: View, number: Number) -> ViewIds {
-        if let Some(ids) = self.views.get(&(view, number)) {
+    fn view(&mut self, view: View, number: Number, storage: bool) -> ViewIds {
+        if let Some(ids) = self.views.get(&(view, number, storage)) {
             return *ids;
         }
         let types = self.image_types();
+        if storage {
+            for capability in [
+                Capability::StorageImageWriteWithoutFormat,
+                Capability::StorageImageArrayNonUniformIndexing,
+            ] {
+                self.b.capability(capability);
+            }
+        }
         let component = match number {
             Number::Float => self.t.f32_,
             Number::Uint => self.t.u32_,
@@ -122,30 +138,60 @@ impl Emitter {
             View::D2Array => (Dim::Dim2D, 1),
             View::D3 => (Dim::Dim3D, 0),
         };
-        let image = self
-            .b
-            .type_image(component, dim, 0, arrayed, 0, 1, ImageFormat::Unknown, None);
+        let sampled = if storage { 2 } else { 1 };
+        let image = self.b.type_image(
+            component,
+            dim,
+            0,
+            arrayed,
+            0,
+            sampled,
+            ImageFormat::Unknown,
+            None,
+        );
         let array = self.b.type_runtime_array(image);
         let ptr_array = self
             .b
             .type_pointer(None, StorageClass::UniformConstant, array);
-        let var = self.global(
-            ptr_array,
-            StorageClass::UniformConstant,
-            images::binding(view, number),
-        );
+        let binding = if storage {
+            images::storage_binding(view, number)
+        } else {
+            images::binding(view, number)
+        };
+        let var = self.global(ptr_array, StorageClass::UniformConstant, binding);
         let ids = ViewIds {
             var,
             image,
             ptr: self
                 .b
                 .type_pointer(None, StorageClass::UniformConstant, image),
-            sampled: self.b.type_sampled_image(image),
+            sampled: if storage {
+                0
+            } else {
+                self.b.type_sampled_image(image)
+            },
         };
-        self.views.insert((view, number), ids);
+        self.views.insert((view, number, storage), ids);
         ids
     }
 
+    fn compare_samplers(&mut self) -> Word {
+        if let Some(id) = self.compare_samplers {
+            return id;
+        }
+        let types = self.image_types();
+        let array = self.b.type_runtime_array(types.sampler);
+        let ptr_array = self
+            .b
+            .type_pointer(None, StorageClass::UniformConstant, array);
+        let id = self.global(
+            ptr_array,
+            StorageClass::UniformConstant,
+            images::COMPARE_SAMPLERS,
+        );
+        self.compare_samplers = Some(id);
+        id
+    }
     fn i32c(&mut self, value: i32) -> Word {
         let ty = self.image_types().i32_;
         *self
@@ -254,19 +300,9 @@ impl Emitter {
         Ok(words[component])
     }
 
-    fn image_words(&mut self, image: &Image) -> Result<[Word; 4], EmitError> {
-        if image.op == ImageOp::Sample {
-            return Err(EmitError::Unsupported(
-                "implicit-LOD sampling outside a pixel shader",
-            ));
-        }
-        let sampled = image.sampler.is_some();
-        if sampled && image.unnormalized && image.dim == ImageDim::Cube {
-            return Err(EmitError::Unsupported("unnormalized cube-map coordinates"));
-        }
+    /// The bindless index and number type registered for the instruction's T#.
+    fn texture_slot(&mut self, image: &Image) -> Result<(Word, Word), EmitError> {
         let u32_ = self.t.u32_;
-        let types = self.image_types();
-        let view = View::of(image.dim);
         let key: Vec<Word> = image
             .resource
             .iter()
@@ -278,37 +314,39 @@ impl Emitter {
         let index = ok(self.b.bitwise_and(u32_, None, entry, mask))?;
         let thirty = self.u32c(30);
         let number = ok(self.b.shift_right_logical(u32_, None, entry, thirty))?;
-        let sampler = match image.sampler {
-            Some(words) => {
-                let zero = self.u32c(0);
-                let key: Vec<Word> = words
-                    .iter()
-                    .map(|t| self.values[*t as usize])
-                    .chain([zero; 4])
-                    .collect();
-                let lookup = self.lookup_function(1);
-                let entry = ok(self.b.function_call(u32_, None, lookup, key))?;
-                let slot = ok(self.b.bitwise_and(u32_, None, entry, mask))?;
-                let ptr = ok(self
-                    .b
-                    .access_chain(types.ptr_sampler, None, types.samplers, [slot]))?;
-                let ptr = self.nonuniform(ptr);
-                let loaded = ok(self.b.load(types.sampler, None, ptr, None, []))?;
-                Some(self.nonuniform(loaded))
-            }
-            None => None,
-        };
-        let values: Vec<Word> = image
-            .coordinates
+        Ok((index, number))
+    }
+
+    fn sampler_handle(&mut self, words: [u32; 4], compare: bool) -> Result<Word, EmitError> {
+        let u32_ = self.t.u32_;
+        let types = self.image_types();
+        let zero = self.u32c(0);
+        let key: Vec<Word> = words
             .iter()
             .map(|t| self.values[*t as usize])
+            .chain([zero; 4])
             .collect();
-        let coordinates = if sampled {
-            self.sample_coordinates(image.dim, &values)?
+        let lookup = self.lookup_function(1);
+        let entry = ok(self.b.function_call(u32_, None, lookup, key))?;
+        let mask = self.u32c(images::SLOT_MASK);
+        let slot = ok(self.b.bitwise_and(u32_, None, entry, mask))?;
+        let array = if compare {
+            self.compare_samplers()
         } else {
-            self.load_coordinates(image.dim, &values)?
+            types.samplers
         };
-        let lod = image.lod.map(|t| self.values[t as usize]);
+        let ptr = ok(self.b.access_chain(types.ptr_sampler, None, array, [slot]))?;
+        let ptr = self.nonuniform(ptr);
+        let loaded = ok(self.b.load(types.sampler, None, ptr, None, []))?;
+        Ok(self.nonuniform(loaded))
+    }
+
+    /// Runs `arm` once per number type, switching on the registered one, and joins the four result words.
+    fn per_number(
+        &mut self,
+        number: Word,
+        mut arm: impl FnMut(&mut Self, Number) -> Result<Option<Word>, EmitError>,
+    ) -> Result<Option<Word>, EmitError> {
         let labels = [self.b.id(), self.b.id(), self.b.id()];
         let merge = self.b.id();
         ok(self.b.selection_merge(merge, SelectionControl::NONE))?;
@@ -323,13 +361,60 @@ impl Emitter {
         let mut arms = Vec::new();
         for (number, label) in NUMBERS.into_iter().zip(labels) {
             self.begin(label)?;
-            let bits = self.image_arm(image, view, number, index, sampler, coordinates, lod)?;
-            arms.push((bits, self.label));
+            if let Some(bits) = arm(self, number)? {
+                arms.push((bits, self.label));
+            }
             ok(self.b.branch(merge))?;
         }
         self.begin(merge)?;
+        if arms.is_empty() {
+            return Ok(None);
+        }
         let uvec4 = self.t.uvec4;
-        let result = ok(self.b.phi(uvec4, None, arms))?;
+        Ok(Some(ok(self.b.phi(uvec4, None, arms))?))
+    }
+
+    fn image_words(&mut self, image: &Image) -> Result<[Word; 4], EmitError> {
+        if image.op.implicit() {
+            return Err(EmitError::Unsupported(
+                "implicit-LOD sampling outside a pixel shader",
+            ));
+        }
+        let sampled = image.sampler.is_some();
+        if sampled
+            && image.unnormalized
+            && (image.dim == ImageDim::Cube || !image.gradients.is_empty())
+        {
+            return Err(EmitError::Unsupported(
+                "unnormalized coordinates on a cube map or with gradients",
+            ));
+        }
+        if image.offset.is_some() && matches!(image.dim, ImageDim::Cube | ImageDim::D3) {
+            return Err(EmitError::Unsupported("offsets on cube maps and volumes"));
+        }
+        let u32_ = self.t.u32_;
+        let view = View::of(image.dim);
+        let (index, number) = self.texture_slot(image)?;
+        let sampler = match image.sampler {
+            Some(words) => Some(self.sampler_handle(words, image.compare.is_some())?),
+            None => None,
+        };
+        let values: Vec<Word> = image
+            .coordinates
+            .iter()
+            .map(|t| self.values[*t as usize])
+            .collect();
+        let coordinates = match image.op {
+            ImageOp::Size => 0,
+            _ if sampled => self.sample_coordinates(image.dim, &values)?,
+            _ => self.load_coordinates(image.dim, &values)?,
+        };
+        let extras = self.sample_extras(image, view)?;
+        let result = self.per_number(number, |e, number| {
+            e.image_arm(image, view, number, index, sampler, coordinates, &extras)
+                .map(Some)
+        })?;
+        let result = result.expect("every arm returns a value");
         let mut words = [0; 4];
         for (component, word) in words.iter_mut().enumerate() {
             *word = ok(self
@@ -337,6 +422,66 @@ impl Emitter {
                 .composite_extract(u32_, None, result, [component as u32]))?;
         }
         Ok(words)
+    }
+
+    fn sample_extras(&mut self, image: &Image, view: View) -> Result<Extras, EmitError> {
+        let types = self.image_types();
+        let f32_ = self.t.f32_;
+        let float = |e: &mut Self, t: Option<u32>| -> Result<Option<Word>, EmitError> {
+            t.map(|t| e.float(e.values[t as usize])).transpose()
+        };
+        let compare = float(self, image.compare)?;
+        let clamp = float(self, image.clamp)?;
+        let gradients = if image.gradients.is_empty() {
+            None
+        } else {
+            let each = image.gradients.len() / 2;
+            let spatial = if view == View::D3 { 3 } else { 2 };
+            let mut directions = Vec::new();
+            for direction in image.gradients.chunks(each) {
+                let mut parts = Vec::new();
+                for t in direction {
+                    parts.push(self.float(self.values[*t as usize])?);
+                }
+                let zero = self.f32c(0.0);
+                parts.resize(spatial, zero);
+                directions.push(ok(self.b.composite_construct(
+                    types.floats[spatial],
+                    None,
+                    parts,
+                ))?);
+            }
+            Some((directions[0], directions[1]))
+        };
+        let offset = match image.offset {
+            Some(t) => {
+                let packed = self.values[t as usize];
+                let u32_ = self.t.u32_;
+                let mut parts = Vec::new();
+                for shift in [26, 18] {
+                    let up = self.u32c(shift);
+                    let raised = ok(self.b.shift_left_logical(u32_, None, packed, up))?;
+                    let down = self.u32c(26);
+                    let value = ok(self.b.shift_right_arithmetic(u32_, None, raised, down))?;
+                    parts.push(ok(self.b.bitcast(types.i32_, None, value))?);
+                }
+                if view == View::D2Array || view == View::D2 {
+                    self.b.capability(Capability::ImageGatherExtended);
+                }
+                Some(ok(self.b.composite_construct(types.ints[2], None, parts))?)
+            }
+            None => None,
+        };
+        if clamp.is_some() {
+            self.b.capability(Capability::MinLod);
+        }
+        let _ = f32_;
+        Ok(Extras {
+            compare,
+            clamp,
+            gradients,
+            offset,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -348,10 +493,10 @@ impl Emitter {
         index: Word,
         sampler: Option<Word>,
         coordinates: Word,
-        lod: Option<Word>,
+        extras: &Extras,
     ) -> Result<Word, EmitError> {
         let types = self.image_types();
-        let ids = self.view(view, number);
+        let ids = self.view(view, number, false);
         let ptr = ok(self.b.access_chain(ids.ptr, None, ids.var, [index]))?;
         let ptr = self.nonuniform(ptr);
         let texture = ok(self.b.load(ids.image, None, ptr, None, []))?;
@@ -361,6 +506,10 @@ impl Emitter {
             Number::Uint => self.t.uvec4,
             Number::Sint => types.ints[4],
         };
+        let lod = image.lod.map(|t| self.values[t as usize]);
+        if image.op == ImageOp::Size {
+            return self.size_query(image.dim, view, texture, lod);
+        }
         let value = match (image.op, sampler) {
             (ImageOp::Load | ImageOp::LoadMip, _) => {
                 let mip = match lod {
@@ -384,34 +533,210 @@ impl Emitter {
                 };
                 let combined = ok(self.b.sampled_image(ids.sampled, None, texture, sampler))?;
                 let combined = self.nonuniform(combined);
-                if let ImageOp::Gather { channel } = op {
-                    let channel = self.u32c(u32::from(channel));
-                    ok(self
-                        .b
-                        .image_gather(vec4, None, combined, coordinates, channel, None, []))?
-                } else {
-                    let level = match lod {
-                        Some(level) => self.float(level)?,
-                        None => self.f32c(0.0),
-                    };
-                    ok(self.b.image_sample_explicit_lod(
+                let level = |e: &mut Self| -> Result<(ImageOperands, Vec<Operand>), EmitError> {
+                    Ok(match (op, extras.gradients) {
+                        (ImageOp::SampleGrad, Some((dx, dy))) => {
+                            let mut operands = vec![Operand::IdRef(dx), Operand::IdRef(dy)];
+                            let mut mask = ImageOperands::GRAD;
+                            if let Some(clamp) = extras.clamp {
+                                mask |= ImageOperands::MIN_LOD;
+                                operands.push(Operand::IdRef(clamp));
+                            }
+                            (mask, operands)
+                        }
+                        _ => {
+                            let level = match lod {
+                                Some(level) if op == ImageOp::SampleLod => e.float(level)?,
+                                _ => e.f32c(0.0),
+                            };
+                            (ImageOperands::LOD, vec![Operand::IdRef(level)])
+                        }
+                    })
+                };
+                let gather_operands = match extras.offset {
+                    Some(offset) => (Some(ImageOperands::OFFSET), vec![Operand::IdRef(offset)]),
+                    None => (None, Vec::new()),
+                };
+                match (op, extras.compare) {
+                    (_, Some(_)) if number != Number::Float => {
+                        let zero = self.u32c(0);
+                        return ok(self.b.composite_construct(self.t.uvec4, None, [zero; 4]));
+                    }
+                    (ImageOp::Gather { .. }, Some(reference)) => ok(self.b.image_dref_gather(
                         vec4,
                         None,
                         combined,
                         coordinates,
-                        ImageOperands::LOD,
-                        [Operand::IdRef(level)],
-                    ))?
+                        reference,
+                        gather_operands.0,
+                        gather_operands.1,
+                    ))?,
+                    (_, Some(reference)) => {
+                        let (mask, operands) = level(self)?;
+                        let f32_ = self.t.f32_;
+                        let scalar = ok(self.b.image_sample_dref_explicit_lod(
+                            f32_,
+                            None,
+                            combined,
+                            coordinates,
+                            reference,
+                            mask,
+                            operands,
+                        ))?;
+                        ok(self.b.composite_construct(vec4, None, [scalar; 4]))?
+                    }
+                    (ImageOp::Gather { channel }, None) => {
+                        let channel = self.u32c(u32::from(channel));
+                        ok(self.b.image_gather(
+                            vec4,
+                            None,
+                            combined,
+                            coordinates,
+                            channel,
+                            gather_operands.0,
+                            gather_operands.1,
+                        ))?
+                    }
+                    (_, None) => {
+                        let (mask, operands) = level(self)?;
+                        ok(self.b.image_sample_explicit_lod(
+                            vec4,
+                            None,
+                            combined,
+                            coordinates,
+                            mask,
+                            operands,
+                        ))?
+                    }
                 }
             }
             (_, None) => return Err(EmitError::Unsupported("sampling without a sampler")),
         };
-        Ok(match number {
+        let bits = match number {
             Number::Uint => value,
             _ => ok(self.b.bitcast(self.t.uvec4, None, value))?,
-        })
+        };
+        if !image.d16 {
+            return Ok(bits);
+        }
+        let u32_ = self.t.u32_;
+        let mut halves = Vec::new();
+        for component in 0..4 {
+            let word = ok(self.b.composite_extract(u32_, None, bits, [component]))?;
+            halves.push(match number {
+                Number::Float => self.single_to_half(word, shader_ir::Round::Even)?,
+                _ => {
+                    let mask = self.u32c(0xFFFF);
+                    ok(self.b.bitwise_and(u32_, None, word, mask))?
+                }
+            });
+        }
+        ok(self.b.composite_construct(self.t.uvec4, None, halves))
     }
 
+    /// Width, height, depth or layers, and the mip count; zero sizes past the last mip.
+    fn size_query(
+        &mut self,
+        dim: ImageDim,
+        view: View,
+        texture: Word,
+        mip: Option<Word>,
+    ) -> Result<Word, EmitError> {
+        let types = self.image_types();
+        let (u32_, bool_) = (self.t.u32_, self.t.bool_);
+        let levels = ok(self.b.image_query_levels(types.i32_, None, texture))?;
+        let levels = ok(self.b.bitcast(u32_, None, levels))?;
+        let mip = match mip {
+            Some(mip) => mip,
+            None => self.u32c(0),
+        };
+        let one = self.u32c(1);
+        let last = ok(self.b.i_sub(u32_, None, levels, one))?;
+        let level = self.glsl(u32_, GLOp::UMin, &[mip, last])?;
+        let level = ok(self.b.bitcast(types.i32_, None, level))?;
+        let count = if view == View::D2 { 2 } else { 3 };
+        let size = ok(self
+            .b
+            .image_query_size_lod(types.ints[count], None, texture, level))?;
+        let mut parts = Vec::new();
+        for axis in 0..count as u32 {
+            let part = ok(self.b.composite_extract(types.i32_, None, size, [axis]))?;
+            parts.push(ok(self.b.bitcast(u32_, None, part))?);
+        }
+        let inside = ok(self.b.u_less_than(bool_, None, mip, levels))?;
+        let zero = self.u32c(0);
+        let x = parts[0];
+        let (y, z) = match dim {
+            ImageDim::D1 => (one, one),
+            ImageDim::D1Array => (parts[2], one),
+            ImageDim::D2 => (parts[1], one),
+            ImageDim::Cube => {
+                let six = self.u32c(6);
+                (parts[1], ok(self.b.u_div(u32_, None, parts[2], six))?)
+            }
+            ImageDim::D2Array | ImageDim::D3 => (parts[1], parts[2]),
+        };
+        let mut words = Vec::new();
+        for value in [x, y, z] {
+            words.push(ok(self.b.select(u32_, None, inside, value, zero))?);
+        }
+        words.push(levels);
+        ok(self.b.composite_construct(self.t.uvec4, None, words))
+    }
+
+    pub(super) fn image_store(
+        &mut self,
+        image: &Image,
+        values: [Option<u32>; 4],
+    ) -> Result<(), EmitError> {
+        let types = self.image_types();
+        let u32_ = self.t.u32_;
+        let view = View::of(image.dim);
+        let (index, number) = self.texture_slot(image)?;
+        let coordinates: Vec<Word> = image
+            .coordinates
+            .iter()
+            .map(|t| self.values[*t as usize])
+            .collect();
+        let coordinates = self.load_coordinates(image.dim, &coordinates)?;
+        let zero = self.u32c(0);
+        let words: Vec<Word> = values
+            .iter()
+            .map(|v| v.map_or(zero, |t| self.values[t as usize]))
+            .collect();
+        self.per_number(number, |e, number| {
+            let ids = e.view(view, number, true);
+            let ptr = ok(e.b.access_chain(ids.ptr, None, ids.var, [index]))?;
+            let ptr = e.nonuniform(ptr);
+            let texture = ok(e.b.load(ids.image, None, ptr, None, []))?;
+            let texture = e.nonuniform(texture);
+            let mut parts = Vec::new();
+            for word in &words {
+                parts.push(if image.d16 {
+                    match number {
+                        Number::Float => e.half_to_single(*word, true)?,
+                        Number::Uint => *word,
+                        Number::Sint => {
+                            let sixteen = e.u32c(16);
+                            let up = ok(e.b.shift_left_logical(u32_, None, *word, sixteen))?;
+                            ok(e.b.shift_right_arithmetic(u32_, None, up, sixteen))?
+                        }
+                    }
+                } else {
+                    *word
+                });
+            }
+            let texel = ok(e.b.composite_construct(e.t.uvec4, None, parts))?;
+            let texel = match number {
+                Number::Uint => texel,
+                Number::Float => ok(e.b.bitcast(types.floats[4], None, texel))?,
+                Number::Sint => ok(e.b.bitcast(types.ints[4], None, texel))?,
+            };
+            ok(e.b.image_write(texture, coordinates, texel, None, []))?;
+            Ok(None)
+        })?;
+        Ok(())
+    }
     /// Hardware cube coordinates are face-relative in [1, 2]; the 2D array view wants [0, 1].
     fn sample_coordinates(&mut self, dim: ImageDim, values: &[Word]) -> Result<Word, EmitError> {
         let types = self.image_types();

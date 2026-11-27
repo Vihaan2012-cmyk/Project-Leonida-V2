@@ -533,6 +533,7 @@ impl Run<'_> {
                     }
                 }
             }
+            Stmt::ImageStore { .. } => return Err(RunError::Image),
             Stmt::Store {
                 when,
                 address,

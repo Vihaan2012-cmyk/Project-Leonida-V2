@@ -150,6 +150,15 @@ impl ImageDim {
             ImageDim::D3 | ImageDim::Cube | ImageDim::D2Array => 3,
         }
     }
+
+    /// Derivatives per screen direction for gradient sampling; a cube's are on its face.
+    pub fn gradients(self) -> usize {
+        match self {
+            ImageDim::D1 | ImageDim::D1Array => 1,
+            ImageDim::D2 | ImageDim::D2Array | ImageDim::Cube => 2,
+            ImageDim::D3 => 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -157,12 +166,29 @@ pub enum ImageOp {
     Load,
     LoadMip,
     Sample,
+    SampleBias,
     SampleLod,
     SampleLodZero,
+    SampleGrad,
     Gather { channel: u8 },
+    Size,
+    QueryLod,
+    Store,
+}
+
+impl ImageOp {
+    /// Whether the level of detail comes from screen-space derivatives, which only pixel shaders have.
+    pub fn implicit(self) -> bool {
+        matches!(
+            self,
+            ImageOp::Sample | ImageOp::SampleBias | ImageOp::QueryLod
+        )
+    }
 }
 
 /// One result component of an image instruction. Every component of one instruction shares all other fields.
+/// `lod` is the explicit level, bias or mip; `gradients` lists the horizontal derivatives, then the vertical
+/// ones. With `d16`, each component is a half (or the low 16 bits of an integer) in its low bits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Image {
     pub op: ImageOp,
@@ -171,7 +197,12 @@ pub struct Image {
     pub sampler: Option<[Tmp; 4]>,
     pub coordinates: Vec<Tmp>,
     pub lod: Option<Tmp>,
+    pub compare: Option<Tmp>,
+    pub gradients: Vec<Tmp>,
+    pub clamp: Option<Tmp>,
+    pub offset: Option<Tmp>,
     pub unnormalized: bool,
+    pub d16: bool,
     pub component: u8,
 }
 
@@ -182,6 +213,10 @@ impl Image {
             .chain(self.sampler.iter().flatten())
             .chain(&self.coordinates)
             .chain(&self.lod)
+            .chain(&self.compare)
+            .chain(&self.gradients)
+            .chain(&self.clamp)
+            .chain(&self.offset)
             .copied()
             .collect()
     }
@@ -252,6 +287,11 @@ pub enum Stmt {
         when: Option<Tmp>,
         address: Tmp,
         value: Tmp,
+    },
+    /// Writes a texel; `image.op` is `ImageOp::Store` and components without a value are written as zero.
+    ImageStore {
+        image: Box<Image>,
+        values: [Option<Tmp>; 4],
     },
 }
 

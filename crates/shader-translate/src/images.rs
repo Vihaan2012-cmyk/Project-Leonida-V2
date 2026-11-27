@@ -45,6 +45,14 @@ pub fn binding(view: View, number: Number) -> u32 {
     3 + 3 * view as u32 + number as u32
 }
 
+/// The same textures as writable storage images, at the same indices.
+pub fn storage_binding(view: View, number: Number) -> u32 {
+    12 + 3 * view as u32 + number as u32
+}
+
+/// Each sampler again with depth comparison on, at the same index, for the compare instructions.
+pub const COMPARE_SAMPLERS: u32 = 21;
+
 /// Which array a texture with this T# belongs in, from the FORMAT field (word 1, bits 20-28).
 pub fn number(descriptor: &[u32; 8]) -> Number {
     match rdna::format::number((descriptor[1] >> 20) & 0x1FF) {

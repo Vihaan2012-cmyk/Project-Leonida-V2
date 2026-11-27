@@ -1053,9 +1053,10 @@ impl Lifter {
     fn image(&mut self, name: &str, inst: &Inst) -> Result<(), LiftError> {
         let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
         let has = |flag: &str| inst.mods.iter().any(|m| m == flag);
-        if IMAGE_FLAGS.iter().any(|flag| has(flag)) {
+        if ["tfe", "lwe", "r128"].iter().any(|flag| has(flag)) {
             return Err(unsupported(inst));
         }
+        let (a16, d16) = (has("a16"), has("d16"));
         let dim = inst
             .mods
             .iter()
@@ -1063,28 +1064,19 @@ impl Lifter {
             .and_then(image_dim)
             .ok_or_else(|| unsupported(inst))?;
         let dmask = Self::immediate(inst, "dmask") as u32 & 0xF;
-        let (op, sampled, lod) = match name {
-            "image_load" => (ImageOp::Load, false, false),
-            "image_load_mip" => (ImageOp::LoadMip, false, true),
-            "image_sample" => (ImageOp::Sample, true, false),
-            "image_sample_l" => (ImageOp::SampleLod, true, true),
-            "image_sample_lz" => (ImageOp::SampleLodZero, true, false),
-            "image_gather4_lz" if dmask.count_ones() == 1 => {
-                let channel = dmask.trailing_zeros() as u8;
-                (ImageOp::Gather { channel }, true, false)
-            }
-            _ => return Err(unsupported(inst)),
-        };
-        let (data, count) = vgprs(arg(0)?, inst)?;
-        let addresses: Vec<u8> = match &arg(1)?.operand {
-            Operand::Vgpr { reg, count } => (0..*count).map(|i| reg + i).collect(),
-            Operand::VgprList(regs) => regs.clone(),
-            _ => return Err(unsupported(inst)),
-        };
-        let used = dim.coordinates() + usize::from(lod);
-        if addresses.len() < used {
+        let form = image_form(name, dmask).ok_or_else(|| unsupported(inst))?;
+        if d16 && matches!(form.op, ImageOp::Size | ImageOp::QueryLod) {
             return Err(unsupported(inst));
         }
+        let (data, count) = vgprs(arg(0)?, inst)?;
+        let mut addresses = Addresses {
+            regs: match &arg(1)?.operand {
+                Operand::Vgpr { reg, count } => (0..*count).map(|i| reg + i).collect(),
+                Operand::VgprList(regs) => regs.clone(),
+                _ => return Err(unsupported(inst)),
+            },
+            at: 0,
+        };
         let Operand::Sgpr {
             reg: resource,
             count: 8,
@@ -1092,7 +1084,7 @@ impl Lifter {
         else {
             return Err(unsupported(inst));
         };
-        let sampler = if sampled {
+        let sampler = if form.sampled {
             let Operand::Sgpr { reg, count: 4 } = arg(3)?.operand else {
                 return Err(unsupported(inst));
             };
@@ -1100,31 +1092,106 @@ impl Lifter {
         } else {
             None
         };
-        let components: Vec<u8> = match op {
-            ImageOp::Gather { .. } => vec![0, 1, 2, 3],
-            _ => (0..4).filter(|c| dmask >> c & 1 != 0).collect(),
+        let float = form.sampled;
+        let offset = if form.offset {
+            Some(addresses.word(self).ok_or_else(|| unsupported(inst))?)
+        } else {
+            None
         };
-        if components.is_empty() || components.len() > usize::from(count) {
-            return Err(unsupported(inst));
+        let bias = if form.bias {
+            let word = addresses.word(self).ok_or_else(|| unsupported(inst))?;
+            Some(if a16 {
+                self.unpack_half(word, false, true)
+            } else {
+                word
+            })
+        } else {
+            None
+        };
+        let compare = if form.compare {
+            Some(addresses.word(self).ok_or_else(|| unsupported(inst))?)
+        } else {
+            None
+        };
+        let mut gradients = Vec::new();
+        if form.gradients {
+            let each = dim.gradients();
+            for _ in 0..2 {
+                let values = if form.g16 {
+                    addresses.halves(self, each, true)
+                } else {
+                    addresses.words(self, each)
+                };
+                gradients.extend(values.ok_or_else(|| unsupported(inst))?);
+            }
         }
-        let values: Vec<Tmp> = addresses[..used]
-            .iter()
-            .map(|reg| self.value(Expr::Get(Reg::V(*reg))))
-            .collect();
+        let coordinates = if form.op == ImageOp::Size {
+            0
+        } else {
+            dim.coordinates()
+        };
+        let extra = usize::from(form.lod) + usize::from(form.clamp);
+        let body = if a16 {
+            addresses.halves(self, coordinates + extra, float)
+        } else {
+            addresses.words(self, coordinates + extra)
+        }
+        .ok_or_else(|| unsupported(inst))?;
+        let level = form.lod.then(|| body[coordinates]);
+        let clamp = form
+            .clamp
+            .then(|| body[coordinates + usize::from(form.lod)]);
         let resource =
             [0, 1, 2, 3, 4, 5, 6, 7].map(|i| self.value(Expr::Get(Reg::S(resource + i))));
         let sampler =
             sampler.map(|reg| [0, 1, 2, 3].map(|i| self.value(Expr::Get(Reg::S(reg + i)))));
         let image = Image {
-            op,
+            op: form.op,
             dim,
             resource,
             sampler,
-            coordinates: values[..dim.coordinates()].to_vec(),
-            lod: lod.then(|| values[dim.coordinates()]),
+            coordinates: body[..coordinates].to_vec(),
+            lod: level.or(bias),
+            compare,
+            gradients,
+            clamp,
+            offset,
             unnormalized: has("unorm"),
+            d16,
             component: 0,
         };
+        let components: Vec<u8> = match form.op {
+            ImageOp::Gather { .. } => vec![0, 1, 2, 3],
+            _ => (0..4).filter(|c| dmask >> c & 1 != 0).collect(),
+        };
+        let registers = if d16 {
+            components.len().div_ceil(2)
+        } else {
+            components.len()
+        };
+        if components.is_empty() || registers > usize::from(count) {
+            return Err(unsupported(inst));
+        }
+        if form.op == ImageOp::Store {
+            let mut values = [None; 4];
+            for (n, component) in components.iter().enumerate() {
+                let reg = data + if d16 { n / 2 } else { n } as u8;
+                let word = self.value(Expr::Get(Reg::V(reg)));
+                values[usize::from(*component)] = Some(if d16 {
+                    let shift = self.c(if n % 2 == 1 { 16 } else { 0 });
+                    let moved = self.bin(Bin::ShrU, word, shift);
+                    let mask = self.c(0xFFFF);
+                    self.bin(Bin::And, moved, mask)
+                } else {
+                    word
+                });
+            }
+            self.stmts.push(Stmt::ImageStore {
+                image: Box::new(image),
+                values,
+            });
+            return Ok(());
+        }
         let results: Vec<Tmp> = components
             .iter()
             .map(|component| {
@@ -1134,12 +1201,38 @@ impl Lifter {
                 })))
             })
             .collect();
-        for (offset, value) in results.into_iter().enumerate() {
-            self.stmts.push(Stmt::SetLane(data + offset as u8, value));
+        if d16 {
+            for (offset, pair) in results.chunks(2).enumerate() {
+                let value = match pair {
+                    [low, high] => {
+                        let sixteen = self.c(16);
+                        let high = self.bin(Bin::Shl, *high, sixteen);
+                        self.bin(Bin::Or, *low, high)
+                    }
+                    [low] => *low,
+                    _ => unreachable!("chunks of two"),
+                };
+                self.stmts.push(Stmt::SetLane(data + offset as u8, value));
+            }
+        } else {
+            for (offset, value) in results.into_iter().enumerate() {
+                self.stmts.push(Stmt::SetLane(data + offset as u8, value));
+            }
         }
         Ok(())
     }
 
+    fn unpack_half(&mut self, word: Tmp, high: bool, float: bool) -> Tmp {
+        let shift = self.c(if high { 16 } else { 0 });
+        let moved = self.bin(Bin::ShrU, word, shift);
+        let mask = self.c(0xFFFF);
+        let half = self.bin(Bin::And, moved, mask);
+        if float {
+            self.un(Un::F16ToF32, half)
+        } else {
+            half
+        }
+    }
     fn setreg(&mut self, inst: &Inst) -> Result<(), LiftError> {
         if inst.text().contains("HW_REG_FLAT_SCR") {
             return Ok(());
@@ -2684,6 +2777,128 @@ fn op_sel(inst: &Inst, key: &str) -> [bool; 4] {
 }
 
 const IMAGE_FLAGS: [&str; 5] = ["a16", "d16", "tfe", "lwe", "r128"];
+
+/// The address registers of an image instruction, read in order.
+struct Addresses {
+    regs: Vec<u8>,
+    at: usize,
+}
+
+impl Addresses {
+    fn word(&mut self, lifter: &mut Lifter) -> Option<Tmp> {
+        let reg = *self.regs.get(self.at)?;
+        self.at += 1;
+        Some(lifter.value(Expr::Get(Reg::V(reg))))
+    }
+
+    fn words(&mut self, lifter: &mut Lifter, count: usize) -> Option<Vec<Tmp>> {
+        (0..count).map(|_| self.word(lifter)).collect()
+    }
+
+    /// `count` 16-bit values packed two to a register, low half first.
+    fn halves(&mut self, lifter: &mut Lifter, count: usize, float: bool) -> Option<Vec<Tmp>> {
+        let mut values = Vec::new();
+        for _ in 0..count.div_ceil(2) {
+            let word = self.word(lifter)?;
+            for high in [false, true] {
+                if values.len() < count {
+                    values.push(lifter.unpack_half(word, high, float));
+                }
+            }
+        }
+        Some(values)
+    }
+}
+
+struct ImageForm {
+    op: ImageOp,
+    sampled: bool,
+    compare: bool,
+    bias: bool,
+    lod: bool,
+    gradients: bool,
+    g16: bool,
+    clamp: bool,
+    offset: bool,
+}
+
+fn image_form(name: &str, dmask: u32) -> Option<ImageForm> {
+    let mut form = ImageForm {
+        op: ImageOp::Load,
+        sampled: false,
+        compare: false,
+        bias: false,
+        lod: false,
+        gradients: false,
+        g16: false,
+        clamp: false,
+        offset: false,
+    };
+    match name {
+        "image_load" => return Some(form),
+        "image_load_mip" => {
+            form.op = ImageOp::LoadMip;
+            form.lod = true;
+            return Some(form);
+        }
+        "image_store" => {
+            form.op = ImageOp::Store;
+            return Some(form);
+        }
+        "image_get_resinfo" => {
+            form.op = ImageOp::Size;
+            form.lod = true;
+            return Some(form);
+        }
+        "image_get_lod" => {
+            form.op = ImageOp::QueryLod;
+            form.sampled = true;
+            return Some(form);
+        }
+        _ => {}
+    }
+    let (rest, gather) = match name.strip_prefix("image_sample") {
+        Some(rest) => (rest, false),
+        None => (name.strip_prefix("image_gather4")?, true),
+    };
+    form.sampled = true;
+    let mut level = None;
+    for token in rest.split('_').filter(|t| !t.is_empty()) {
+        match token {
+            "c" => form.compare = true,
+            "o" => form.offset = true,
+            "cl" => form.clamp = true,
+            "g16" => form.g16 = true,
+            "b" | "l" | "lz" | "d" if level.is_none() => level = Some(token),
+            _ => return None,
+        }
+    }
+    form.op = match (gather, level) {
+        (true, None | Some("lz")) if dmask.count_ones() == 1 && !form.clamp => ImageOp::Gather {
+            channel: dmask.trailing_zeros() as u8,
+        },
+        (true, _) => return None,
+        (false, None) => ImageOp::Sample,
+        (false, Some("b")) => {
+            form.bias = true;
+            ImageOp::SampleBias
+        }
+        (false, Some("l")) => {
+            form.lod = true;
+            ImageOp::SampleLod
+        }
+        (false, Some("lz")) => ImageOp::SampleLodZero,
+        (false, Some("d")) => {
+            form.gradients = true;
+            ImageOp::SampleGrad
+        }
+        _ => return None,
+    };
+    if (form.g16 && !form.gradients) || (form.offset && !gather) {
+        return None;
+    }
+    Some(form)
+}
 
 fn image_dim(name: &str) -> Option<ImageDim> {
     Some(match name {

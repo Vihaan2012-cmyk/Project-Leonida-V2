@@ -148,7 +148,8 @@ struct Emitter {
     types: Vec<Ty>,
     storage_block: Option<Word>,
     image_types: Option<image::ImageTypes>,
-    views: HashMap<(View, Number), image::ViewIds>,
+    views: HashMap<(View, Number, bool), image::ViewIds>,
+    compare_samplers: Option<Word>,
     lookups: [Option<Word>; 2],
     image_cache: Option<(Image, [Word; 4])>,
 }
@@ -448,6 +449,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         storage_block,
         image_types: None,
         views: HashMap::new(),
+        compare_samplers: None,
         lookups: [None; 2],
         image_cache: None,
     };
@@ -1439,6 +1441,12 @@ impl Emitter {
                 if self.lanes == 64 {
                     self.barrier()?;
                 }
+            }
+            Stmt::ImageStore { image, values } => {
+                let active = self.active()?;
+                let image = (**image).clone();
+                let values = *values;
+                self.if_then(active, |e| e.image_store(&image, values))?;
             }
             Stmt::Store {
                 when,

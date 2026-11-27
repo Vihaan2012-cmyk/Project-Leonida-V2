@@ -63,6 +63,9 @@ pub struct DeviceInfo {
     pub nan_preserve_32: bool,
     pub max_shared_memory: u32,
     pub descriptor_indexing: bool,
+    pub storage_images: bool,
+    pub min_lod: bool,
+    pub gather_extended: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,12 +74,13 @@ pub enum TextureFormat {
     Rgba32Uint,
     Rgba32Sint,
     Rgba8Unorm,
+    Depth32Float,
 }
 
 impl TextureFormat {
     pub fn texel_bytes(self) -> usize {
         match self {
-            TextureFormat::Rgba8Unorm => 4,
+            TextureFormat::Rgba8Unorm | TextureFormat::Depth32Float => 4,
             _ => 16,
         }
     }
@@ -87,6 +91,14 @@ impl TextureFormat {
             TextureFormat::Rgba32Uint => vk::Format::R32G32B32A32_UINT,
             TextureFormat::Rgba32Sint => vk::Format::R32G32B32A32_SINT,
             TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
+            TextureFormat::Depth32Float => vk::Format::D32_SFLOAT,
+        }
+    }
+
+    fn aspect(self) -> vk::ImageAspectFlags {
+        match self {
+            TextureFormat::Depth32Float => vk::ImageAspectFlags::DEPTH,
+            _ => vk::ImageAspectFlags::COLOR,
         }
     }
 }
@@ -142,6 +154,8 @@ impl Texture {
 pub struct Sampler {
     pub linear: bool,
     pub repeat: bool,
+    /// A depth comparison, as a `vk::CompareOp` value (the hardware's DEPTH_COMPARE_FUNC uses the same order).
+    pub compare: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +163,8 @@ pub enum Resource {
     Buffer(Vec<u32>),
     Samplers(Vec<Sampler>),
     Textures(Vec<Texture>),
+    /// Writable textures; their data is read back after the dispatch.
+    StorageTextures(Vec<Texture>),
 }
 
 pub struct Gpu {
@@ -199,8 +215,15 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
         instance.get_physical_device_features2(physical, &mut features);
         let int64 = features.features.shader_int64 == vk::TRUE;
         let float64 = features.features.shader_float64 == vk::TRUE;
+        let write_without_format =
+            features.features.shader_storage_image_write_without_format == vk::TRUE;
+        let min_lod = features.features.shader_resource_min_lod == vk::TRUE;
+        let gather_extended = features.features.shader_image_gather_extended == vk::TRUE;
         let descriptor_indexing = f12.runtime_descriptor_array == vk::TRUE
             && f12.shader_sampled_image_array_non_uniform_indexing == vk::TRUE;
+        let storage_images = descriptor_indexing
+            && f12.shader_storage_image_array_non_uniform_indexing == vk::TRUE
+            && write_without_format;
         let size_control = f13.subgroup_size_control == vk::TRUE;
         let needed = vk::SubgroupFeatureFlags::BASIC
             | vk::SubgroupFeatureFlags::BALLOT
@@ -233,6 +256,9 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
                 nan_preserve_32: v12.shader_signed_zero_inf_nan_preserve_float32 == vk::TRUE,
                 max_shared_memory: base.limits.max_compute_shared_memory_size,
                 descriptor_indexing,
+                storage_images,
+                min_lod,
+                gather_extended,
             },
         })
     }
@@ -310,13 +336,18 @@ impl Gpu {
                 .subgroup_size_control(chosen.info.subgroup_size_control)
                 .compute_full_subgroups(chosen.info.full_subgroups);
             let indexing = chosen.info.descriptor_indexing;
+            let storage = chosen.info.storage_images;
             let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
                 .buffer_device_address(true)
                 .runtime_descriptor_array(indexing)
-                .shader_sampled_image_array_non_uniform_indexing(indexing);
+                .shader_sampled_image_array_non_uniform_indexing(indexing)
+                .shader_storage_image_array_non_uniform_indexing(storage);
             let base = vk::PhysicalDeviceFeatures::default()
                 .shader_int64(chosen.info.int64)
-                .shader_float64(chosen.info.float64);
+                .shader_float64(chosen.info.float64)
+                .shader_storage_image_write_without_format(storage)
+                .shader_resource_min_lod(chosen.info.min_lod)
+                .shader_image_gather_extended(chosen.info.gather_extended);
             let mut features = vk::PhysicalDeviceFeatures2::default()
                 .features(base)
                 .push_next(&mut f13)
@@ -422,7 +453,7 @@ impl Gpu {
         groups: [u32; 3],
         subgroup_size: Option<u32>,
     ) -> Result<(), GpuError> {
-        self.dispatch_resources(spirv, buffers, push, groups, subgroup_size, &[])
+        self.dispatch_resources(spirv, buffers, push, groups, subgroup_size, &mut [])
     }
 
     /// Like `dispatch_with`, with descriptor set 1 holding `resources` at their bindings.
@@ -433,7 +464,7 @@ impl Gpu {
         push: impl FnOnce(&[u64]) -> Vec<u32>,
         groups: [u32; 3],
         subgroup_size: Option<u32>,
-        resources: &[(u32, Resource)],
+        resources: &mut [(u32, Resource)],
     ) -> Result<(), GpuError> {
         if spirv.is_empty() {
             return Err(GpuError::BadSpirv);
@@ -462,8 +493,8 @@ impl Gpu {
                 None,
             )?;
             let mut extra_bindings = Vec::new();
-            let mut counts = [0u32; 3];
-            for (binding, resource) in resources {
+            let mut counts = [0u32; 4];
+            for (binding, resource) in resources.iter() {
                 let (kind, slot, count) = match resource {
                     Resource::Buffer(data) => {
                         scratch.extra_buffers.push(self.host_buffer(data, storage)?);
@@ -477,9 +508,15 @@ impl Gpu {
                     }
                     Resource::Textures(list) => {
                         for texture in list {
-                            self.texture(&mut scratch, texture)?;
+                            self.texture(&mut scratch, texture, false)?;
                         }
                         (vk::DescriptorType::SAMPLED_IMAGE, 2, list.len())
+                    }
+                    Resource::StorageTextures(list) => {
+                        for texture in list {
+                            self.texture(&mut scratch, texture, true)?;
+                        }
+                        (vk::DescriptorType::STORAGE_IMAGE, 3, list.len())
                     }
                 };
                 counts[slot] += count as u32;
@@ -547,6 +584,7 @@ impl Gpu {
                 vk::DescriptorType::STORAGE_BUFFER,
                 vk::DescriptorType::SAMPLER,
                 vk::DescriptorType::SAMPLED_IMAGE,
+                vk::DescriptorType::STORAGE_IMAGE,
             ]
             .into_iter()
             .zip(counts)
@@ -587,7 +625,7 @@ impl Gpu {
                 .collect();
             let mut image_infos = Vec::new();
             let (mut next_sampler, mut next_view) = (0, 0);
-            for (_, resource) in resources {
+            for (_, resource) in resources.iter() {
                 image_infos.push(match resource {
                     Resource::Buffer(_) => Vec::new(),
                     Resource::Samplers(list) => {
@@ -599,13 +637,18 @@ impl Gpu {
                         next_sampler += list.len();
                         infos
                     }
-                    Resource::Textures(list) => {
+                    Resource::Textures(list) | Resource::StorageTextures(list) => {
+                        let layout = if matches!(resource, Resource::StorageTextures(_)) {
+                            vk::ImageLayout::GENERAL
+                        } else {
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                        };
                         let infos: Vec<_> = scratch.images[next_view..next_view + list.len()]
                             .iter()
                             .map(|(_, _, view)| {
                                 vk::DescriptorImageInfo::default()
                                     .image_view(*view)
-                                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                                    .image_layout(layout)
                             })
                             .collect();
                         next_view += list.len();
@@ -641,6 +684,9 @@ impl Gpu {
                         .image_info(images),
                     Resource::Textures(_) => write
                         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(images),
+                    Resource::StorageTextures(_) => write
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                         .image_info(images),
                 });
             }
@@ -682,12 +728,39 @@ impl Gpu {
                 );
             }
             device.cmd_dispatch(command, groups[0], groups[1], groups[2]);
+            let mut readbacks = Vec::new();
+            if scratch.uploads.iter().any(|u| u.storage) {
+                let to_copy = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                device.cmd_pipeline_barrier(
+                    command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[to_copy],
+                    &[],
+                    &[],
+                );
+                for upload in scratch.uploads.iter().filter(|u| u.storage) {
+                    let words = vec![0u32; upload.bytes.div_ceil(4)];
+                    let target = self.host_buffer(&words, vk::BufferUsageFlags::TRANSFER_DST)?;
+                    device.cmd_copy_image_to_buffer(
+                        command,
+                        upload.image,
+                        vk::ImageLayout::GENERAL,
+                        target.0,
+                        &upload.regions,
+                    );
+                    readbacks.push(target);
+                }
+            }
             let barrier = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ);
             device.cmd_pipeline_barrier(
                 command,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::HOST,
                 vk::DependencyFlags::empty(),
                 &[barrier],
@@ -709,6 +782,21 @@ impl Gpu {
                 std::ptr::copy_nonoverlapping(mapped, data.as_mut_ptr(), data.len());
                 device.unmap_memory(*memory);
             }
+            let written = resources
+                .iter_mut()
+                .filter_map(|(_, r)| match r {
+                    Resource::StorageTextures(list) => Some(list),
+                    _ => None,
+                })
+                .flatten();
+            for (texture, (_, memory, size)) in written.zip(&readbacks) {
+                let mapped =
+                    device.map_memory(*memory, 0, *size, vk::MemoryMapFlags::empty())? as *const u8;
+                let length = texture.data.len();
+                std::ptr::copy_nonoverlapping(mapped, texture.data.as_mut_ptr(), length);
+                device.unmap_memory(*memory);
+            }
+            scratch.staging.extend(readbacks);
         }
         Ok(())
     }
@@ -716,6 +804,7 @@ impl Gpu {
     /// # Safety
     /// The caller destroys the sampler after the GPU has finished with it.
     unsafe fn sampler(&self, sampler: Sampler) -> Result<vk::Sampler, GpuError> {
+        let compare = sampler.compare.map(vk::CompareOp::from_raw);
         let (filter, mipmap) = if sampler.linear {
             (vk::Filter::LINEAR, vk::SamplerMipmapMode::LINEAR)
         } else {
@@ -733,6 +822,8 @@ impl Gpu {
             .address_mode_u(address)
             .address_mode_v(address)
             .address_mode_w(address)
+            .compare_enable(compare.is_some())
+            .compare_op(compare.unwrap_or(vk::CompareOp::NEVER))
             .max_lod(vk::LOD_CLAMP_NONE);
         // SAFETY: a plain sampler from valid create info.
         Ok(unsafe { self.device.create_sampler(&info, None)? })
@@ -742,7 +833,12 @@ impl Gpu {
     ///
     /// # Safety
     /// `scratch` must belong to `self.device`; it owns everything created here.
-    unsafe fn texture(&self, scratch: &mut Scratch<'_>, texture: &Texture) -> Result<(), GpuError> {
+    unsafe fn texture(
+        &self,
+        scratch: &mut Scratch<'_>,
+        texture: &Texture,
+        storage: bool,
+    ) -> Result<(), GpuError> {
         let device = &self.device;
         let expected: usize = (0..texture.mips).map(|m| texture.mip_bytes(m)).sum();
         if texture.data.len() != expected || texture.mips == 0 {
@@ -769,7 +865,13 @@ impl Gpu {
                     .array_layers(texture.layers())
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                    .usage(if storage {
+                        vk::ImageUsageFlags::STORAGE
+                            | vk::ImageUsageFlags::TRANSFER_DST
+                            | vk::ImageUsageFlags::TRANSFER_SRC
+                    } else {
+                        vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST
+                    })
                     .initial_layout(vk::ImageLayout::UNDEFINED),
                 None,
             )?;
@@ -795,7 +897,7 @@ impl Gpu {
             scratch.images.last_mut().expect("just pushed").1 = memory;
             device.bind_image_memory(image, memory, 0)?;
             let range = vk::ImageSubresourceRange::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .aspect_mask(texture.format.aspect())
                 .level_count(texture.mips)
                 .layer_count(texture.layers());
             let view = device.create_image_view(
@@ -827,7 +929,7 @@ impl Gpu {
                         .buffer_offset(offset as u64)
                         .image_subresource(
                             vk::ImageSubresourceLayers::default()
-                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .aspect_mask(texture.format.aspect())
                                 .mip_level(mip)
                                 .layer_count(texture.layers()),
                         )
@@ -844,6 +946,8 @@ impl Gpu {
                 image,
                 range,
                 regions,
+                storage,
+                bytes: expected,
             });
         }
         Ok(())
@@ -855,6 +959,8 @@ struct Upload {
     image: vk::Image,
     range: vk::ImageSubresourceRange,
     regions: Vec<vk::BufferImageCopy>,
+    storage: bool,
+    bytes: usize,
 }
 
 impl Upload {
@@ -872,9 +978,13 @@ impl Upload {
             .subresource_range(self.range);
         let to_shader = to_transfer
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            .new_layout(if self.storage {
+                vk::ImageLayout::GENERAL
+            } else {
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+            });
         // SAFETY: guaranteed by the caller.
         unsafe {
             device.cmd_pipeline_barrier(

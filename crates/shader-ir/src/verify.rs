@@ -247,6 +247,15 @@ impl Checker<'_> {
                 self.expect(*address, Ty::U64)?;
                 self.expect(*value, Ty::U32)?;
             }
+            Stmt::ImageStore { image, values } => {
+                for tmp in image
+                    .operands()
+                    .into_iter()
+                    .chain(values.iter().flatten().copied())
+                {
+                    self.expect(tmp, Ty::U32)?;
+                }
+            }
         }
         Ok(())
     }
