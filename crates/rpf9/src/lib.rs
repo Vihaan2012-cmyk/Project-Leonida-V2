@@ -6,6 +6,7 @@
 mod archive;
 mod error;
 mod group;
+mod index;
 mod inflate;
 mod model;
 mod names;
@@ -13,6 +14,7 @@ mod walk;
 
 pub use archive::{Archive, Header, ResourceData, ScanReport};
 pub use error::Rpf9Error;
+pub use index::{ArchiveInfo, Index, Query};
 pub use model::{Codec, Kind, Layout, Resource, Segment, Space, hex};
 pub use names::{find_names, joaat, name_hash, stem};
 pub use walk::WalkStats;
