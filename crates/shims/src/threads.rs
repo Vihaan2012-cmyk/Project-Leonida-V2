@@ -18,6 +18,9 @@ use crate::Shim;
 pub const CONSOLE_CORES: usize = 8;
 pub const CONSOLE_LOGICAL: usize = CONSOLE_CORES * 2;
 /// The affinity mask with every console logical processor.
+/// Fewest fastest-class cores for the console layout to leave the slower ones out of it.
+const MIN_LAYOUT_CORES: usize = 4;
+
 pub const CONSOLE_MASK: u64 = (1 << CONSOLE_LOGICAL) - 1;
 
 /// One physical core of the PC: the logical processors it runs (bits of `mask`, within one processor
@@ -32,11 +35,18 @@ pub struct PcCore {
 /// Maps console logical processors onto PC ones.
 ///
 /// Only one processor group is used for pinned threads (the one with the most logical processors), so a
-/// thread's mask never spans groups. Within it, cores are taken fastest class first and, inside a core, its
-/// logical processors in order, so the console's `2k`/`2k + 1` pairs land on SMT siblings where the PC has
-/// them and on separate cores where it does not; a PC with fewer logical processors than the console wraps
-/// around. Efficiency cores come after every performance core, so the low-numbered processors, where the
-/// game's main threads live, avoid them.
+/// thread's mask never spans groups. Console core `k` (logical processors `2k` and `2k + 1`) lands on:
+///
+/// - PC core `k` when the PC has at least [`CONSOLE_CORES`] cores of the fastest efficiency class (the
+///   extra cores stay free for threads the game leaves unpinned), with its two logical processors in order;
+/// - PC core `k * cores / 8` when it has fewer, so the game's pinned groups (for example console cores 4 to 6
+///   for rendering, core 0 for its own thread) stay apart from each other instead of wrapping around onto
+///   the same few cores;
+/// - on a PC with 16 or more fastest-class logical processors but no SMT, each console processor takes its
+///   own core.
+///
+/// Efficiency cores take part in the layout only when the fastest class has fewer than four cores; otherwise
+/// only masks that cover every console processor reach them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mapper {
     group: u16,
@@ -59,17 +69,35 @@ impl Mapper {
             .copied()
             .filter(|c| c.group == group && c.mask != 0)
             .collect();
-        cores.sort_by_key(|c| std::cmp::Reverse(c.efficiency));
-        let order: Vec<u8> = cores
-            .iter()
-            .flat_map(|c| (0..64u8).filter(|bit| c.mask >> bit & 1 == 1))
-            .collect();
-        if order.is_empty() {
+        if cores.is_empty() {
             return None;
         }
+        cores.sort_by_key(|c| std::cmp::Reverse(c.efficiency));
+        let fastest = cores[0].efficiency;
+        let fast = cores.iter().take_while(|c| c.efficiency == fastest).count();
+        let layout = if fast >= MIN_LAYOUT_CORES {
+            &cores[..fast]
+        } else {
+            &cores[..]
+        };
+        let bits = |core: &PcCore| -> Vec<u8> {
+            (0..64u8).filter(|bit| core.mask >> bit & 1 == 1).collect()
+        };
+        let order: Vec<u8> = layout.iter().flat_map(bits).collect();
         let mut table = [0; CONSOLE_LOGICAL];
         for (i, slot) in table.iter_mut().enumerate() {
-            *slot = order[i % order.len()];
+            *slot = if order.len() >= CONSOLE_LOGICAL {
+                order[i]
+            } else {
+                let k = i / 2;
+                let core = &layout[if layout.len() >= CONSOLE_CORES {
+                    k
+                } else {
+                    k * layout.len() / CONSOLE_CORES
+                }];
+                let threads = bits(core);
+                threads[(i % 2).min(threads.len() - 1)]
+            };
         }
         Some(Mapper {
             group,
@@ -744,27 +772,51 @@ mod tests {
     }
 
     #[test]
-    fn six_cores_with_smt_wrap_the_last_console_cores_onto_the_first() {
+    fn six_cores_with_smt_share_cores_between_neighbouring_console_cores() {
         let cores = pc(&[&[(0, 2); 6]]);
         assert_eq!(
             table(&cores),
-            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3]
+            vec![0, 1, 0, 1, 2, 3, 4, 5, 6, 7, 6, 7, 8, 9, 10, 11]
         );
         let m = Mapper::new(&cores).unwrap();
         assert_eq!(m.map_mask(CONSOLE_MASK), Some(0xFFF));
-        assert_eq!(m.map_mask(0xF000), Some(0b1111));
+        assert_eq!(m.map_mask(0xF000), Some(0xF00));
     }
 
     #[test]
-    fn eight_cores_without_smt_put_each_console_processor_on_its_own_core() {
+    fn the_games_render_and_main_masks_stay_apart_on_small_pcs() {
+        let render = 0x3F00;
+        let first_core = 0b1;
+        for cores in [
+            pc(&[&[(0, 2); 6]]),
+            pc(&[&[(0, 2); 4]]),
+            pc(&[&[(0, 1); 6]]),
+            pc(&[&[(0, 2); 5]]),
+        ] {
+            let m = Mapper::new(&cores).unwrap();
+            let on_render = m.map_mask(render).unwrap();
+            assert_eq!(on_render & m.map_mask(first_core).unwrap(), 0);
+            assert!(on_render.count_ones() >= 2);
+            assert_ne!(on_render, m.all());
+        }
+    }
+
+    #[test]
+    fn eight_cores_without_smt_put_both_console_threads_of_a_core_on_it() {
         let cores = pc(&[&[(0, 1); 8]]);
         assert_eq!(
             table(&cores),
-            vec![0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7]
+            vec![0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7]
         );
         let m = Mapper::new(&cores).unwrap();
-        assert_eq!(m.map_mask(0b0101), Some(0b0101));
-        assert_eq!(m.map_mask(0b1_0000_0001), Some(0b1));
+        assert_eq!(m.map_mask(0b0101), Some(0b11));
+        assert_eq!(m.map_mask(0b1_0000_0001), Some(0b1_0001));
+    }
+
+    #[test]
+    fn sixteen_cores_without_smt_give_every_console_processor_its_own() {
+        let cores = pc(&[&[(0, 1); 16]]);
+        assert_eq!(table(&cores), (0..16).collect::<Vec<u8>>());
     }
 
     #[test]
@@ -778,44 +830,46 @@ mod tests {
     }
 
     #[test]
-    fn efficiency_cores_come_after_the_performance_cores() {
+    fn efficiency_cores_are_left_to_unpinned_threads() {
         let mut list = vec![(1, 2); 6];
         list.extend([(0, 1); 8]);
         let cores = pc(&[&list]);
         let m = Mapper::new(&cores).unwrap();
-        let performance_mask = 0xFFF;
-        for console in 0..12 {
-            assert_eq!(
-                1u64 << m.map_processor(console) & performance_mask,
-                1u64 << m.map_processor(console)
-            );
+        for console in 0..16 {
+            assert!(m.map_processor(console) < 12);
         }
-        for console in 12..16 {
-            assert!(m.map_processor(console) >= 12);
-        }
-        assert_eq!(m.map_mask(0x0FFF), Some(performance_mask));
+        assert_eq!(m.map_mask(0x0FFF), Some(0xFF));
         assert_eq!(m.map_mask(CONSOLE_MASK), Some((1 << 20) - 1));
     }
 
     #[test]
-    fn efficiency_cores_listed_first_still_come_last() {
+    fn efficiency_cores_listed_first_are_still_left_out() {
         let mut list = vec![(0, 1); 4];
         list.extend([(1, 2); 4]);
         let m = Mapper::new(&pc(&[&list])).unwrap();
         assert_eq!(m.map_processor(0), 4);
         assert_eq!(m.map_processor(1), 5);
-        assert_eq!(m.map_processor(8), 0);
+        assert_eq!(m.map_processor(8), 8);
+        for console in 0..16 {
+            assert!(m.map_processor(console) >= 4);
+        }
     }
 
     #[test]
-    fn a_small_pc_wraps_around() {
+    fn too_few_fast_cores_bring_the_slow_ones_into_the_layout() {
+        let mut list = vec![(1, 2); 2];
+        list.extend([(0, 1); 6]);
+        let m = Mapper::new(&pc(&[&list])).unwrap();
+        assert_eq!(m.map_processor(0), 0);
+        assert_eq!(m.map_processor(15), 9);
+    }
+
+    #[test]
+    fn a_two_core_pc_splits_the_console_in_halves() {
         let cores = pc(&[&[(0, 2); 2]]);
-        assert_eq!(
-            table(&cores),
-            vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]
-        );
         let m = Mapper::new(&cores).unwrap();
-        assert_eq!(m.map_mask(0b1111_1110), Some(0b1111));
+        assert_eq!(m.map_mask(0x00FF), Some(0b0011));
+        assert_eq!(m.map_mask(0xFF00), Some(0b1100));
         assert_eq!(m.map_mask(0b10), Some(0b10));
     }
 
@@ -865,8 +919,8 @@ mod tests {
     #[test]
     fn host_processors_report_as_console_ones() {
         let m = Mapper::new(&pc(&[&[(0, 2); 4]])).unwrap();
-        assert_eq!(m.console_processor(0, 3), 3);
-        assert_eq!(m.console_processor(0, 6), 6);
+        assert_eq!(m.console_processor(0, 3), 5);
+        assert_eq!(m.console_processor(0, 6), 12);
         assert_eq!(m.console_processor(1, 6), 6);
         let big = Mapper::new(&pc(&[&[(0, 2); 16]])).unwrap();
         assert_eq!(big.console_processor(0, 29), 13);
