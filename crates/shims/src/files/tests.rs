@@ -5,7 +5,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WIN32_FIND_DATAW, WriteFile};
 
 use super::*;
-use crate::files::configure;
+use crate::files::{configure, set_redirect};
 
 static LOCK: Mutex<()> = Mutex::new(());
 
@@ -37,6 +37,7 @@ fn setup() -> Setup {
     std::fs::create_dir_all(package.join("data")).expect("package");
     std::fs::create_dir_all(&output).expect("output");
     assert!(configure(package.clone(), output.clone()));
+    set_redirect(None);
     Setup {
         _guard: guard,
         _dir: dir,
@@ -316,4 +317,25 @@ fn network_paths_are_refused_and_names_are_traced() {
     assert_eq!(last_error(), 123);
     let seen = crate::trace::files();
     assert!(seen.iter().any(|f| f == "tcpip:1.2.3.4/x"));
+}
+
+#[test]
+fn a_redirected_package_file_is_read_from_the_mod() {
+    let s = setup();
+    std::fs::write(s.package.join("data").join("a.txt"), b"package").expect("package file");
+    let modded = s.output.join("mod-a.txt");
+    std::fs::write(&modded, b"mod").expect("mod file");
+    let target = modded.clone();
+    set_redirect(Some(Box::new(move |relative| {
+        (relative == Path::new("data").join("a.txt")).then(|| target.clone())
+    })));
+    assert_eq!(read_location("GAME:/data/a.txt"), Ok(modded.clone()));
+    let other = s.package.join("data").join("b.txt");
+    std::fs::write(&other, b"b").expect("other");
+    assert_eq!(read_location("data/b.txt"), Ok(other));
+    set_redirect(None);
+    assert_eq!(
+        read_location("GAME:/data/a.txt"),
+        Ok(s.package.join("data").join("a.txt"))
+    );
 }

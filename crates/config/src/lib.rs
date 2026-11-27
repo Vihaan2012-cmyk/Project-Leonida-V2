@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-pub use general::{Content, General, Nudity};
+pub use general::{Audio, AudioOutput, Content, General, Nudity};
 pub use graphics::{
     AspectMode, FrameRate, FrameRateMode, Graphics, Upscaler, WindowMode, adjust_sampler,
 };

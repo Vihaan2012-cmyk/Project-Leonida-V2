@@ -152,6 +152,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "png",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -1134,6 +1135,7 @@ dependencies = [
  "content-filter",
  "decompile",
  "embed-manifest",
+ "enhancements",
  "game-package",
  "gpu",
  "iced-x86",
@@ -1152,7 +1154,9 @@ dependencies = [
  "shims",
  "systems",
  "tempfile",
+ "upscale",
  "vfs",
+ "xbox-d3d12",
 ]
 
 [[package]]
@@ -2327,13 +2331,16 @@ dependencies = [
 name = "shims"
 version = "0.1.0"
 dependencies = [
+ "audio-codec",
  "bvh-build",
+ "config",
  "cpal",
  "gilrs",
  "offline",
  "pe-loader",
  "tempfile",
  "thiserror 2.0.21",
+ "upscale",
  "windows-sys 0.61.2",
  "xbox-d3d12",
 ]

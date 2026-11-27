@@ -78,6 +78,7 @@ pub struct Graphics {
     pub texture_lod_bias: f32,
     pub aspect_mode: AspectMode,
     pub fov_offset: f32,
+    pub fov_scale: f32,
 }
 
 impl Default for Graphics {
@@ -96,6 +97,7 @@ impl Default for Graphics {
             texture_lod_bias: 0.0,
             aspect_mode: AspectMode::Letterbox,
             fov_offset: 0.0,
+            fov_scale: 1.0,
         }
     }
 }
@@ -167,6 +169,10 @@ aspect_mode = \"letterbox\"
 
 # Degrees added to the game's field of view. -30.0 to 30.0.
 fov_offset = 0.0
+
+# Factor on the game's vertical field of view, applied to the game's code: 1.0 leaves it alone, 1.2 shows more of
+# the world. 0.5 to 1.8.
+fov_scale = 1.0
 "
         .to_string()
     }
@@ -187,6 +193,7 @@ fov_offset = 0.0
         }
         problems.range_f32("texture_lod_bias", self.texture_lod_bias, -4.0, 4.0);
         problems.range_f32("fov_offset", self.fov_offset, -30.0, 30.0);
+        problems.range_f32("fov_scale", self.fov_scale, 0.5, 1.8);
     }
 }
 
@@ -239,6 +246,17 @@ anisotropic_filtering = 0\n";
         );
         assert!(
             error.contains("fov_offset: must be between -30 and 30, got 40"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn fov_scale_defaults_to_one_and_is_range_checked() {
+        assert_eq!(Graphics::default().fov_scale, 1.0);
+        assert_eq!(Graphics::parse("fov_scale = 1.25").unwrap().fov_scale, 1.25);
+        let error = Graphics::parse("fov_scale = 2.5").unwrap_err().to_string();
+        assert!(
+            error.contains("fov_scale: must be between 0.5 and 1.8, got 2.5"),
             "{error}"
         );
     }

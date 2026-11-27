@@ -3,9 +3,7 @@ use std::collections::BTreeMap;
 use rspirv::dr::Operand;
 use rspirv::spirv::{BuiltIn, Capability, Decoration, StorageClass, Word};
 
-use super::{
-    EXEC, EmitError, Emitter, MeshOptions, PUSH_CODE, PUSH_HEAP, VertexInput, VertexOptions, ok,
-};
+use super::{EXEC, EmitError, Emitter, MeshOptions, PUSH_HEAP, VertexInput, VertexOptions, ok};
 use crate::images::Number;
 
 const POSITION: u8 = 12;
@@ -40,8 +38,8 @@ impl Emitter {
         let low = self.push_word(PUSH_HEAP)?;
         let high = self.push_word(PUSH_HEAP + 1)?;
         self.heap = Some(self.pack(low, high)?);
-        let low = self.push_word(PUSH_CODE)?;
-        let high = self.push_word(PUSH_CODE + 1)?;
+        let low = self.push_word(self.code_word)?;
+        let high = self.push_word(self.code_word + 1)?;
         self.code = Some(self.pack(low, high)?);
         Ok(())
     }
