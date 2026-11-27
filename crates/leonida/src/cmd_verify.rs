@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -244,6 +244,8 @@ struct Verify {
     saved: HashMap<String, usize>,
     replacement: Option<Vec<u32>>,
     no_build: bool,
+    /// Every program built so far, by fingerprint, with how its pipeline went; shared by the workers.
+    built: Arc<Mutex<HashMap<u64, Result<(), String>>>>,
     kinds: BTreeMap<&'static str, Tally>,
     failures: BTreeMap<String, (usize, String)>,
     containers: usize,
@@ -307,9 +309,32 @@ impl Verify {
         tally.translated += 1;
         tally.words += built.spirv().len();
         tally.translate_time += translate_time;
-        let errors = gpu::validation_errors();
+        let fingerprint = built.fingerprint();
+        let earlier = self
+            .built
+            .lock()
+            .expect("no worker panicked")
+            .get(&fingerprint)
+            .cloned();
         let started = Instant::now();
-        let result = check(gpu, partners, &built);
+        let outcome = match earlier {
+            Some(outcome) => outcome,
+            None => {
+                let errors = gpu::validation_errors();
+                let outcome = match check(gpu, partners, &built) {
+                    Err(error) => Err(format!("{} pipeline: {error}", kind(&built))),
+                    Ok(()) if gpu::validation_errors() > errors => {
+                        Err(format!("{} pipeline: validation errors", kind(&built)))
+                    }
+                    Ok(()) => Ok(()),
+                };
+                self.built
+                    .lock()
+                    .expect("no worker panicked")
+                    .insert(fingerprint, outcome.clone());
+                outcome
+            }
+        };
         let took = started.elapsed();
         if self.each {
             println!(
@@ -321,13 +346,8 @@ impl Verify {
         }
         let tally = self.kinds.entry(kind(&built)).or_default();
         tally.pipeline_time += took;
-        let new_errors = gpu::validation_errors() - errors;
-        match result {
-            Err(error) => self.fail(format!("{} pipeline: {error}", kind(&built)), name),
-            Ok(()) if new_errors > 0 => self.fail(
-                format!("{} pipeline: validation errors", kind(&built)),
-                name,
-            ),
+        match outcome {
+            Err(error) => self.fail(error, name),
             Ok(()) => self.kinds.entry(kind(&built)).or_default().passed += 1,
         }
     }
@@ -413,6 +433,7 @@ pub fn verify_command(args: &VerifyArgs) -> Result<ExitCode> {
             .with_context(|| format!("creating {}", folder.display()))?;
     }
     let gpu = Gpu::new().context("opening the GPU")?;
+    let built = Arc::new(Mutex::new(HashMap::new()));
     let workers = args.jobs.max(1);
     let started = Instant::now();
     let (sender, receiver) = mpsc::sync_channel::<CarvedShader>(4 * workers);
@@ -427,6 +448,7 @@ pub fn verify_command(args: &VerifyArgs) -> Result<ExitCode> {
                         save: args.save_spirv.clone(),
                         replacement: replacement.clone(),
                         no_build: args.no_build,
+                        built: Arc::clone(&built),
                         ..Verify::default()
                     };
                     loop {

@@ -24,6 +24,23 @@ impl Built {
         }
     }
 
+    /// Equal for programs that build the same pipeline.
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let options = match self {
+            Built::Compute(_) | Built::Mesh(_) => String::new(),
+            Built::Pixel(_, options) => format!("{options:?}"),
+            Built::Vertex(_, options) => format!("{options:?}"),
+            Built::Geometry(_, options) => format!("{options:?}"),
+            Built::FirstHalf(_, options) => format!("{options:?}"),
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::mem::discriminant(self).hash(&mut hasher);
+        options.hash(&mut hasher);
+        self.spirv().hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub fn spirv_mut(&mut self) -> &mut Vec<u32> {
         match self {
             Built::Compute(spirv) | Built::Mesh(spirv) => spirv,
