@@ -255,6 +255,61 @@ pub fn array_layout(
     })
 }
 
+impl ArrayLayout {
+    /// The byte offset of the block at (`x`, `y`) of `mip` in `slice`, from the start of the texture.
+    pub fn block_offset(&self, slice: u32, mip: u32, x: u32, y: u32) -> Option<u64> {
+        if slice >= self.slices {
+            return None;
+        }
+        let m = self.slice.mips.get(mip as usize)?;
+        let single = self.slice.block_offset(mip, x, y)?;
+        let (start, stride) = self.mips[mip as usize];
+        let step = u64::from(slice) * stride;
+        Some(if m.in_tail {
+            single + step
+        } else {
+            single - m.offset + start + step
+        })
+    }
+
+    /// One subresource as tightly packed rows of blocks.
+    pub fn detile(&self, slice: u32, mip: u32, memory: &[u8]) -> Option<Vec<u8>> {
+        let m = self.slice.mips.get(mip as usize)?;
+        let element = self.slice.element_bytes as usize;
+        if (memory.len() as u64) < self.size {
+            return None;
+        }
+        let mut out = vec![0; m.blocks_w as usize * m.blocks_h as usize * element];
+        for y in 0..m.blocks_h {
+            for x in 0..m.blocks_w {
+                let at = self.block_offset(slice, mip, x, y)? as usize;
+                let line = (y * m.blocks_w + x) as usize * element;
+                out[line..line + element].copy_from_slice(&memory[at..at + element]);
+            }
+        }
+        Some(out)
+    }
+
+    /// Writes tightly packed rows of blocks into one subresource of the texture's memory.
+    pub fn tile(&self, slice: u32, mip: u32, rows: &[u8], memory: &mut [u8]) -> Option<()> {
+        let m = self.slice.mips.get(mip as usize)?;
+        let element = self.slice.element_bytes as usize;
+        if (memory.len() as u64) < self.size
+            || rows.len() < m.blocks_w as usize * m.blocks_h as usize * element
+        {
+            return None;
+        }
+        for y in 0..m.blocks_h {
+            for x in 0..m.blocks_w {
+                let at = self.block_offset(slice, mip, x, y)? as usize;
+                let line = (y * m.blocks_w + x) as usize * element;
+                memory[at..at + element].copy_from_slice(&rows[line..line + element]);
+            }
+        }
+        Some(())
+    }
+}
+
 /// A subresource in the row-major arrangement `GetCopyableFootprints` describes: rows `row_pitch` bytes apart
 /// (a multiple of 256), each subresource starting at a multiple of 512.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
