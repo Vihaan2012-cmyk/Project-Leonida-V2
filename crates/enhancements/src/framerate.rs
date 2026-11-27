@@ -142,6 +142,28 @@ pub const STEP_FLOOR: Entry = Entry {
     find: Some(find_step_floor),
 };
 
+pub const CLOCK_FLOOR: Entry = Entry {
+    id: "clock-floor",
+    summary: "Stop every game clock, not only one, from being held at 1 / the game's frame limit",
+    proof: Proof::Static,
+    activation: Activation::WithCustomLimit,
+    evidence: &[
+        Evidence {
+            rva: 0x0222_6040,
+            what: "sub_02226040, a leaf outside the exception table: clamps with 1/limit loaded at 0x222605a",
+        },
+        Evidence {
+            rva: 0x0222_6190,
+            what: "sub_02226130 stores 1/3000 s and then 1/limit; both stores become 1/3000 s",
+        },
+        Evidence {
+            rva: 0x0224_35e6,
+            what: "sub_022434a0 recomputes 1/limit on a settings change; the store becomes 1/3000 s",
+        },
+    ],
+    find: Some(crate::clock_floor::find),
+};
+
 pub const FRAME_EVENT_INTERVAL: Entry = Entry {
     id: "frame-event-interval",
     summary: "The interval the title registers for the frame events, 8333 to 66667 microseconds",
@@ -221,8 +243,9 @@ pub const FIXED_STEP_CONSTANTS: Entry = Entry {
 };
 
 /// Every entry, patches first.
-pub const ENTRIES: [&Entry; 5] = [
+pub const ENTRIES: [&Entry; 6] = [
     &STEP_FLOOR,
+    &CLOCK_FLOOR,
     &FRAME_EVENT_INTERVAL,
     &CEILING,
     &GAME_LIMITER,
