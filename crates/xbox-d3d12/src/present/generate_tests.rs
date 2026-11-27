@@ -776,3 +776,112 @@ mod through_presentation {
         );
     }
 }
+
+fn bench(display: (u32, u32), render: (u32, u32)) {
+    let Some(vk) = gpu() else { return };
+    let ctx = &vk.ctx;
+    let mut generator = FrameGen::new(ctx).unwrap();
+    let texel = |x: u32, y: u32| ((x * 7 + y * 3) % 251) as f32 / 251.0;
+    let mut color = Vec::new();
+    for y in 0..display.1 {
+        for x in 0..display.0 {
+            for c in 0..3 {
+                color.extend(f32_to_f16(texel(x + c * 5, y)).to_le_bytes());
+            }
+            color.extend(f32_to_f16(1.0).to_le_bytes());
+        }
+    }
+    let depth: Vec<u8> = (0..render.0 * render.1)
+        .flat_map(|i| (0.2 + 0.6 * ((i / render.0 / 64) % 2) as f32).to_le_bytes())
+        .collect();
+    let motion: Vec<u8> = (0..render.0 * render.1)
+        .flat_map(|_| [(-3.0f32).to_le_bytes(), 1.0f32.to_le_bytes()].concat())
+        .collect();
+    let read_only = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+    let aspect = vk::ImageAspectFlags::COLOR;
+    let color = upload(
+        ctx,
+        display,
+        vk::Format::R16G16B16A16_SFLOAT,
+        aspect,
+        &color,
+        read_only,
+    );
+    let depth = upload(
+        ctx,
+        render,
+        vk::Format::R32_SFLOAT,
+        aspect,
+        &depth,
+        read_only,
+    );
+    let motion = upload(
+        ctx,
+        render,
+        vk::Format::R32G32_SFLOAT,
+        aspect,
+        &motion,
+        read_only,
+    );
+    let r = InputResource {
+        handle: 1,
+        width: render.0,
+        height: render.1,
+        format: 0,
+    };
+    let inputs = FrameInputs {
+        depth: r,
+        motion: r,
+        render_size: [render.0, render.1],
+        output_size: [display.0, display.1],
+        motion_vector_scale: [1.0, 1.0],
+        depth_reversed: true,
+        camera_near: 0.1,
+        camera_far: f32::INFINITY,
+        ..FrameInputs::default()
+    };
+    let request = Capture {
+        color: &color.source,
+        src_rect: None,
+        inputs: &inputs,
+        depth: &depth.source,
+        motion: &motion.source,
+        generate: true,
+        phase: 0.5,
+        hud_threshold: 0.06,
+    };
+    let mut totals = Vec::new();
+    for i in 0..14 {
+        generator.capture(&request).unwrap();
+        let t = generator.last_gpu_times().expect("timestamps");
+        if i >= 4 {
+            totals.push(t);
+        }
+    }
+    totals.sort_by_key(|t| t.total());
+    let t = totals[totals.len() / 2];
+    eprintln!(
+        "{}x{} (render {}x{}) on a generated frame: loads {:.2} ms, generation {:.2} ms, stores {:.2} ms, total {:.2} ms",
+        display.0,
+        display.1,
+        render.0,
+        render.1,
+        t.loads.as_secs_f64() * 1e3,
+        t.generation.as_secs_f64() * 1e3,
+        t.stores.as_secs_f64() * 1e3,
+        t.total().as_secs_f64() * 1e3
+    );
+    eprintln!("device {}", vk.name);
+}
+
+#[test]
+#[ignore = "measures; run with --ignored --nocapture"]
+fn gpu_cost_of_a_generated_frame_at_1080p() {
+    bench((1920, 1080), (1920, 1080));
+}
+
+#[test]
+#[ignore = "measures; run with --ignored --nocapture"]
+fn gpu_cost_of_a_generated_frame_at_4k() {
+    bench((3840, 2160), (1920, 1080));
+}
