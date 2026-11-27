@@ -2,6 +2,7 @@
 
 pub mod demangle;
 mod model;
+mod rtti;
 mod scan;
 #[cfg(test)]
 mod testimage;
