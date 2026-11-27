@@ -49,6 +49,12 @@ fn run_script(script: &Script, environment: &Environment) -> Report {
 fn child(name: &str) {
     let environment = environment();
     match name {
+        "boot-to-device" => {
+            let report = run_script(&steps::boot_until(Stage::Device), &environment);
+            for stage in Stage::ALL {
+                check_stage(stage, &report, &environment);
+            }
+        }
         "boot" => {
             let report = run_script(&steps::boot(), &environment);
             for stage in Stage::ALL {
@@ -186,6 +192,11 @@ fn device() {
 #[ignore = "needs the assembled device"]
 fn present() {
     in_child("present");
+}
+
+#[test]
+fn boot_to_device() {
+    in_child("boot-to-device");
 }
 
 #[test]

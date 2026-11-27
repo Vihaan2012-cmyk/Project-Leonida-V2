@@ -36,9 +36,15 @@ pub fn stage(stage: Stage) -> Script {
 
 /// The whole boot, in the game's order.
 pub fn boot() -> Script {
+    boot_until(Stage::Present)
+}
+
+/// The boot up to and including `last`.
+pub fn boot_until(last: Stage) -> Script {
     Stage::ALL
         .into_iter()
-        .fold(Script::new(), |script, stage| add(script, stage))
+        .filter(|stage| *stage <= last)
+        .fold(Script::new(), add)
 }
 
 pub const LIBRARY_LOADER: &str = "api-ms-win-core-libraryloader-l1-2-0.dll";
