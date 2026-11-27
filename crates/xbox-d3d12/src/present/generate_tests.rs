@@ -625,3 +625,154 @@ fn unusable_images_are_refused_with_a_reason() {
         .expect("refused");
     assert!(error.to_string().contains("smaller than the render size"));
 }
+
+mod through_presentation {
+    use std::any::Any;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::*;
+    use crate::pacing::Clock;
+    use crate::present::vulkan::OffscreenTarget;
+    use crate::present::{
+        ConsolePolicy, Frame, FrameGeneration, Plane, PresentBackend, PresentConfig, PresentError,
+        Presentation, ResolvedInputs, S_OK, ScaleMode, Shown, VulkanBackend,
+    };
+
+    #[derive(Clone, Default)]
+    struct FakeClock(Arc<Mutex<Duration>>);
+
+    impl FakeClock {
+        fn set(&self, to: Duration) {
+            let mut now = self.0.lock().unwrap();
+            *now = (*now).max(to);
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&self) -> Duration {
+            *self.0.lock().unwrap()
+        }
+
+        fn sleep_until(&self, deadline: Duration) {
+            self.set(deadline);
+        }
+    }
+
+    type Log = Arc<Mutex<Vec<(Duration, Option<u32>)>>>;
+
+    /// An offscreen backend that notes, after every present, the clock and where the red square is.
+    struct Watch {
+        inner: VulkanBackend<OffscreenTarget>,
+        clock: FakeClock,
+        log: Log,
+    }
+
+    impl PresentBackend for Watch {
+        fn supports_hdr10(&self) -> bool {
+            false
+        }
+
+        fn present(&mut self, frame: Frame) -> Result<Shown, PresentError> {
+            let shown = self.inner.present(frame)?;
+            let pixels = self.inner.target.read_pixels()?;
+            let row = 32 * N as usize;
+            let left = (0..N as usize).find(|x| {
+                let i = (row + x) * 8;
+                f16_to_f32(u16::from_le_bytes([pixels[i], pixels[i + 1]])) > 0.97
+            });
+            self.log
+                .lock()
+                .unwrap()
+                .push((self.clock.now(), left.map(|x| x as u32)));
+            Ok(shown)
+        }
+
+        fn as_any(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn capture(
+            &mut self,
+            request: &Capture<'_>,
+        ) -> Result<super::super::generate::Captured, PresentError> {
+            self.inner.capture(request)
+        }
+
+        fn forget_generated(&mut self) {
+            self.inner.forget_generated();
+        }
+    }
+
+    fn plane(image: &Held) -> Plane {
+        Plane {
+            token: 0,
+            resource_count: 1,
+            source: Some(image.source.clone()),
+            src_rect: None,
+            placement: None,
+            color_space: 0,
+            scale_filter: 0,
+        }
+    }
+
+    #[test]
+    fn real_and_generated_frames_reach_the_target_in_order_and_never_across_a_cut_or_a_menu() {
+        let Some(vk) = gpu() else { return };
+        let ctx = &vk.ctx;
+        let clock = FakeClock::default();
+        let log: Log = Arc::default();
+        let target =
+            OffscreenTarget::new(ctx, (N, N), vk::Format::R16G16B16A16_SFLOAT, false).unwrap();
+        let watch = Watch {
+            inner: VulkanBackend::offscreen(ctx, target).unwrap(),
+            clock: clock.clone(),
+            log: log.clone(),
+        };
+        let config = PresentConfig {
+            scale: ScaleMode::Stretch,
+            frame_generation: FrameGeneration::on(),
+            ..PresentConfig::default()
+        };
+        let mut presentation = Presentation::new(Box::new(watch), Arc::new(ConsolePolicy), config);
+        presentation.set_pacing_clock(Arc::new(clock.clone()));
+        let interval = Duration::from_micros(16_667);
+
+        // (square position, camera cut, inputs given)
+        let frames = [
+            (16, false, true),
+            (24, false, true),
+            (32, false, true),
+            (40, true, true),
+            (48, false, false),
+        ];
+        for (k, (left, cut, described)) in frames.into_iter().enumerate() {
+            presentation.flush_generated();
+            clock.set(interval * k as u32);
+            let scene = upload_scene(ctx, left, false, vk::Format::R32_SFLOAT);
+            let resolved = described.then(|| ResolvedInputs {
+                inputs: frame_inputs(cut),
+                depth: scene.depth.source.clone(),
+                motion: scene.motion.source.clone(),
+            });
+            let code =
+                presentation.present_planes_with(&[plane(&scene.color)], 0.0, resolved.as_ref());
+            assert_eq!(code, S_OK);
+            presentation.flush_generated();
+        }
+        let shown: Vec<Option<u32>> = log.lock().unwrap().iter().map(|e| e.1).collect();
+        let near = |a: Option<u32>, b: u32| a.is_some_and(|a| a.abs_diff(b) <= 1);
+        let expect = [16, 20, 24, 28, 32, 40, 48];
+        assert_eq!(shown.len(), expect.len(), "{shown:?}");
+        for (got, want) in shown.iter().zip(expect) {
+            assert!(near(*got, want), "shown {shown:?}, wanted {expect:?}");
+        }
+        let times: Vec<Duration> = log.lock().unwrap().iter().map(|e| e.0).collect();
+        let gen_gap = times[2] - times[1];
+        let real_gap = times[3] - times[2];
+        assert!(
+            gen_gap.abs_diff(real_gap) < Duration::from_micros(2),
+            "{times:?}"
+        );
+    }
+}

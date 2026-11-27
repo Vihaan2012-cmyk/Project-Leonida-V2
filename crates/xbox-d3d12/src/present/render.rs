@@ -23,6 +23,16 @@ pub struct Draw {
     pub point_filter: bool,
     pub scale: ScaleMode,
     pub params: Params,
+    /// Whether the values read from the source are the linear form of an sRGB-encoded picture. `None` takes it from
+    /// the source's format; a generated frame, held in half floats, says it explicitly.
+    pub srgb_values: Option<bool>,
+}
+
+impl Draw {
+    pub fn values_are_srgb(&self) -> bool {
+        self.srgb_values
+            .unwrap_or_else(|| is_srgb(self.source.format))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -732,7 +742,7 @@ impl Renderer {
                 src_space: u32::from(d.space == Space::Hdr10),
                 out_space: u32::from(out_hdr),
                 point: u32::from(d.point_filter),
-                src_srgb: u32::from(is_srgb(d.source.format)),
+                src_srgb: u32::from(d.values_are_srgb()),
                 gamma22: u32::from(d.params.sdr_eotf == SdrEotf::Gamma22),
                 pad: 0,
                 sdr_white: d.params.sdr_white_nits,

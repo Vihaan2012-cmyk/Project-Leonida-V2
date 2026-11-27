@@ -36,7 +36,10 @@ pub use window::{WindowHost, WindowMode, WindowOptions, WindowState};
 
 use convert::{Params, Rect, Space};
 use frames::{Clock, FrameEvents, SystemClock};
+use generate::{Capture, Captured, FrameGen};
+use interleave::{Presenter, Scheduled, Sequencer};
 use render::{Draw, Path, Renderer};
+use upscale::framegen::{FrameInputs, Gate, Verdict};
 use vulkan::{OffscreenTarget, SwapchainTarget, Target, TargetWant};
 
 #[derive(Debug, thiserror::Error)]
@@ -127,6 +130,61 @@ pub struct PresentConfig {
     pub hdr_peak_nits: f32,
     /// Use an HDR10 swap chain when the display offers one and the title presents HDR10.
     pub prefer_hdr: bool,
+    pub frame_generation: FrameGeneration,
+}
+
+/// Frame generation: a frame built from the game's motion vectors and depth is shown halfway between two real ones.
+///
+/// Only a multiplier of 2 is served; larger values are shown as 2. A frame is never generated across a camera cut,
+/// and a frame the game's upscaler dispatch did not describe (a menu) is shown alone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameGeneration {
+    pub enabled: bool,
+    pub multiplier: u32,
+    /// The colour step that still counts as unchanged when the HUD is looked for; 0 turns the HUD test off.
+    pub hud_threshold: f32,
+}
+
+impl Default for FrameGeneration {
+    fn default() -> Self {
+        FrameGeneration {
+            enabled: false,
+            multiplier: 2,
+            hud_threshold: 0.06,
+        }
+    }
+}
+
+impl FrameGeneration {
+    pub fn on() -> Self {
+        FrameGeneration {
+            enabled: true,
+            ..FrameGeneration::default()
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.multiplier >= 2
+    }
+}
+
+static FRAME_GENERATION: Mutex<Option<FrameGeneration>> = Mutex::new(None);
+
+/// Switches frame generation for every presentation of the process; it takes the place of the setting in
+/// [`PresentConfig`] until [`clear_frame_generation`].
+pub fn set_frame_generation(setting: FrameGeneration) {
+    *FRAME_GENERATION.lock().unwrap_or_else(|e| e.into_inner()) = Some(setting);
+}
+
+pub fn clear_frame_generation() {
+    *FRAME_GENERATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// The depth and motion vector images of the frame being presented, resolved from what the upscaler dispatch named.
+pub struct ResolvedInputs {
+    pub inputs: FrameInputs,
+    pub depth: SourceImage,
+    pub motion: SourceImage,
 }
 
 impl Default for PresentConfig {
@@ -138,6 +196,7 @@ impl Default for PresentConfig {
             sdr_white_nits: 0.0,
             hdr_peak_nits: convert::DEFAULT_HDR_PEAK_NITS,
             prefer_hdr: true,
+            frame_generation: FrameGeneration::default(),
         }
     }
 }
@@ -175,6 +234,16 @@ pub trait PresentBackend: Send {
     fn supports_hdr10(&self) -> bool;
     fn present(&mut self, frame: Frame) -> Result<Shown, PresentError>;
     fn as_any(&mut self) -> &mut dyn Any;
+
+    /// Copies a real frame into frames of the backend's own and, when asked, generates the one before it.
+    fn capture(&mut self, _request: &Capture<'_>) -> Result<Captured, PresentError> {
+        Err(PresentError::Unsupported(
+            "this backend generates no frames".into(),
+        ))
+    }
+
+    /// Drops the previous frame kept for generation.
+    fn forget_generated(&mut self) {}
 }
 
 /// Frames drawn by the renderer into a target (a swap chain, or an offscreen image).
@@ -182,6 +251,8 @@ pub struct VulkanBackend<T: Target + 'static> {
     pub renderer: Renderer,
     pub target: T,
     window: Option<Arc<WindowHost>>,
+    ctx: VulkanContext,
+    framegen: Option<FrameGen>,
 }
 
 impl VulkanBackend<SwapchainTarget> {
@@ -191,6 +262,8 @@ impl VulkanBackend<SwapchainTarget> {
             renderer: Renderer::new(ctx)?,
             target,
             window: Some(host),
+            ctx: ctx.clone(),
+            framegen: None,
         })
     }
 
@@ -200,6 +273,8 @@ impl VulkanBackend<SwapchainTarget> {
             renderer: Renderer::new(ctx)?,
             target: SwapchainTarget::new(ctx, window)?,
             window: None,
+            ctx: ctx.clone(),
+            framegen: None,
         })
     }
 }
@@ -210,6 +285,8 @@ impl VulkanBackend<OffscreenTarget> {
             renderer: Renderer::new(ctx)?,
             target,
             window: None,
+            ctx: ctx.clone(),
+            framegen: None,
         })
     }
 }
@@ -233,10 +310,7 @@ impl<T: Target + 'static> PresentBackend for VulkanBackend<T> {
             }
             None => self.target.extent(),
         };
-        let srgb = frame
-            .draw
-            .as_ref()
-            .is_some_and(|d| vulkan::is_srgb(d.source.format));
+        let srgb = frame.draw.as_ref().is_some_and(|d| d.values_are_srgb());
         let want = TargetWant {
             hdr10: frame.hdr10,
             srgb,
@@ -254,6 +328,22 @@ impl<T: Target + 'static> PresentBackend for VulkanBackend<T> {
 
     fn as_any(&mut self) -> &mut dyn Any {
         self
+    }
+
+    fn capture(&mut self, request: &Capture<'_>) -> Result<Captured, PresentError> {
+        if self.framegen.is_none() {
+            self.framegen = Some(FrameGen::new(&self.ctx)?);
+        }
+        match self.framegen.as_mut() {
+            Some(generator) => generator.capture(request),
+            None => Err(PresentError::Vulkan("no frame generator".into())),
+        }
+    }
+
+    fn forget_generated(&mut self) {
+        if let Some(generator) = self.framegen.as_mut() {
+            generator.forget();
+        }
     }
 }
 
@@ -347,9 +437,19 @@ pub struct Plane {
     pub scale_filter: i32,
 }
 
+/// What frame generation keeps between frames: the gate, the rhythm and the thread that shows the frames on time.
+struct Generation {
+    gate: Gate,
+    sequencer: Sequencer,
+    presenter: Presenter<Frame>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
 pub struct Presentation {
     events: FrameEvents,
-    backend: Mutex<Box<dyn PresentBackend>>,
+    backend: Arc<Mutex<Box<dyn PresentBackend>>>,
+    pacing_clock: Arc<dyn crate::pacing::Clock>,
+    generation: Mutex<Option<Generation>>,
     policy: Arc<dyn FramePolicy>,
     config: RwLock<PresentConfig>,
     sync: Mutex<SyncMode>,
@@ -376,7 +476,9 @@ impl Presentation {
     ) -> Presentation {
         Presentation {
             events: FrameEvents::new(clock),
-            backend: Mutex::new(backend),
+            backend: Arc::new(Mutex::new(backend)),
+            pacing_clock: Arc::new(crate::pacing::SystemClock::new()),
+            generation: Mutex::new(None),
             policy,
             config: RwLock::new(config),
             sync: Mutex::new(SyncMode::Vsync),
@@ -419,6 +521,31 @@ impl Presentation {
 
     pub fn set_config(&self, config: PresentConfig) {
         *self.config.write().unwrap_or_else(|e| e.into_inner()) = config;
+    }
+
+    /// The clock the generated frames' timing runs on; tests give a fake one before the first frame.
+    pub fn set_pacing_clock(&mut self, clock: Arc<dyn crate::pacing::Clock>) {
+        self.pacing_clock = clock;
+    }
+
+    /// The setting in force: the process-wide one from [`set_frame_generation`], else the configuration's.
+    pub fn frame_generation(&self) -> FrameGeneration {
+        FRAME_GENERATION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or(self.config().frame_generation)
+    }
+
+    /// Waits until every generated frame queued so far has been shown.
+    pub fn flush_generated(&self) {
+        if let Some(g) = self
+            .generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            g.presenter.flush();
+        }
     }
 
     pub fn config(&self) -> PresentConfig {
@@ -578,11 +705,37 @@ impl Presentation {
             // SAFETY: a non-null parameter block is valid.
             unsafe { (*params).immediate_threshold_percent }
         };
-        self.present_planes(&list, threshold)
+        let extra = self.resolve_generation_inputs(resolver);
+        self.present_planes_with(&list, threshold, extra.as_ref())
+    }
+
+    /// What the upscaler dispatch of this frame named, as images; drained even when frame generation is off.
+    fn resolve_generation_inputs(&self, resolver: &dyn ResourceResolver) -> Option<ResolvedInputs> {
+        let inputs = upscale::framegen::take_inputs()?;
+        if !self.frame_generation().is_active() || !inputs.is_usable() {
+            return None;
+        }
+        let depth = resolver.source_image(inputs.depth.handle as *mut c_void)?;
+        let motion = resolver.source_image(inputs.motion.handle as *mut c_void)?;
+        Some(ResolvedInputs {
+            inputs,
+            depth,
+            motion,
+        })
     }
 
     /// Queue `PresentX` on resolved planes. No planes presents a black frame.
     pub fn present_planes(&self, planes: &[Plane], immediate_threshold: f32) -> i32 {
+        self.present_planes_with(planes, immediate_threshold, None)
+    }
+
+    /// `PresentX` on resolved planes with the depth and motion vectors of the frame, when the game described them.
+    pub fn present_planes_with(
+        &self,
+        planes: &[Plane],
+        immediate_threshold: f32,
+        inputs: Option<&ResolvedInputs>,
+    ) -> i32 {
         if self.events.with(|s, _| s.is_suspended()) {
             return E_INVALID_STATE;
         }
@@ -666,7 +819,13 @@ impl Presentation {
             point_filter: config.point_filter,
             scale: config.scale,
             params: config.params(),
+            srgb_values: None,
         };
+        if self.frame_generation().is_active()
+            && let Some(code) = self.present_generated(&draw, hdr_out, sync, inputs)
+        {
+            return code;
+        }
         self.hand_over(Frame {
             draw: Some(draw),
             sync,
@@ -674,7 +833,138 @@ impl Presentation {
         })
     }
 
+    fn start_generation(&self) -> Generation {
+        let backend = self.backend.clone();
+        let failure: Arc<Mutex<Option<String>>> = Arc::default();
+        let report = failure.clone();
+        let presenter = Presenter::new(self.pacing_clock.clone(), move |s: Scheduled<Frame>| {
+            let result = backend
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .present(s.item);
+            if let Err(e) = result {
+                *report.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.to_string());
+            }
+        });
+        Generation {
+            gate: Gate::new(),
+            sequencer: Sequencer::new(0.5),
+            presenter,
+            failure,
+        }
+    }
+
+    /// Captures the real frame and queues it with its generated partner, to be shown on time by the presenter thread.
+    /// `None` when the frame is to be shown the ordinary way: the queued frames have been shown by then.
+    fn present_generated(
+        &self,
+        draw: &Draw,
+        hdr10: bool,
+        sync: SyncMode,
+        extra: Option<&ResolvedInputs>,
+    ) -> Option<i32> {
+        let setting = self.frame_generation();
+        if setting.multiplier > 2 {
+            self.note_once(
+                "frame generation multiplier",
+                "frame generation: a multiplier above 2 is shown as 2",
+            );
+        }
+        let mut guard = self.generation.lock().unwrap_or_else(|e| e.into_inner());
+        let state = guard.get_or_insert_with(|| self.start_generation());
+        if let Some(why) = state
+            .failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            self.note_once(
+                "generated present failed",
+                &format!("frame generation: {why}"),
+            );
+        }
+        let size = match draw.src_rect {
+            Some(r) if !r.is_empty() => [r.width() as u32, r.height() as u32],
+            _ => [draw.source.extent.0, draw.source.extent.1],
+        };
+        let verdict = state.gate.on_real_frame(size, extra.map(|e| &e.inputs));
+        let alone = |state: &mut Generation, backend: &Mutex<Box<dyn PresentBackend>>| {
+            state.sequencer.reset();
+            state.presenter.flush();
+            backend
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .forget_generated();
+        };
+        let extra = match extra {
+            Some(extra) if verdict.keeps_frame() => extra,
+            _ => {
+                alone(state, &self.backend);
+                return None;
+            }
+        };
+        state.presenter.wait_at_most(1);
+        let now = self.pacing_clock.now();
+        let plan = state.sequencer.on_real_frame(now);
+        let generate = verdict == Verdict::Generate && plan.is_some();
+        let captured = self
+            .backend
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .capture(&Capture {
+                color: &draw.source,
+                src_rect: draw.src_rect,
+                inputs: &extra.inputs,
+                depth: &extra.depth,
+                motion: &extra.motion,
+                generate,
+                phase: plan.map_or(0.5, |p| p.phase),
+                hud_threshold: setting.hud_threshold,
+            });
+        let captured = match captured {
+            Ok(c) => c,
+            Err(e) => {
+                self.note_once(
+                    "frame generation unavailable",
+                    &format!("frame generation: {e}; frames are shown as they are"),
+                );
+                state.gate.reset();
+                alone(state, &self.backend);
+                return None;
+            }
+        };
+        let sync = if sync == SyncMode::Immediate {
+            SyncMode::Immediate
+        } else {
+            SyncMode::Mailbox
+        };
+        let srgb_values = captured.srgb_values;
+        let frame = |source: SourceImage| Frame {
+            draw: Some(Draw {
+                source,
+                src_rect: None,
+                placement: draw.placement,
+                space: draw.space,
+                point_filter: draw.point_filter,
+                scale: draw.scale,
+                params: draw.params,
+                srgb_values: Some(srgb_values),
+            }),
+            sync,
+            hdr10,
+        };
+        let entries = state.sequencer.entries(
+            now,
+            plan,
+            frame(captured.real),
+            captured.generated.map(frame),
+        );
+        state.presenter.schedule(entries);
+        Some(S_OK)
+    }
+
     fn hand_over(&self, frame: Frame) -> i32 {
+        self.flush_generated();
         let result = self
             .backend
             .lock()
