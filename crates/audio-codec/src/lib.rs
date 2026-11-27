@@ -1,5 +1,6 @@
 //! Audio decoding and container handling for the game's audio.
 
+pub mod awc;
 pub mod bits;
 pub mod error;
 pub mod huffman;
