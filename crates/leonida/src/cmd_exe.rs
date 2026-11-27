@@ -6,7 +6,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, anyhow, bail};
 use game_package::{Manifest, map_file};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter};
-use pe_image::{Function, Image};
+use pe_image::Image;
+use source_export::{text_at, thunk_target};
 
 use crate::cli::{ExeArgs, ExeCommand};
 use crate::game::resolve_game;
@@ -39,10 +40,36 @@ pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
     match &args.command {
         ExeCommand::Info => info(&image),
         ExeCommand::Decompile { address, depth } => decompile(&image, address, *depth)?,
+        ExeCommand::ExportSource {
+            out,
+            jobs,
+            resume,
+            only,
+            max_size,
+            db,
+            no_db,
+            per_file,
+        } => export_source(
+            &image,
+            (!*no_db).then(|| {
+                db.clone()
+                    .unwrap_or_else(|| out.parent().unwrap_or(Path::new("")).join("program.db"))
+            }),
+            source_export::Options {
+                out: out.clone(),
+                jobs: *jobs,
+                resume: *resume,
+                only: only.clone(),
+                max_function_bytes: *max_size,
+                functions_per_file: *per_file,
+                ..source_export::Options::default()
+            },
+        )?,
         ExeCommand::Imports { dll } => imports(&image, dll.as_deref()),
         ExeCommand::Network => network(&image),
         ExeCommand::Functions { top } => functions(&image, *top),
         ExeCommand::Disasm { address, limit } => disasm(&image, address, *limit)?,
+        ExeCommand::Analyze { out, threads } => analyze(&image, out, *threads)?,
         ExeCommand::Strings { find, min, limit } => strings(&image, find.as_deref(), *min, *limit),
         ExeCommand::Xrefs {
             address,
@@ -58,6 +85,61 @@ pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
         )?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn export_source(
+    image: &Image<'_>,
+    db_path: Option<PathBuf>,
+    options: source_export::Options,
+) -> Result<()> {
+    let out = options.out.clone();
+    let summary = match db_path {
+        Some(path) => {
+            let db = match exe_analysis::ProgramDb::load(&path) {
+                Ok(db) if db.image_base() == image.image_base => {
+                    println!("using {}", path.display());
+                    db
+                }
+                _ => {
+                    println!(
+                        "building the program database (saved to {})",
+                        path.display()
+                    );
+                    let build = exe_analysis::BuildOptions {
+                        threads: options.jobs,
+                    };
+                    let db = exe_analysis::ProgramDb::build_with(image, &build);
+                    db.save(&path)
+                        .with_context(|| format!("writing {}", path.display()))?;
+                    println!("{}", db.summary());
+                    db
+                }
+            };
+            source_export::export(image, &source_export::DbSymbols::new(&db), &options)?
+        }
+        None => source_export::export(image, &source_export::ImageSymbols::new(image), &options)?,
+    };
+    println!(
+        "{} functions, {} failed, {} stubbed, {} files written ({} kept from an earlier run), {:.1}s",
+        summary.functions,
+        summary.failed,
+        summary.stubbed,
+        summary.files,
+        summary.skipped_files,
+        summary.elapsed.as_secs_f64()
+    );
+    println!("see {}", out.join("index.md").display());
+    Ok(())
+}
+
+fn analyze(image: &Image<'_>, out: &Path, threads: usize) -> Result<()> {
+    let options = exe_analysis::BuildOptions { threads };
+    let db = exe_analysis::ProgramDb::build_with(image, &options);
+    db.save(out)
+        .with_context(|| format!("writing {}", out.display()))?;
+    println!("{}", db.summary());
+    println!("saved to {}", out.display());
+    Ok(())
 }
 
 fn info(image: &Image<'_>) {
@@ -204,34 +286,6 @@ fn import_names(image: &Image<'_>) -> HashMap<u32, String> {
     names
 }
 
-/// The IAT slot an import thunk (`jmp qword ptr [rip+x]`) at `rva` jumps through.
-fn thunk_target(image: &Image<'_>, rva: u32) -> Option<u32> {
-    let bytes = image.read(rva, 16)?;
-    let mut decoder = Decoder::with_ip(
-        64,
-        bytes,
-        image.image_base + u64::from(rva),
-        DecoderOptions::NONE,
-    );
-    let instruction = decoder.decode();
-    (instruction.flow_control() == FlowControl::IndirectBranch
-        && instruction.is_ip_rel_memory_operand())
-    .then(|| (instruction.ip_rel_memory_address() - image.image_base) as u32)
-}
-
-/// A NUL-terminated run of at least four printable bytes at `rva` in a data section.
-fn text_at(image: &Image<'_>, rva: u32) -> Option<String> {
-    if image.section_of(rva)?.executable() {
-        return None;
-    }
-    let bytes = image.bytes_at(rva)?;
-    let end = bytes.iter().take(512).position(|b| *b == 0)?;
-    let printable = bytes[..end]
-        .iter()
-        .all(|b| (0x20..0x7F).contains(b) || matches!(b, b'\t' | b'\n' | b'\r'));
-    (end >= 4 && printable).then(|| String::from_utf8_lossy(&bytes[..end]).into_owned())
-}
-
 /// The code RVA a pointer stored in the file at `rva` holds before any code runs.
 fn code_pointer_at(image: &Image<'_>, rva: u32) -> Option<u32> {
     let value = u64::from_le_bytes(image.read(rva, 8)?.try_into().ok()?);
@@ -340,6 +394,29 @@ fn strings(image: &Image<'_>, find: Option<&str>, min: usize, limit: usize) {
     }
 }
 
+/// Stubs of the form `jmp qword ptr [rip+x]` through one of the IAT slots in `slots`. Most lie
+/// outside the exception table, so the whole code section is searched for them.
+fn import_thunks(image: &Image<'_>, slots: &HashSet<u32>) -> Vec<u32> {
+    let mut thunks = Vec::new();
+    for section in image.sections.iter().filter(|s| s.executable()) {
+        let Some(bytes) = image.read(section.virtual_address, section.raw_size as usize) else {
+            continue;
+        };
+        for (offset, window) in bytes.windows(6).enumerate() {
+            if window[0] != 0xFF || window[1] != 0x25 {
+                continue;
+            }
+            let rva = section.virtual_address + offset as u32;
+            let displacement = i32::from_le_bytes([window[2], window[3], window[4], window[5]]);
+            let slot = i64::from(rva) + 6 + i64::from(displacement);
+            if u32::try_from(slot).is_ok_and(|slot| slots.contains(&slot)) {
+                thunks.push(rva);
+            }
+        }
+    }
+    thunks
+}
+
 fn xrefs(
     image: &Image<'_>,
     address: Option<&str>,
@@ -376,12 +453,7 @@ fn xrefs(
         bail!("nothing to look for: give an address, --import or --string");
     }
     let functions = image.functions();
-    let thunks: Vec<u32> = functions
-        .iter()
-        .filter(|f| f.end - f.begin <= 16)
-        .filter(|f| thunk_target(image, f.begin).is_some_and(|slot| targets.contains(&slot)))
-        .map(|f| f.begin)
-        .collect();
+    let thunks = import_thunks(image, &targets);
     targets.extend(thunks);
     let base = image.image_base;
     let rva = |va: u64| va.wrapping_sub(base) as u32;
@@ -425,93 +497,15 @@ fn xrefs(
     Ok(())
 }
 
-struct Program<'a> {
-    image: &'a Image<'a>,
-    functions: Vec<Function>,
-    imports: HashMap<u32, String>,
-}
-
-impl Program<'_> {
-    fn rva(&self, va: u64) -> Option<u32> {
-        u32::try_from(va.checked_sub(self.image.image_base)?).ok()
-    }
-
-    fn containing(&self, rva: u32) -> Option<Function> {
-        let index = self.functions.partition_point(|f| f.begin <= rva);
-        self.functions[..index]
-            .last()
-            .copied()
-            .filter(|f| rva < f.end)
-    }
-
-    fn owner(&self, rva: u32) -> Option<u32> {
-        self.containing(rva).map(|f| self.image.primary(f).begin)
-    }
-}
-
-impl decompile::Program for Program<'_> {
-    fn image_base(&self) -> u64 {
-        self.image.image_base
-    }
-
-    fn code(&self, va: u64) -> Option<&[u8]> {
-        let rva = self.rva(va)?;
-        self.image
-            .section_of(rva)?
-            .executable()
-            .then(|| self.image.bytes_at(rva))
-            .flatten()
-    }
-
-    fn bytes(&self, va: u64) -> Option<&[u8]> {
-        self.image.bytes_at(self.rva(va)?)
-    }
-
-    fn symbol(&self, va: u64) -> decompile::Symbol {
-        use decompile::Symbol;
-        let Some(rva) = self.rva(va) else {
-            return Symbol::Unknown;
-        };
-        if let Some(name) = self.imports.get(&rva) {
-            return Symbol::Import(name.clone());
-        }
-        match self.image.section_of(rva) {
-            Some(section) if section.executable() => {
-                match thunk_target(self.image, rva).and_then(|slot| self.imports.get(&slot)) {
-                    Some(name) => Symbol::Import(name.clone()),
-                    None => Symbol::Function,
-                }
-            }
-            Some(_) => text_at(self.image, rva).map_or(Symbol::Data, Symbol::Text),
-            None => Symbol::Unknown,
-        }
-    }
-
-    fn inside(&self, entry: u64, target: u64) -> bool {
-        let (Some(entry), Some(target)) = (self.rva(entry), self.rva(target)) else {
-            return false;
-        };
-        match (self.owner(entry), self.owner(target)) {
-            (None, None) => target.abs_diff(entry) < 0x400,
-            (a, b) => a == b,
-        }
-    }
-}
-
-fn short_names(image: &Image<'_>) -> HashMap<u32, String> {
-    import_names(image)
-        .into_iter()
-        .map(|(slot, name)| (slot, name.rsplit('!').next().unwrap_or(&name).to_string()))
-        .collect()
-}
-
 fn decompile(image: &Image<'_>, address: &str, depth: usize) -> Result<()> {
     let rva = parse_address(image, address)?;
-    let program = Program {
+    let symbols = source_export::ImageSymbols::new(image);
+    let program = source_export::ImageProgram::new(
         image,
-        functions: image.functions(),
-        imports: short_names(image),
-    };
+        &image.functions(),
+        &source_export::ImportTable::new(image),
+        &symbols,
+    );
     let start = program
         .containing(rva)
         .map_or(rva, |f| image.primary(f).begin);

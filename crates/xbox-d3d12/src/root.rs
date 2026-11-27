@@ -7,6 +7,61 @@
 //! (the 32-bit VA of its first descriptor); the first parameter that does not fit, and every later one, goes to a
 //! packed array behind a 40-bit pointer in `s[0:1]`. [`pack`] fills the 32 user dwords from the arguments a
 //! command list has set.
+//!
+//! # What is measured
+//!
+//! `leonida shaders census` reads every program of `shaders.rpf` (26,698: 2,689 compute, 12,101 pixel, 2,236
+//! vertex, 195 geometry, 9,282 mesh and 195 first halves of vertex shaders merged with a geometry shader) and
+//! follows which SGPRs each reads before writing. No game container carries an `RTS0` (0 of 26,698), so no
+//! signature is paired with a program directly. The programs are named `<Stage>_<Name>_<hash>_Wrapped`, and the
+//! hash behaves as the root signature's identity: programs of different stages that share it have the same
+//! header user SGPR count (pixel and vertex: 662 hashes with one count in each stage, all equal; pixel and mesh
+//! 412 of 412; pixel and geometry 12 of 12) and use each parameter SGPR the same way, at the shifts below.
+//!
+//! - **Compute, base s4.** `RTS0` of the 29 FidelityFX programs (an earlier measurement) plus the census: the
+//!   lowest pointer is s4 in 2,364 of 2,689 programs and s5 in 318, none below s4 (s1..s3 are read as plain
+//!   values by at most 11). The header's user SGPR count (bits 16-21 of the word at 0xD4) equals
+//!   `COMPUTE_PGM_RSRC2.USER_SGPR` in 2,689 of 2,689 programs, so that field is the user count; the smallest
+//!   count is 4 (4 programs).
+//! - **Vertex and pixel, base s8.** No pixel program reads s0..s7 (0 of 12,101); the lowest user SGPR read is
+//!   s8 in 9,832 and s9 in 1,856 (s8 unused). The smallest header count is 8 (5 pixel and 8 vertex programs: an
+//!   empty signature takes exactly the reserved block, as compute takes 4). Pixel and vertex programs of one
+//!   hash agree on how every SGPR both read is used in 379,611 of 379,620 cases at shift 0, and in 40,547 of
+//!   134,372 at shift 8. 788 of 2,236 vertex programs jump through `s[4:5]`, a code address below the base.
+//! - **Mesh and geometry, base s16.** Mesh against pixel programs of one hash: 5,099,693 agree and 11,182 differ
+//!   at shift +8, 981,383 and 1,099,689 at shift 0. Geometry: 36,856 and 3 at +8, 1,043 and 28,918 at 0. The
+//!   lowest mesh pointer is s16 in 7,977 of 9,282 programs and s17 in the other 1,305; none is lower. Geometry
+//!   programs also read a 64-bit pointer at `s[8:9]` (195 of 195) and s2, s3 as plain values, which are not
+//!   parameters. The first half of a merged vertex shader sits in the geometry window too (33,675 agree and 6
+//!   differ at +8 against the same hash's vertex program): [`UserStage::GeometryVertex`].
+//! - **The header count is stage independent.** It is 8 plus the signature's dwords for every graphics stage,
+//!   so a mesh or geometry window really ends at `count + 7` (highest pointer minus count is 7 in all 1,338 mesh
+//!   programs that index both heaps, against -1 in 7,038 of 7,055 such pixel programs).
+//!   [`StageLayout::header_count`] gives the count. Largest counts: pixel 20, vertex 20, mesh 17, geometry 17,
+//!   compute 14; no signature comes near 32 dwords.
+//! - **Heap bases come last, resource then sampler.** Of the pixel programs whose `SFI0` sets both
+//!   heap-indexing bits, 7,038 of 7,055 have their last pointer at the final user SGPR; the 1,043 that set only
+//!   the sampler bit always end there; vertex programs that set only the resource bit end one SGPR before the
+//!   final one in 821 of 864 (the sampler base follows, unused by them). That is the order
+//!   [`RootSignature::layout`] uses: resource base, then sampler base, after the parameters.
+//! - **Tables are one dword.** Every `s_load` base in a pixel, vertex or mesh program is 32-bit (the high half
+//!   is a constant). Root views appear as descriptors built from an SGPR pair in vertex and mesh programs only;
+//!   no pixel program builds one.
+//! - **Code base.** 271 compute, 93 pixel, 54 vertex and 266 mesh programs call `s_getpc_b64`; none combines it
+//!   with a user SGPR (0 of 26,698), so the code base is not user data.
+//! - **Visibility.** Vertex and pixel programs of one hash never show a shifted window, so there is no sign
+//!   that a parameter is hidden from one stage; whether any signature restricts visibility is not measured,
+//!   and the layout ignores it.
+//!
+//! # Not measured
+//!
+//! - The spill pointer in `s[0:1]` for graphics: no graphics program reads s0 or s1 (0 of 24,009), and no
+//!   graphics signature is wide enough to spill, so nothing confirms or contradicts it.
+//! - [`SPILL_TABLE_BYTES`]: no program reads a spill array.
+//! - Which parameter feeds which SGPR in a graphics signature: the window's start and end and the kinds of
+//!   the SGPRs read are known, not the signatures themselves.
+//! - What the reserved block holds (s2, s3 and `s[8:9]` of geometry, s3 of mesh, `s[4:5]` of some vertex
+//!   programs).
 
 use sha2::{Digest, Sha256};
 
@@ -50,8 +105,9 @@ pub const FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED: u32 = 0x800;
 /// The D3D12 cost limit of a root signature, in dwords.
 pub const COST_LIMIT: u32 = 64;
 pub const USER_SGPRS: u32 = 32;
-/// Bytes a descriptor table takes in the spill array. Unmeasured: the console compiler's notes give 4 for a
-/// constant and 8 for a descriptor; a table is taken to keep the 32-bit form it has inline.
+/// Bytes a descriptor table takes in the spill array. Unmeasured, and the census cannot measure it: no program
+/// of `shaders.rpf` reads a spill array. The console compiler's notes give 4 for a constant and 8 for a
+/// descriptor; a table is taken to keep the 32-bit form it has inline.
 pub const SPILL_TABLE_BYTES: u32 = 4;
 pub const SPILL_VIEW_BYTES: u32 = 8;
 
@@ -573,22 +629,41 @@ pub enum UserStage {
     Pixel,
     Geometry,
     Mesh,
+    /// The vertex program that runs inside a geometry shader's wave (the first half of a merged shader).
+    GeometryVertex,
 }
 
 impl UserStage {
-    /// The first SGPR a parameter takes. Compute's s4 is measured against the console compiler and 29
-    /// signatures; the graphics bases (vertex, pixel and geometry s8, mesh s16) come from a census of the
-    /// shaders' reads only.
+    /// The first SGPR a parameter takes. Compute's s4 is measured against signatures and the census; the
+    /// graphics bases against the census and the name hash (see the module docs): vertex and pixel s8, and
+    /// geometry, mesh and the vertex half of a geometry shader s16.
     pub fn base(self) -> u32 {
         match self {
             UserStage::Compute => 4,
-            UserStage::Vertex | UserStage::Pixel | UserStage::Geometry => 8,
-            UserStage::Mesh => 16,
+            UserStage::Vertex | UserStage::Pixel => 8,
+            UserStage::Geometry | UserStage::Mesh | UserStage::GeometryVertex => 16,
         }
     }
 
+    /// Every base is measured. Only compute's is also checked against serialized signatures.
     pub fn base_measured(self) -> bool {
+        true
+    }
+
+    pub fn base_against_signatures(self) -> bool {
         self == UserStage::Compute
+    }
+
+    /// What is still unmeasured for the stage, for a pipeline to note.
+    pub fn open_questions(self) -> &'static [&'static str] {
+        match self {
+            UserStage::Compute => &["the spill array's table size"],
+            _ => &[
+                "the spill pointer's SGPR for graphics stages",
+                "the spill array's table size",
+                "whether shader visibility removes parameters from a stage",
+            ],
+        }
     }
 }
 
@@ -603,8 +678,8 @@ pub enum Place {
 pub struct StageLayout {
     pub stage: UserStage,
     pub places: Vec<Place>,
-    /// The SGPR holding the 32-bit base of the CBV/SRV/UAV heap, after the parameters, when the signature
-    /// indexes it directly. The position is read off the shaders' reads, not a signature.
+    /// The SGPR holding the 32-bit base of the CBV/SRV/UAV heap, right after the parameters (the sampler heap's
+    /// follows), when the signature indexes it directly. Measured on the shaders' reads, not on a signature.
     pub resource_heap: Option<u32>,
     pub sampler_heap: Option<u32>,
     pub spill_bytes: u32,
@@ -613,6 +688,15 @@ pub struct StageLayout {
 }
 
 impl StageLayout {
+    /// The user SGPR count a program of this signature carries in its header. Every graphics stage carries the
+    /// same number, counted as if its window started at s8; compute counts from s0.
+    pub fn header_count(&self) -> u32 {
+        match self.stage {
+            UserStage::Compute | UserStage::Vertex | UserStage::Pixel => self.end,
+            _ => self.end - 8,
+        }
+    }
+
     pub fn spills(&self) -> bool {
         self.spill_bytes > 0
     }
@@ -1141,5 +1225,82 @@ mod tests {
                 handle: 1 << 33
             })
         );
+    }
+
+    #[test]
+    fn graphics_bases_are_the_measured_ones() {
+        let bases = [
+            (UserStage::Compute, 4),
+            (UserStage::Vertex, 8),
+            (UserStage::Pixel, 8),
+            (UserStage::Geometry, 16),
+            (UserStage::Mesh, 16),
+            (UserStage::GeometryVertex, 16),
+        ];
+        for (stage, base) in bases {
+            assert_eq!(stage.base(), base, "{stage:?}");
+            assert!(stage.base_measured());
+        }
+        assert!(UserStage::Compute.base_against_signatures());
+        assert!(!UserStage::Pixel.base_against_signatures());
+        assert!(!UserStage::Pixel.open_questions().is_empty());
+    }
+
+    #[test]
+    fn the_header_count_is_the_same_for_every_graphics_stage() {
+        // Two tables and one CBV: four dwords, then both heap bases.
+        let mut signature = fidelity_shape(RootVersion::V1_1);
+        signature.parameters.truncate(3);
+        signature.flags =
+            FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+        let counts: Vec<u32> = [
+            UserStage::Vertex,
+            UserStage::Pixel,
+            UserStage::Geometry,
+            UserStage::GeometryVertex,
+            UserStage::Mesh,
+        ]
+        .iter()
+        .map(|&s| signature.layout(s).unwrap().header_count())
+        .collect();
+        assert_eq!(counts, vec![14; 5]);
+        let mesh = signature.layout(UserStage::Mesh).unwrap();
+        assert_eq!(
+            (mesh.end, mesh.resource_heap, mesh.sampler_heap),
+            (22, Some(20), Some(21))
+        );
+        assert_eq!(
+            signature.layout(UserStage::Compute).unwrap().header_count(),
+            10
+        );
+    }
+
+    #[test]
+    fn a_geometry_shader_and_its_vertex_half_share_one_window() {
+        let mut signature = fidelity_shape(RootVersion::V1_1);
+        signature.parameters.truncate(3);
+        let args = set_up(&signature);
+        let (geometry, vertex) = (
+            signature.layout(UserStage::Geometry).unwrap(),
+            signature.layout(UserStage::GeometryVertex).unwrap(),
+        );
+        let data = pack(&[&vertex, &geometry], &args, HeapBases::default()).unwrap();
+        assert_eq!(&data.sgprs[16..18], &[0x1_0000, 0x2_0000]);
+        assert_eq!(&data.sgprs[8..16], &[0; 8]);
+        let pixel = signature.layout(UserStage::Pixel).unwrap();
+        assert!(pack(&[&geometry, &pixel], &args, HeapBases::default()).is_ok());
+        let wide = RootSignature {
+            parameters: vec![constants(10)],
+            ..signature
+        };
+        let clash = pack(
+            &[
+                &wide.layout(UserStage::Geometry).unwrap(),
+                &wide.layout(UserStage::Pixel).unwrap(),
+            ],
+            &RootArguments::new(&wide),
+            HeapBases::default(),
+        );
+        assert!(matches!(clash, Err(RootError::StageWindowsClash { .. })));
     }
 }

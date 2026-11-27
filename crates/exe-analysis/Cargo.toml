@@ -1,0 +1,21 @@
+[package]
+name = "exe-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+iced-x86.workspace = true
+memchr.workspace = true
+pe-image.workspace = true
+postcard.workspace = true
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

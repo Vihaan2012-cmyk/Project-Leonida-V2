@@ -1,5 +1,5 @@
 //! AMD FidelityFX Super Resolution 1 (EASU upscale, RCAS sharpen), ported to WGSL (`shaders/easu.wgsl`,
-//! `shaders/rcas.wgsl`) and to a CPU reference ([`reference`]) that the tests compare the GPU against.
+//! `shaders/rcas.wgsl`) and to a CPU reference ([`mod@reference`]) that the tests compare the GPU against.
 //!
 //! The algorithm is AMD's `ffx_fsr1.h`, which is licensed under the MIT licence:
 //!

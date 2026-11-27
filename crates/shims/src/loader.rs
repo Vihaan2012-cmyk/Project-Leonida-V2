@@ -1,8 +1,8 @@
 //! Run-time library loading (LoadLibrary*, GetModuleHandle*, GetProcAddress, FreeLibrary) for console DLLs, and the GDK runtime behind xgameruntime.dll.
 //!
 //! The program reaches the GDK runtime without importing it: `xgameruntime.lib`'s thunks `LoadLibraryW`
-//! `xgameruntime.dll` and `GetProcAddress` its entry points. [`modules`] answers those calls from the shim
-//! registry, [`runtime`] is what the entry points hand out: the runtime's COM classes, all offline.
+//! `xgameruntime.dll` and `GetProcAddress` its entry points. `modules` answers those calls from the shim
+//! registry, `runtime` is what the entry points hand out: the runtime's COM classes, all offline.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
