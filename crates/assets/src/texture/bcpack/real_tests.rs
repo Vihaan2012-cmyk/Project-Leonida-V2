@@ -214,3 +214,43 @@ fn mip_zero_downsamples_to_mip_one_on_real_pools() {
     }
     let _ = (any, BcPackCodec::Bc1);
 }
+
+/// Throughput of the whole chunk decode over every BC1/BC3/BC5 chunk of a pool, in decoded MB/s.
+#[test]
+fn decode_speed_on_real_chunks() {
+    use super::decode_with;
+    use std::time::Instant;
+    for rel in ["peds/peds_loose.ttpf", "graphics/ttdb_graphics.ttpf"] {
+        let Some(file) = pool_file(rel) else { continue };
+        let pool = Pool::parse(&file).unwrap();
+        let opts = DecodeOptions {
+            allow_provisional: true,
+        };
+        let mut per: BTreeMap<u8, (usize, usize, f64)> = BTreeMap::new();
+        let mut lane_secs = 0.0;
+        for c in pool.chunks().iter().filter(|c| (1..=5).contains(&c.codec)) {
+            let codec = BcPackCodec::from_chunk_codec(c.codec).unwrap();
+            let raw = &file[c.src as usize..(c.src + c.packed) as usize];
+            let t = Instant::now();
+            let ok = decode_with(codec, raw, c.size as usize, &opts).is_ok();
+            let l = Instant::now();
+            let _ =
+                super::lanes::decode_slice(raw, codec.lane_widths().unwrap(), c.size as usize / 8);
+            lane_secs += l.elapsed().as_secs_f64();
+            let e = per.entry(c.codec).or_default();
+            if ok {
+                e.0 += 1;
+                e.1 += c.size as usize;
+                e.2 += t.elapsed().as_secs_f64();
+            }
+        }
+        eprintln!("lane stage alone: {lane_secs:.2} s");
+        for (codec, (n, bytes, secs)) in per {
+            eprintln!(
+                "{rel} codec {codec}: {n} chunks, {:.1} MB decoded in {secs:.2} s = {:.1} MB/s",
+                bytes as f64 / 1e6,
+                bytes as f64 / 1e6 / secs
+            );
+        }
+    }
+}

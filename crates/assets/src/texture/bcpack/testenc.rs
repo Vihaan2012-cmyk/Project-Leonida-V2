@@ -135,10 +135,15 @@ struct Recorder {
 }
 
 impl ByteSource for Recorder {
-    fn next(&mut self, lane: usize) -> Option<u8> {
-        let b = self.queues[lane].pop_front()?;
-        self.stream.push(b);
-        Some(b)
+    fn peek(&self, lane: usize) -> Option<u8> {
+        self.queues[lane].front().copied()
+    }
+
+    fn commit(&mut self, lane: usize, granted: bool) {
+        if granted {
+            let b = self.queues[lane].pop_front().expect("peeked");
+            self.stream.push(b);
+        }
     }
 
     fn consumed(&self) -> usize {

@@ -131,4 +131,23 @@ mod tests {
             assert_eq!(m.advance(enc, s), x);
         }
     }
+
+    #[test]
+    fn the_symbol_lookup_matches_the_segment_arithmetic_for_every_state_of_every_model() {
+        for eab in 0..=MAX_EAB {
+            for q in 0..16 {
+                let (base, freq) = (&BASE_TABLE[eab][q], &FREQ_TABLE[eab][q]);
+                let m = model(eab, q);
+                for cf in 1..65536u32 {
+                    let seg = (0..=eab + 1)
+                        .rev()
+                        .find(|&k| cf >= u32::from(base[k]))
+                        .unwrap();
+                    let steps = (cf - u32::from(base[seg])) / u32::from(freq[seg]);
+                    let expect = (if seg == 0 { 0 } else { 1 << (seg - 1) }) + steps;
+                    assert_eq!(u32::from(m.symbol(cf)), expect, "eab {eab} q {q} cf {cf}");
+                }
+            }
+        }
+    }
 }

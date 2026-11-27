@@ -377,15 +377,59 @@ impl<'a> Pool<'a> {
         }
     }
 
-    /// Decode the chunks of a range into `cache` without copying the range out.
+    /// Decode the chunks of a range into `cache` without copying the range out. Several missing chunks are
+    /// decoded on separate threads (at most four): they are independent.
     pub fn warm(&self, start: u64, size: u64, cache: &mut ChunkCache) -> Result<(), ReadError> {
-        for chunk in self.chunks_for(start, size)? {
-            let i = self.chunk_index(chunk);
-            if let std::collections::hash_map::Entry::Vacant(e) = cache.0.entry(i) {
-                e.insert(self.decode_chunk(i)?);
+        let missing: Vec<usize> = self
+            .chunks_for(start, size)?
+            .iter()
+            .map(|c| self.chunk_index(c))
+            .filter(|i| !cache.0.contains_key(i))
+            .collect();
+        let threads = missing.len().min(
+            std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(4),
+        );
+        if threads <= 1 {
+            for i in missing {
+                cache.0.insert(i, self.decode_chunk(i)?);
+            }
+            return Ok(());
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let done: Vec<Vec<(usize, Result<Vec<u8>, ReadError>)>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut mine = Vec::new();
+                        loop {
+                            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(&i) = missing.get(at) else { break };
+                            mine.push((i, self.decode_chunk(i)));
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("chunk decoding does not panic"))
+                .collect()
+        });
+        let mut first_error: Option<(usize, ReadError)> = None;
+        for (i, result) in done.into_iter().flatten() {
+            match result {
+                Ok(bytes) => {
+                    cache.0.insert(i, bytes);
+                }
+                Err(e) if first_error.as_ref().is_none_or(|(j, _)| i < *j) => {
+                    first_error = Some((i, e));
+                }
+                Err(_) => {}
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), |(_, e)| Err(e))
     }
 
     /// Decoded bytes of `[start, start + size)` of the virtual address space.
@@ -395,12 +439,10 @@ impl<'a> Pool<'a> {
         size: u64,
         cache: &mut ChunkCache,
     ) -> Result<Vec<u8>, ReadError> {
+        self.warm(start, size, cache)?;
         let mut out = vec![0u8; size as usize];
         for chunk in self.chunks_for(start, size)? {
             let i = self.chunk_index(chunk);
-            if let std::collections::hash_map::Entry::Vacant(e) = cache.0.entry(i) {
-                e.insert(self.decode_chunk(i)?);
-            }
             let bytes = &cache.0[&i];
             let lo = start.max(chunk.virt);
             let hi = (start + size).min(chunk.virt + chunk.size);

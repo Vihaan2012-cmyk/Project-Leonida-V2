@@ -179,3 +179,60 @@ fn the_first_bytes_follow_the_eight_per_cycle_window() {
         [8, 9, 10, 11]
     );
 }
+
+/// A synthetic BC1 chunk of `blocks` blocks: no predictors (lane 0 and 1 are zero), skewed endpoint and index
+/// symbols. The lane array is built with the test encoder and replayed through the clock.
+pub fn synthetic_bc1(blocks: usize, seed: u64) -> Vec<u8> {
+    let mut rng = Rng(seed);
+    let widths = super::BcPackCodec::Bc1.lane_widths().unwrap();
+    let lanes = widths
+        .iter()
+        .enumerate()
+        .map(|(l, &w)| {
+            let data: Vec<u8> = (0..blocks)
+                .map(|_| if l < 2 { 0 } else { rng.skewed(u32::from(w)) })
+                .collect();
+            let chunks: Vec<(Frag, &[u8])> = data
+                .chunks(20000)
+                .map(|c| {
+                    let q = if l < 2 { 15 } else { 5 };
+                    (Frag { z: 0, q, count: 0 }, c)
+                })
+                .collect();
+            encode_flush(w, &chunks)
+        })
+        .collect();
+    interleave(widths, lanes, blocks)
+}
+
+#[test]
+#[ignore = "benchmark: cargo test --release -p assets --lib -- --ignored speed --nocapture"]
+fn speed_on_synthetic_bc1() {
+    use std::time::Instant;
+    let blocks = 262_144;
+    let stream = synthetic_bc1(blocks, 99);
+    let mb = (blocks * 8) as f64 / 1e6;
+    let mut best_lanes = f64::MAX;
+    let mut best_full = f64::MAX;
+    for _ in 0..7 {
+        let t = Instant::now();
+        let out = decode_slice(
+            &stream,
+            &super::BcPackCodec::Bc1.lane_widths().unwrap(),
+            blocks,
+        )
+        .unwrap();
+        best_lanes = best_lanes.min(t.elapsed().as_secs_f64());
+        std::hint::black_box(&out);
+        let t = Instant::now();
+        let full = super::decode(super::BcPackCodec::Bc1, &stream, blocks * 8).unwrap();
+        best_full = best_full.min(t.elapsed().as_secs_f64());
+        std::hint::black_box(&full);
+    }
+    eprintln!(
+        "synthetic BC1, {} KiB packed -> {mb:.1} MB: lane stage {:.1} MB/s, full decode {:.1} MB/s",
+        stream.len() / 1024,
+        mb / best_lanes,
+        mb / best_full
+    );
+}

@@ -39,8 +39,10 @@ pub enum LaneError {
 
 /// Where the shared stream's bytes come from.
 pub trait ByteSource {
-    /// The next byte, handed to `lane`; `None` when the stream is exhausted.
-    fn next(&mut self, lane: usize) -> Option<u8>;
+    /// The byte the next served request would get, `None` when the stream is exhausted.
+    fn peek(&self, lane: usize) -> Option<u8>;
+    /// Hand the peeked byte to `lane` when `granted`.
+    fn commit(&mut self, lane: usize, granted: bool);
     /// Bytes handed out so far.
     fn consumed(&self) -> usize;
 }
@@ -58,10 +60,13 @@ impl<'a> SliceSource<'a> {
 
 impl ByteSource for SliceSource<'_> {
     #[inline(always)]
-    fn next(&mut self, _lane: usize) -> Option<u8> {
-        let b = *self.data.get(self.pos)?;
-        self.pos += 1;
-        Some(b)
+    fn peek(&self, _lane: usize) -> Option<u8> {
+        self.data.get(self.pos).copied()
+    }
+
+    #[inline(always)]
+    fn commit(&mut self, _lane: usize, granted: bool) {
+        self.pos += usize::from(granted);
     }
 
     fn consumed(&self) -> usize {
@@ -100,6 +105,34 @@ struct Lane {
     done: bool,
     pushed: u32,
     final_state: u32,
+}
+
+impl Lane {
+    #[inline(always)]
+    fn wants_bytes(&self) -> bool {
+        match self.state {
+            State::Hdr0 | State::Hdr1 | State::Hdr2 => true,
+            State::Proc => self.in_rem > 0,
+            _ => false,
+        }
+    }
+}
+
+/// A fragment's last byte has been merged: finish the lane or continue with the next fragment header.
+#[inline(always)]
+fn proc_end(ln: &mut Lane, x: u32, decodes: bool) {
+    if ln.out_rem > 0 {
+        if x == L {
+            ln.state = State::Hdr0;
+            if ln.flush {
+                ln.p1 = 0;
+            }
+        } else {
+            ln.state = State::Drain;
+        }
+    } else {
+        finish(ln, x, decodes);
+    }
 }
 
 fn is_legal_end(x: u32) -> bool {
@@ -143,7 +176,6 @@ pub fn decode_lanes<S: ByteSource>(
     let mut cycles = 0u64;
     let mut watch = (usize::MAX, u64::MAX);
     let mut idle_checks = 0;
-    let mut pushed_total = 0u64;
 
     loop {
         let mut served = 0usize;
@@ -151,46 +183,70 @@ pub fn decode_lanes<S: ByteSource>(
         let mut finished = true;
         for (i, ln) in lanes.iter_mut().enumerate() {
             let bit = 1u32 << i;
-            let blocked = ln.sym_full && slots & bit != 0;
-            let wants = !ln.in_full
-                && match ln.state {
-                    State::Hdr0 | State::Hdr1 | State::Hdr2 => true,
-                    State::Proc => ln.in_rem > 0,
-                    _ => false,
-                };
-            let mut fed = None;
-            if wants && !blocked && served < FEED_WINDOW {
-                match src.next(i) {
-                    Some(b) => fed = Some(b),
-                    None => {
-                        return Err(LaneError::Truncated {
-                            consumed: src.consumed(),
-                        });
-                    }
-                }
+            let blocked = ln.sym_full & (slots & bit != 0);
+            let wants = !ln.in_full & ln.wants_bytes();
+            let grant = wants & !blocked & (served < FEED_WINDOW);
+            let byte = src.peek(i);
+            if grant & byte.is_none() {
+                return Err(LaneError::Truncated {
+                    consumed: src.consumed(),
+                });
             }
-            let stall = (wants && fed.is_none()) || blocked;
+            let stall = (wants & !grant) | blocked;
             if !stall {
-                if matches!(ln.state, State::Proc | State::Drain) {
-                    ln.p0 = if ln.sym_full {
+                src.commit(i, grant);
+                let byte = byte.unwrap_or(0);
+                served += usize::from(grant);
+                if ln.state == State::Proc {
+                    let p0 = if ln.sym_full {
                         ln.model.advance(ln.p1, ln.sym)
                     } else {
                         ln.p1
                     };
+                    ln.in_buf = if grant { byte } else { ln.in_buf };
+                    ln.in_full |= grant;
+                    if ln.sym_full {
+                        slots |= bit;
+                        symbols[i * per_lane + ln.pushed as usize] = ln.sym;
+                        ln.pushed += 1;
+                    }
+                    let merge = (p0 < L) & (ln.in_rem > 0) & ln.in_full;
+                    let x = if merge {
+                        (p0 & 0xFF_FFFF) << 8 | u32::from(ln.in_buf)
+                    } else {
+                        p0
+                    };
+                    let decodes = (x > L) & (ln.out_rem > 0);
+                    ln.sym = ln.model.symbol(x);
+                    ln.out_rem -= u32::from(decodes);
+                    ln.p0 = p0;
+                    ln.p1 = x;
+                    ln.sym_full = decodes;
+                    ln.in_rem -= u32::from(merge);
+                    ln.in_full &= !merge;
+                    if ln.in_rem == 0 {
+                        proc_end(ln, x, decodes);
+                    }
+                } else {
+                    if ln.state == State::Drain {
+                        ln.p0 = if ln.sym_full {
+                            ln.model.advance(ln.p1, ln.sym)
+                        } else {
+                            ln.p1
+                        };
+                    }
+                    if grant {
+                        ln.in_buf = byte;
+                        ln.in_full = true;
+                    }
+                    if ln.sym_full {
+                        slots |= bit;
+                        symbols[i * per_lane + ln.pushed as usize] = ln.sym;
+                        ln.pushed += 1;
+                        ln.sym_full = false;
+                    }
+                    step(i, ln)?;
                 }
-                if let Some(b) = fed {
-                    ln.in_buf = b;
-                    ln.in_full = true;
-                    served += 1;
-                }
-                if ln.sym_full {
-                    slots |= bit;
-                    symbols[i * per_lane + ln.pushed as usize] = ln.sym;
-                    ln.pushed += 1;
-                    pushed_total += 1;
-                    ln.sym_full = false;
-                }
-                step(i, ln)?;
             }
             if !(ln.done && !ln.sym_full && slots & bit == 0) {
                 active |= bit;
@@ -205,7 +261,10 @@ pub fn decode_lanes<S: ByteSource>(
             break;
         }
         if cycles & 0x3FF == 0 {
-            let now = (src.consumed(), pushed_total);
+            let now = (
+                src.consumed(),
+                lanes.iter().map(|l| u64::from(l.pushed)).sum::<u64>(),
+            );
             if now == watch {
                 idle_checks += 1;
                 if idle_checks >= 4 {
@@ -288,18 +347,7 @@ fn step(i: usize, ln: &mut Lane) -> Result<(), LaneError> {
                     ln.in_full = false;
                 }
                 if ln.in_rem == 0 {
-                    if ln.out_rem > 0 {
-                        if x == L {
-                            ln.state = State::Hdr0;
-                            if ln.flush {
-                                ln.p1 = 0;
-                            }
-                        } else {
-                            ln.state = State::Drain;
-                        }
-                    } else {
-                        finish(ln, x, decodes);
-                    }
+                    proc_end(ln, x, decodes);
                 }
             } else if x <= L {
                 if ln.out_rem > 0 {
