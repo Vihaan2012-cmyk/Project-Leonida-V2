@@ -20,6 +20,8 @@ pub enum Command {
     Exe(ExeArgs),
     /// Check that every game file is there and the right size; with --full, that its contents are right too.
     Check(CheckArgs),
+    /// Show or reset the settings in the Config folder.
+    Config(ConfigArgs),
     /// Run the game executable, or with --dry-run only show how its imports would be provided.
     Run(RunArgs),
     /// Look at every file in the game folder for signs of tampering, without running or loading anything.
@@ -220,4 +222,24 @@ pub struct ScanArgs {
     /// The game folder. Searched for when omitted.
     #[arg(long)]
     pub game: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigArgs {
+    /// The folder the settings files are in. Missing files are written with their defaults.
+    #[arg(long, global = true, default_value = "Config")]
+    pub dir: PathBuf,
+    #[command(subcommand)]
+    pub command: Option<ConfigCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Print every setting in use (the default command).
+    Show,
+    /// Replace settings files with their documented defaults.
+    Reset {
+        /// Only these files, such as graphics or input.toml. All of them when omitted.
+        file: Vec<String>,
+    },
 }

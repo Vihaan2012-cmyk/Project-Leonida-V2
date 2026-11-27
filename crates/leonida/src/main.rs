@@ -1,5 +1,6 @@
 mod cli;
 mod cmd_check;
+mod cmd_config;
 mod cmd_exe;
 mod cmd_package;
 mod cmd_run;
@@ -29,6 +30,7 @@ fn main() -> ExitCode {
         },
         Some(Command::Exe(exe)) => cmd_exe::exe_command(exe),
         Some(Command::Check(args)) => cmd_check::check_command(args),
+        Some(Command::Config(args)) => cmd_config::config_command(args),
         Some(Command::Run(args)) => cmd_run::run_command(args),
         Some(Command::Triage(args)) => cmd_package::triage_command(args),
     };
