@@ -365,3 +365,57 @@ fn garbage_and_damaged_packets_never_panic() {
         }
     }
 }
+
+/// Interleave the packets of several streams the way multi-stream files do: each packet's skip count is the
+/// number of other streams' packets before the next packet of its own stream.
+fn interleave(streams: &[Vec<Vec<u8>>]) -> Vec<Vec<u8>> {
+    let mut order: Vec<(usize, usize)> = Vec::new();
+    let longest = streams.iter().map(Vec::len).max().unwrap();
+    for i in 0..longest {
+        for (s, packets) in streams.iter().enumerate() {
+            if i < packets.len() {
+                order.push((s, i));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (pos, &(s, i)) in order.iter().enumerate() {
+        let next = order.iter().position(|&(s2, i2)| s2 == s && i2 == i + 1);
+        let mut p = streams[s][i].clone();
+        p[3] = next.map_or(0, |n| (n - pos - 1) as u8);
+        out.push(p);
+    }
+    out
+}
+
+#[test]
+fn multi_stream_files_interleave_by_skip_counts() {
+    let mut rng = Rng(31);
+    let mut stereo_frames = Vec::new();
+    let (mut want_l, mut want_r) = (Vec::new(), Vec::new());
+    for _ in 0..60 {
+        let a = random_tuples(&mut rng, 30);
+        let d = random_tuples(&mut rng, 30);
+        let (ca, cd) = (coefficients(&a), coefficients(&d));
+        want_l.push(ca.iter().zip(&cd).map(|(x, y)| x - y).collect::<Vec<_>>());
+        want_r.push(ca.iter().zip(&cd).map(|(x, y)| x + y).collect::<Vec<_>>());
+        stereo_frames.push(finish_frame(&encode_frame(&[&a, &d], 0, true)));
+    }
+    let mut mono_frames = Vec::new();
+    let mut want_m = Vec::new();
+    for _ in 0..60 {
+        let t = random_tuples(&mut rng, 30);
+        want_m.push(coefficients(&t));
+        mono_frames.push(finish_frame(&encode_frame(&[&t], 0, false)));
+    }
+    let stereo = packetize(&stereo_frames);
+    let mono = packetize(&mono_frames);
+    assert!(stereo.len() >= 2 && mono.len() >= 2 && stereo.len() != mono.len());
+    let file = interleave(&[stereo, mono]);
+
+    let got = decode(&file, 3);
+    let pick = |c: usize| got.iter().skip(c).step_by(3).copied().collect::<Vec<f32>>();
+    assert_close(&pick(0), &reference(&want_l, 90), "stream 0 left");
+    assert_close(&pick(1), &reference(&want_r, 90), "stream 0 right");
+    assert_close(&pick(2), &reference(&want_m, 90), "stream 1");
+}
