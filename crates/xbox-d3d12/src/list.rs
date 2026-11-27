@@ -1194,6 +1194,37 @@ unsafe extern "win64" fn l_unmeasured_132(
     S_OK
 }
 
+/// Slots the game's per-draw and per-dispatch state flushes call whose meaning is not measured (an executable
+/// census: 70 with two floats, depth-bounds shaped; 75 with a pipeline flag byte; 142 with a u64 kept next to the
+/// scratch buffer; 62, 72, 126, 127 and 128 at single sites). They record nothing; the note is made once without
+/// allocating on later calls, since some run for every draw.
+macro_rules! ignored_slot {
+    ($name:ident, $slot:literal) => {
+        unsafe extern "win64" fn $name(
+            _this: *mut c_void,
+            _a: u64,
+            _b: u64,
+            _c: u64,
+            _d: u64,
+        ) -> u32 {
+            static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                unmeasured_call($slot, "arguments not measured");
+            }
+            S_OK
+        }
+    };
+}
+
+ignored_slot!(l_ignored_62, 62);
+ignored_slot!(l_ignored_70, 70);
+ignored_slot!(l_ignored_72, 72);
+ignored_slot!(l_ignored_75, 75);
+ignored_slot!(l_ignored_126, 126);
+ignored_slot!(l_ignored_127, 127);
+ignored_slot!(l_ignored_128, 128);
+ignored_slot!(l_ignored_142, 142);
+
 fn list_vtable(core: &DeviceCore) -> *const usize {
     macro_rules! f {
         ($f:expr) => {
@@ -1251,13 +1282,21 @@ fn list_vtable(core: &DeviceCore) -> *const usize {
         (55, f!(l_discard_resource)),
         (59, f!(l_gpu_event)),
         (61, f!(l_execute_indirect)),
+        (62, f!(l_ignored_62)),
+        (70, f!(l_ignored_70)),
         (71, f!(l_write_value)),
+        (72, f!(l_ignored_72)),
         (73, f!(l_wait_value)),
+        (75, f!(l_ignored_75)),
         (80, f!(l_dispatch_x)),
         (85, f!(l_copy_texture_region)),
+        (126, f!(l_ignored_126)),
+        (127, f!(l_ignored_127)),
+        (128, f!(l_ignored_128)),
         (131, f!(l_unmeasured_131)),
         (132, f!(l_unmeasured_132)),
         (141, f!(l_set_scratch_buffer)),
+        (142, f!(l_ignored_142)),
         (146, f!(l_barrier)),
         (148, f!(l_allocate_upload)),
     ];
