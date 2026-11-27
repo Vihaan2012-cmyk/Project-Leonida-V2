@@ -200,3 +200,134 @@ fn compact_chain(desc: &SurfaceDesc, eq: &Equation) -> Result<Chain, LayoutError
     })
 }
 
+impl SurfaceDesc {
+    pub fn layout(&self) -> Result<Layout, LayoutError> {
+        let eq = Equation::new(self.swizzle, self.format.elem_bytes)?;
+        let mut subs = Vec::new();
+        let mut linear = 0u64;
+        let mut push = |mip: u32, slice: u32, texels: [u32; 3], mut job: Job, tiled: u64| {
+            job.tiled_offset = tiled;
+            job.linear_offset = linear;
+            linear = (linear + job.linear_bytes()).next_multiple_of(16);
+            subs.push(Subresource {
+                mip,
+                slice,
+                texels,
+                job,
+            });
+        };
+        let block = self.format.block;
+        let texels_of = |mip: u32| [(self.width >> mip).max(1), (self.height >> mip).max(1)];
+        let job_of = |m: &Mip, depth: u32| Job {
+            swizzle: self.swizzle,
+            elem_bytes: self.format.elem_bytes,
+            extent: [m.blocks[0], m.blocks[1], depth],
+            origin: m.origin,
+            tiles: [
+                m.padded[0] / eq.tile_extent()[0],
+                m.padded[1] / eq.tile_extent()[1],
+            ],
+            tiled_offset: 0,
+            linear_offset: 0,
+        };
+        let tiled_size;
+        match self.kind {
+            Kind::Volume { depth } => {
+                if self.mips != 1 {
+                    return Err(LayoutError::VolumeMips(self.mips));
+                }
+                if self.swizzle != Swizzle::Sw4kbS3d || block != 1 || depth == 0 {
+                    return Err(LayoutError::VolumeFormat);
+                }
+                let [tw, th, td] = eq.tile_extent();
+                let tiles = [self.width.div_ceil(tw), self.height.div_ceil(th)];
+                let job = Job {
+                    swizzle: self.swizzle,
+                    elem_bytes: self.format.elem_bytes,
+                    extent: [self.width, self.height, depth],
+                    origin: [0, 0],
+                    tiles,
+                    tiled_offset: 0,
+                    linear_offset: 0,
+                };
+                tiled_size = job.tiled_bytes()?;
+                debug_assert_eq!(
+                    tiled_size,
+                    tiles[0] as u64 * tiles[1] as u64 * depth.div_ceil(td) as u64 * 4096
+                );
+                push(0, 0, [self.width, self.height, depth], job, 0);
+            }
+            kind => {
+                if self.swizzle == Swizzle::Sw4kbS3d {
+                    return Err(LayoutError::VolumeFormat);
+                }
+                let chain = compact_chain(self, &eq)?;
+                let tile = self.swizzle.tile_bytes() as u64;
+                let (slices, base, face_size) = match kind {
+                    Kind::Texture2d => (1, 0, 0),
+                    Kind::Array { layers } => (layers, 0, 0),
+                    Kind::Cube { data_offset } => (6, data_offset, chain.size),
+                    Kind::Volume { .. } => unreachable!(),
+                };
+                let array = matches!(kind, Kind::Array { .. });
+                let mip_base = if array && chain.first_tail < self.mips {
+                    slices as u64 * tile
+                } else {
+                    0
+                };
+                // Standalone mips of an array follow the tail slab, each one a slab of `slices` regions.
+                let mut standalone_offset = mip_base;
+                let mut array_offsets = vec![0u64; chain.mips.len()];
+                if array {
+                    for (i, m) in chain
+                        .mips
+                        .iter()
+                        .enumerate()
+                        .take(chain.first_tail as usize)
+                        .rev()
+                    {
+                        array_offsets[i] = standalone_offset;
+                        standalone_offset += slices as u64
+                            * m.padded[0] as u64
+                            * m.padded[1] as u64
+                            * self.format.elem_bytes as u64;
+                    }
+                }
+                for (i, m) in chain.mips.iter().enumerate() {
+                    let [tx, ty] = texels_of(i as u32);
+                    for slice in 0..slices {
+                        let tiled = if array {
+                            let stride = if m.in_tail {
+                                tile
+                            } else {
+                                m.padded[0] as u64
+                                    * m.padded[1] as u64
+                                    * self.format.elem_bytes as u64
+                            };
+                            array_offsets[i] + slice as u64 * stride
+                        } else {
+                            base + slice as u64 * face_size + m.offset
+                        };
+                        push(i as u32, slice, [tx, ty, 1], job_of(m, 1), tiled);
+                    }
+                }
+                tiled_size = if array {
+                    standalone_offset
+                } else {
+                    base + slices as u64
+                        * if face_size == 0 {
+                            chain.size
+                        } else {
+                            face_size
+                        }
+                };
+            }
+        }
+        Ok(Layout {
+            desc: *self,
+            tiled_size,
+            linear_size: linear,
+            subresources: subs,
+        })
+    }
+}
