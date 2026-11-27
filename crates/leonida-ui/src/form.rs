@@ -155,7 +155,12 @@ pub fn pages(env: &Env) -> Vec<Page> {
         Page {
             id: MODS,
             title: "Mods",
-            columns: Vec::new(),
+            columns: vec![vec![Field::new(
+                "mods.load_order",
+                "Load order",
+                "Packages that load, lowest priority first, separated by commas.",
+                Kind::List,
+            )]],
         },
         Page {
             id: TRACE,

@@ -100,6 +100,7 @@ impl Cache {
     }
 
     /// Both the translated shaders and the pipeline cache exist.
+    #[cfg(test)]
     pub fn is_prepared(&self) -> bool {
         self.shaders.is_some() && self.pipelines.is_some()
     }

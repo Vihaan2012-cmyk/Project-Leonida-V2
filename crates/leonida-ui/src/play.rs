@@ -54,10 +54,12 @@ impl Launch {
         line
     }
 
+    #[cfg(test)]
     pub fn has_flag(&self, flag: &str) -> bool {
         self.args.iter().any(|arg| arg == flag)
     }
 
+    #[cfg(test)]
     pub fn value_of(&self, flag: &str) -> Option<PathBuf> {
         let at = self.args.iter().position(|arg| arg == flag)?;
         self.args.get(at + 1).map(PathBuf::from)
@@ -93,10 +95,6 @@ impl Paths {
 
     pub fn boot_dir(&self) -> PathBuf {
         self.output_dir.join("boot")
-    }
-
-    pub fn mods_dir(&self) -> PathBuf {
-        self.root.join("Mods")
     }
 }
 
@@ -183,7 +181,6 @@ mod tests {
         assert_eq!(full.output_dir, Path::new("C:/Leonida/Output"));
         assert_eq!(full.game_dir.as_deref(), Some(Path::new("E:/Games/GTA6")));
         assert_eq!(full.boot_dir(), Path::new("C:/Leonida/Output/boot"));
-        assert_eq!(full.mods_dir(), Path::new("C:/Leonida/Mods"));
         let relative = paths(Some("Games/GTA6"));
         assert_eq!(
             relative.game_dir.unwrap(),

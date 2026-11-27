@@ -73,6 +73,7 @@ pub struct Running {
 }
 
 impl Running {
+    #[cfg(test)]
     pub fn cancelling(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }

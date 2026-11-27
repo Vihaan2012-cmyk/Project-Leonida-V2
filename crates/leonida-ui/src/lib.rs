@@ -10,14 +10,14 @@ mod model;
 mod modlist;
 mod play;
 mod settings;
-#[cfg(any())]
+#[cfg(windows)]
 mod window;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 #[cfg(windows)]
 pub fn run() -> Result<(), Error> {
-    Ok(())
+    window::run()
 }
 
 #[cfg(not(windows))]
