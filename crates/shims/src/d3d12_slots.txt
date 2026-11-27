@@ -79,6 +79,11 @@ ID3D12CommandQueue 15 Wait pc
 ID3D12CommandQueue 16 GetTimestampFrequency pc
 ID3D12CommandQueue 17 GetClockCalibration pc
 ID3D12CommandQueue 18 GetDesc pc
+# Queue slots 28 to 32 are a guess: PresentX is 30 in the older console runtime layout and 32 in the newer; SuspendX and ResumeX are placed before the older PresentX. Both PresentX slots answer; a call to 29 or 31 names itself in the trace.
+ID3D12CommandQueue 28 SuspendX inferred
+ID3D12CommandQueue 29 ResumeX inferred
+ID3D12CommandQueue 30 PresentX inferred
+ID3D12CommandQueue 32 PresentX inferred
 ID3D12CommandAllocator 0 QueryInterface pc
 ID3D12CommandAllocator 1 AddRef pc
 ID3D12CommandAllocator 2 Release pc
@@ -157,3 +162,18 @@ ID3D12GraphicsCommandList 85 CopyTextureRegion inferred
 ID3D12GraphicsCommandList 141 SetScratchBufferX measured
 ID3D12GraphicsCommandList 146 Barrier measured
 ID3D12GraphicsCommandList 148 AllocateUploadMemoryX measured
+ID3D12Resource 0 QueryInterface pc
+ID3D12Resource 1 AddRef pc
+ID3D12Resource 2 Release pc
+ID3D12Resource 7 GetDevice pc
+ID3D12Resource 8 Map pc
+ID3D12Resource 9 Unmap pc
+ID3D12Resource 10 GetDesc pc
+ID3D12Resource 11 GetGPUVirtualAddress pc
+ID3D12Resource 12 WriteToSubresource pc
+ID3D12Resource 13 ReadFromSubresource pc
+ID3D12Resource 14 GetHeapProperties pc
+ID3D12PipelineState 7 GetDevice pc
+ID3D12PipelineState 8 GetCachedBlob pc
+ID3D12PipelineState 11 GetScratchBlobX measured
+ID3D12RootSignature 7 GetDevice pc
