@@ -814,3 +814,46 @@ fn skinned_model_has_consistent_skin_and_rest_pose() {
     assert_eq!(j0[8], 2);
 }
 
+#[test]
+fn external_skeleton_binds_character_parts() {
+    let skeleton = Skeleton {
+        bones: decode_resource(
+            &{
+                let mut s = DrawableSpec::simple(GeometrySpec::quad());
+                s.skeleton = two_bones();
+                drawable_resource(&s)
+            },
+            None,
+        )
+        .unwrap()
+        .drawables[0]
+            .skeleton
+            .clone()
+            .unwrap()
+            .bones,
+    };
+    let mut spec = skinned_spec(
+        SkinForm::Bytes(1),
+        vec![
+            vec![(0, 255)],
+            vec![(1, 255)],
+            vec![(1, 255)],
+            vec![(0, 255)],
+        ],
+        vec![joaat("SKEL_ROOT"), joaat("SKEL_Pelvis")],
+    );
+    spec.name = Some("part");
+    let set = decode_resource(&drawable_resource(&spec), None).unwrap();
+    let options = ExportOptions {
+        skeleton: Some(&skeleton),
+        ..ExportOptions::default()
+    };
+    let e = export(&set, &options).unwrap().remove(0);
+    let glb = parse_glb(&e.glb);
+    glb.validate();
+    assert_eq!(glb.doc["skins"][0]["joints"].as_array().unwrap().len(), 2);
+    let sidecar: Value = serde_json::from_str(&e.sidecar).unwrap();
+    assert_eq!(sidecar["drawables"][0]["skeleton"]["own"], false);
+    assert_eq!(sidecar["drawables"][0]["skeleton"]["bones"], 2);
+}
+
