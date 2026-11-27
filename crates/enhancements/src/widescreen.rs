@@ -392,6 +392,96 @@ pub fn rel32(next_rva: u32, target: u32) -> [u8; 4] {
     target.wrapping_sub(next_rva).to_le_bytes()
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Evidence {
+    pub rva: u32,
+    pub what: &'static str,
+}
+
+pub const ASPECT_QUANTIZER: u32 = 0x73c790;
+pub const ASPECT_WIDE_TEST: u32 = 0x73c7c0;
+pub const ASPECT_GETTER: u32 = 0x73c0d0;
+pub const DISPLAY_WIDTH: u32 = 0x92d7924;
+pub const DISPLAY_HEIGHT: u32 = 0x92d7928;
+pub const ASPECT_16_9: u32 = 0x615a1c0;
+pub const HALF_ANGLE_CONSTANT: u32 = 0x615be20;
+pub const BARS_TEST: u32 = 0x28c07d9;
+
+pub const EVIDENCE: &[Evidence] = &[
+    Evidence {
+        rva: 0x1de4030,
+        what: "writes the display size globals 0x92d7924 (width) and 0x92d7928 (height) as i32, from the settings object (+0x114/+0x118 display, +0x134/+0x138 internal render size); called from the settings callback 0x26192a0",
+    },
+    Evidence {
+        rva: 0x73c7c0,
+        what: "wide test: float(width)/float(height) > 1.5 (0x6159cc0)",
+    },
+    Evidence {
+        rva: 0x73c790,
+        what: "aspect quantizer: 16/9 (0x615a1c0) when the wide test passes, else 4/3 (0x6159fa8); callers 0x73c770 and the HUD edge remap 0x2258ec0",
+    },
+    Evidence {
+        rva: 0x73c770,
+        what: "stores the quantized aspect in the float global 0x6c32270; run once by the initializer 0x73c4e0 (listed in the table at 0x63da6a0)",
+    },
+    Evidence {
+        rva: 0x73c0d0,
+        what: "aspect getter: loads 0x6c32270; 15 callers include the projection build 0x737b90, the horizontal fov helper 0x1295d80, 0x2e206b0, 0x36aa660, 0x417a970, 0x4a241e0, 0x4163180, 0x1914670",
+    },
+    Evidence {
+        rva: 0x737b90,
+        what: "projection: tan(fov_degrees * pi/360) from camera +0x1d0, times the aspect, with near +0x1d4 and far +0x1d8, into the matrix builder 0x11c6ca0; the field of view is vertical, so a true aspect gives Hor+",
+    },
+    Evidence {
+        rva: 0x1295d80,
+        what: "atan(tan(fov/2) * aspect): horizontal half-angle for culling; shares the half-angle constant",
+    },
+    Evidence {
+        rva: 0x3108cc0,
+        what: "shader parameter globals 0x147f0dfdc/e0: tan(fov/2) and tan(fov/2) * aspect, the aspect read from a viewport object +0x6dc or 16/9 when none; twin at 0x3b6c4f0 (globals 0x14926ac1c/20)",
+    },
+    Evidence {
+        rva: 0x615be20,
+        what: "float 0x3c0efa35 = pi/360, used by roughly 180 sites; only those next to tanf and the aspect are patched",
+    },
+    Evidence {
+        rva: 0x4163180,
+        what: "field of view factor for the snapped aspect: (16/9) / snapped, clamped to 1.0..max (0x616c900), stored at +0x70; 1.0 for shapes wider than 16:9",
+    },
+    Evidence {
+        rva: 0x3ddc350,
+        what: "snaps an aspect to the nearest of eight shapes in the table at 0x654fc80 (16:9, 16:10, 4:3, 21:9, 17:9, 5:4, 3:2, 5:3), caching the last input in 0x6c32268/6c",
+    },
+    Evidence {
+        rva: 0x28c0520,
+        what: "scene viewport bars: aspect = width/height; no bars when |aspect - 16/9| <= 1e-6, else fractional margins from the 16/9 vectors at 0x6162b90/a0 (pillarbox wider, letterbox narrower); entered through 0x28c04d0 from 0x17bd7f0",
+    },
+    Evidence {
+        rva: 0x1914670,
+        what: "cinematic bars: target shape 16/9 against the snapped aspect, margins in 0x98c16d8",
+    },
+    Evidence {
+        rva: 0x32be1b0,
+        what: "full-screen effect extent: when width/height > 16/9 sets a crop range in 0x47659a3c/44",
+    },
+    Evidence {
+        rva: 0x2258ec0,
+        what: "HUD edge anchors: when the wide test passes remaps a 0..1 coordinate by (4/3)/aspect (anchor kinds 0-4, 8): the HUD is laid out for 4:3 inside the wide frame",
+    },
+    Evidence {
+        rva: 0x2627eb0,
+        what: "effect buffer size from the display globals: capped at 1920x1080 keeping the shape, width and height rounded down to 16, then to multiples of 4",
+    },
+    Evidence {
+        rva: 0x22b1860,
+        what: "default output extent 3840x2160 (0x615a3ec/f0) when the output query gives nothing",
+    },
+    Evidence {
+        rva: 0x504c1b0,
+        what: "settings object accessor (global 0xaad3ce0, +0x450): output size at +0x204/+0x208, upscaled render size at +0x1ec/+0x1f0 when +0x1e8 is set",
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
