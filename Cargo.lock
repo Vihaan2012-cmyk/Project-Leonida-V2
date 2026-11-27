@@ -2324,6 +2324,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
+ "xbox-d3d12",
 ]
 
 [[package]]
@@ -3231,6 +3232,7 @@ name = "xbox-d3d12"
 version = "0.1.0"
 dependencies = [
  "thiserror 2.0.21",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
