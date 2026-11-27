@@ -99,10 +99,16 @@ impl Drop for TestGpu {
 /// Committed host memory at an address between 1 and 3 GiB, standing in for an `XMemVirtualAlloc` region.
 pub struct Region {
     pub address: u64,
+    pub len: u64,
 }
 
 impl Region {
     pub fn new(len: u64, write_watch: bool) -> Region {
+        Region::new_in(len, write_watch, 1 << 30, 1 << 26, 28)
+    }
+
+    /// Committed memory at the first of `tries` addresses, `step` apart from `first`, that is free.
+    pub fn new_in(len: u64, write_watch: bool, first: u64, step: u64, tries: u64) -> Region {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
         };
@@ -111,8 +117,8 @@ impl Region {
         if write_watch {
             flags |= MEM_WRITE_WATCH;
         }
-        for step in 0..28u64 {
-            let hint = (1u64 << 30) + step * (1 << 26);
+        for n in 0..tries {
+            let hint = first + n * step;
             // SAFETY: a fresh allocation, at the hint or nowhere.
             let at = unsafe {
                 VirtualAlloc(
@@ -123,15 +129,25 @@ impl Region {
                 )
             };
             if !at.is_null() {
-                return Region { address: at as u64 };
+                return Region {
+                    address: at as u64,
+                    len,
+                };
             }
         }
-        panic!("no free address between 1 and 3 GiB");
+        panic!("no free address from {first:#x}");
     }
 
     pub fn read(&self, index: u64) -> u32 {
         // SAFETY: the region is ours and committed; callers stay inside it.
         unsafe { *((self.address + index * 4) as *const u32) }
+    }
+
+    /// Writes one word at byte `offset`, which dirties its page.
+    pub fn touch(&self, offset: u64, value: u32) {
+        debug_assert!(offset + 4 <= self.len);
+        // SAFETY: inside the region, which is ours and committed.
+        unsafe { *((self.address + offset) as *mut u32) = value };
     }
 
     pub fn write(&self, index: u64, value: u32) {

@@ -1141,6 +1141,8 @@ fn write_watch(_va: u64, _len: u64) -> Option<Vec<u64>> {
 }
 
 #[cfg(test)]
+mod bench;
+#[cfg(test)]
 pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
