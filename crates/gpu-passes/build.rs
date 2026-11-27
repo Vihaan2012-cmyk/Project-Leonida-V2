@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    for name in ["surface"] {
+    for name in ["surface", "bc1"] {
         let path = format!("shaders/{name}.wgsl");
         println!("cargo:rerun-if-changed={path}");
         let source = fs::read_to_string(&path).unwrap();
