@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+config.workspace = true
 decompile.workspace = true
 game-package.workspace = true
 gpu.workspace = true
