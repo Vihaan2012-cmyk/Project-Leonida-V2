@@ -3,5 +3,6 @@
 pub mod bits;
 pub mod error;
 pub mod huffman;
+pub mod mdct;
 
 pub use error::{Error, Result};
