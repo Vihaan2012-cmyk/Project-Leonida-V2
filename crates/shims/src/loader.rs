@@ -10,6 +10,8 @@ use std::sync::Mutex;
 use crate::Shim;
 
 #[cfg(windows)]
+mod com;
+#[cfg(windows)]
 mod modules;
 
 pub(crate) const S_OK: i32 = 0;
@@ -150,6 +152,16 @@ pub fn shims() -> Vec<Shim> {
     {
         Vec::new()
     }
+}
+
+/// Serves `QueryApiImpl`, for tests and for callers that hold no module handle.
+#[cfg(windows)]
+pub fn query_api(class: &[u8; 16], interface: &[u8; 16], out: &mut usize) -> i32 {
+    com::query(
+        &com::Guid(*class),
+        &com::Guid(*interface),
+        out as *mut usize as *mut *mut std::ffi::c_void,
+    )
 }
 
 #[cfg(test)]
