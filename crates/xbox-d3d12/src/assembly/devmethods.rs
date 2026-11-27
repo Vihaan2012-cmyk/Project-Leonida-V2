@@ -15,11 +15,12 @@ use super::objects::{
 use super::rawdesc::*;
 use super::resapi::Placement;
 use super::state::{Assembly, assembly_of};
-use crate::com::{self, E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, E_POINTER, S_OK};
+use crate::com::{self, E_FAIL, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, S_OK};
 use crate::descriptor::views::{SrvKind, ViewResource};
 use crate::descriptor::{self, SLOT_BYTES};
 use crate::heap;
 use crate::pipeline::{ComputePsoDesc, PipelineError};
+use crate::pso_stream::{Dialect, HostMemory, Memory, PipelineStream};
 use crate::resource::desc::AllocationInfo;
 use crate::resource::{HeapKind, layout};
 use crate::root::RootSignature;
@@ -607,8 +608,9 @@ unsafe extern "win64" fn d_create_compute_pipeline_state_x(
     unsafe { d_create_compute_pipeline_state(this, desc, riid, out) }
 }
 
-/// Slot 67: the root signature, then pointer and size pairs for the FSPX payload's kinds 0, 1, 6 and 7.
-unsafe extern "win64" fn d_create_compute_pipeline_state_from_native(
+/// Slot 86: `D3D12_PIPELINE_STATE_STREAM_DESC {size, pointer}`, then `(riid, out)`. The title's streams are the
+/// console's numbering of the d3dx12 subobjects.
+unsafe extern "win64" fn d_create_pipeline_state_stream(
     this: *mut c_void,
     desc: *const u8,
     riid: *const u8,
@@ -617,13 +619,96 @@ unsafe extern "win64" fn d_create_compute_pipeline_state_from_native(
     if desc.is_null() || out.is_null() {
         return E_POINTER;
     }
-    // SAFETY: the title's description.
-    let (root, parts) = unsafe { (root_of(pso_root(desc)), read_slot67(desc)) };
-    match ComputePsoDesc::from_slot67(root, &parts) {
-        Ok(desc) => create_compute(this, &desc, riid, out),
-        Err(e) => pipeline_hresult("a native compute pipeline", e),
+    // SAFETY: the title's two-word stream description.
+    let (size, pointer) = unsafe { (Mem(desc).u64(0), Mem(desc).u64(8)) };
+    if pointer == 0 || size == 0 || size > MAX_STREAM_BYTES {
+        com::note_once("a pipeline state stream with no bytes was refused");
+        return E_INVALIDARG;
+    }
+    // SAFETY: the title keeps `size` bytes at `pointer` alive for the call.
+    let bytes = unsafe { std::slice::from_raw_parts(pointer as usize as *const u8, size as usize) };
+    create_from_stream(this, bytes, &HostMemory, riid, out)
+}
+
+const MAX_STREAM_BYTES: u64 = 0x10000;
+
+fn create_from_stream(
+    this: *mut c_void,
+    bytes: &[u8],
+    memory: &dyn Memory,
+    riid: *const u8,
+    out: *mut *mut c_void,
+) -> u32 {
+    let stream = match PipelineStream::parse(bytes, memory, Dialect::Console) {
+        Ok(stream) => stream,
+        Err(e) => {
+            com::note(format!("a pipeline state stream was refused: {e}"));
+            return E_INVALIDARG;
+        }
+    };
+    if let Err(e) = stream.validate() {
+        com::note(format!("a pipeline state stream was refused: {e}"));
+        return E_INVALIDARG;
+    }
+    for kind in stream.unsupported() {
+        com::note_once(format!(
+            "a pipeline state stream asks for {kind}, which is not honoured"
+        ));
+    }
+    let Some(asm) = asm(this) else {
+        return E_FAIL;
+    };
+    // SAFETY: the title's root signature object, or any pointer, which `root_of` checks by kind.
+    let root = stream
+        .root_signature
+        .and_then(|p| unsafe { root_of(p as usize as *mut c_void) });
+    if stream.is_compute() {
+        return match stream.compute(root) {
+            Ok(desc) => create_compute(this, &desc, riid, out),
+            Err(e) => pipeline_hresult("a compute pipeline stream", e.into()),
+        };
+    }
+    let Some(root) = root else {
+        com::note_once("a graphics pipeline stream without a root signature was refused");
+        return E_INVALIDARG;
+    };
+    match stream.graphics(root) {
+        Ok(desc) => match asm.pipelines.create_graphics(&desc) {
+            Ok(pipeline) => new_pipeline(this, &asm, pipeline, riid, out),
+            Err(e) => pipeline_hresult("a graphics pipeline", e),
+        },
+        Err(e) => pipeline_hresult("a graphics pipeline stream", e.into()),
     }
 }
+
+/// Slots 55, 57 and 67 build pipelines from the title's own shader cache. They fail at once: the title treats
+/// the failure as a miss (only device-removed codes end its run) and creates the pipeline through slot 86 or 62.
+macro_rules! cache_path {
+    ($name:ident, $text:literal) => {
+        unsafe extern "win64" fn $name(
+            _this: *mut c_void,
+            _desc: *const u8,
+            _riid: *const u8,
+            _out: *mut *mut c_void,
+        ) -> u32 {
+            com::note_once($text);
+            E_NOTIMPL
+        }
+    };
+}
+
+cache_path!(
+    d_create_pipeline_from_cache_55,
+    "device slot 55 (cache pipeline creation) is declined; the title falls back to slots 86 and 62"
+);
+cache_path!(
+    d_create_graphics_from_cache,
+    "device slot 57 (console graphics pipeline from the cache) is declined; the title falls back to slot 86"
+);
+cache_path!(
+    d_create_compute_from_cache,
+    "device slot 67 (console compute pipeline from the cache) is declined; the title falls back to slot 62"
+);
 
 /// Slot 39: `D3D12_QUERY_HEAP_DESC`, `(type, count, node mask)`.
 unsafe extern "win64" fn d_create_query_heap(
@@ -678,9 +763,12 @@ pub fn table() -> Vec<(usize, usize)> {
         (38, f!(d_copyable_footprints)),
         (39, f!(d_create_query_heap)),
         (41, f!(d_create_command_signature)),
+        (55, f!(d_create_pipeline_from_cache_55)),
+        (57, f!(d_create_graphics_from_cache)),
         (62, f!(d_create_compute_pipeline_state_x)),
-        (67, f!(d_create_compute_pipeline_state_from_native)),
+        (67, f!(d_create_compute_from_cache)),
         (76, f!(d_create_committed_resource)),
+        (86, f!(d_create_pipeline_state_stream)),
         (133, f!(d_create_placed_resource_x)),
     ]
 }
