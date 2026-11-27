@@ -1,17 +1,22 @@
 //! Translated shaders, kept in a `redb` database so each game shader is translated once.
+//!
+//! The runtime asks [`Store::program`] with a program's FSSM bytes and gets the stored or freshly translated
+//! program; `leonida pipelines` fills the store ahead of time.
 
 mod error;
 mod program;
 mod record;
+mod store;
 pub mod translate;
 
 pub use error::StoreError;
 pub use program::{
-    Failure, Key, Source, Translated, container_programs, key_hex, key_of, record_of, translate_built,
-    translate_program,
+    Failure, Key, Source, Translated, container_programs, key_hex, key_of, record_of,
+    translate_built, translate_program,
 };
 pub use record::{
     Exactness, Options, PipelineOutcome, Record, Role, SCHEMA_VERSION, stage_kind,
     translator_version,
 };
+pub use store::{Program, Store};
 pub use translate::Built;
