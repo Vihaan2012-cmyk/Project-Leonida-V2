@@ -402,6 +402,13 @@ impl Generator {
                     self.sreg()
                 )
             }
+            3 if self.rng.chance(3) => format!(
+                "ds_bpermute_b32 {}, {}, {} offset:{}",
+                self.vdst(),
+                self.vreg(),
+                self.vreg(),
+                4 * self.rng.below(70)
+            ),
             3 => {
                 let pattern = match self.rng.below(5) {
                     0 => {
@@ -426,6 +433,17 @@ impl Generator {
                     "ds_swizzle_b32 {}, {} offset:swizzle({pattern})",
                     self.vdst(),
                     self.vreg()
+                )
+            }
+            _ if self.rng.chance(2) => {
+                let index = if self.rng.chance(6) {
+                    300
+                } else {
+                    self.rng.below(if self.gpu { 4 } else { 9 })
+                };
+                format!(
+                    "s_mov_b32 m0, {index}\nv_movreld_b32_e32 v1, {}",
+                    self.vsrc(false)
                 )
             }
             _ => {

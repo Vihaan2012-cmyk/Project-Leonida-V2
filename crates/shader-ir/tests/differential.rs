@@ -163,6 +163,31 @@ fn float_modifiers() {
 }
 
 #[test]
+fn long_jumps_land_where_the_computed_address_points() {
+    for (wave64, seed) in [(false, 3), (true, 4)] {
+        let mut wave = start(wave64, seed);
+        wave.code_base = 0x1234_5678_0000;
+        let source = "s_mov_b32 s5, 1
+             s_mov_b32 s6, 0
+             s_getpc_b64 s[0:1]
+             s_add_u32 s0, s0, 16
+             s_addc_u32 s1, s1, 0
+             s_setpc_b64 s[0:1]
+             s_mov_b32 s5, 2
+             s_add_u32 s6, s6, 1
+             s_cmp_ge_u32 s6, 3
+             s_cbranch_scc1 4
+             s_getpc_b64 s[2:3]
+             s_sub_u32 s2, s2, 16
+             s_subb_u32 s3, s3, 0
+             s_setpc_b64 s[2:3]
+             s_mov_b32 s7, 4
+             s_endpgm";
+        assert!(check(source, wave, memory(seed)), "{source}");
+    }
+}
+
+#[test]
 fn unsupported_instructions_are_reported() {
     let code = rdna::assemble("v_frexp_mant_f64_e32 v[0:1], v[2:3]", true).unwrap();
     assert!(matches!(

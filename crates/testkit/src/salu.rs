@@ -169,6 +169,11 @@ fn program_flow(name: &str, inst: &Inst, wave: &mut Wave) -> Result<Option<Flow>
             wave.write_scalar64(arg(inst, 0)?, address, inst)?;
             return Ok(Some(Flow::Next));
         }
+        "s_setpc_b64" => {
+            let address = wave.read_scalar64(arg(inst, 0)?, inst)?;
+            let target = address.wrapping_sub(wave.code_base) as i64;
+            return Ok(Some(Flow::Jump((target - inst.pc as i64 - 4) / 4)));
+        }
         "s_branch" => true,
         "s_cbranch_scc0" => !wave.scc,
         "s_cbranch_scc1" => wave.scc,

@@ -158,6 +158,24 @@ fn lds(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
     if name == "ds_swizzle_b32" {
         return swizzle(inst, wave);
     }
+    if name == "ds_bpermute_b32" {
+        let offset = offset_mod(inst, "offset") as u32;
+        let target = vreg(arg(inst, 0)?, inst)?;
+        let source = wave.vgpr[vreg(arg(inst, 2)?, inst)?];
+        let lanes = if wave.wave64 { 64 } else { 32 };
+        let mut values = Vec::new();
+        for lane in wave.active_lanes() {
+            let address = wave
+                .read_lane(arg(inst, 1)?, lane, inst)?
+                .wrapping_add(offset);
+            let from = (address >> 2) as usize % lanes;
+            values.push((lane, if wave.active(from) { source[from] } else { 0 }));
+        }
+        for (lane, value) in values {
+            wave.vgpr[target][lane] = value;
+        }
+        return Ok(());
+    }
     if name.starts_with("ds_read2") || name.starts_with("ds_write2") {
         return lds_pair(name, inst, wave);
     }

@@ -244,7 +244,7 @@ impl Checker<'_> {
             Stmt::Set(reg, tmp) => self.expect(*tmp, reg_type(*reg))?,
             Stmt::SetPair(_, tmp) => self.expect(*tmp, Ty::U64)?,
             Stmt::SetLane(_, tmp) => self.expect(*tmp, Ty::U32)?,
-            Stmt::WriteLane(_, lane, value) => {
+            Stmt::WriteLane(_, lane, value) | Stmt::SetRelative(_, lane, value) => {
                 self.expect(*lane, Ty::U32)?;
                 self.expect(*value, Ty::U32)?;
             }

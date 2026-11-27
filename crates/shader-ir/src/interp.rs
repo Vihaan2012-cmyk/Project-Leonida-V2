@@ -547,6 +547,16 @@ impl Run<'_> {
                     }
                 }
             }
+            Stmt::SetRelative(base, index, value) => {
+                let at = usize::from(*base) + self.values[*index as usize][0] as u32 as usize;
+                if at < 256 {
+                    for lane in 0..self.lanes {
+                        if self.active(lane) {
+                            self.machine.vgpr[at][lane] = self.values[*value as usize][lane] as u32;
+                        }
+                    }
+                }
+            }
             Stmt::WriteLane(r, lane, value) => {
                 let lane = self.values[*lane as usize][0] as usize % self.lanes;
                 self.machine.vgpr[usize::from(*r)][lane] = self.values[*value as usize][0] as u32;

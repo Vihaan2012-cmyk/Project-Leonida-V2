@@ -22,7 +22,7 @@ pub fn lift(code: &[u8], wave64: bool) -> Result<Function, LiftError> {
     if decoded.invalid > 0 {
         return Err(LiftError::Invalid);
     }
-    let insts = decoded.insts;
+    let insts = long_jumps(decoded.insts);
     let mut leaders = BTreeSet::from([0usize]);
     for (index, inst) in insts.iter().enumerate() {
         if let Some(target) = branch_target(inst) {
@@ -172,9 +172,10 @@ pub struct Coverage {
 
 pub fn coverage(code: &[u8], wave64: bool) -> Coverage {
     let decoded = rdna::decode_all(code, !wave64, 0);
+    let insts = long_jumps(decoded.insts);
     let mut unsupported = Vec::new();
     let mut texts = Vec::new();
-    for inst in &decoded.insts {
+    for inst in &insts {
         let mut lifter = Lifter::new(wave64);
         let supported = if is_end(inst) {
             true
@@ -194,7 +195,7 @@ pub fn coverage(code: &[u8], wave64: bool) -> Coverage {
         }
     }
     Coverage {
-        instructions: decoded.insts.len(),
+        instructions: insts.len(),
         invalid_words: decoded.invalid,
         unsupported,
         texts,
@@ -203,6 +204,59 @@ pub fn coverage(code: &[u8], wave64: bool) -> Coverage {
 
 fn is_end(inst: &Inst) -> bool {
     inst.name.starts_with("s_endpgm")
+}
+
+/// The compiler's jump past the reach of a branch: `s_getpc_b64 s[n:n+1]`, a 64-bit add or subtract of a
+/// constant to the pair, then `s_setpc_b64 s[n:n+1]`. The `s_setpc` becomes a branch to the address it computes.
+fn long_jumps(mut insts: Vec<Inst>) -> Vec<Inst> {
+    for at in 3..insts.len() {
+        let Some(offset) = long_jump(&insts[at - 3..=at]) else {
+            continue;
+        };
+        let jump = &insts[at];
+        let target = insts[at - 3].pc as i64 + 4 + offset;
+        let words = (target - (jump.pc as i64 + 4)) / 4;
+        insts[at] = Inst {
+            name: "s_branch".into(),
+            args: vec![Arg::new(Operand::Int(words))],
+            mods: Vec::new(),
+            pc: jump.pc,
+            bytes: jump.bytes.clone(),
+        };
+    }
+    insts
+}
+
+fn long_jump(window: &[Inst]) -> Option<i64> {
+    let [get, low, high, set] = window else {
+        return None;
+    };
+    let pair = |inst: &Inst, index: usize| match inst.args.get(index)?.operand {
+        Operand::Sgpr { reg, count } => Some((reg, count)),
+        _ => None,
+    };
+    let constant = |inst: &Inst| match inst.args.get(2)?.operand {
+        Operand::Int(value) => Some(value),
+        Operand::Literal(value) => Some(i64::from(value)),
+        _ => None,
+    };
+    let (reg, _) = pair(set, 0).filter(|(_, count)| *count == 2)?;
+    let subtract = match (low.name.as_str(), high.name.as_str()) {
+        ("s_add_u32", "s_addc_u32") => false,
+        ("s_sub_u32", "s_subb_u32") => true,
+        _ => return None,
+    };
+    let same = |inst: &Inst, r: u8| pair(inst, 0) == Some((r, 1)) && pair(inst, 1) == Some((r, 1));
+    if set.name != "s_setpc_b64"
+        || get.name != "s_getpc_b64"
+        || pair(get, 0) != Some((reg, 2))
+        || !same(low, reg)
+        || !same(high, reg + 1)
+    {
+        return None;
+    }
+    let offset = (constant(high)? << 32) + (constant(low)? & 0xFFFF_FFFF);
+    Some(if subtract { -offset } else { offset })
 }
 
 fn branch_target(inst: &Inst) -> Option<usize> {
@@ -308,6 +362,7 @@ impl Lifter {
         let written = self.stmts.iter().rev().find_map(|stmt| match stmt {
             Stmt::SetLane(r, t) if *r == reg => Some(Some(*t)),
             Stmt::WriteLane(r, _, _) if *r == reg => Some(None),
+            Stmt::SetRelative(base, _, _) if *base <= reg => Some(None),
             _ => None,
         })??;
         self.stmts.iter().find_map(|stmt| match stmt {
@@ -2221,6 +2276,13 @@ impl Lifter {
             return Ok(true);
         }
         let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
+        if name == "v_movreld_b32" {
+            let (base, _) = vgprs(arg(0)?, inst)?;
+            let value = self.lane(arg(1)?, inst)?;
+            let index = self.value(Expr::Get(Reg::M0));
+            self.stmts.push(Stmt::SetRelative(base, index, value));
+            return Ok(true);
+        }
         let value = match name {
             "v_mov_b32" => self.lane(arg(1)?, inst)?,
             "v_movrels_b32" => {
@@ -2911,6 +2973,22 @@ impl Lifter {
                     let group_base = self.bin(Bin::And, lane, group);
                     self.bin(Bin::Or, group_base, picked)
                 };
+                let value = self.value(Expr::Shuffle(source, from));
+                let active = self.lane_active(from);
+                let zero = self.c(0);
+                let value = self.value(Expr::Select(active, value, zero));
+                self.set_lane(arg(0)?, value, inst)?;
+                Ok(true)
+            }
+            "ds_bpermute_b32" => {
+                let address = self.lane(arg(1)?, inst)?;
+                let immediate = self.c(offset as u32);
+                let address = self.bin(Bin::Add, address, immediate);
+                let two = self.c(2);
+                let index = self.bin(Bin::ShrU, address, two);
+                let mask = self.c(if self.wave64 { 63 } else { 31 });
+                let from = self.bin(Bin::And, index, mask);
+                let source = self.lane(arg(2)?, inst)?;
                 let value = self.value(Expr::Shuffle(source, from));
                 let active = self.lane_active(from);
                 let zero = self.c(0);

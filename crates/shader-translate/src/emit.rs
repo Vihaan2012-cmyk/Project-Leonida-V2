@@ -247,6 +247,7 @@ fn registers(function: &Function) -> (BTreeSet<u8>, BTreeSet<u8>) {
                     vectors.insert(0);
                     vectors.extend(*base..=255);
                 }
+                Stmt::SetRelative(base, _, _) => vectors.extend(*base..=255),
                 _ => {}
             }
         }
@@ -1650,6 +1651,30 @@ impl Emitter {
                 let u32_ = self.t.u32_;
                 let value = ok(self.b.select(u32_, None, active, v(self, tmp), old))?;
                 self.store(var, value)?;
+            }
+            Stmt::SetRelative(base, index, value) => {
+                let u32_ = self.t.u32_;
+                let first = self.u32c(u32::from(*base));
+                let at = ok(self.b.i_add(u32_, None, first, v(self, index)))?;
+                let active = self.active()?;
+                let new = v(self, value);
+                let merge = self.b.id();
+                let labels: Vec<(u8, Word)> = (*base..=255u8).map(|r| (r, self.b.id())).collect();
+                ok(self.b.selection_merge(merge, SelectionControl::NONE))?;
+                let targets: Vec<(Operand, Word)> = labels
+                    .iter()
+                    .map(|(r, label)| (Operand::LiteralBit32(u32::from(*r)), *label))
+                    .collect();
+                ok(self.b.switch(at, merge, targets))?;
+                for (reg, label) in labels {
+                    self.begin(label)?;
+                    let var = self.vgpr[&reg];
+                    let old = self.load(var)?;
+                    let chosen = ok(self.b.select(u32_, None, active, new, old))?;
+                    self.store(var, chosen)?;
+                    ok(self.b.branch(merge))?;
+                }
+                self.begin(merge)?;
             }
             Stmt::WriteLane(reg, lane, value) => {
                 let target = self.masked_shift(v(self, lane), self.lanes - 1)?;

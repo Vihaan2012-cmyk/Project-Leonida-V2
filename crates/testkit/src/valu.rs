@@ -242,6 +242,18 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
         return dpp(op, inst, wave);
     }
     match name {
+        "v_movreld_b32" => {
+            let Operand::Vgpr { reg, .. } = arg(inst, 0)?.operand else {
+                return Err(bad(inst));
+            };
+            let index = usize::from(reg) + wave.sgpr[124] as usize;
+            if index < 256 {
+                for lane in wave.active_lanes() {
+                    wave.vgpr[index][lane] = wave.read_lane(arg(inst, 1)?, lane, inst)?;
+                }
+            }
+            return Ok(true);
+        }
         "v_movrels_b32" => {
             let Operand::Vgpr { reg, .. } = arg(inst, 1)?.operand else {
                 return Err(bad(inst));

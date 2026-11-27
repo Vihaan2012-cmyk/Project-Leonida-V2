@@ -340,6 +340,8 @@ pub enum Stmt {
     Set(Reg, Tmp),
     SetPair(u8, Tmp),
     SetLane(u8, Tmp),
+    /// Writes VGPR `base + index` in each active lane; nothing when that is past v255.
+    SetRelative(u8, Tmp, Tmp),
     WriteLane(u8, Tmp, Tmp),
     LdsStore(Tmp, Tmp),
     /// `done` marks a pixel shader's last export, whose exec mask decides which pixels survive; `compressed`
