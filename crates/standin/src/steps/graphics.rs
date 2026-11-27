@@ -34,10 +34,8 @@ const DEVICE_SET_FRAME_INTERVAL: u32 = 78;
 const DEVICE_SCHEDULE_FRAME_EVENT: u32 = 79;
 const DEVICE_WAIT_FRAME_EVENT: u32 = 80;
 // Queue, list, fence and heap slots.
-const QUEUE_EXECUTE: u32 = 10;
-const QUEUE_SIGNAL: u32 = 14;
-/// `PresentX` is slot 30 in the older console runtime layout and 32 in the newer; which the game's runtime uses is
-/// not decided.
+const QUEUE_EXECUTE: u32 = 35;
+const QUEUE_SIGNAL: u32 = 16;
 pub const PRESENT_X_SLOT: u32 = 32;
 const ALLOCATOR_RESET: u32 = 8;
 const LIST_CLOSE: u32 = 9;
@@ -309,7 +307,11 @@ fn submit(e: &mut Emitter) -> Res {
     )?;
     e.vcall(list, LIST_CLOSE, &[])?;
     e.fail_if_hresult_failed()?;
-    e.vcall(queue, QUEUE_EXECUTE, &[Arg::Imm(1), Arg::addr(list)])?;
+    e.vcall(
+        queue,
+        QUEUE_EXECUTE,
+        &[Arg::Imm(1), Arg::addr(list), Arg::Imm(0), Arg::Imm(0)],
+    )?;
     e.vcall(queue, QUEUE_SIGNAL, &[Arg::load64(fence), Arg::Imm(1)])?;
     e.fail_if_hresult_failed()?;
     wait_for_fence(e, 1)
@@ -431,7 +433,11 @@ fn clear(e: &mut Emitter) -> Res {
     )?;
     e.vcall(list, LIST_CLOSE, &[])?;
     e.fail_if_hresult_failed()?;
-    e.vcall(queue, QUEUE_EXECUTE, &[Arg::Imm(1), Arg::addr(list)])?;
+    e.vcall(
+        queue,
+        QUEUE_EXECUTE,
+        &[Arg::Imm(1), Arg::addr(list), Arg::Imm(0), Arg::Imm(0)],
+    )?;
     e.vcall(queue, QUEUE_SIGNAL, &[Arg::load64(fence), Arg::Imm(2)])?;
     e.fail_if_hresult_failed()?;
     wait_for_fence(e, 2)

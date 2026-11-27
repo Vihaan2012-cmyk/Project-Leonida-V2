@@ -477,8 +477,8 @@ fn a_queue_waits_for_a_fence_and_signals_another() {
     let (a, b) = (make_fence(device, 0), make_fence(device, 0));
     // SAFETY: queue slots 14 (`Signal`) and 15 (`Wait`), fence slots 9, 10 and 12.
     unsafe {
-        let wait: unsafe extern "win64" fn(Ptr, Ptr, u64) -> u32 = slot(queue, 15);
-        let signal: unsafe extern "win64" fn(Ptr, Ptr, u64) -> u32 = slot(queue, 14);
+        let wait: unsafe extern "win64" fn(Ptr, Ptr, u64) -> u32 = slot(queue, 17);
+        let signal: unsafe extern "win64" fn(Ptr, Ptr, u64) -> u32 = slot(queue, 16);
         assert_eq!(wait(queue, a, 5), 0);
         assert_eq!(signal(queue, b, 1), 0);
         std::thread::sleep(Duration::from_millis(60));
@@ -565,7 +565,7 @@ fn a_dropped_queue_with_a_wait_that_never_comes_shuts_down() {
     let fence = make_fence(device, 0);
     // SAFETY: queue slot 15 (`Wait`) and `Release`.
     unsafe {
-        let wait: unsafe extern "win64" fn(Ptr, Ptr, u64) -> u32 = slot(queue, 15);
+        let wait: unsafe extern "win64" fn(Ptr, Ptr, u64) -> u32 = slot(queue, 17);
         wait(queue, fence, 99);
         let release: RefFn = slot(queue, 2);
         assert_eq!(release(queue), 0);

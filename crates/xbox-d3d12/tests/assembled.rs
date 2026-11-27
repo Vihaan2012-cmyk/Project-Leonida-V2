@@ -187,7 +187,7 @@ impl Harness {
     /// Executes the closed list and waits on a fence the queue signals behind it.
     fn run(&self, queue: Ptr, list: Ptr) {
         let mut fence = std::ptr::null_mut();
-        // SAFETY: device slot 36, queue slots 10 and 14, fence slot 9.
+        // SAFETY: device slot 36, queue slots 10 and 16, fence slot 9.
         unsafe {
             let create_fence: unsafe extern "win64" fn(Ptr, u64, u32, *const u8, *mut Ptr) -> u32 =
                 slot(self.device, 36);
@@ -197,7 +197,7 @@ impl Harness {
             );
             let execute: unsafe extern "win64" fn(Ptr, u32, *const Ptr) = slot(queue, 10);
             execute(queue, 1, &list);
-            let signal: unsafe extern "win64" fn(Ptr, Ptr, u64) -> u32 = slot(queue, 14);
+            let signal: unsafe extern "win64" fn(Ptr, Ptr, u64) -> u32 = slot(queue, 16);
             assert_eq!(signal(queue, fence, 1), 0);
             let wait: unsafe extern "win64" fn(Ptr, u64, Ptr) -> u32 = slot(fence, 9);
             assert_eq!(wait(fence, 1, std::ptr::null_mut()), 0);
@@ -573,7 +573,7 @@ fn a_cleared_back_buffer_presents_to_the_offscreen_target() {
 
     // The title's frame loop: interval, origin event, wait for a token, present with it.
     let mut token = 0u64;
-    // SAFETY: device slots 78 to 80 and queue slot 30 with the console argument shapes.
+    // SAFETY: device slots 78 to 80 and queue slot 32 with the console argument shapes.
     unsafe {
         let set_interval: unsafe extern "win64" fn(Ptr, usize, u32, usize, u32) -> u32 =
             slot(h.device, 78);
@@ -610,7 +610,7 @@ fn a_cleared_back_buffer_presents_to_the_offscreen_target() {
             u32,
             *const PlaneParameters,
             *const PresentParameters,
-        ) -> u32 = slot(queue, 30);
+        ) -> u32 = slot(queue, 32);
         assert_eq!(present(queue, 1, &plane, &params), 0);
         xbox_d3d12::queue::queue_of(queue).expect("a queue").flush();
     }

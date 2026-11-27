@@ -248,20 +248,16 @@ unsafe extern "win64" fn q_resume_x(_this: *mut c_void) -> u32 {
     current().map_or(S_OK, |a| a.presentation.resume_x() as u32)
 }
 
-/// `PresentX` is slot 30 in the older console runtime layout and 32 in the newer; which one this title has is not
-/// decided, so both answer. `SuspendX` and `ResumeX` are placed before the older `PresentX`, which is a guess:
-/// a call to any other queue slot is noted by the trap with its number.
-pub const PRESENT_SLOTS: [usize; 2] = [30, 32];
-pub const SUSPEND_SLOT: usize = 28;
-pub const RESUME_SLOT: usize = 29;
+/// Queue slots the executable calls: `SuspendX(0)` and `ResumeX()` from one function, `PresentX` from two sites.
+pub const SUSPEND_SLOT: usize = 23;
+pub const RESUME_SLOT: usize = 24;
+pub const PRESENT_SLOT: usize = 32;
 
 pub fn queue_table() -> Vec<(usize, usize)> {
-    let present = q_present_x as *const () as usize;
     vec![
         (SUSPEND_SLOT, q_suspend_x as *const () as usize),
         (RESUME_SLOT, q_resume_x as *const () as usize),
-        (PRESENT_SLOTS[0], present),
-        (PRESENT_SLOTS[1], present),
+        (PRESENT_SLOT, q_present_x as *const () as usize),
     ]
 }
 
