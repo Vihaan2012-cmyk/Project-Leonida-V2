@@ -5,6 +5,8 @@
 
 mod error;
 mod model;
+mod names;
 
 pub use error::Rpf9Error;
 pub use model::{Codec, Kind, Layout, Resource, Segment, Space, hex};
+pub use names::{find_names, joaat, name_hash, stem};
