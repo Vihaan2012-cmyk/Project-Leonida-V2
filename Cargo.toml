@@ -51,6 +51,7 @@ upscale = { path = "crates/upscale" }
 config = { path = "crates/config" }
 systems = { path = "crates/systems" }
 decompile = { path = "crates/decompile" }
+source-export = { path = "crates/source-export" }
 offline = { path = "crates/offline" }
 gpu = { path = "crates/gpu" }
 gpu-passes = { path = "crates/gpu-passes" }

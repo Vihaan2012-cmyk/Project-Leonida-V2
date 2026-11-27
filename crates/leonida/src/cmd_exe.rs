@@ -39,6 +39,31 @@ pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
     match &args.command {
         ExeCommand::Info => info(&image),
         ExeCommand::Decompile { address, depth } => decompile(&image, address, *depth)?,
+        ExeCommand::ExportSource {
+            out,
+            jobs,
+            resume,
+            only,
+            max_size,
+            db,
+            no_db,
+            per_file,
+        } => export_source(
+            &image,
+            (!*no_db).then(|| {
+                db.clone()
+                    .unwrap_or_else(|| out.parent().unwrap_or(Path::new("")).join("program.db"))
+            }),
+            source_export::Options {
+                out: out.clone(),
+                jobs: *jobs,
+                resume: *resume,
+                only: only.clone(),
+                max_function_bytes: *max_size,
+                functions_per_file: *per_file,
+                ..source_export::Options::default()
+            },
+        )?,
         ExeCommand::Imports { dll } => imports(&image, dll.as_deref()),
         ExeCommand::Network => network(&image),
         ExeCommand::Functions { top } => functions(&image, *top),
@@ -59,6 +84,51 @@ pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
         )?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn export_source(
+    image: &Image<'_>,
+    db_path: Option<PathBuf>,
+    options: source_export::Options,
+) -> Result<()> {
+    let out = options.out.clone();
+    let summary = match db_path {
+        Some(path) => {
+            let db = match exe_analysis::ProgramDb::load(&path) {
+                Ok(db) if db.image_base() == image.image_base => {
+                    println!("using {}", path.display());
+                    db
+                }
+                _ => {
+                    println!(
+                        "building the program database (saved to {})",
+                        path.display()
+                    );
+                    let build = exe_analysis::BuildOptions {
+                        threads: options.jobs,
+                    };
+                    let db = exe_analysis::ProgramDb::build_with(image, &build);
+                    db.save(&path)
+                        .with_context(|| format!("writing {}", path.display()))?;
+                    println!("{}", db.summary());
+                    db
+                }
+            };
+            source_export::export(image, &source_export::DbSymbols::new(&db), &options)?
+        }
+        None => source_export::export(image, &source_export::ImageSymbols::new(image), &options)?,
+    };
+    println!(
+        "{} functions, {} failed, {} stubbed, {} files written ({} kept from an earlier run), {:.1}s",
+        summary.functions,
+        summary.failed,
+        summary.stubbed,
+        summary.files,
+        summary.skipped_files,
+        summary.elapsed.as_secs_f64()
+    );
+    println!("see {}", out.join("index.md").display());
+    Ok(())
 }
 
 fn analyze(image: &Image<'_>, out: &Path, threads: usize) -> Result<()> {
