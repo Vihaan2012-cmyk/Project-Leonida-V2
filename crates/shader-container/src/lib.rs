@@ -13,7 +13,7 @@ mod xdat;
 pub use carve::{CarveStats, CarvedShader, carve};
 pub use dxbc::{Part, ShaderModel, Stage, find_part, parts, shader_model};
 pub use error::ContainerError;
-pub use fssm::{CodeRange, ENDPGM, Fssm, WaveSize};
+pub use fssm::{CodeRange, ENDPGM, Fssm, Interpolant, PixelSetup, WaveSize};
 pub use scan::{ScanResult, ScanSummary, ShaderInfo};
 pub use signature::{
     Interface, MeshInfo, PipelineInfo, SignatureElement, interface, pipeline_info, signature,

@@ -19,6 +19,10 @@ pub enum GpuError {
     BadSpirv,
     #[error("texture data does not match its size, format and mip count")]
     BadTexture,
+    #[error(
+        "this GPU cannot run translated pixel shaders: it lacks dynamic rendering, fragment barycentrics or fragment stores"
+    )]
+    NoPixelShaders,
 }
 
 static VALIDATION_ERRORS: AtomicUsize = AtomicUsize::new(0);
@@ -67,6 +71,7 @@ pub struct DeviceInfo {
     pub min_lod: bool,
     pub gather_extended: bool,
     pub image_int64_atomics: bool,
+    pub pixel_shaders: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +169,30 @@ pub struct Sampler {
     pub compare: Option<i32>,
 }
 
+/// A draw's colour or depth attachment: cleared to `clear` (depth: the first word, as a float), then read back
+/// into `data`, rows top to bottom.
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub format: TextureFormat,
+    pub clear: [u32; 4],
+    pub data: Vec<u8>,
+}
+
+enum Work<'a> {
+    Compute {
+        spirv: &'a [u32],
+        groups: [u32; 3],
+        subgroup_size: Option<u32>,
+    },
+    Draw {
+        vertex: &'a [u32],
+        fragment: &'a [u32],
+        extent: [u32; 2],
+        targets: &'a mut [Target],
+        depth: Option<&'a mut Target>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub enum Resource {
     Buffer(Vec<u32>),
@@ -216,25 +245,38 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut atomics64 = vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT::default();
-        let has_atomics64 = instance
+        let mut barycentric = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();
+        let extensions = instance
             .enumerate_device_extension_properties(physical)
-            .unwrap_or_default()
-            .iter()
-            .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::shader_image_atomic_int64::NAME));
+            .unwrap_or_default();
+        let has = |name: &CStr| {
+            extensions
+                .iter()
+                .any(|e| e.extension_name_as_c_str() == Ok(name))
+        };
+        let has_atomics64 = has(ash::ext::shader_image_atomic_int64::NAME);
+        let has_barycentric = has(ash::khr::fragment_shader_barycentric::NAME);
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut f13)
             .push_next(&mut f12);
         if has_atomics64 {
             features = features.push_next(&mut atomics64);
         }
+        if has_barycentric {
+            features = features.push_next(&mut barycentric);
+        }
         instance.get_physical_device_features2(physical, &mut features);
         let int64 = features.features.shader_int64 == vk::TRUE;
         let float64 = features.features.shader_float64 == vk::TRUE;
         let write_without_format =
             features.features.shader_storage_image_write_without_format == vk::TRUE;
+        let fragment_stores = features.features.fragment_stores_and_atomics == vk::TRUE;
         let min_lod = features.features.shader_resource_min_lod == vk::TRUE;
         let gather_extended = features.features.shader_image_gather_extended == vk::TRUE;
         let image_int64_atomics = has_atomics64 && atomics64.shader_image_int64_atomics == vk::TRUE;
+        let pixel_shaders = has_barycentric
+            && barycentric.fragment_shader_barycentric == vk::TRUE
+            && fragment_stores;
         let descriptor_indexing = f12.runtime_descriptor_array == vk::TRUE
             && f12.shader_sampled_image_array_non_uniform_indexing == vk::TRUE;
         let storage_images = descriptor_indexing
@@ -276,6 +318,7 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
                 min_lod,
                 gather_extended,
                 image_int64_atomics,
+                pixel_shaders: pixel_shaders && f13.dynamic_rendering == vk::TRUE,
             },
         })
     }
@@ -351,7 +394,8 @@ impl Gpu {
                 .queue_priorities(&priorities)];
             let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
                 .subgroup_size_control(chosen.info.subgroup_size_control)
-                .compute_full_subgroups(chosen.info.full_subgroups);
+                .compute_full_subgroups(chosen.info.full_subgroups)
+                .dynamic_rendering(chosen.info.pixel_shaders);
             let indexing = chosen.info.descriptor_indexing;
             let storage = chosen.info.storage_images;
             let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
@@ -364,17 +408,24 @@ impl Gpu {
                 .shader_float64(chosen.info.float64)
                 .shader_storage_image_write_without_format(storage)
                 .shader_resource_min_lod(chosen.info.min_lod)
-                .shader_image_gather_extended(chosen.info.gather_extended);
+                .shader_image_gather_extended(chosen.info.gather_extended)
+                .fragment_stores_and_atomics(chosen.info.pixel_shaders);
             let mut atomics64 = vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT::default()
                 .shader_image_int64_atomics(true);
             let mut features = vk::PhysicalDeviceFeatures2::default()
                 .features(base)
                 .push_next(&mut f13)
                 .push_next(&mut f12);
+            let mut barycentric = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default()
+                .fragment_shader_barycentric(true);
             let mut extensions = Vec::new();
             if chosen.info.image_int64_atomics {
                 features = features.push_next(&mut atomics64);
                 extensions.push(ash::ext::shader_image_atomic_int64::NAME.as_ptr());
+            }
+            if chosen.info.pixel_shaders {
+                features = features.push_next(&mut barycentric);
+                extensions.push(ash::khr::fragment_shader_barycentric::NAME.as_ptr());
             }
             let create = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queues)
@@ -491,9 +542,55 @@ impl Gpu {
         subgroup_size: Option<u32>,
         resources: &mut [(u32, Resource)],
     ) -> Result<(), GpuError> {
-        if spirv.is_empty() {
+        let work = Work::Compute {
+            spirv,
+            groups,
+            subgroup_size,
+        };
+        self.submit(work, buffers, push, resources)
+    }
+
+    /// Draws one triangle (three vertices, no vertex buffers) into `targets`, cleared first, and reads every
+    /// target back. Buffers, push constants and resources are as for `dispatch_resources`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(
+        &self,
+        vertex: &[u32],
+        fragment: &[u32],
+        extent: [u32; 2],
+        targets: &mut [Target],
+        depth: Option<&mut Target>,
+        buffers: &mut [&mut [u32]],
+        push: impl FnOnce(&[u64]) -> Vec<u32>,
+        resources: &mut [(u32, Resource)],
+    ) -> Result<(), GpuError> {
+        let work = Work::Draw {
+            vertex,
+            fragment,
+            extent,
+            targets,
+            depth,
+        };
+        self.submit(work, buffers, push, resources)
+    }
+
+    fn submit(
+        &self,
+        mut work: Work<'_>,
+        buffers: &mut [&mut [u32]],
+        push: impl FnOnce(&[u64]) -> Vec<u32>,
+        resources: &mut [(u32, Resource)],
+    ) -> Result<(), GpuError> {
+        let empty = match &work {
+            Work::Compute { spirv, .. } => spirv.is_empty(),
+            Work::Draw {
+                vertex, fragment, ..
+            } => vertex.is_empty() || fragment.is_empty(),
+        };
+        if empty {
             return Err(GpuError::BadSpirv);
         }
+        let stages = vk::ShaderStageFlags::ALL;
         let mut scratch = Scratch::new(&self.device);
         // SAFETY: every handle is created from `self.device`, recorded in `scratch` and destroyed when it drops,
         // after the fence wait below has made the GPU finish with them.
@@ -510,7 +607,7 @@ impl Gpu {
                         .binding(binding)
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                        .stage_flags(stages)
                 })
                 .collect();
             scratch.set_layout = device.create_descriptor_set_layout(
@@ -550,7 +647,7 @@ impl Gpu {
                         .binding(*binding)
                         .descriptor_type(kind)
                         .descriptor_count(count as u32)
-                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                        .stage_flags(stages),
                 );
             }
             if !resources.is_empty() {
@@ -570,7 +667,7 @@ impl Gpu {
                 .collect();
             let constants = push(&addresses);
             let ranges = [vk::PushConstantRange::default()
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .stage_flags(stages)
                 .size((constants.len() * 4) as u32)];
             let mut set_layouts = vec![scratch.set_layout];
             if !resources.is_empty() {
@@ -581,29 +678,60 @@ impl Gpu {
                 layout = layout.push_constant_ranges(&ranges);
             }
             scratch.pipeline_layout = device.create_pipeline_layout(&layout, None)?;
-            scratch.module = device
-                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spirv), None)?;
-            let mut required = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
-                .required_subgroup_size(subgroup_size.unwrap_or(self.info.subgroup_size));
-            let mut stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(scratch.module)
-                .name(c"main");
-            if let Some(size) = subgroup_size
-                && self.info.subgroup_size_control
-                && (self.info.min_subgroup_size..=self.info.max_subgroup_size).contains(&size)
-            {
-                stage = stage.push_next(&mut required);
-                if self.info.full_subgroups {
-                    stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
+            match &mut work {
+                Work::Compute {
+                    spirv,
+                    subgroup_size,
+                    ..
+                } => {
+                    scratch.module = device.create_shader_module(
+                        &vk::ShaderModuleCreateInfo::default().code(spirv),
+                        None,
+                    )?;
+                    let mut required =
+                        vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                            .required_subgroup_size(
+                                subgroup_size.unwrap_or(self.info.subgroup_size),
+                            );
+                    let mut stage = vk::PipelineShaderStageCreateInfo::default()
+                        .stage(vk::ShaderStageFlags::COMPUTE)
+                        .module(scratch.module)
+                        .name(c"main");
+                    if let Some(size) = *subgroup_size
+                        && self.info.subgroup_size_control
+                        && (self.info.min_subgroup_size..=self.info.max_subgroup_size)
+                            .contains(&size)
+                    {
+                        stage = stage.push_next(&mut required);
+                        if self.info.full_subgroups {
+                            stage = stage
+                                .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
+                        }
+                    }
+                    let create = vk::ComputePipelineCreateInfo::default()
+                        .stage(stage)
+                        .layout(scratch.pipeline_layout);
+                    scratch.pipeline = device
+                        .create_compute_pipelines(vk::PipelineCache::null(), &[create], None)
+                        .map_err(|(_, error)| error)?[0];
+                }
+                Work::Draw {
+                    vertex,
+                    fragment,
+                    extent,
+                    targets,
+                    depth,
+                } => {
+                    self.graphics_pipeline(
+                        &mut scratch,
+                        vertex,
+                        fragment,
+                        *extent,
+                        targets,
+                        depth,
+                    )?;
                 }
             }
-            let create = vk::ComputePipelineCreateInfo::default()
-                .stage(stage)
-                .layout(scratch.pipeline_layout);
-            scratch.pipeline = device
-                .create_compute_pipelines(vk::PipelineCache::null(), &[create], None)
-                .map_err(|(_, error)| error)?[0];
             counts[0] += buffers.len() as u32;
             let mut sizes: Vec<vk::DescriptorPoolSize> = [
                 vk::DescriptorType::STORAGE_BUFFER,
@@ -733,26 +861,42 @@ impl Gpu {
             for upload in &scratch.uploads {
                 upload.record(device, command);
             }
-            device.cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, scratch.pipeline);
-            device.cmd_bind_descriptor_sets(
-                command,
-                vk::PipelineBindPoint::COMPUTE,
-                scratch.pipeline_layout,
-                0,
-                &sets,
-                &[],
-            );
+            let point = match work {
+                Work::Compute { .. } => vk::PipelineBindPoint::COMPUTE,
+                Work::Draw { .. } => vk::PipelineBindPoint::GRAPHICS,
+            };
+            if let Work::Draw {
+                extent,
+                targets,
+                depth,
+                ..
+            } = &work
+            {
+                Self::begin_rendering(device, command, &scratch, *extent, targets, depth);
+            }
+            device.cmd_bind_pipeline(command, point, scratch.pipeline);
+            device.cmd_bind_descriptor_sets(command, point, scratch.pipeline_layout, 0, &sets, &[]);
             if !constants.is_empty() {
                 let bytes: Vec<u8> = constants.iter().flat_map(|w| w.to_le_bytes()).collect();
-                device.cmd_push_constants(
-                    command,
-                    scratch.pipeline_layout,
-                    vk::ShaderStageFlags::COMPUTE,
-                    0,
-                    &bytes,
-                );
+                device.cmd_push_constants(command, scratch.pipeline_layout, stages, 0, &bytes);
             }
-            device.cmd_dispatch(command, groups[0], groups[1], groups[2]);
+            let mut target_readbacks = Vec::new();
+            match &work {
+                Work::Compute { groups, .. } => {
+                    device.cmd_dispatch(command, groups[0], groups[1], groups[2]);
+                }
+                Work::Draw {
+                    extent,
+                    targets,
+                    depth,
+                    ..
+                } => {
+                    device.cmd_draw(command, 3, 1, 0, 0);
+                    device.cmd_end_rendering(command);
+                    target_readbacks =
+                        self.read_targets(device, command, &scratch, *extent, targets, depth)?;
+                }
+            }
             let mut readbacks = Vec::new();
             if scratch.uploads.iter().any(|u| u.storage) {
                 let to_copy = vk::MemoryBarrier::default()
@@ -822,8 +966,377 @@ impl Gpu {
                 device.unmap_memory(*memory);
             }
             scratch.staging.extend(readbacks);
+            if let Work::Draw { targets, depth, .. } = &mut work {
+                let all = targets.iter_mut().chain(depth.as_deref_mut());
+                for (target, (_, memory, size)) in all.zip(&target_readbacks) {
+                    let mapped =
+                        device.map_memory(*memory, 0, *size, vk::MemoryMapFlags::empty())?
+                            as *const u8;
+                    let length = target.data.len();
+                    std::ptr::copy_nonoverlapping(mapped, target.data.as_mut_ptr(), length);
+                    device.unmap_memory(*memory);
+                }
+            }
+            scratch.staging.extend(target_readbacks);
         }
         Ok(())
+    }
+
+    /// An attachment image and view, recorded in `scratch`.
+    ///
+    /// # Safety
+    /// `scratch` must belong to `self.device`.
+    unsafe fn attachment(
+        &self,
+        scratch: &mut Scratch<'_>,
+        format: TextureFormat,
+        [width, height]: [u32; 2],
+    ) -> Result<(), GpuError> {
+        let device = &self.device;
+        let usage = if format == TextureFormat::Depth32Float {
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+        } else {
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+        } | vk::ImageUsageFlags::TRANSFER_SRC;
+        // SAFETY: fresh handles from valid create infos, recorded in `scratch` straight away.
+        unsafe {
+            let image = device.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(format.vk())
+                    .extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(usage)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )?;
+            scratch
+                .images
+                .push((image, vk::DeviceMemory::null(), vk::ImageView::null()));
+            let needs = device.get_image_memory_requirements(image);
+            let kind = self
+                .memory_type_with(
+                    needs.memory_type_bits,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                )
+                .or_else(|| {
+                    self.memory_type_with(needs.memory_type_bits, vk::MemoryPropertyFlags::empty())
+                })
+                .ok_or(GpuError::NoMemory)?;
+            let memory = device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(needs.size)
+                    .memory_type_index(kind),
+                None,
+            )?;
+            scratch.images.last_mut().expect("just pushed").1 = memory;
+            device.bind_image_memory(image, memory, 0)?;
+            let view = device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format.vk())
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(format.aspect())
+                            .level_count(1)
+                            .layer_count(1),
+                    ),
+                None,
+            )?;
+            scratch.images.last_mut().expect("just pushed").2 = view;
+            scratch.attachments.push((image, view, format));
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// `scratch` must belong to `self.device`; the pipeline it creates is recorded there.
+    unsafe fn graphics_pipeline(
+        &self,
+        scratch: &mut Scratch<'_>,
+        vertex: &[u32],
+        fragment: &[u32],
+        extent: [u32; 2],
+        targets: &[Target],
+        depth: &Option<&mut Target>,
+    ) -> Result<(), GpuError> {
+        if !self.info.pixel_shaders {
+            return Err(GpuError::NoPixelShaders);
+        }
+        for target in targets {
+            // SAFETY: as this function's.
+            unsafe { self.attachment(scratch, target.format, extent)? };
+        }
+        if let Some(depth) = depth {
+            // SAFETY: as this function's.
+            unsafe { self.attachment(scratch, depth.format, extent)? };
+        }
+        let device = &self.device;
+        // SAFETY: valid create infos; every handle goes into `scratch`.
+        unsafe {
+            let vertex = device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(vertex), None)?;
+            scratch.extra_modules.push(vertex);
+            let fragment = device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(fragment),
+                None,
+            )?;
+            scratch.extra_modules.push(fragment);
+            let stages = [
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::VERTEX)
+                    .module(vertex)
+                    .name(c"main"),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(fragment)
+                    .name(c"main"),
+            ];
+            let input = vk::PipelineVertexInputStateCreateInfo::default();
+            let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            let viewports = [vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: extent[0] as f32,
+                height: extent[1] as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }];
+            let scissors = [vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: extent[0],
+                    height: extent[1],
+                },
+            }];
+            let viewport = vk::PipelineViewportStateCreateInfo::default()
+                .viewports(&viewports)
+                .scissors(&scissors);
+            let raster = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL)
+                .cull_mode(vk::CullModeFlags::NONE)
+                .line_width(1.0);
+            let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            let depth_state = vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(depth.is_some())
+                .depth_write_enable(depth.is_some())
+                .depth_compare_op(vk::CompareOp::ALWAYS);
+            let blends: Vec<_> = targets
+                .iter()
+                .map(|_| {
+                    vk::PipelineColorBlendAttachmentState::default()
+                        .color_write_mask(vk::ColorComponentFlags::RGBA)
+                })
+                .collect();
+            let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blends);
+            let formats: Vec<vk::Format> = targets.iter().map(|t| t.format.vk()).collect();
+            let mut rendering = vk::PipelineRenderingCreateInfo::default()
+                .color_attachment_formats(&formats)
+                .depth_attachment_format(
+                    depth
+                        .as_ref()
+                        .map_or(vk::Format::UNDEFINED, |d| d.format.vk()),
+                );
+            let create = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages)
+                .vertex_input_state(&input)
+                .input_assembly_state(&assembly)
+                .viewport_state(&viewport)
+                .rasterization_state(&raster)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&depth_state)
+                .color_blend_state(&blend)
+                .layout(scratch.pipeline_layout)
+                .push_next(&mut rendering);
+            scratch.pipeline = device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[create], None)
+                .map_err(|(_, error)| error)?[0];
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// `command` is recording and the attachments in `scratch` outlive it.
+    unsafe fn begin_rendering(
+        device: &ash::Device,
+        command: vk::CommandBuffer,
+        scratch: &Scratch<'_>,
+        [width, height]: [u32; 2],
+        targets: &[Target],
+        depth: &Option<&mut Target>,
+    ) {
+        let mut barriers = Vec::new();
+        let mut colours = Vec::new();
+        let mut depth_info = None;
+        let clears = targets.iter().chain(depth.as_deref());
+        for ((image, view, format), target) in scratch.attachments.iter().zip(clears) {
+            let is_depth = *format == TextureFormat::Depth32Float;
+            let layout = if is_depth {
+                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL
+            } else {
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+            };
+            barriers.push(
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(if is_depth {
+                        vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+                    } else {
+                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    })
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(layout)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(*image)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(format.aspect())
+                            .level_count(1)
+                            .layer_count(1),
+                    ),
+            );
+            let clear = if is_depth {
+                vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: f32::from_bits(target.clear[0]),
+                        stencil: 0,
+                    },
+                }
+            } else {
+                vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        uint32: target.clear,
+                    },
+                }
+            };
+            let info = vk::RenderingAttachmentInfo::default()
+                .image_view(*view)
+                .image_layout(layout)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(clear);
+            if is_depth {
+                depth_info = Some(info);
+            } else {
+                colours.push(info);
+            }
+        }
+        let mut rendering = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D { width, height },
+            })
+            .layer_count(1)
+            .color_attachments(&colours);
+        if let Some(depth) = &depth_info {
+            rendering = rendering.depth_attachment(depth);
+        }
+        // SAFETY: guaranteed by the caller.
+        unsafe {
+            device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barriers,
+            );
+            device.cmd_begin_rendering(command, &rendering);
+        }
+    }
+
+    /// Records copies of every attachment into fresh host buffers, in target order then depth.
+    ///
+    /// # Safety
+    /// `command` is recording, after rendering has ended.
+    unsafe fn read_targets(
+        &self,
+        device: &ash::Device,
+        command: vk::CommandBuffer,
+        scratch: &Scratch<'_>,
+        [width, height]: [u32; 2],
+        targets: &[Target],
+        depth: &Option<&mut Target>,
+    ) -> Result<Vec<(vk::Buffer, vk::DeviceMemory, u64)>, GpuError> {
+        let mut out = Vec::new();
+        let all = targets.iter().chain(depth.as_deref());
+        for ((image, _, format), target) in scratch.attachments.iter().zip(all) {
+            let is_depth = *format == TextureFormat::Depth32Float;
+            let (layout, access, stage) = if is_depth {
+                (
+                    vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                )
+            } else {
+                (
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                )
+            };
+            let range = vk::ImageSubresourceRange::default()
+                .aspect_mask(format.aspect())
+                .level_count(1)
+                .layer_count(1);
+            let barrier = vk::ImageMemoryBarrier::default()
+                .src_access_mask(access)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(layout)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(*image)
+                .subresource_range(range);
+            let words = vec![0u32; target.data.len().div_ceil(4).max(1)];
+            // SAFETY: guaranteed by the caller; the buffer is fresh and large enough.
+            unsafe {
+                let buffer = self.host_buffer(&words, vk::BufferUsageFlags::TRANSFER_DST)?;
+                device.cmd_pipeline_barrier(
+                    command,
+                    stage,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(format.aspect())
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    });
+                device.cmd_copy_image_to_buffer(
+                    command,
+                    *image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    buffer.0,
+                    &[region],
+                );
+                out.push(buffer);
+            }
+        }
+        Ok(out)
     }
 
     /// # Safety
@@ -1061,6 +1574,8 @@ struct Scratch<'a> {
     extra_buffers: Vec<(vk::Buffer, vk::DeviceMemory, u64)>,
     staging: Vec<(vk::Buffer, vk::DeviceMemory, u64)>,
     images: Vec<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
+    attachments: Vec<(vk::Image, vk::ImageView, TextureFormat)>,
+    extra_modules: Vec<vk::ShaderModule>,
     samplers: Vec<vk::Sampler>,
     uploads: Vec<Upload>,
     set_layout: vk::DescriptorSetLayout,
@@ -1081,6 +1596,8 @@ impl<'a> Scratch<'a> {
             extra_buffers: Vec::new(),
             staging: Vec::new(),
             images: Vec::new(),
+            attachments: Vec::new(),
+            extra_modules: Vec::new(),
             samplers: Vec::new(),
             uploads: Vec::new(),
             set_layout: vk::DescriptorSetLayout::null(),
@@ -1106,6 +1623,9 @@ impl Drop for Scratch<'_> {
             d.destroy_descriptor_pool(self.pool, None);
             d.destroy_pipeline(self.pipeline, None);
             d.destroy_shader_module(self.module, None);
+            for module in &self.extra_modules {
+                d.destroy_shader_module(*module, None);
+            }
             d.destroy_pipeline_layout(self.pipeline_layout, None);
             d.destroy_descriptor_set_layout(self.set_layout, None);
             d.destroy_descriptor_set_layout(self.extra_layout, None);

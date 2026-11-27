@@ -538,7 +538,7 @@ impl Run<'_> {
                 let lane = self.values[*lane as usize][0] as usize % self.lanes;
                 self.machine.vgpr[usize::from(*r)][lane] = self.values[*value as usize][0] as u32;
             }
-            Stmt::Export { target, values } => {
+            Stmt::Export { target, values, .. } => {
                 for lane in 0..self.lanes {
                     if self.active(lane) {
                         for (component, value) in values.iter().enumerate() {

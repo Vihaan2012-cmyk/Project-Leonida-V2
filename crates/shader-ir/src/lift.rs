@@ -908,7 +908,12 @@ impl Lifter {
                     values[component] = Some(self.value(Expr::Get(Reg::V(reg))));
                 }
             }
-            self.stmts.push(Stmt::Export { target, values });
+            self.stmts.push(Stmt::Export {
+                target,
+                values,
+                done: inst.mods.iter().any(|m| m == "done"),
+                compressed,
+            });
             return Ok(());
         }
         if base == "s_sendmsg" {

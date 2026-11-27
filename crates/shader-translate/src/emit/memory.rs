@@ -16,6 +16,9 @@ impl Emitter {
         when: Option<Word>,
     ) -> Result<Word, EmitError> {
         let (u32_, u64_, bool_) = (self.t.u32_, self.t.u64_, self.t.bool_);
+        if space == Space::Lds && self.pixel.is_some() {
+            return Err(EmitError::Unsupported("LDS in a pixel shader"));
+        }
         let mut condition = self.active()?;
         if let Some(when) = when {
             condition = ok(self.b.logical_and(bool_, None, condition, when))?;

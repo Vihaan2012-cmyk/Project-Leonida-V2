@@ -19,6 +19,12 @@ pub(super) struct ImageTypes {
     tables: [Word; 2],
 }
 
+/// The image operands that set the level of detail, and whether the hardware derives it from derivatives.
+enum Level {
+    Explicit(ImageOperands, Vec<Operand>),
+    Implicit(Option<ImageOperands>, Vec<Operand>),
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Extras {
     compare: Option<Word>,
@@ -500,7 +506,7 @@ impl Emitter {
         if let ImageOp::Atomic(op) = image.op {
             return self.image_atomic(image, op);
         }
-        if image.op.implicit() {
+        if image.op.implicit() && self.pixel.is_none() {
             return Err(EmitError::Unsupported(
                 "implicit-LOD sampling outside a pixel shader",
             ));
@@ -658,23 +664,58 @@ impl Emitter {
                 };
                 let combined = ok(self.b.sampled_image(ids.sampled, None, texture, sampler))?;
                 let combined = self.nonuniform(combined);
-                let level = |e: &mut Self| -> Result<(ImageOperands, Vec<Operand>), EmitError> {
+                if op == ImageOp::QueryLod {
+                    if number != Number::Float {
+                        let zero = self.u32c(0);
+                        return ok(self.b.composite_construct(self.t.uvec4, None, [zero; 4]));
+                    }
+                    let vec2 = types.floats[2];
+                    let lods = ok(self.b.image_query_lod(vec2, None, combined, coordinates))?;
+                    let f32_ = self.t.f32_;
+                    let mut words = Vec::new();
+                    for axis in 0..2 {
+                        let part = ok(self.b.composite_extract(f32_, None, lods, [axis]))?;
+                        words.push(self.bits(part)?);
+                    }
+                    let zero = self.u32c(0);
+                    words.extend([zero, zero]);
+                    return ok(self.b.composite_construct(self.t.uvec4, None, words));
+                }
+                let level = |e: &mut Self| -> Result<Level, EmitError> {
+                    let with_clamp = |mut mask: ImageOperands, mut operands: Vec<Operand>| {
+                        if let Some(clamp) = extras.clamp {
+                            mask |= ImageOperands::MIN_LOD;
+                            operands.push(Operand::IdRef(clamp));
+                        }
+                        (mask, operands)
+                    };
                     Ok(match (op, extras.gradients) {
                         (ImageOp::SampleGrad, Some((dx, dy))) => {
-                            let mut operands = vec![Operand::IdRef(dx), Operand::IdRef(dy)];
-                            let mut mask = ImageOperands::GRAD;
-                            if let Some(clamp) = extras.clamp {
-                                mask |= ImageOperands::MIN_LOD;
-                                operands.push(Operand::IdRef(clamp));
-                            }
-                            (mask, operands)
+                            let (mask, operands) = with_clamp(
+                                ImageOperands::GRAD,
+                                vec![Operand::IdRef(dx), Operand::IdRef(dy)],
+                            );
+                            Level::Explicit(mask, operands)
+                        }
+                        (ImageOp::Sample, _) => {
+                            let (mask, operands) = with_clamp(ImageOperands::NONE, Vec::new());
+                            Level::Implicit((!mask.is_empty()).then_some(mask), operands)
+                        }
+                        (ImageOp::SampleBias, _) => {
+                            let bias = match lod {
+                                Some(bias) => e.float(bias)?,
+                                None => e.f32c(0.0),
+                            };
+                            let (mask, operands) =
+                                with_clamp(ImageOperands::BIAS, vec![Operand::IdRef(bias)]);
+                            Level::Implicit(Some(mask), operands)
                         }
                         _ => {
                             let level = match lod {
                                 Some(level) if op == ImageOp::SampleLod => e.float(level)?,
                                 _ => e.f32c(0.0),
                             };
-                            (ImageOperands::LOD, vec![Operand::IdRef(level)])
+                            Level::Explicit(ImageOperands::LOD, vec![Operand::IdRef(level)])
                         }
                     })
                 };
@@ -697,17 +738,31 @@ impl Emitter {
                         gather_operands.1,
                     ))?,
                     (_, Some(reference)) => {
-                        let (mask, operands) = level(self)?;
                         let f32_ = self.t.f32_;
-                        let scalar = ok(self.b.image_sample_dref_explicit_lod(
-                            f32_,
-                            None,
-                            combined,
-                            coordinates,
-                            reference,
-                            mask,
-                            operands,
-                        ))?;
+                        let scalar = match level(self)? {
+                            Level::Explicit(mask, operands) => {
+                                ok(self.b.image_sample_dref_explicit_lod(
+                                    f32_,
+                                    None,
+                                    combined,
+                                    coordinates,
+                                    reference,
+                                    mask,
+                                    operands,
+                                ))?
+                            }
+                            Level::Implicit(mask, operands) => {
+                                ok(self.b.image_sample_dref_implicit_lod(
+                                    f32_,
+                                    None,
+                                    combined,
+                                    coordinates,
+                                    reference,
+                                    mask,
+                                    operands,
+                                ))?
+                            }
+                        };
                         ok(self.b.composite_construct(vec4, None, [scalar; 4]))?
                     }
                     (ImageOp::Gather { channel }, None) => {
@@ -722,17 +777,24 @@ impl Emitter {
                             gather_operands.1,
                         ))?
                     }
-                    (_, None) => {
-                        let (mask, operands) = level(self)?;
-                        ok(self.b.image_sample_explicit_lod(
+                    (_, None) => match level(self)? {
+                        Level::Explicit(mask, operands) => ok(self.b.image_sample_explicit_lod(
                             vec4,
                             None,
                             combined,
                             coordinates,
                             mask,
                             operands,
-                        ))?
-                    }
+                        ))?,
+                        Level::Implicit(mask, operands) => ok(self.b.image_sample_implicit_lod(
+                            vec4,
+                            None,
+                            combined,
+                            coordinates,
+                            mask,
+                            operands,
+                        ))?,
+                    },
                 }
             }
             (_, None) => return Err(EmitError::Unsupported("sampling without a sampler")),

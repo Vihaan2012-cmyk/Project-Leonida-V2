@@ -143,6 +143,7 @@ struct Report {
     lifted: usize,
     emitted: usize,
     compute_entries: usize,
+    pixel_entries: usize,
     instructions: usize,
     unsupported: usize,
     missing: BTreeMap<String, (usize, usize, String, String)>,
@@ -151,7 +152,13 @@ struct Report {
 }
 
 impl Report {
-    fn add(&mut self, name: &str, stage: Option<Stage>, blob: &[u8]) -> Option<()> {
+    fn add(
+        &mut self,
+        name: &str,
+        stage: Option<Stage>,
+        blob: &[u8],
+        found: Option<&Interface>,
+    ) -> Option<()> {
         let fssm = Fssm::parse(blob).ok()?;
         let CodeRange::Header { start, end } = fssm.code_range() else {
             return None;
@@ -185,6 +192,18 @@ impl Report {
                 Ok(function) if function.verify().is_ok() => {
                     self.lifted += 1;
                     match (stage, fssm.compute_setup()) {
+                        (Some(Stage::Pixel), _) => {
+                            let result = pixel_options(&fssm, found)
+                                .ok_or_else(|| "no pixel setup in the header".to_string())
+                                .and_then(|options| {
+                                    shader_translate::pixel(&function, &options)
+                                        .map_err(|e| e.to_string())
+                                });
+                            match result {
+                                Ok(_) => self.pixel_entries += 1,
+                                Err(error) => *self.lift_errors.entry(error).or_default() += 1,
+                            }
+                        }
                         (Some(Stage::Compute), Some((rsrc2, group))) => {
                             let options = shader_translate::ComputeOptions::from_rsrc2(
                                 rsrc2,
@@ -239,12 +258,13 @@ impl Report {
         );
         println!("shaders with undecodable words: {}", self.invalid);
         println!(
-            "shaders the translator fully handles: {} ({:.1}%), lifted and checked: {}, turned into test-form SPIR-V: {}, into real compute shaders: {}",
+            "shaders the translator fully handles: {} ({:.1}%), lifted and checked: {}, turned into test-form SPIR-V: {}, into real compute shaders: {}, into real pixel shaders: {}",
             self.complete,
             percent(self.complete, self.shaders),
             self.lifted,
             self.emitted,
-            self.compute_entries
+            self.compute_entries,
+            self.pixel_entries
         );
         for (error, count) in &self.lift_errors {
             println!("  {count} stopped at: {error}");
@@ -264,6 +284,33 @@ impl Report {
     }
 }
 
+/// The fragment entry's inputs from the header and its colour targets from the output signature.
+fn pixel_options(fssm: &Fssm, found: Option<&Interface>) -> Option<shader_translate::PixelOptions> {
+    use shader_translate::images::Number;
+    let setup = fssm.pixel_setup()?;
+    let outputs = found
+        .map(|f| f.outputs.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter(|element| element.system_value == 64 && element.register < 8)
+        .map(|element| shader_translate::PixelOutput {
+            target: element.register as u8,
+            number: match element.component_type {
+                1 => Number::Uint,
+                2 => Number::Sint,
+                _ => Number::Float,
+            },
+        })
+        .collect();
+    Some(shader_translate::PixelOptions {
+        user_sgprs: setup.user_sgprs,
+        inputs: setup.inputs,
+        outputs,
+        depth: shader_translate::DepthOutput::from_control(setup.depth_control),
+        float: shader_translate::FloatMode::default(),
+    })
+}
+
 pub fn report_command(args: &ReportArgs) -> Result<ExitCode> {
     with_archive(args.game.as_ref(), |archive| {
         let mut report = Report {
@@ -271,10 +318,13 @@ pub fn report_command(args: &ReportArgs) -> Result<ExitCode> {
             ..Report::default()
         };
         carve(archive, |shader| {
+            let found = parts(&shader.dxbc)
+                .ok()
+                .and_then(|list| interface(&list, None).ok());
             let added = unpack_all(&shader.dxbc).ok().and_then(|blobs| {
                 blobs
                     .last()
-                    .and_then(|blob| report.add(&shader.name, shader.stage, blob))
+                    .and_then(|blob| report.add(&shader.name, shader.stage, blob, found.as_ref()))
             });
             if added.is_none() {
                 report.unreadable += 1;

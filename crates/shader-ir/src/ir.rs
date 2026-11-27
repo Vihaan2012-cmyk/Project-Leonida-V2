@@ -338,9 +338,13 @@ pub enum Stmt {
     SetLane(u8, Tmp),
     WriteLane(u8, Tmp, Tmp),
     LdsStore(Tmp, Tmp),
+    /// `done` marks a pixel shader's last export, whose exec mask decides which pixels survive; `compressed`
+    /// exports carry two registers of packed 16-bit pairs in the first two values.
     Export {
         target: u8,
         values: [Option<Tmp>; 4],
+        done: bool,
+        compressed: bool,
     },
     Message(u32, Tmp),
     FetchVertexInputs,

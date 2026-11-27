@@ -176,6 +176,17 @@ them are wave64 (counts from upstream's README).
    structured control flow, decorations and capabilities. `spirv-val` runs over the corpus in development and CI as an
    independent cross-check; on the player's PC, driver pipeline creation (`leonida pipelines`) is the final check.
 
+**Pixel shaders.** The program header gives the input enables (offset 0x248), depth control and colour write mask
+after them, the user-SGPR count (bits 16-21 of 0xD4) and one two-word entry per interpolated input from 0x138
+(index, mask and input-signature register; then the mode, 1 flat or 2 interpolated, with 8 for half precision).
+Every shader in the game uses only centre perspective barycentrics plus position and front-face inputs. The
+fragment entry preloads v0-v1 from `BaryCoordKHR` (I = y, J = z) and the enabled position and facing inputs after
+them, and reads attribute N as the raw words of a `PerVertexKHR` input at location N, so interpolation runs the
+shader's own instructions. Colour target N is the output at location N, typed from the output signature; `mrtz`
+writes `FragDepth`. Exec starts as the non-helper invocations, and pixels outside exec at the last (`done`) export are
+discarded. Wave64 code runs on 32-wide subgroups: fragment shaders have no workgroup to emulate 64 lanes with. The
+vertex-side contract (which parameter export feeds which location) is the linker's job and still to come.
+
 **Images and samplers.** A shader names a texture by its 8-word T# and a sampler by its 4-word S#, both in SGPRs.
 The runtime registers every texture and sampler it creates in two lookup tables, and the shader finds the bindless
 slot by looking its descriptor up:

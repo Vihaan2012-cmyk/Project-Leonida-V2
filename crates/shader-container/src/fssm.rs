@@ -32,6 +32,35 @@ pub enum CodeRange {
     NotFound,
 }
 
+/// One interpolated pixel shader input: a register of the input signature and the attribute the code reads it as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Interpolant {
+    pub register: u8,
+    pub mask: u8,
+    /// Taken from the first vertex instead of interpolated.
+    pub flat: bool,
+    /// Interpolated at half precision, two values to a channel.
+    pub half: bool,
+}
+
+/// What a pixel shader needs set up before it runs, as its header records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PixelSetup {
+    /// SPI_PS_INPUT_ENA: the barycentrics, position components and front-face flag preloaded into VGPRs.
+    pub inputs: u32,
+    /// DB_SHADER_CONTROL: whether the shader writes depth, and which way a conservative depth may move.
+    pub depth_control: u32,
+    /// CB_SHADER_MASK: four component-write bits per colour target.
+    pub target_mask: u32,
+    pub user_sgprs: u32,
+    /// In attribute order: attribute N is entry N.
+    pub interpolants: Vec<Interpolant>,
+}
+
+const PIXEL_TABLE: usize = 0x138;
+const PIXEL_TABLE_END: usize = 0x238;
+const PIXEL_INPUTS: usize = 0x248;
+
 /// A precompiled RDNA2 program with its metadata, as unpacked from XBCH.
 #[derive(Debug, Clone, Copy)]
 pub struct Fssm<'a> {
@@ -78,6 +107,41 @@ impl<'a> Fssm<'a> {
 
     pub fn code_range(&self) -> CodeRange {
         code_range(self.bytes)
+    }
+
+    /// A pixel shader's setup: input enables at 0x248, depth control and target mask after them, the user
+    /// SGPR count in bits 16-21 of 0xD4, and two words per interpolant from 0x138 (index, mask and signature
+    /// register; then the mode, 1 flat or 2 interpolated, with 8 for half precision).
+    pub fn pixel_setup(&self) -> Option<PixelSetup> {
+        let word = |at: usize| {
+            self.bytes
+                .get(at..at + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+        };
+        let mut interpolants = Vec::new();
+        for (index, at) in (PIXEL_TABLE..PIXEL_TABLE_END).step_by(8).enumerate() {
+            let (first, second) = (word(at)?, word(at + 4)?);
+            if first == 0 && second == 0 {
+                break;
+            }
+            if (first >> 24) as usize != index {
+                return None;
+            }
+            let mode = second >> 24;
+            interpolants.push(Interpolant {
+                register: (first >> 8) as u8,
+                mask: ((first >> 16) & 0xF) as u8,
+                flat: mode & 3 == 1,
+                half: mode & 8 != 0,
+            });
+        }
+        Some(PixelSetup {
+            inputs: word(PIXEL_INPUTS)?,
+            depth_control: word(PIXEL_INPUTS + 4)?,
+            target_mask: word(PIXEL_INPUTS + 8)?,
+            user_sgprs: (word(WAVE_FLAGS)? >> 16) & 0x3F,
+            interpolants,
+        })
     }
 }
 
@@ -212,6 +276,53 @@ mod tests {
 mod setup_tests {
     use super::*;
     use crate::testutil::fssm;
+
+    #[test]
+    fn pixel_setup_reads_inputs_and_interpolants() {
+        let mut blob = fssm(false, &[0xBF81_0000]);
+        blob.resize(blob.len().max(0x260), 0);
+        let put = |blob: &mut Vec<u8>, at: usize, value: u32| {
+            blob[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        put(&mut blob, 0xD4, 0x000A_0000);
+        put(&mut blob, 0x138, 0x000F_0106);
+        put(&mut blob, 0x13C, 0x0201_0000);
+        put(&mut blob, 0x140, 0x0107_0206);
+        put(&mut blob, 0x144, 0x0102_0000);
+        put(&mut blob, 0x148, 0x0203_0306);
+        put(&mut blob, 0x14C, 0x1A03_0200);
+        put(&mut blob, 0x248, 0x302);
+        put(&mut blob, 0x24C, 0x51);
+        put(&mut blob, 0x250, 0xF);
+        let setup = Fssm::parse(&blob).unwrap().pixel_setup().unwrap();
+        assert_eq!(setup.inputs, 0x302);
+        assert_eq!(setup.depth_control, 0x51);
+        assert_eq!(setup.target_mask, 0xF);
+        assert_eq!(setup.user_sgprs, 10);
+        assert_eq!(
+            setup.interpolants,
+            [
+                Interpolant {
+                    register: 1,
+                    mask: 0xF,
+                    flat: false,
+                    half: false
+                },
+                Interpolant {
+                    register: 2,
+                    mask: 0x7,
+                    flat: true,
+                    half: false
+                },
+                Interpolant {
+                    register: 3,
+                    mask: 0x3,
+                    flat: false,
+                    half: true
+                },
+            ]
+        );
+    }
 
     #[test]
     fn compute_setup_reads_rsrc2_and_group_size() {

@@ -15,6 +15,7 @@ use crate::images::{Number, View};
 
 mod image;
 mod memory;
+mod pixel;
 
 pub const STATE_SCC: u32 = 128;
 pub const STATE_VGPR: u32 = 256;
@@ -45,7 +46,7 @@ fn ok<T>(result: Result<T, rspirv::dr::Error>) -> Result<T, EmitError> {
     result.map_err(|e| EmitError::Build(format!("{e:?}")))
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FloatMode {
     pub nan_preserve: bool,
     pub flush_denormals: bool,
@@ -87,6 +88,31 @@ impl ComputeOptions {
 enum Entry<'a> {
     Harness(&'a HarnessOptions),
     Compute(&'a ComputeOptions),
+    Pixel(&'a PixelOptions),
+}
+
+/// Which way a pixel shader's depth output may move, when it writes one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepthOutput {
+    Any,
+    GreaterEqual,
+    LessEqual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixelOutput {
+    pub target: u8,
+    pub number: Number,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PixelOptions {
+    pub user_sgprs: u32,
+    /// SPI_PS_INPUT_ENA.
+    pub inputs: u32,
+    pub outputs: Vec<PixelOutput>,
+    pub depth: Option<DepthOutput>,
+    pub float: FloatMode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -155,6 +181,7 @@ struct Emitter {
     lookups: [Option<Word>; 2],
     encode: [Option<Word>; 2],
     image_cache: Option<(Image, [Word; 4])>,
+    pixel: Option<pixel::PixelState>,
 }
 
 fn registers(function: &Function) -> (BTreeSet<u8>, BTreeSet<u8>) {
@@ -207,8 +234,24 @@ pub fn compute(function: &Function, options: &ComputeOptions) -> Result<Vec<u32>
     build(function, Entry::Compute(options))
 }
 
+/// A fragment shader following the runtime contract: push constants as for compute; v0-v1 hold the
+/// perspective barycentrics and the enabled position and front-face inputs follow; interpolated attribute N is
+/// the per-vertex input at location N, as raw words; colour target N is the output at location N.
+pub fn pixel(function: &Function, options: &PixelOptions) -> Result<Vec<u32>, EmitError> {
+    build(function, Entry::Pixel(options))
+}
+
 fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
-    let lanes: u32 = if function.wave64 { 64 } else { 32 };
+    let pixel_options = match entry {
+        Entry::Pixel(options) => Some(options.clone()),
+        _ => None,
+    };
+    let pixel_mode = pixel_options.is_some();
+    let lanes: u32 = if function.wave64 && !pixel_mode {
+        64
+    } else {
+        32
+    };
     let (float, group_size, lds_words) = match entry {
         Entry::Harness(options) => (
             FloatMode {
@@ -226,6 +269,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
             }
             (options.float, options.group_size, words)
         }
+        Entry::Pixel(options) => (options.float, [32, 1, 1], 32),
     };
     let threads: u32 = group_size.iter().product();
     if threads == 0 || !threads.is_multiple_of(lanes) {
@@ -234,7 +278,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         ));
     }
     let waves = threads / lanes;
-    let heap_mode = matches!(entry, Entry::Compute(_));
+    let heap_mode = matches!(entry, Entry::Compute(_) | Entry::Pixel(_));
     if !lds_words.is_power_of_two() {
         return Err(EmitError::LdsSize);
     }
@@ -310,10 +354,14 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         lds_image = buffer(&mut b, 2);
         exports = buffer(&mut b, 3);
     }
-    let lds_len = b.constant_bit32(u32_, lds_words);
-    let lds_array = b.type_array(u32_, lds_len);
-    let ptr_lds = b.type_pointer(None, StorageClass::Workgroup, lds_array);
-    let lds = b.variable(ptr_lds, None, StorageClass::Workgroup, None);
+    let lds = if pixel_mode {
+        0
+    } else {
+        let lds_len = b.constant_bit32(u32_, lds_words);
+        let lds_array = b.type_array(u32_, lds_len);
+        let ptr_lds = b.type_pointer(None, StorageClass::Workgroup, lds_array);
+        b.variable(ptr_lds, None, StorageClass::Workgroup, None)
+    };
     let ptr_input_u32 = b.type_pointer(None, StorageClass::Input, u32_);
     let ptr_input_uvec3 = b.type_pointer(None, StorageClass::Input, uvec3);
     let input = |b: &mut Builder, ty: Word, builtin: BuiltIn| {
@@ -322,13 +370,21 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         var
     };
     let lane_input = input(&mut b, ptr_input_u32, BuiltIn::SubgroupLocalInvocationId);
-    let half_input = input(&mut b, ptr_input_u32, BuiltIn::SubgroupId);
-    let group_input = input(&mut b, ptr_input_uvec3, BuiltIn::WorkgroupId);
-    let thread_input = input(&mut b, ptr_input_uvec3, BuiltIn::LocalInvocationId);
-    let slots = b.constant_bit32(u32_, 64 * waves);
-    let exchange_array = b.type_array(u32_, slots);
-    let ptr_exchange = b.type_pointer(None, StorageClass::Workgroup, exchange_array);
-    let exchange = b.variable(ptr_exchange, None, StorageClass::Workgroup, None);
+    if pixel_mode {
+        b.decorate(lane_input, Decoration::Flat, []);
+    }
+    let (half_input, group_input, thread_input, exchange) = if pixel_mode {
+        (0, 0, 0, 0)
+    } else {
+        let half_input = input(&mut b, ptr_input_u32, BuiltIn::SubgroupId);
+        let group_input = input(&mut b, ptr_input_uvec3, BuiltIn::WorkgroupId);
+        let thread_input = input(&mut b, ptr_input_uvec3, BuiltIn::LocalInvocationId);
+        let slots = b.constant_bit32(u32_, 64 * waves);
+        let exchange_array = b.type_array(u32_, slots);
+        let ptr_exchange = b.type_pointer(None, StorageClass::Workgroup, exchange_array);
+        let exchange = b.variable(ptr_exchange, None, StorageClass::Workgroup, None);
+        (half_input, group_input, thread_input, exchange)
+    };
     let t = Types {
         bool_,
         u32_,
@@ -378,8 +434,13 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     let current = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let iterations = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let messages = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
+    let alive = b.variable(t.ptr_function_bool, None, StorageClass::Function, None);
     let local = ok(b.load(u32_, None, lane_input, None, []))?;
-    let subgroup = ok(b.load(u32_, None, half_input, None, []))?;
+    let subgroup = if pixel_mode {
+        b.constant_bit32(u32_, 0)
+    } else {
+        ok(b.load(u32_, None, half_input, None, []))?
+    };
     let (lane, half, wave) = if function.wave64 {
         let one = b.constant_bit32(u32_, 1);
         let half = ok(b.bitwise_and(u32_, None, subgroup, one))?;
@@ -395,7 +456,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     let lanes_constant = b.constant_bit32(u32_, lanes);
     let thread_index = ok(b.i_mul(u32_, None, wave, lanes_constant))?;
     let thread_index = ok(b.i_add(u32_, None, thread_index, lane))?;
-    let (group_ids, thread_ids) = if heap_mode {
+    let (group_ids, thread_ids) = if heap_mode && !pixel_mode {
         (
             ok(b.load(uvec3, None, group_input, None, []))?,
             ok(b.load(uvec3, None, thread_input, None, []))?,
@@ -403,17 +464,20 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     } else {
         (0, 0)
     };
-    let mut interface = vec![lane_input, half_input];
-    if heap_mode {
+    let mut interface = vec![lane_input];
+    if !pixel_mode {
+        interface.push(half_input);
+    }
+    if heap_mode && !pixel_mode {
         interface.extend([group_input, thread_input]);
     }
     let compute_options = match entry {
         Entry::Compute(options) => Some(*options),
-        Entry::Harness(_) => None,
+        Entry::Harness(_) | Entry::Pixel(_) => None,
     };
     let code_base = match entry {
         Entry::Harness(options) => options.code_base,
-        Entry::Compute(_) => 0,
+        Entry::Compute(_) | Entry::Pixel(_) => 0,
     };
     let mut e = Emitter {
         b,
@@ -457,8 +521,11 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         lookups: [None; 2],
         encode: [None; 2],
         image_cache: None,
+        pixel: None,
     };
-    if heap_mode {
+    if let Some(options) = pixel_options.clone() {
+        e.pixel_prologue(options, alive)?;
+    } else if heap_mode {
         e.compute_prologue()?;
     } else {
         e.prologue()?;
@@ -487,6 +554,9 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     if !heap_mode {
         e.epilogue()?;
     }
+    if pixel_mode {
+        e.pixel_epilogue()?;
+    }
     ok(e.b.ret())?;
     ok(e.b.end_function())?;
     if let Some(decode) = e.decode {
@@ -494,8 +564,24 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     }
     e.lookup_bodies()?;
     e.encode_bodies()?;
-    e.b.entry_point(ExecutionModel::GLCompute, main, "main", interface);
-    e.b.execution_mode(main, ExecutionMode::LocalSize, group_size);
+    if let Some(state) = &e.pixel {
+        interface.extend(state.interface());
+        e.b.entry_point(ExecutionModel::Fragment, main, "main", interface);
+        e.b.execution_mode(main, ExecutionMode::OriginUpperLeft, []);
+        if let Some(depth) = pixel_options.as_ref().and_then(|o| o.depth) {
+            e.b.execution_mode(main, ExecutionMode::DepthReplacing, []);
+            match depth {
+                DepthOutput::Any => {}
+                DepthOutput::GreaterEqual => {
+                    e.b.execution_mode(main, ExecutionMode::DepthGreater, [])
+                }
+                DepthOutput::LessEqual => e.b.execution_mode(main, ExecutionMode::DepthLess, []),
+            }
+        }
+    } else {
+        e.b.entry_point(ExecutionModel::GLCompute, main, "main", interface);
+        e.b.execution_mode(main, ExecutionMode::LocalSize, group_size);
+    }
     if float.nan_preserve {
         e.b.execution_mode(main, ExecutionMode::SignedZeroInfNanPreserve, [32]);
     }
@@ -1406,12 +1492,25 @@ impl Emitter {
                 let new = ok(self.b.select(u32_, None, hit, v(self, value), old))?;
                 self.store(var, new)?;
             }
+            Stmt::Export {
+                target,
+                values,
+                done,
+                compressed,
+            } if self.pixel.is_some() => {
+                let values = values.map(|v| v.map(|t| self.values[t as usize]));
+                self.pixel_export(*target, values, *done, *compressed)?;
+            }
+            Stmt::Message(..) | Stmt::FetchVertexInputs if self.pixel.is_some() => {}
+            Stmt::LdsStore(..) if self.pixel.is_some() => {
+                return Err(EmitError::Unsupported("LDS in a pixel shader"));
+            }
             Stmt::Export { .. } | Stmt::Message(..) if self.heap.is_some() => {
                 return Err(EmitError::Unsupported(
                     "exports and messages in a compute shader",
                 ));
             }
-            Stmt::Export { target, values } => {
+            Stmt::Export { target, values, .. } => {
                 let active = self.active()?;
                 let values = *values;
                 let target = *target;
@@ -1666,6 +1765,9 @@ impl Emitter {
                     ok(self.b.select(u32_, None, none, upper, lowest))?
                 }
             }
+            Expr::LdsLoad(_) if self.pixel.is_some() => {
+                return Err(EmitError::Unsupported("LDS in a pixel shader"));
+            }
             Expr::LdsLoad(address) => {
                 let index = self.lds_index(v(self, address))?;
                 let ptr = self.lds_element(index)?;
@@ -1775,6 +1877,11 @@ impl Emitter {
                 let (address, value) = (v(self, address), v(self, value));
                 self.atomic(*space, *op, address, value, compare, when)?
             }
+            Expr::Attribute {
+                attr,
+                channel,
+                vertex,
+            } if self.pixel.is_some() => self.pixel_attribute_word(*attr, *channel, *vertex)?,
             Expr::Attribute {
                 attr,
                 channel,
