@@ -6,8 +6,9 @@ mod expr;
 mod lift;
 mod simplify;
 mod structure;
+mod vars;
 
-use expr::{Expr, Loc, Printer, register_name};
+use expr::{Expr, Loc, Printer, register_name, type_name};
 use lift::{Function, Stmt};
 use structure::Node;
 
@@ -28,6 +29,10 @@ pub trait Program {
     fn symbol(&self, va: u64) -> Symbol;
     /// Whether a jump from the function at `entry` to `target` stays inside that function.
     fn inside(&self, entry: u64, target: u64) -> bool;
+    /// A name for the function or data at `va`, if the caller knows one.
+    fn name(&self, _va: u64) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -59,14 +64,18 @@ pub fn decompile(program: &dyn Program, entry: u64) -> Result<String, Error> {
     dump(&function, "lifted");
     simplify::run(&mut function);
     simplify::merge_conditions(&mut function);
+    let vars = vars::rename(&mut function, 20_000).unwrap_or_default();
     dump(&function, "simplified");
     let (nodes, _) = structure::structure(&function);
-    Ok(Writer::new(&function).function(entry, registers, &nodes))
+    let title = program
+        .name(entry)
+        .unwrap_or_else(|| format!("sub_{:08x}", entry - function.base));
+    Ok(Writer::new(&function, &vars).function(&title, registers, &nodes))
 }
 
 fn stack_name(o: i64) -> String {
     if o < 0 {
-        format!("var_{:x}", -o)
+        format!("v_{:x}", -o)
     } else if o >= 0x28 && o % 8 == 0 {
         format!("a{}", 5 + (o - 0x28) / 8)
     } else {
@@ -76,22 +85,33 @@ fn stack_name(o: i64) -> String {
 
 struct Writer<'f> {
     f: &'f Function,
+    vars: &'f [vars::VarInfo],
     text: String,
     depth: usize,
 }
 
 impl<'f> Writer<'f> {
-    fn new(f: &'f Function) -> Self {
+    fn new(f: &'f Function, vars: &'f [vars::VarInfo]) -> Self {
         Self {
             f,
+            vars,
             text: String::new(),
             depth: 0,
+        }
+    }
+
+    fn var_name(&self, n: u32) -> String {
+        match self.vars.get(n as usize) {
+            Some(v) if v.param != 0 => format!("a{}", v.param),
+            _ => format!("v{}", n + 1),
         }
     }
 
     fn expr(&self, e: &Expr) -> String {
         Printer {
             stack_name: &stack_name,
+            var_width: &|n| self.vars.get(n as usize).map_or(8, |v| v.width),
+            var_name: &|n| self.var_name(n),
         }
         .expr(e)
     }
@@ -108,7 +128,7 @@ impl<'f> Writer<'f> {
         format!("L_{:x}", self.f.blocks[b].start - self.f.base)
     }
 
-    fn function(mut self, entry: u64, registers: u8, nodes: &[Node]) -> String {
+    fn function(mut self, title: &str, registers: u8, nodes: &[Node]) -> String {
         let mut stack_params = 0;
         for block in &self.f.blocks {
             let mut note = |e: &Expr| {
@@ -126,20 +146,19 @@ impl<'f> Writer<'f> {
                 note(e);
             }
         }
-        let count = i64::from(registers).max(stack_params);
+        let named = self
+            .vars
+            .iter()
+            .map(|v| i64::from(v.param))
+            .max()
+            .unwrap_or(0);
+        let count = i64::from(registers).max(stack_params).max(named);
         let params: Vec<String> = (1..=count).map(|n| format!("u64 a{n}")).collect();
         let returns = match self.f.returns {
-            None => "void",
-            Some(1) => "u8",
-            Some(2) => "u16",
-            Some(4) => "u32",
-            Some(_) => "u64",
+            None => "void".to_string(),
+            Some((loc, w)) => type_name(w, loc.is_vector() && matches!(w, 4 | 8)),
         };
-        self.line(&format!(
-            "{returns} sub_{:08x}({}) {{",
-            entry - self.f.base,
-            params.join(", ")
-        ));
+        self.line(&format!("{returns} {title}({}) {{", params.join(", ")));
         self.depth = 1;
         self.nodes(nodes);
         self.depth = 0;
@@ -163,6 +182,7 @@ impl<'f> Writer<'f> {
                 let target = Expr::Var(*loc, *w);
                 let lhs = match loc {
                     Loc::Reg(r) => register_name(*r, *w),
+                    Loc::Var(n) => self.var_name(*n),
                     _ => self.expr(&target),
                 };
                 assign(lhs, e, &target)
@@ -279,77 +299,4 @@ impl<'f> Writer<'f> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const BASE: u64 = 0x1_4000_0000;
-    const START: u64 = BASE + 0x1000;
-
-    struct Bytes(Vec<u8>);
-
-    impl Program for Bytes {
-        fn image_base(&self) -> u64 {
-            BASE
-        }
-
-        fn code(&self, va: u64) -> Option<&[u8]> {
-            self.bytes(va)
-        }
-
-        fn bytes(&self, va: u64) -> Option<&[u8]> {
-            self.0.get(usize::try_from(va.checked_sub(START)?).ok()?..)
-        }
-
-        fn symbol(&self, _: u64) -> Symbol {
-            Symbol::Function
-        }
-
-        fn inside(&self, _: u64, target: u64) -> bool {
-            self.bytes(target).is_some()
-        }
-    }
-
-    fn run(code: &[u8]) -> String {
-        decompile(&Bytes(code.to_vec()), START).expect("decompiles")
-    }
-
-    #[test]
-    fn early_return() {
-        // test rcx,rcx; je +6; lea rax,[rcx+1]; ret; int3; xor eax,eax; ret
-        let text = run(&[
-            0x48, 0x85, 0xC9, 0x74, 0x06, 0x48, 0x8D, 0x41, 0x01, 0xC3, 0xCC, 0x31, 0xC0, 0xC3,
-        ]);
-        assert!(text.contains("u32 sub_00001000(u64 a1)"), "{text}");
-        assert!(
-            text.contains("if (a1 == 0) {\n        return 0;\n    }"),
-            "{text}"
-        );
-        assert!(text.contains("return (u32)(a1 + 1);"), "{text}");
-        assert!(!text.contains("goto"), "{text}");
-    }
-
-    #[test]
-    fn counted_loop() {
-        // xor eax,eax; test ecx,ecx; je +6; add eax,ecx; dec ecx; jne -6; ret
-        let text = run(&[
-            0x31, 0xC0, 0x85, 0xC9, 0x74, 0x06, 0x01, 0xC8, 0xFF, 0xC9, 0x75, 0xFA, 0xC3,
-        ]);
-        assert!(text.contains("do {"), "{text}");
-        assert!(text.contains("eax += ecx;"), "{text}");
-        assert!(text.contains("} while (ecx != 0);"), "{text}");
-        assert!(text.contains("return eax;"), "{text}");
-    }
-
-    #[test]
-    fn call_arguments_and_frame() {
-        // sub rsp,28h; mov ecx,5; call +0Eh; add rsp,28h; ret
-        let mut code = vec![
-            0x48, 0x83, 0xEC, 0x28, 0xB9, 0x05, 0, 0, 0, 0xE8, 0x0E, 0, 0, 0, 0x48, 0x83, 0xC4,
-            0x28, 0xC3,
-        ];
-        code.resize(0x20, 0xCC);
-        let text = run(&code);
-        assert!(text.contains("return sub_0000101c(5);"), "{text}");
-        assert!(!text.contains("rsp"), "{text}");
-    }
-}
+mod tests;
