@@ -1,0 +1,20 @@
+[package]
+name = "standin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+iced-x86 = { workspace = true, features = ["code_asm"] }
+pe-loader.workspace = true
+shims.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+xbox-d3d12.workspace = true
+
+[dev-dependencies]
+pe-image.workspace = true
+
+[lints]
+workspace = true
