@@ -55,7 +55,7 @@ fn real_xma2_stream_decodes_to_its_declared_length() {
         let h = PacketHeader::parse(p).unwrap();
         assert_eq!(h.carry_bits, 0, "packet {i}");
         assert_eq!(h.skip_count, 0, "packet {i}");
-        let frames_before = u32::from(table[i] / 512);
+        let frames_before = table[i] / 512;
         let frames_here = u32::from(h.frame_count);
         let next = table.get(i + 1).copied().unwrap_or(fmt.samples) / 512;
         assert_eq!(frames_before + frames_here, next, "packet {i}");
