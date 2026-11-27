@@ -63,7 +63,7 @@ ID3D12Device 47 CreatePipelineState pc
 ID3D12Device 81 GetFrameStatisticsX measured
 # Device slot 57 is the console's graphics pipeline creation from the title's PSO cache (inferred from its description layout and its fall back to slot 86); the PC's CreateLifetimeTracker is not what the title calls there.
 # Slot 55 is the other cache path (inferred); slot 86 takes a D3D12_PIPELINE_STATE_STREAM_DESC (measured).
-# Queue: PresentX is slot 30 (older console runtime layout) or 32 (newer), from public code; not decided for this title.
+# Queue slots 16 to 35 are the console's order as the executable calls them (slots 8 to 13 are not measured and keep the PC names).
 ID3D12CommandQueue 0 QueryInterface pc
 ID3D12CommandQueue 1 AddRef pc
 ID3D12CommandQueue 2 Release pc sites=5
@@ -78,16 +78,16 @@ ID3D12CommandQueue 10 ExecuteCommandLists pc
 ID3D12CommandQueue 11 SetMarker pc
 ID3D12CommandQueue 12 BeginEvent pc
 ID3D12CommandQueue 13 EndEvent pc
-ID3D12CommandQueue 14 Signal pc
-ID3D12CommandQueue 15 Wait pc
-ID3D12CommandQueue 16 GetTimestampFrequency pc (the executable calls Signal at slot 16)
-ID3D12CommandQueue 17 GetClockCalibration pc
-ID3D12CommandQueue 18 GetDesc pc
-# Queue slots 28 to 32 are a guess: PresentX is 30 in the older console runtime layout and 32 in the newer; SuspendX and ResumeX are placed before the older PresentX. Both PresentX slots answer; a call to 29 or 31 names itself in the trace.
-ID3D12CommandQueue 28 SuspendX inferred
-ID3D12CommandQueue 29 ResumeX inferred
-ID3D12CommandQueue 30 PresentX inferred
-ID3D12CommandQueue 32 PresentX inferred
+ID3D12CommandQueue 16 Signal measured (called as (fence, value), HRESULT checked)
+ID3D12CommandQueue 17 Wait inferred (follows Signal)
+ID3D12CommandQueue 18 GetTimestampFrequency measured (called as (UINT64*), the result divides a constant)
+ID3D12CommandQueue 19 GetClockCalibration inferred (follows GetTimestampFrequency)
+ID3D12CommandQueue 20 GetDesc inferred (follows GetClockCalibration)
+ID3D12CommandQueue 23 SuspendX measured (called as (0), one function calls it and ResumeX)
+ID3D12CommandQueue 24 ResumeX measured (called as ())
+ID3D12CommandQueue 31 MapTilesX measured (called as (count, ranges, handle, dword, 0) after XMemMapPhysicalPagesScatter; meaning unknown)
+ID3D12CommandQueue 32 PresentX measured (planeCount, planes, params; two sites)
+ID3D12CommandQueue 35 ExecuteCommandListsX measured (count, lists, token from WaitFrameEventX, flags 3 or 0; the only way the executable submits)
 ID3D12CommandAllocator 0 QueryInterface pc
 ID3D12CommandAllocator 1 AddRef pc
 ID3D12CommandAllocator 2 Release pc
@@ -133,6 +133,8 @@ ID3D12GraphicsCommandList 23 OMSetBlendFactor pc sites=1
 ID3D12GraphicsCommandList 24 OMSetStencilRef pc sites=1
 ID3D12GraphicsCommandList 25 SetPipelineState measured sites=3
 ID3D12GraphicsCommandList 26 ResourceBarrier measured
+ID3D12GraphicsCommandList 29 Unnamed29 measured (called as (ptr, u32, u32); meaning unknown, ignored)
+ID3D12GraphicsCommandList 30 Unnamed30 measured (called as (ptr, u32, first, count, ptr, byte offset); meaning unknown, ignored)
 ID3D12GraphicsCommandList 32 SetDescriptorHeaps measured
 ID3D12GraphicsCommandList 33 SetComputeRootSignature measured sites=2
 ID3D12GraphicsCommandList 34 SetGraphicsRootSignature inferred sites=1
@@ -163,6 +165,8 @@ ID3D12GraphicsCommandList 71 WriteValueX inferred
 ID3D12GraphicsCommandList 73 WaitValueX inferred
 ID3D12GraphicsCommandList 80 DispatchX inferred
 ID3D12GraphicsCommandList 85 CopyTextureRegion inferred
+ID3D12GraphicsCommandList 131 Unnamed131 measured (called as (a, b, c, mask) once per list before Close; meaning unknown, ignored)
+ID3D12GraphicsCommandList 132 Unnamed132 measured (called as (a, b, c, mask) once per list before Close; meaning unknown, ignored)
 ID3D12GraphicsCommandList 141 SetScratchBufferX measured
 ID3D12GraphicsCommandList 146 Barrier measured
 ID3D12GraphicsCommandList 148 AllocateUploadMemoryX measured

@@ -464,6 +464,36 @@ unsafe extern "win64" fn q_execute_command_lists(
     }
 }
 
+/// Console slot 35: `(count, lists, token, flags)`. The token comes from `WaitFrameEventX`; the flags (3 for a
+/// batch, 0 for a single list) are not measured beyond that, and the lists run in order either way.
+unsafe extern "win64" fn q_execute_command_lists_x(
+    this: *mut c_void,
+    count: u32,
+    lists: *const *mut c_void,
+    _token: u64,
+    _flags: u32,
+) -> u32 {
+    // SAFETY: the same call as the plain slot.
+    unsafe { q_execute_command_lists(this, count, lists) };
+    S_OK
+}
+
+/// Console slot 31: `(count, ranges, handle, dword, 0)`, called right after `XMemMapPhysicalPagesScatter`. What it
+/// does is not measured, so it succeeds and says so once.
+unsafe extern "win64" fn q_map_tiles_x(
+    _this: *mut c_void,
+    count: u32,
+    _ranges: *const c_void,
+    _handle: *const c_void,
+    _value: u32,
+    _zero: u32,
+) -> u32 {
+    com::note_once(format!(
+        "ID3D12CommandQueue slot 31 (tile mapping, {count} ranges): meaning not measured, ignored"
+    ));
+    S_OK
+}
+
 unsafe extern "win64" fn q_marker(
     _this: *mut c_void,
     _metadata: u32,
@@ -550,11 +580,13 @@ fn queue_vtable(core: &DeviceCore) -> *const usize {
         (11, q_marker as *const () as usize),
         (12, q_marker as *const () as usize),
         (13, q_end_event as *const () as usize),
-        (14, q_signal as *const () as usize),
-        (15, q_wait as *const () as usize),
-        (16, q_timestamp_frequency as *const () as usize),
-        (17, q_clock_calibration as *const () as usize),
-        (18, q_get_desc as *const () as usize),
+        (16, q_signal as *const () as usize),
+        (17, q_wait as *const () as usize),
+        (18, q_timestamp_frequency as *const () as usize),
+        (19, q_clock_calibration as *const () as usize),
+        (20, q_get_desc as *const () as usize),
+        (31, q_map_tiles_x as *const () as usize),
+        (35, q_execute_command_lists_x as *const () as usize),
     ];
     known.extend_from_slice(&core.integration.queue_methods);
     core.cached_vtable(Kind::CommandQueue, 64, &known)
