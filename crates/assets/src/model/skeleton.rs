@@ -32,12 +32,18 @@ pub(crate) fn read_skeleton(p: &Pages<'_>, header: usize) -> Result<Skeleton, Mo
         if parent != 0xFFFF && (parent as usize >= n || parent as usize == i) {
             return Err(ModelError::Invalid(format!("bone {i} has parent {parent}")));
         }
-        let matrix: [f32; 16] = p.f32s(inverse + 64 * i, "inverse bind matrix")?;
-        if !matrix.iter().all(|v| v.is_finite()) {
+        let mut matrix: [f32; 16] = p.f32s(inverse + 64 * i, "inverse bind matrix")?;
+        if !matrix.iter().all(|v| v.is_finite())
+            || matrix[3] != 0.0
+            || matrix[7] != 0.0
+            || matrix[11] != 0.0
+        {
             return Err(ModelError::Invalid(format!(
-                "inverse bind matrix {i} is not finite"
+                "inverse bind matrix {i} is not an affine finite matrix"
             )));
         }
+        // The stored w entry is not 1 in the game data; the matrix is affine.
+        matrix[15] = 1.0;
         bones.push(Bone {
             name: p.c_string(r + 0x30),
             hash: p.u32(r + 0x1C, "bone hash")?,
