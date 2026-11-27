@@ -674,3 +674,68 @@ fn page_destinations_split_over_consecutive_entries() {
         ]
     );
 }
+
+#[test]
+fn a_page_destination_lands_in_physical_pages_every_view_sees() {
+    fn shim<T: Copy>(name: &str) -> T {
+        let address = crate::builtin()
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("{name} registered"))
+            .address;
+        // SAFETY: `T` is the function pointer type matching the shim's measured shape.
+        unsafe { std::mem::transmute_copy(&address) }
+    }
+    type Reserve = unsafe extern "win64" fn(*mut c_void, usize, u32, u64, u32) -> *mut c_void;
+    type Allocate = unsafe extern "win64" fn(usize, *mut usize, *mut usize) -> i32;
+    type Map = unsafe extern "win64" fn(*mut c_void, usize, *const usize) -> i32;
+    const PAGE: usize = 0x1_0000;
+    let s = setup();
+    let data = pattern(150_000);
+    let (_dir, path) = temp_file(&data);
+    let file = open_file(&s, &path);
+    let reserve: Reserve = shim("XMemVirtualAlloc");
+    let allocate: Allocate = shim("XMemAllocatePhysicalPages");
+    let map: Map = shim("XMemMapPhysicalPages");
+    // SAFETY: the shapes the executable uses; every pointer is valid.
+    let (cpu, graphics, table) = unsafe {
+        let cpu = reserve(std::ptr::null_mut(), 3 * PAGE, 0x2040_2000, 0x23, 0x2004);
+        let graphics = reserve(std::ptr::null_mut(), 3 * PAGE, 0x2040_2000, 0x23, 0x2004);
+        let mut count = 3usize;
+        let mut pages = [0usize; 3];
+        assert_eq!(allocate(0x280, &mut count, pages.as_mut_ptr()), 1);
+        assert_eq!(map(cpu, 3, pages.as_ptr()), 1);
+        assert_eq!(map(graphics, 3, pages.as_ptr()), 1);
+        // The title's table lists the pages in the order the data fills them, not the order they were mapped.
+        let table: [u64; 3] = [pages[2] as u64, pages[0] as u64, pages[1] as u64];
+        (cpu as usize, graphics as usize, table)
+    };
+    crate::dstorage::set_page_writer(Some(crate::xmem::write_physical_page));
+    enqueue(
+        &s,
+        &Spec {
+            file,
+            size: 150_000,
+            destination: 1,
+            target: table.as_ptr() as usize,
+            extra: 0x100,
+            ..Spec::default()
+        },
+    );
+    mark_and_submit(&s, 0);
+    let result = wait(&s, 0);
+    crate::dstorage::set_page_writer(None);
+    assert_eq!(result, 0);
+    let first = PAGE - 0x100;
+    for base in [cpu, graphics] {
+        // SAFETY: three mapped pages of a reservation of ours.
+        let view = unsafe { std::slice::from_raw_parts(base as *const u8, 3 * PAGE) };
+        assert_eq!(&view[2 * PAGE + 0x100..], &data[..first], "first page");
+        assert_eq!(&view[..PAGE], &data[first..first + PAGE], "second page");
+        assert_eq!(
+            &view[PAGE..PAGE + (150_000 - first - PAGE)],
+            &data[first + PAGE..],
+            "third page"
+        );
+    }
+}
