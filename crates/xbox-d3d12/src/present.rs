@@ -9,6 +9,7 @@
 
 pub mod convert;
 pub mod frames;
+pub mod render;
 pub mod vulkan;
 pub mod window;
 
