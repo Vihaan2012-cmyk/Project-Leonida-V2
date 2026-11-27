@@ -6,7 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+cpal.workspace = true
 offline.workspace = true
+thiserror.workspace = true
 pe-loader.workspace = true
 
 [target.'cfg(windows)'.dependencies]
