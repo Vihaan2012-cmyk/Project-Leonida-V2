@@ -8,6 +8,9 @@
 
 use thiserror::Error;
 
+mod model;
+mod tables;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BcPackCodec {
     Bc1 = 1,
