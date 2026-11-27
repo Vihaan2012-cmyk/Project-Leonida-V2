@@ -1,7 +1,10 @@
 //! Finding what the CPU wrote: address-range sets, and Windows' write watch queried so that it stays cheap.
 //!
 //! Measured on an RTX 4060 machine (Windows 11): `GetWriteWatch` over 2.5 GiB with nothing written takes
-//! 0.3-0.5 ms in 128 MiB calls (1.2 ms in 16 MiB calls), and about 0.15 us for every page it reports and resets.
+//! 0.3-0.5 ms in 128 MiB calls (1.2 ms in 16 MiB calls) while the pages were never touched, but 8-10 ms once they
+//! are resident and imported into Vulkan (13 ns a page), and about 0.15 us for every page it reports and resets.
+//! A scan every submission therefore suits only memory the game writes without saying so; large static memory
+//! should be `SyncPolicy::Marked` and announced with `mark_dirty`.
 //! The larger cost is the write fault the game thread takes on the first write to a page after the reset:
 //! 0.7 us a page, so a buffer rewritten in full every frame costs the game 45 ms a 256 MiB. Tiles written
 //! that densely are therefore left unreset and copied whole; they are probed now and then to see whether they
@@ -180,7 +183,6 @@ impl Tiles {
 /// Reusable buffers for the queries.
 #[derive(Default)]
 pub(super) struct Scanner {
-    pages: Vec<usize>,
     counts: Vec<u32>,
 }
 
@@ -274,8 +276,9 @@ impl Scanner {
         true
     }
 
-    /// Queries `lo..hi` in calls of at most `QUERY_PAGES` pages, appending the written pages as runs and counting
-    /// them per tile.
+    /// Queries `lo..hi`, appending the written pages as runs and counting them per tile. The system walks every
+    /// resident page it is asked about (13 ns each, 8 ms for 2.5 GiB), and threads do not speed that up: the
+    /// calls are serialised inside the kernel.
     fn query(
         &mut self,
         lo: u64,
@@ -285,35 +288,45 @@ impl Scanner {
         first_tile: u64,
         out: &mut Vec<(u64, u64)>,
     ) -> bool {
-        let mut at = lo;
+        let Some(pages) = fetch(lo, hi) else {
+            return false;
+        };
         let mut run: Option<(u64, u64)> = None;
-        while at < hi {
-            let part = (QUERY_PAGES * WATCH_PAGE).min(hi - at);
-            self.pages.resize((part / WATCH_PAGE) as usize, 0);
-            let Some(count) = write_watch_call(at, part, &mut self.pages) else {
-                return false;
-            };
-            for &page in &self.pages[..count] {
-                let page = page as u64;
-                let tile = (page - host + offset) / TILE;
-                self.counts[(tile - first_tile) as usize] += 1;
-                match &mut run {
-                    Some((_, end)) if *end == page => *end = page + WATCH_PAGE,
-                    _ => {
-                        if let Some(done) = run.take() {
-                            out.push(done);
-                        }
-                        run = Some((page, page + WATCH_PAGE));
+        for page in pages {
+            let page = page as u64;
+            let tile = (page - host + offset) / TILE;
+            self.counts[(tile - first_tile) as usize] += 1;
+            match &mut run {
+                Some((_, end)) if *end == page => *end = page + WATCH_PAGE,
+                _ => {
+                    if let Some(done) = run.take() {
+                        out.push(done);
                     }
+                    run = Some((page, page + WATCH_PAGE));
                 }
             }
-            at += part;
         }
         if let Some(done) = run {
             out.push(done);
         }
         true
     }
+}
+
+/// The pages written in `lo..hi`, queried in calls of at most `QUERY_PAGES` pages; `None` where the system cannot
+/// say.
+fn fetch(lo: u64, hi: u64) -> Option<Vec<usize>> {
+    let mut found = Vec::new();
+    let mut window = Vec::new();
+    let mut at = lo;
+    while at < hi {
+        let part = (QUERY_PAGES * WATCH_PAGE).min(hi - at);
+        window.resize((part / WATCH_PAGE) as usize, 0);
+        let count = write_watch_call(at, part, &mut window)?;
+        found.extend_from_slice(&window[..count]);
+        at += part;
+    }
+    Some(found)
 }
 
 /// `WRITE_WATCH_FLAG_RESET`, which windows-sys does not carry.

@@ -149,7 +149,7 @@ impl Burner {
             let command = rig.slots[0].command;
             rig.begin(gpu, 0);
             self.record(&gpu.handles.device, command);
-            rig.submit(gpu, 0, &[], &[]);
+            rig.submit(gpu, 0, &[]);
             rig.wait(gpu, 0);
         }
         let ms = start.elapsed().as_secs_f64() * 1000.0 / 3.0;
@@ -250,12 +250,16 @@ impl Rig {
         slot.busy.set(false);
     }
 
-    /// Ends and submits slot `i`, after the semaphores in `waits` (binary, at all-commands).
-    fn submit(&self, gpu: &TestGpu, i: usize, waits: &[vk::Semaphore], signals: &[vk::Semaphore]) {
+    /// Ends and submits slot `i`, after the timeline values in `waits`, at all-commands.
+    fn submit(&self, gpu: &TestGpu, i: usize, waits: &[TimelineWait]) {
         let device = &gpu.handles.device;
         let slot = &self.slots[i];
         let commands = [slot.command];
         let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
+        let semaphores: Vec<vk::Semaphore> = waits.iter().map(|w| w.semaphore).collect();
+        let values: Vec<u64> = waits.iter().map(|w| w.value).collect();
+        let mut timeline =
+            vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values);
         // SAFETY: the command buffer is recording and complete.
         unsafe {
             device.end_command_buffer(slot.command).unwrap();
@@ -264,9 +268,9 @@ impl Rig {
                     gpu.handles.queue,
                     &[vk::SubmitInfo::default()
                         .command_buffers(&commands)
-                        .wait_semaphores(waits)
+                        .wait_semaphores(&semaphores)
                         .wait_dst_stage_mask(&stages)
-                        .signal_semaphores(signals)],
+                        .push_next(&mut timeline)],
                     slot.fence,
                 )
                 .unwrap();
@@ -311,12 +315,21 @@ struct Report {
     downloaded_mb: f64,
 }
 
-/// What each frame calls to get its uploads and downloads recorded.
+/// How a frame gets its uploads and downloads recorded.
 trait Strategy {
     fn name(&self) -> String;
+    /// `None` when the strategy needs a queue the GPU lacks.
+    fn transfer(&self, _gpu: &TestGpu) -> Option<Option<TransferQueue>> {
+        Some(None)
+    }
+    /// Before the frame's command buffer is recorded: queue work for the transfer queue.
+    fn prepare(&mut self, _space: &mut AddressSpace) -> Option<TimelineWait> {
+        None
+    }
     /// Records the frame's uploads into `command`, returns the bytes copied.
     fn uploads(&mut self, space: &mut AddressSpace, command: vk::CommandBuffer) -> u64;
-    /// Records the downloads of the GPU-written buffer at `va..va + len`; `read` says the CPU reads it this frame.
+    /// Records the downloads of the GPU-written buffer at `va..va + len` after the GPU wrote it; `read` says the
+    /// CPU reads it this frame.
     fn downloads(
         &mut self,
         space: &mut AddressSpace,
@@ -325,10 +338,14 @@ trait Strategy {
         len: u64,
         read: bool,
     ) -> u64;
+    /// After the frame was submitted: reads that block.
+    fn after_submit(&mut self, _space: &mut AddressSpace, _va: u64, _len: u64, _read: bool) -> u64 {
+        0
+    }
 }
 
+/// The calls the layer had before the transfer queue and the stale tracking.
 struct Naive {
-    /// Downloads the GPU-written buffer after every frame, as a caller with no knowledge of reads must.
     every_frame: bool,
 }
 
@@ -364,18 +381,81 @@ impl Strategy for Naive {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Queue {
+    Main,
+    Sibling,
+    Dedicated,
+}
+
+/// `submit_uploads` on a queue of its own and the stale tracking.
+struct Tracked {
+    queue: Queue,
+    access: HostAccess,
+}
+
+impl Strategy for Tracked {
+    fn name(&self) -> String {
+        format!("{:?} queue, GPU data {:?}", self.queue, self.access)
+    }
+
+    fn transfer(&self, gpu: &TestGpu) -> Option<Option<TransferQueue>> {
+        match self.queue {
+            Queue::Main => Some(None),
+            Queue::Sibling => gpu.sibling.clone().map(Some),
+            Queue::Dedicated => gpu.dedicated.clone().map(Some),
+        }
+    }
+
+    fn prepare(&mut self, space: &mut AddressSpace) -> Option<TimelineWait> {
+        space.submit_uploads().unwrap()
+    }
+
+    fn uploads(&mut self, space: &mut AddressSpace, command: vk::CommandBuffer) -> u64 {
+        space.record_uploads(command)
+    }
+
+    fn downloads(
+        &mut self,
+        space: &mut AddressSpace,
+        command: vk::CommandBuffer,
+        va: u64,
+        len: u64,
+        _read: bool,
+    ) -> u64 {
+        space.set_host_access(va, len, self.access);
+        space.note_gpu_write(va, len);
+        space.record_pending_downloads(command)
+    }
+
+    fn after_submit(&mut self, space: &mut AddressSpace, va: u64, len: u64, read: bool) -> u64 {
+        if read && self.access == HostAccess::OnDemand {
+            space.read_back(va, len).unwrap()
+        } else {
+            0
+        }
+    }
+}
+
 fn run_traffic(
     gpu: &TestGpu,
     space: &mut AddressSpace,
     burner: &Burner,
     traffic: Traffic,
     policy: SyncPolicy,
+    static_policy: SyncPolicy,
     strategy: &mut dyn Strategy,
 ) -> Report {
     let watch = policy == SyncPolicy::WriteWatch;
     let mb = 1u64 << 20;
     let high = 4u64 << 30;
-    let statics = Region::new_in(traffic.static_mb * mb, watch, high, 8 << 30, 20);
+    let statics = Region::new_in(
+        traffic.static_mb * mb,
+        static_policy == SyncPolicy::WriteWatch,
+        high,
+        8 << 30,
+        20,
+    );
     let dynamics = Region::new_in(
         traffic.dynamic_mb * mb,
         watch,
@@ -389,7 +469,10 @@ fn run_traffic(
     let rig = Rig::new(gpu, 2);
 
     space.begin_batch();
-    for region in [&statics, &dynamics, &written] {
+    space
+        .map_host(statics.address, statics.len, static_policy)
+        .unwrap();
+    for region in [&dynamics, &written] {
         space.map_host(region.address, region.len, policy).unwrap();
     }
     space.end_batch().unwrap();
@@ -416,11 +499,14 @@ fn run_traffic(
         let slot = frame % 2;
         touch_all(&dynamics, frame as u32 + 2);
         let begun = Instant::now();
+        let before = Instant::now();
+        let wait = strategy.prepare(space);
+        let mut found = before.elapsed().as_secs_f64() * 1000.0;
         rig.begin(gpu, slot);
         let command = rig.slots[slot].command;
         let before = Instant::now();
         let uploaded = strategy.uploads(space, command);
-        let found = before.elapsed().as_secs_f64() * 1000.0;
+        found += before.elapsed().as_secs_f64() * 1000.0;
         burner.record(device, command);
         // SAFETY: recording; the range is inside the window.
         unsafe {
@@ -434,16 +520,17 @@ fn run_traffic(
         }
         let read = traffic.read_every > 0 && frame % traffic.read_every == 0;
         let downloaded = strategy.downloads(space, command, written.address, written.len, read);
-        rig.submit(gpu, slot, &[], &[]);
+        let waits: Vec<TimelineWait> = wait.into_iter().collect();
+        rig.submit(gpu, slot, &waits);
+        let blocked = strategy.after_submit(space, written.address, written.len, read);
         if frame == 0 {
             rig.idle(gpu);
             report.load_ms = begun.elapsed().as_secs_f64() * 1000.0;
-            report.uploaded_mb = uploaded as f64 / mb as f64;
         }
         if frame >= warm {
             find += found;
             up += uploaded;
-            down += downloaded;
+            down += downloaded + blocked;
             measured += 1;
         }
     }
@@ -460,19 +547,24 @@ fn run_traffic(
     report
 }
 
-fn print_header(gpu: &TestGpu, space: &AddressSpace) {
-    eprintln!("== {} ({:?})", gpu.name(), space.backing());
-    eprintln!(
-        "{:<44} {:>6} {:>5} {:>9} {:>9} {:>9} {:>8} {:>8}",
-        "strategy / traffic", "dyn", "ms", "load ms", "find ms", "frame ms", "up MB", "down MB"
-    );
+fn big_space(gpu: &TestGpu, transfer: Option<TransferQueue>) -> AddressSpace {
+    AddressSpace::new_with_transfer(
+        gpu.handles.clone(),
+        Config {
+            base: 0,
+            size: Some(1 << 39),
+            chunk: 1 << 30,
+        },
+        transfer,
+    )
+    .unwrap()
 }
 
 fn table(
     gpu: &TestGpu,
-    make: &dyn Fn(&TestGpu) -> AddressSpace,
     strategies: &mut [Box<dyn Strategy>],
-    policies: &[SyncPolicy],
+    policy: SyncPolicy,
+    static_policy: SyncPolicy,
     read_every: usize,
 ) {
     let statics = env_mb("LEONIDA_BENCH_STATIC_MB", "2560")[0];
@@ -481,70 +573,188 @@ fn table(
     let frames = env_mb("LEONIDA_BENCH_FRAMES", "90")[0] as usize;
     let mut burner = Burner::new(gpu);
     burner.calibrate(gpu, render);
-    for &policy in policies {
-        for dynamic_mb in env_mb("LEONIDA_BENCH_DYNAMIC_MB", "64,256") {
-            for strategy in strategies.iter_mut() {
-                let mut space = make(gpu);
-                if space.backing() == Backing::Direct {
-                    eprintln!("skipped: the window is direct on this GPU");
-                    drop(space);
-                    burner.finish(gpu);
-                    return;
-                }
-                let traffic = Traffic {
-                    static_mb: statics,
-                    dynamic_mb,
-                    gpu_mb,
-                    frames,
-                    read_every,
-                };
-                let r = run_traffic(gpu, &mut space, &burner, traffic, policy, strategy.as_mut());
-                eprintln!(
-                    "{:<44} {:>6} {:>5} {:>9.1} {:>9.3} {:>9.3} {:>8.1} {:>8.1}",
-                    format!("{:?}: {}", policy, strategy.name()),
-                    dynamic_mb,
-                    render,
-                    r.load_ms,
-                    r.find_ms,
-                    r.frame_ms,
-                    r.uploaded_mb,
-                    r.downloaded_mb
-                );
-            }
+    eprintln!(
+        "{:<44} {:>5} {:>9} {:>9} {:>9} {:>8} {:>8}",
+        "strategy", "dyn", "load ms", "find ms", "frame ms", "up MB", "down MB"
+    );
+    for dynamic_mb in env_mb("LEONIDA_BENCH_DYNAMIC_MB", "64,256") {
+        for strategy in strategies.iter_mut() {
+            let Some(transfer) = strategy.transfer(gpu) else {
+                continue;
+            };
+            let mut space = big_space(gpu, transfer);
+            let traffic = Traffic {
+                static_mb: statics,
+                dynamic_mb,
+                gpu_mb,
+                frames,
+                read_every,
+            };
+            let r = run_traffic(
+                gpu,
+                &mut space,
+                &burner,
+                traffic,
+                policy,
+                static_policy,
+                strategy.as_mut(),
+            );
+            eprintln!(
+                "{:<44} {:>5} {:>9.1} {:>9.3} {:>9.3} {:>8.1} {:>8.1}",
+                strategy.name(),
+                dynamic_mb,
+                r.load_ms,
+                r.find_ms,
+                r.frame_ms,
+                r.uploaded_mb,
+                r.downloaded_mb
+            );
         }
     }
     burner.finish(gpu);
-}
-
-fn big_space(gpu: &TestGpu) -> AddressSpace {
-    AddressSpace::new(
-        gpu.handles.clone(),
-        Config {
-            base: 0,
-            size: Some(1 << 39),
-            chunk: 1 << 30,
-        },
-    )
-    .unwrap()
 }
 
 #[test]
 #[ignore = "benchmark"]
 fn bench_the_sync_of_a_mirrored_window() {
     for gpu in &TestGpu::open_all() {
-        let probe = big_space(gpu);
-        print_header(gpu, &probe);
+        let probe = big_space(gpu, None);
+        eprintln!("== {} ({:?})", gpu.name(), probe.backing());
+        let mirrored = probe.backing() == Backing::Mirrored;
         drop(probe);
+        if !mirrored {
+            eprintln!("skipped: the window is direct on this GPU");
+            continue;
+        }
         let mut strategies: Vec<Box<dyn Strategy>> = vec![
             Box::new(Naive { every_frame: true }),
             Box::new(Naive { every_frame: false }),
         ];
-        table(
-            gpu,
-            &big_space,
-            &mut strategies,
-            &[SyncPolicy::WriteWatch],
-            30,
+        for queue in [Queue::Main, Queue::Sibling, Queue::Dedicated] {
+            for access in [HostAccess::Eager, HostAccess::OnDemand, HostAccess::Never] {
+                strategies.push(Box::new(Tracked { queue, access }));
+            }
+        }
+        for static_policy in [SyncPolicy::WriteWatch, SyncPolicy::Marked] {
+            eprintln!("-- static memory: {static_policy:?}");
+            table(
+                gpu,
+                &mut strategies,
+                SyncPolicy::WriteWatch,
+                static_policy,
+                30,
+            );
+        }
+    }
+}
+
+fn query_run(address: u64, len: u64, window: u64, scratch: &mut Vec<*mut c_void>) -> (u64, f64) {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let start = Instant::now();
+    let mut pages = 0u64;
+    let mut at = address;
+    while at < address + len {
+        let part = window.min(address + len - at);
+        let mut count = (part / 4096) as usize;
+        scratch.resize(count, std::ptr::null_mut());
+        let mut granularity = 0u32;
+        // SAFETY: the scratch has room for `count` entries.
+        let status = unsafe {
+            GetWriteWatch(
+                1,
+                at as usize as *const c_void,
+                part as usize,
+                scratch.as_mut_ptr(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        assert_eq!(status, 0);
+        pages += count as u64;
+        at += part;
+    }
+    (pages, start.elapsed().as_secs_f64() * 1000.0)
+}
+
+#[test]
+#[ignore = "benchmark"]
+fn bench_write_watch_scaling() {
+    let mb = 1u64 << 20;
+    let region = Region::new_in(2560 * mb, true, 4 << 30, 8 << 30, 8);
+    let mut scratch = Vec::new();
+    for window_mb in [16u64, 128, 2560] {
+        for _ in 0..2 {
+            let (pages, ms) = query_run(region.address, region.len, window_mb * mb, &mut scratch);
+            eprintln!("clean 2.5 GiB in {window_mb} MiB calls: {pages} pages {ms:.3} ms");
+        }
+    }
+    for threads in [2u64, 4, 8] {
+        let part = region.len / threads;
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                let base = region.address + t * part;
+                scope.spawn(move || {
+                    let mut scratch = Vec::new();
+                    query_run(base, part, 128 * mb, &mut scratch);
+                });
+            }
+        });
+        eprintln!(
+            "clean 2.5 GiB on {threads} threads: {:.3} ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    for dirty_mb in [64u64, 256] {
+        for threads in [1u64, 4] {
+            for offset in (0..dirty_mb * mb).step_by(4096) {
+                region.touch(offset, 1);
+            }
+            let part = region.len / threads;
+            let start = Instant::now();
+            std::thread::scope(|scope| {
+                for t in 0..threads {
+                    let base = region.address + t * part;
+                    scope.spawn(move || {
+                        let mut scratch = Vec::new();
+                        query_run(base, part, 128 * mb, &mut scratch);
+                    });
+                }
+            });
+            eprintln!(
+                "{dirty_mb} MiB dirty on {threads} threads: {:.3} ms",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "benchmark"]
+fn bench_write_watch_fault_cost() {
+    let mb = 1u64 << 20;
+    for watch in [true, false] {
+        let region = Region::new_in(256 * mb, watch, 4 << 30, 8 << 30, 8);
+        let touch = |value: u32| {
+            let start = Instant::now();
+            for offset in (0..region.len).step_by(4096) {
+                region.touch(offset, value);
+            }
+            start.elapsed().as_secs_f64() * 1000.0
+        };
+        let first = touch(1);
+        let again = touch(2);
+        let mut scratch = Vec::new();
+        let mut after_reset = Vec::new();
+        let mut query = Vec::new();
+        for n in 0..4 {
+            if watch {
+                query.push(query_run(region.address, region.len, 128 * mb, &mut scratch).1);
+            }
+            after_reset.push(touch(3 + n));
+        }
+        eprintln!(
+            "256 MiB, write watch {watch}: first touch {first:.2} ms, second {again:.2} ms, after a reset {after_reset:.2?} ms, queries {query:.2?} ms"
         );
     }
 }
