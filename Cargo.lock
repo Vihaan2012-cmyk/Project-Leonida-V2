@@ -2346,6 +2346,7 @@ dependencies = [
 name = "shader-translate"
 version = "0.1.0"
 dependencies = [
+ "bvh-build",
  "gpu",
  "rdna",
  "rspirv",
