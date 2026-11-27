@@ -235,11 +235,18 @@ fn fssm_compute(source: &str) -> Vec<u8> {
 fn a_compute_list_runs_on_the_assembled_device_and_its_result_is_in_game_memory() {
     let Some(h) = harness() else { return };
     let buffer = h.committed(1, &buffer_desc(0x10000, 4), 8);
-    run_ids(&h, buffer);
+    run_ids(&h, buffer, Creation::Slot11);
+}
+
+#[derive(Clone, Copy)]
+enum Creation {
+    Slot11,
+    Slot62,
+    Slot86,
 }
 
 /// Dispatches the id-storing shader at `buffer` and checks every thread's word in game memory.
-fn run_ids(h: &Harness, buffer: Ptr) {
+fn run_ids(h: &Harness, buffer: Ptr, creation: Creation) {
     let queue = h.queue();
     // SAFETY: resource slot 11, device slots 16 and 11.
     let (address, root, pipeline) = unsafe {
@@ -285,14 +292,36 @@ fn run_ids(h: &Harness, buffer: Ptr) {
         desc[8..16].copy_from_slice(&(container.as_ptr() as u64).to_le_bytes());
         desc[16..24].copy_from_slice(&(container.len() as u64).to_le_bytes());
         let mut pipeline = std::ptr::null_mut();
-        let create_pipeline: unsafe extern "win64" fn(Ptr, *const u8, *const u8, *mut Ptr) -> u32 =
-            slot(h.device, 11);
-        let made = create_pipeline(
-            h.device,
-            desc.as_ptr(),
-            guid(&iid::PIPELINE_STATE).as_ptr(),
-            &mut pipeline,
-        );
+        let riid = guid(&iid::PIPELINE_STATE);
+        let made = match creation {
+            Creation::Slot11 => {
+                let create: unsafe extern "win64" fn(Ptr, *const u8, *const u8, *mut Ptr) -> u32 =
+                    slot(h.device, 11);
+                create(h.device, desc.as_ptr(), riid.as_ptr(), &mut pipeline)
+            }
+            Creation::Slot62 => {
+                let create: unsafe extern "win64" fn(
+                    Ptr,
+                    *const u8,
+                    usize,
+                    usize,
+                    *const u8,
+                    *mut Ptr,
+                ) -> u32 = slot(h.device, 62);
+                create(h.device, desc.as_ptr(), 0, 0, riid.as_ptr(), &mut pipeline)
+            }
+            Creation::Slot86 => {
+                let mut stream = [0u8; 40];
+                stream[8..16].copy_from_slice(&(root as u64).to_le_bytes());
+                stream[16..20].copy_from_slice(&6u32.to_le_bytes());
+                stream[24..32].copy_from_slice(&(container.as_ptr() as u64).to_le_bytes());
+                stream[32..40].copy_from_slice(&(container.len() as u64).to_le_bytes());
+                let wrapper = [stream.len() as u64, stream.as_ptr() as u64];
+                let create: unsafe extern "win64" fn(Ptr, *const u64, *const u8, *mut Ptr) -> u32 =
+                    slot(h.device, 86);
+                create(h.device, wrapper.as_ptr(), riid.as_ptr(), &mut pipeline)
+            }
+        };
         assert_eq!(made, 0, "notes: {:?}", xbox_d3d12::com::notes());
         (address, root, pipeline)
     };
@@ -322,6 +351,164 @@ fn run_ids(h: &Harness, buffer: Ptr) {
                 xbox_d3d12::com::notes()
             );
         }
+    }
+}
+
+#[test]
+fn a_compute_pipeline_made_through_slot_62_with_its_two_zero_words_runs() {
+    let Some(h) = harness() else { return };
+    let buffer = h.committed(1, &buffer_desc(0x10000, 4), 8);
+    run_ids(&h, buffer, Creation::Slot62);
+}
+
+#[test]
+fn a_compute_pipeline_made_through_a_slot_86_stream_runs() {
+    let Some(h) = harness() else { return };
+    let buffer = h.committed(1, &buffer_desc(0x10000, 4), 8);
+    run_ids(&h, buffer, Creation::Slot86);
+}
+
+fn empty_root(h: &Harness) -> Ptr {
+    let signature = RootSignature {
+        version: RootVersion::V1_1,
+        parameters: Vec::new(),
+        static_samplers: Vec::new(),
+        flags: 0,
+    }
+    .serialize();
+    let mut root = std::ptr::null_mut();
+    // SAFETY: device slot 16.
+    unsafe {
+        let create_root: unsafe extern "win64" fn(
+            Ptr,
+            u32,
+            *const u8,
+            usize,
+            *const u8,
+            *mut Ptr,
+        ) -> u32 = slot(h.device, 16);
+        assert_eq!(
+            create_root(
+                h.device,
+                0,
+                signature.as_ptr(),
+                signature.len(),
+                guid(&iid::ROOT_SIGNATURE).as_ptr(),
+                &mut root
+            ),
+            0
+        );
+    }
+    root
+}
+
+/// The stream of the title's own filler: 0x2b0 bytes, the tags of VS, PS, DS, HS and GS always written.
+fn games_stream(root: Ptr, vs: &[u8], ps: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0u8; 0x2b0];
+    for (at, ty) in [
+        (0x10, 1u32),
+        (0x28, 2),
+        (0x40, 3),
+        (0x58, 4),
+        (0x70, 5),
+        (0x88, 8),
+        (0x1d8, 9),
+        (0x1e0, 10),
+        (0x210, 21),
+        (0x250, 17),
+        (0x260, 12),
+        (0x278, 14),
+        (0x280, 15),
+        (0x2a8, 16),
+    ] {
+        bytes[at..at + 4].copy_from_slice(&ty.to_le_bytes());
+    }
+    bytes[8..16].copy_from_slice(&(root as u64).to_le_bytes());
+    for (at, code) in [(0x18, vs), (0x30, ps)] {
+        bytes[at..at + 8].copy_from_slice(&(code.as_ptr() as u64).to_le_bytes());
+        bytes[at + 8..at + 16].copy_from_slice(&(code.len() as u64).to_le_bytes());
+    }
+    bytes[0x1dc..0x1e0].copy_from_slice(&u32::MAX.to_le_bytes());
+    bytes[0x27c..0x280].copy_from_slice(&3u32.to_le_bytes());
+    bytes[0x284..0x288].copy_from_slice(&28u32.to_le_bytes());
+    bytes[0x2ac..0x2b0].copy_from_slice(&45u32.to_le_bytes());
+    bytes
+}
+
+fn create_stream(h: &Harness, bytes: &[u8]) -> u32 {
+    let wrapper = [bytes.len() as u64, bytes.as_ptr() as u64];
+    let mut pipeline = std::ptr::null_mut();
+    // SAFETY: device slot 86.
+    unsafe {
+        let create: unsafe extern "win64" fn(Ptr, *const u64, *const u8, *mut Ptr) -> u32 =
+            slot(h.device, 86);
+        create(
+            h.device,
+            wrapper.as_ptr(),
+            guid(&iid::PIPELINE_STATE).as_ptr(),
+            &mut pipeline,
+        )
+    }
+}
+
+#[test]
+fn the_games_graphics_stream_reaches_graphics_pipeline_creation_through_slot_86() {
+    let Some(h) = harness() else { return };
+    let root = empty_root(&h);
+    let (vs, ps) = (vec![1u8, 2, 3, 4], vec![9u8, 8, 7]);
+    // not shader containers, so creation is refused as invalid: the stream got past the parser to the builder
+    let before = xbox_d3d12::com::notes().len();
+    assert_eq!(
+        create_stream(&h, &games_stream(root, &vs, &ps)),
+        0x8007_0057
+    );
+    let notes = xbox_d3d12::com::notes();
+    assert!(
+        notes[before..]
+            .iter()
+            .any(|n| n.starts_with("a graphics pipeline failed")),
+        "{notes:?}"
+    );
+    // no root signature: refused before the builder
+    assert_eq!(
+        create_stream(&h, &games_stream(std::ptr::null_mut(), &vs, &ps)),
+        0x8007_0057
+    );
+    // a stream with no shader at all
+    assert_eq!(
+        create_stream(&h, &games_stream(root, &[], &[])),
+        0x8007_0057
+    );
+}
+
+#[test]
+fn the_cache_creation_slots_fail_without_ending_the_run() {
+    let Some(h) = harness() else { return };
+    let desc = [0u64; 32];
+    let mut out = std::ptr::null_mut();
+    for index in [55, 57, 67] {
+        // SAFETY: the slots take a description, an interface id and an out pointer.
+        let result = unsafe {
+            let create: unsafe extern "win64" fn(Ptr, *const u64, *const u8, *mut Ptr) -> u32 =
+                slot(h.device, index);
+            create(
+                h.device,
+                desc.as_ptr(),
+                guid(&iid::PIPELINE_STATE).as_ptr(),
+                &mut out,
+            )
+        };
+        assert_eq!(result, 0x8000_4001, "slot {index}");
+        assert!(out.is_null());
+    }
+    let notes = xbox_d3d12::com::notes();
+    for index in [55, 57, 67] {
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with(&format!("device slot {index} "))),
+            "{notes:?}"
+        );
     }
 }
 
@@ -524,5 +711,5 @@ fn a_buffer_placed_in_memory_the_title_mapped_is_that_memory_for_the_gpu() {
         gpu_address(out)
     };
     assert_eq!(address, at as u64);
-    run_ids(&h, out);
+    run_ids(&h, out, Creation::Slot11);
 }
