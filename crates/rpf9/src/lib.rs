@@ -4,6 +4,7 @@
 //! area, validating every stream by inflating it, and joining streams by the rules of the measured formats.
 
 mod error;
+mod group;
 mod inflate;
 mod model;
 mod names;
