@@ -710,6 +710,29 @@ cache_path!(
     "device slot 67 (console compute pipeline from the cache) is declined; the title falls back to slot 62"
 );
 
+/// Slot 49, `(0x11f, 1)`: called once after the device is created, only when the reported OS version passes the
+/// title's gate; its result is not read. What feature 0x11f is, is not measured.
+unsafe extern "win64" fn d_set_feature_49(_this: *mut c_void, feature: u32, value: u32) -> u32 {
+    com::note_once(format!(
+        "device slot 49 ({feature:#x}, {value}) is accepted and ignored"
+    ));
+    S_OK
+}
+
+/// Slot 50, `(callback, 0, callback)`: the title registers a GPU crash callback during its crash-handler set-up.
+/// No GPU fault is ever reported to it.
+unsafe extern "win64" fn d_register_crash_callback_50(
+    _this: *mut c_void,
+    _callback: *const c_void,
+    _context: *const c_void,
+    _second: *const c_void,
+) -> u32 {
+    com::note_once(
+        "device slot 50 (GPU crash callback registration) is accepted; no fault is reported to it",
+    );
+    S_OK
+}
+
 /// Slot 39: `D3D12_QUERY_HEAP_DESC`, `(type, count, node mask)`.
 unsafe extern "win64" fn d_create_query_heap(
     this: *mut c_void,
@@ -763,6 +786,8 @@ pub fn table() -> Vec<(usize, usize)> {
         (38, f!(d_copyable_footprints)),
         (39, f!(d_create_query_heap)),
         (41, f!(d_create_command_signature)),
+        (49, f!(d_set_feature_49)),
+        (50, f!(d_register_crash_callback_50)),
         (55, f!(d_create_pipeline_from_cache_55)),
         (57, f!(d_create_graphics_from_cache)),
         (62, f!(d_create_compute_pipeline_state_x)),
