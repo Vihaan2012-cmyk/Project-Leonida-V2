@@ -1010,6 +1010,7 @@ dependencies = [
  "offline",
  "pe-loader",
  "windows-sys",
+ "xbox-d3d12",
 ]
 
 [[package]]
