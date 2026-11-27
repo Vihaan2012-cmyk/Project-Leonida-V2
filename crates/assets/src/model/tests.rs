@@ -247,3 +247,65 @@ fn rigid_and_constant_skin_bind_one_bone() {
     assert!(s.joints.iter().all(|j| j[0] == 2) && s.weights.iter().all(|w| w[0] == 255));
 }
 
+#[test]
+fn bone_index_past_the_palette_is_an_error() {
+    let spec = skinned_spec(SkinForm::Bytes(1), vec![vec![(5, 255)]; 4], vec![1, 2]);
+    let err = decode_resource(&drawable_resource(&spec), None).unwrap_err();
+    assert!(matches!(err, ModelError::Invalid(_)), "{err}");
+}
+
+#[test]
+fn materials_lods_and_names_decode() {
+    let mut spec = DrawableSpec::simple(GeometrySpec::quad());
+    spec.name = Some("prop_chair");
+    spec.lods.push((
+        60.0,
+        vec![ModelSpec {
+            geometries: vec![GeometrySpec::quad()],
+            palette: vec![],
+        }],
+    ));
+    spec.materials = vec![
+        MaterialSpec {
+            shader: 0xAAAA_0001,
+            bucket: 0,
+            textures: vec![],
+        },
+        MaterialSpec {
+            shader: 0xAAAA_0002,
+            bucket: 0x83,
+            textures: vec![
+                TextureSpec {
+                    name_hash: 7,
+                    param: joaat("diffusetex"),
+                    id64: 0x0123_4567_89AB_CDEF,
+                },
+                TextureSpec {
+                    name_hash: 8,
+                    param: joaat("bumptex"),
+                    id64: 0x1111_2222_3333_4444,
+                },
+            ],
+        },
+    ];
+    spec.lods[0].1[0].geometries[0].shader = 1;
+    let set = decode_resource(&drawable_resource(&spec), None).unwrap();
+    let d = &set.drawables[0];
+    assert_eq!(set.kind, ResourceKind::Drawable);
+    assert_eq!(d.name.as_deref(), Some("prop_chair"));
+    assert_eq!(
+        d.lods
+            .iter()
+            .map(|l| (l.level, l.distance))
+            .collect::<Vec<_>>(),
+        vec![(0, 15.0), (1, 60.0)]
+    );
+    assert_eq!(d.lods[0].models[0].geometries[0].material, 1);
+    assert_eq!(d.materials[1].shader_hash, 0xAAAA_0002);
+    assert_eq!(d.materials[1].render_bucket, 0x83);
+    assert_eq!(d.materials[1].textures.len(), 2);
+    assert_eq!(d.materials[1].textures[0].id64, 0x0123_4567_89AB_CDEF);
+    assert_eq!(d.materials[1].textures[0].param_hash, joaat("diffusetex"));
+    assert_eq!(d.materials[1].raw_parameters.len(), 3);
+}
+
