@@ -51,26 +51,24 @@ impl Rng {
             -1e-3,
             1e30,
             -1e30,
-            f32::MAX,
             f32::INFINITY,
             f32::NEG_INFINITY,
             f32::NAN,
             f32::from_bits(0xFFC0_1234),
-            f32::MIN_POSITIVE,
-            1e-20,
+            1e-12,
+            -1e-12,
         ];
         if denormals {
-            values.extend([1e-40, -1e-40, f32::from_bits(1)]);
+            values.extend([
+                1e-40,
+                -1e-40,
+                f32::from_bits(1),
+                f32::MAX,
+                f32::MIN_POSITIVE,
+                1e-20,
+            ]);
         }
         self.pick(&values)
-    }
-
-    pub fn float(&mut self, denormals: bool) -> f32 {
-        if self.chance(40) {
-            self.special(denormals)
-        } else {
-            self.range(-3.0, 3.0)
-        }
     }
 }
 
@@ -196,7 +194,7 @@ fn extent_for(rng: &mut Rng, distance: f32) -> f32 {
     }
 }
 
-fn aimed(rng: &mut Rng, pointer: u32, target: [f32; 3], inside: bool) -> Query {
+pub fn aimed(rng: &mut Rng, pointer: u32, target: [f32; 3], inside: bool) -> Query {
     let reach = if inside { 0.05 } else { rng.range(0.5, 30.0) };
     let away = rng.point(-1.0, 1.0);
     let length = (away[0] * away[0] + away[1] * away[1] + away[2] * away[2])
@@ -218,7 +216,7 @@ fn aimed(rng: &mut Rng, pointer: u32, target: [f32; 3], inside: bool) -> Query {
 }
 
 /// Rays that skim a box face or run along an edge, with a zero direction component and so an infinite inverse.
-fn grazing(rng: &mut Rng, pointer: u32, b: [f32; 6]) -> Query {
+pub fn grazing(rng: &mut Rng, pointer: u32, b: [f32; 6]) -> Query {
     let axis = rng.below(3) as usize;
     let mut origin = [0; 3].map(|a| rng.range(b[a] - 1.0, b[3 + a] + 1.0));
     origin[axis] = if rng.chance(50) { b[axis] } else { b[3 + axis] };
@@ -241,7 +239,7 @@ fn grazing(rng: &mut Rng, pointer: u32, b: [f32; 6]) -> Query {
     )
 }
 
-fn on_triangle(rng: &mut Rng, pointer: u32, v: [[f32; 3]; 3]) -> Query {
+pub fn on_triangle(rng: &mut Rng, pointer: u32, v: [[f32; 3]; 3]) -> Query {
     let mut u = rng.unit();
     let mut w = rng.unit();
     match rng.below(8) {

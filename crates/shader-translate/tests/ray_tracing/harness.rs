@@ -82,6 +82,7 @@ pub struct Report {
     pub inexact: usize,
     pub denormal: usize,
     pub hits: usize,
+    pub results: Vec<[u32; 4]>,
 }
 
 impl Report {
@@ -176,6 +177,13 @@ pub fn translate(gpu: &Gpu, source: &str, name: &str) -> Vec<u32> {
 
 impl Runner {
     pub fn new(gpu: Gpu) -> Runner {
+        eprintln!(
+            "{} preserve {} flush {} nan {}",
+            gpu.info.name,
+            gpu.info.denorm_preserve_32,
+            gpu.info.denorm_flush_32,
+            gpu.info.nan_preserve_32
+        );
         let spirv = [false, true].map(|wide| translate(&gpu, &program(wide), "intersect"));
         Runner { gpu, spirv }
     }
@@ -282,6 +290,7 @@ impl Runner {
                 });
             }
             report.hits += usize::from(want != [u32::MAX; 4]);
+            report.results.push(got);
         }
         report
     }
