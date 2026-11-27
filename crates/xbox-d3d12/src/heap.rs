@@ -4,10 +4,10 @@
 //! with plain moves, so it must point at writable memory), and the handles come back from heap slots 9 and
 //! 10 in RAX, as the console does. On the console one address serves the CPU and the GPU, so a
 //! shader-visible heap's GPU handle is the same number as its CPU handle; a heap that is not shader
-//! visible has GPU handle 0. Where a heap lies is a `HeapPlacement`: the default hands out addresses from a
-//! fixed window in creation order, so the same boot gives the same handles every run, which is what a title
-//! comparing the handle with an address it worked out needs. What the title compares against at the first
-//! heap is not known; `placement` is where to change it.
+//! visible has GPU handle 0. Where a heap lies is a `HeapPlacement`. The title asserts that slot 9 returns
+//! the address it chose for its first heap, so a device that runs the title uses `ConsolePlacement`
+//! (`heap/console.rs` has the measurements); `FixedWindow` is the default for a device with no title behind
+//! it and hands out addresses under 4 GiB in creation order.
 //!
 //! The descriptor writers (`Create*View`, `CopyDescriptors`) belong to `descriptor.rs`; they write at
 //! `cpu_start + index * increment_size(type)`.
