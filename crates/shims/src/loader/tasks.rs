@@ -922,8 +922,10 @@ fn label_id(label: &str) -> usize {
 
 /// A call whose work runs once on the work port and leaves its result as bytes, for the runtime's own `*Async`
 /// functions.
+type OneShotWork = Box<dyn FnOnce() -> (i32, Vec<u8>) + Send>;
+
 struct OneShot {
-    work: Option<Box<dyn FnOnce() -> (i32, Vec<u8>) + Send>>,
+    work: Option<OneShotWork>,
     result: Vec<u8>,
 }
 
@@ -989,15 +991,14 @@ pub(super) unsafe fn begin_one_shot(
         result: Vec::new(),
     }));
     // SAFETY: as the caller promises.
-    let result = unsafe {
+    unsafe {
         begin(
             block,
             shot as usize,
             label_id(label),
             one_shot_provider as *const () as usize,
         )
-    };
-    result
+    }
 }
 
 /// The result of a [`begin_one_shot`] call into `buffer`.
