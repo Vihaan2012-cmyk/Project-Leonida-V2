@@ -47,6 +47,12 @@ pub enum GpuDestination {
         resource: usize,
         first_subresource: u32,
     },
+    /// The console form: `table` is the address of the first 8-byte page entry of the physical pages the data
+    /// goes to (64 KiB each, entries consecutive), `offset` the byte offset into the first page.
+    Pages {
+        table: usize,
+        offset: u16,
+    },
     Tiles {
         resource: usize,
         /// X, Y, Z, subresource.
@@ -66,10 +72,20 @@ pub type GpuCopy = fn(&GpuUpload<'_>) -> i32;
 pub type FenceSignal = fn(fence: usize, value: u64) -> i32;
 pub type Decompress = fn(input: &[u8], output: &mut [u8]) -> Result<(), i32>;
 
+/// Writes bytes into one 64 KiB physical page: page entry, offset inside the page, bytes. Returns an `HRESULT`.
+pub type PageWriter = fn(page: u64, offset: usize, data: &[u8]) -> i32;
+
 static GPU_COPY: RwLock<Option<GpuCopy>> = RwLock::new(None);
+static PAGE_WRITER: RwLock<Option<PageWriter>> = RwLock::new(None);
 static FENCE_SIGNAL: RwLock<Option<FenceSignal>> = RwLock::new(None);
 static DECOMPRESSORS: Mutex<Option<HashMap<u8, Decompress>>> = Mutex::new(None);
 static NOTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+pub fn set_page_writer(writer: Option<PageWriter>) {
+    if let Ok(mut slot) = PAGE_WRITER.write() {
+        *slot = writer;
+    }
+}
 
 pub fn set_gpu_copy(copy: Option<GpuCopy>) {
     if let Ok(mut slot) = GPU_COPY.write() {
@@ -90,7 +106,7 @@ pub fn set_decompressor(format: u8, decompress: Decompress) {
     }
 }
 
-fn note_once(text: String) {
+pub fn note_once(text: String) {
     let fresh = NOTED
         .lock()
         .map(|mut seen| seen.get_or_insert_with(HashSet::new).insert(text.clone()))
@@ -289,6 +305,11 @@ fn decompress(request: &Request, input: &[u8]) -> Result<Vec<u8>, i32> {
         .lock()
         .ok()
         .and_then(|d| d.as_ref()?.get(&request.compression).copied());
+    let function = function.or(if request.compression == 1 {
+        Some(inflate as Decompress)
+    } else {
+        None
+    });
     let Some(function) = function else {
         note_once(format!(
             "DirectStorage compression format {} is not supported ({:?})",
@@ -347,6 +368,11 @@ fn run(request: &Request) -> Result<(), i32> {
             } else {
                 decompress(request, &input)?
             };
+            if let GpuDestination::Pages { table, offset } = destination
+                && let Some(writer) = PAGE_WRITER.read().ok().and_then(|w| *w)
+            {
+                return write_pages(writer, *table, *offset, &data);
+            }
             let copy = GPU_COPY.read().ok().and_then(|c| *c);
             let Some(copy) = copy else {
                 note_once(
@@ -581,31 +607,74 @@ impl Drop for Queue {
     }
 }
 
+/// Most requests of one batch that run at the same time. The title batches a whole streaming round between one
+/// status entry and the poll that follows it, so the requests in a run have no order among themselves.
+const PARALLEL_REQUESTS: usize = 4;
+
+/// Runs the requests collected since the last status, signal or event, side by side. Results are taken in order.
+fn run_group(shared: &Shared, group: &mut Vec<Request>, since_status: &mut i32) {
+    if group.is_empty() {
+        return;
+    }
+    let count = group.len();
+    let results: Vec<AtomicI32> = (0..count).map(|_| AtomicI32::new(S_OK)).collect();
+    let next = AtomicUsize::new(0);
+    let run = || {
+        loop {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            let Some(request) = group.get(index) else {
+                break;
+            };
+            if !shared.cancelled(request) {
+                results[index].store(execute(request), Ordering::Relaxed);
+            }
+        }
+    };
+    let workers = count.min(PARALLEL_REQUESTS);
+    if workers <= 1 {
+        run();
+    } else {
+        std::thread::scope(|scope| {
+            for _ in 1..workers {
+                scope.spawn(run);
+            }
+            run();
+        });
+    }
+    for (request, result) in group.iter().zip(&results) {
+        let result = result.load(Ordering::Relaxed);
+        if result < 0 {
+            note_once(format!(
+                "DirectStorage request {:?} failed with {:#010x}",
+                request.name, result as u32
+            ));
+            shared.fail(result);
+            if *since_status == S_OK {
+                *since_status = result;
+            }
+        }
+    }
+    shared.inflight.fetch_sub(count, Ordering::Relaxed);
+    group.clear();
+}
+
 fn work(shared: &Shared, receiver: Receiver<Vec<Item>>) {
     let mut since_status = S_OK;
+    let mut group: Vec<Request> = Vec::new();
     for batch in receiver {
         for item in batch {
             match item {
                 Item::Request(request) => {
-                    if !shared.cancelled(&request) {
-                        let result = execute(&request);
-                        if result < 0 {
-                            note_once(format!(
-                                "DirectStorage request {:?} failed with {:#010x}",
-                                request.name, result as u32
-                            ));
-                            shared.fail(result);
-                            if since_status == S_OK {
-                                since_status = result;
-                            }
-                        }
-                    }
+                    group.push(request);
+                    continue;
                 }
                 Item::Status { array, index } => {
+                    run_group(shared, &mut group, &mut since_status);
                     array.complete(index, since_status);
                     since_status = S_OK;
                 }
                 Item::Signal { fence, value } => {
+                    run_group(shared, &mut group, &mut since_status);
                     let signal = FENCE_SIGNAL.read().ok().and_then(|s| *s);
                     let result = match signal {
                         Some(signal) => signal(fence, value),
@@ -616,11 +685,52 @@ fn work(shared: &Shared, receiver: Receiver<Vec<Item>>) {
                     }
                 }
                 Item::Event(handle) => {
+                    run_group(shared, &mut group, &mut since_status);
                     // SAFETY: an event handle the program passed to `EnqueueSetEvent`.
                     unsafe { SetEvent(handle as HANDLE) };
                 }
             }
             shared.inflight.fetch_sub(1, Ordering::Relaxed);
         }
+        run_group(shared, &mut group, &mut since_status);
     }
+}
+
+/// Deflate with or without the zlib wrapper; the title's chunks are zlib streams, and a raw stream is taken too.
+fn inflate(input: &[u8], output: &mut [u8]) -> Result<(), i32> {
+    use flate2::{Decompress, FlushDecompress, Status};
+    let zlib = input.len() > 2
+        && input[0] & 0x0F == 8
+        && (u16::from(input[0]) << 8 | u16::from(input[1])) % 31 == 0;
+    let mut stream = Decompress::new(zlib);
+    match stream.decompress(input, output, FlushDecompress::Finish) {
+        Ok(Status::StreamEnd) if stream.total_out() as usize == output.len() => Ok(()),
+        Ok(_) => Err(E_FAIL),
+        Err(_) => Err(E_FAIL),
+    }
+}
+
+const PAGE_SIZE: usize = 0x1_0000;
+
+/// Splits `data` over consecutive page-table entries, starting `offset` bytes into the first page.
+fn write_pages(writer: PageWriter, table: usize, offset: u16, data: &[u8]) -> Result<(), i32> {
+    if table == 0 {
+        return Err(E_INVALIDARG);
+    }
+    let mut inside = usize::from(offset);
+    let mut done = 0;
+    let mut entry = 0;
+    while done < data.len() {
+        let length = (PAGE_SIZE - inside).min(data.len() - done);
+        // SAFETY: the request names a run of page entries covering its data; entries are 8 bytes.
+        let page = unsafe { std::ptr::read_unaligned((table as *const u64).add(entry)) };
+        let code = writer(page, inside, &data[done..done + length]);
+        if code < 0 {
+            return Err(code);
+        }
+        done += length;
+        inside = 0;
+        entry += 1;
+    }
+    Ok(())
 }

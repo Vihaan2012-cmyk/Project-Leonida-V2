@@ -2390,6 +2390,7 @@ dependencies = [
  "bvh-build",
  "config",
  "cpal",
+ "flate2",
  "gilrs",
  "offline",
  "pe-loader",

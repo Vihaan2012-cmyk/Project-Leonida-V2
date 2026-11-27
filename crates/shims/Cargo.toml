@@ -17,9 +17,10 @@ pe-loader.workspace = true
 gilrs.workspace = true
 xbox-d3d12.workspace = true
 upscale.workspace = true
+flate2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_ProcessStatus", "Win32_System_SystemInformation"] }
+windows-sys = { workspace = true, features = ["Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_Media"] }
 
 [lints]
 workspace = true
