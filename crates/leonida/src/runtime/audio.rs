@@ -1,11 +1,12 @@
 //! Sound: the output mode from the settings. XMA streams decode through `audio-codec` inside the audio shims.
 
-use shims::audio::set_output_mode;
+use shims::audio::{opus, set_opus_factory, set_output_mode};
 
 use super::plan::RuntimePlan;
 
 pub fn configure(plan: &RuntimePlan) {
     set_output_mode(plan.audio);
+    set_opus_factory(Some(opus::open));
 }
 
 #[cfg(test)]
