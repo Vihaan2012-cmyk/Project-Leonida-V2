@@ -1,4 +1,5 @@
 mod cli;
+mod cmd_assets;
 mod cmd_check;
 mod cmd_exe;
 mod cmd_package;
@@ -31,6 +32,7 @@ fn main() -> ExitCode {
         Some(Command::Check(args)) => cmd_check::check_command(args),
         Some(Command::Run(args)) => cmd_run::run_command(args),
         Some(Command::Triage(args)) => cmd_package::triage_command(args),
+        Some(Command::Assets(assets)) => cmd_assets::assets_command(assets),
     };
     result.unwrap_or_else(|error| {
         eprintln!("error: {error:#}");
