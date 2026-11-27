@@ -24,12 +24,19 @@ mod com;
 mod engine;
 
 #[cfg(windows)]
-pub use engine::{Decompress, FenceSignal, GpuCopy, GpuDestination, GpuUpload};
+pub use engine::{Decompress, FenceSignal, GpuCopy, GpuDestination, GpuUpload, PageWriter};
 
 /// Sets or clears the callback that copies request data into GPU resources. It returns an `HRESULT`.
 #[cfg(windows)]
 pub fn set_gpu_copy(copy: Option<GpuCopy>) {
     engine::set_gpu_copy(copy);
+}
+
+/// Sets or clears the writer for page-table destinations, the console form: a run of 64 KiB physical pages named
+/// by 8-byte entries. Without one such requests go to the GPU copy callback as `GpuDestination::Pages`.
+#[cfg(windows)]
+pub fn set_page_writer(writer: Option<PageWriter>) {
+    engine::set_page_writer(writer);
 }
 
 /// Sets or clears the function that signals a fence given its pointer and value.

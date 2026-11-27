@@ -72,10 +72,20 @@ pub type GpuCopy = fn(&GpuUpload<'_>) -> i32;
 pub type FenceSignal = fn(fence: usize, value: u64) -> i32;
 pub type Decompress = fn(input: &[u8], output: &mut [u8]) -> Result<(), i32>;
 
+/// Writes bytes into one 64 KiB physical page: page entry, offset inside the page, bytes. Returns an `HRESULT`.
+pub type PageWriter = fn(page: u64, offset: usize, data: &[u8]) -> i32;
+
 static GPU_COPY: RwLock<Option<GpuCopy>> = RwLock::new(None);
+static PAGE_WRITER: RwLock<Option<PageWriter>> = RwLock::new(None);
 static FENCE_SIGNAL: RwLock<Option<FenceSignal>> = RwLock::new(None);
 static DECOMPRESSORS: Mutex<Option<HashMap<u8, Decompress>>> = Mutex::new(None);
 static NOTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+pub fn set_page_writer(writer: Option<PageWriter>) {
+    if let Ok(mut slot) = PAGE_WRITER.write() {
+        *slot = writer;
+    }
+}
 
 pub fn set_gpu_copy(copy: Option<GpuCopy>) {
     if let Ok(mut slot) = GPU_COPY.write() {
@@ -358,6 +368,11 @@ fn run(request: &Request) -> Result<(), i32> {
             } else {
                 decompress(request, &input)?
             };
+            if let GpuDestination::Pages { table, offset } = destination
+                && let Some(writer) = PAGE_WRITER.read().ok().and_then(|w| *w)
+            {
+                return write_pages(writer, *table, *offset, &data);
+            }
             let copy = GPU_COPY.read().ok().and_then(|c| *c);
             let Some(copy) = copy else {
                 note_once(
@@ -693,4 +708,29 @@ fn inflate(input: &[u8], output: &mut [u8]) -> Result<(), i32> {
         Ok(_) => Err(E_FAIL),
         Err(_) => Err(E_FAIL),
     }
+}
+
+const PAGE_SIZE: usize = 0x1_0000;
+
+/// Splits `data` over consecutive page-table entries, starting `offset` bytes into the first page.
+fn write_pages(writer: PageWriter, table: usize, offset: u16, data: &[u8]) -> Result<(), i32> {
+    if table == 0 {
+        return Err(E_INVALIDARG);
+    }
+    let mut inside = usize::from(offset);
+    let mut done = 0;
+    let mut entry = 0;
+    while done < data.len() {
+        let length = (PAGE_SIZE - inside).min(data.len() - done);
+        // SAFETY: the request names a run of page entries covering its data; entries are 8 bytes.
+        let page = unsafe { std::ptr::read_unaligned((table as *const u64).add(entry)) };
+        let code = writer(page, inside, &data[done..done + length]);
+        if code < 0 {
+            return Err(code);
+        }
+        done += length;
+        inside = 0;
+        entry += 1;
+    }
+    Ok(())
 }

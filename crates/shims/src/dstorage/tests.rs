@@ -634,3 +634,43 @@ fn a_failed_request_in_a_group_gives_the_status_its_error() {
     assert_eq!(wait(&s, 0), E_NOTIMPL);
     assert_eq!(good, source);
 }
+
+#[test]
+fn page_destinations_split_over_consecutive_entries() {
+    static WRITES: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
+    fn write(page: u64, offset: usize, data: &[u8]) -> i32 {
+        WRITES
+            .lock()
+            .expect("lock")
+            .push((page, offset, data.len()));
+        0
+    }
+    let s = setup();
+    let data = pattern(150_000);
+    let (_dir, path) = temp_file(&data);
+    let file = open_file(&s, &path);
+    let table: [u64; 4] = [7, 3, 9, 1];
+    crate::dstorage::set_page_writer(Some(write));
+    enqueue(
+        &s,
+        &Spec {
+            file,
+            size: 150_000,
+            destination: 1,
+            target: table.as_ptr() as usize,
+            extra: 0x100,
+            ..Spec::default()
+        },
+    );
+    mark_and_submit(&s, 0);
+    assert_eq!(wait(&s, 0), 0);
+    crate::dstorage::set_page_writer(None);
+    assert_eq!(
+        *WRITES.lock().expect("lock"),
+        vec![
+            (7, 0x100, 0xFF00),
+            (3, 0, 0x1_0000),
+            (9, 0, 150_000 - 0xFF00 - 0x1_0000)
+        ]
+    );
+}
