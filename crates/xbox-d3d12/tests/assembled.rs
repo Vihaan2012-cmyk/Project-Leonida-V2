@@ -727,3 +727,33 @@ fn a_buffer_placed_in_memory_the_title_mapped_is_that_memory_for_the_gpu() {
     assert_eq!(address, at as u64);
     run_ids(&h, out, Creation::Slot11);
 }
+
+#[test]
+fn the_feature_and_crash_callback_slots_the_title_calls_at_start_succeed() {
+    let Some(h) = harness() else { return };
+    // SAFETY: slot 49 takes two words and slot 50 three pointers, as the executable calls them.
+    let (feature, callback) = unsafe {
+        let feature: unsafe extern "win64" fn(Ptr, u32, u32) -> u32 = slot(h.device, 49);
+        let callback: unsafe extern "win64" fn(Ptr, Ptr, Ptr, Ptr) -> u32 = slot(h.device, 50);
+        (
+            feature(h.device, 0x11f, 1),
+            callback(
+                h.device,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+        )
+    };
+    assert_eq!(feature, 0);
+    assert_eq!(callback, 0);
+    let notes = xbox_d3d12::com::notes();
+    for index in [49, 50] {
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with(&format!("device slot {index} "))),
+            "{notes:?}"
+        );
+    }
+}
