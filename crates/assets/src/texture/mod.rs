@@ -5,6 +5,7 @@
 //! come back as [`TextureResult::Partial`] or [`TextureResult::Placeholder`] with a typed
 //! [`Unsupported`] reason; nothing is guessed.
 
+pub mod bcn;
 pub mod format;
 pub mod layout;
 pub mod tiling;
