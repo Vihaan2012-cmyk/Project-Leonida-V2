@@ -192,11 +192,10 @@ pub fn build_nodes(boxes: &[[f32; 6]], params: &NodeParams) -> NodeOutput {
     let sorted: Vec<u32> = order.iter().map(|p| p.1).collect();
     let m = n - 1;
 
-    let mut kids = vec![(0u32, 0u32); m];
+    let kids: Vec<(u32, u32)> = (0..m).map(|i| radix_children(&keys, i as i32)).collect();
     let mut parent = vec![INVALID; m];
-    for i in 0..m {
-        kids[i] = radix_children(&keys, i as i32);
-        for c in [kids[i].0, kids[i].1] {
+    for (i, kid) in kids.iter().enumerate() {
+        for c in [kid.0, kid.1] {
             if c & LEAF == 0 {
                 parent[c as usize] = i as u32;
             }
@@ -216,7 +215,7 @@ pub fn build_nodes(boxes: &[[f32; 6]], params: &NodeParams) -> NodeOutput {
     let mut inclusive = vec![0u32; m];
     let mut running = 0;
     for i in 0..m {
-        running += u32::from(depth[i] % 2 == 0);
+        running += u32::from(depth[i].is_multiple_of(2));
         inclusive[i] = running;
     }
     let node_count = running;
@@ -255,7 +254,7 @@ pub fn build_nodes(boxes: &[[f32; 6]], params: &NodeParams) -> NodeOutput {
     parents[table_index(node_unit(0))] = INVALID;
 
     for i in 0..m {
-        if depth[i] % 2 != 0 {
+        if !depth[i].is_multiple_of(2) {
             continue;
         }
         let mut items = [0u32; 4];

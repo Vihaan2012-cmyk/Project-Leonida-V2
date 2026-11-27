@@ -265,7 +265,7 @@ fn a_refit_follows_moving_geometry() {
                 .iter()
                 .enumerate()
                 .map(|(i, t)| {
-                    let shift = [3.0 * (i % 5) as f32 - 6.0, 2.0, -1.0 * (i % 3) as f32];
+                    let shift = [3.0 * (i % 5) as f32 - 6.0, 2.0, -((i % 3) as f32)];
                     bvh_build::Triangle {
                         vertices: t
                             .vertices
