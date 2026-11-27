@@ -98,3 +98,58 @@ fn seeking_into_a_real_stream_matches_straight_decoding() {
         assert!((g - w).abs() < 1e-6);
     }
 }
+
+/// First bank of the archive (right after the audio config); read in full when it is small enough.
+fn read_first_bank() -> Option<Vec<u8>> {
+    let dir = std::env::var_os("LEONIDA_GAME_DIR")?;
+    let mut f = std::fs::File::open(std::path::Path::new(&dir).join("audio.rpf")).ok()?;
+    f.seek(SeekFrom::Start(0x129B000)).ok()?;
+    let mut head = vec![0u8; 1 << 16];
+    f.read_exact(&mut head).ok()?;
+    let header_size = u32::from_le_bytes(head[12..16].try_into().ok()?) as usize;
+    let awc = Awc::parse(head.get(..header_size)?).ok()?;
+    let end = awc
+        .streams
+        .iter()
+        .flat_map(|s| s.tags.iter())
+        .map(|t| t.offset as usize + t.size as usize)
+        .max()?;
+    if end > 64 << 20 {
+        return None;
+    }
+    f.seek(SeekFrom::Start(0x129B000)).ok()?;
+    let mut bank = vec![0u8; end];
+    f.read_exact(&mut bank).ok()?;
+    Some(bank)
+}
+
+#[test]
+fn real_opus_streams_repackage_to_well_formed_ogg() {
+    use audio_codec::ogg::{FLAG_BOS, FLAG_EOS, read_pages};
+    use audio_codec::opus::{DEFAULT_PRE_SKIP, declared_frames, stream_to_ogg};
+    let Some(bytes) = read_first_bank() else {
+        eprintln!("skipped: no readable first bank");
+        return;
+    };
+    let awc = Awc::parse(&bytes).unwrap();
+    let mut checked = 0;
+    for s in &awc.streams {
+        let Ok(fmt) = awc.format(s) else { continue };
+        if fmt.codec != Codec::Opus || s.tag(audio_codec::awc::TAG_STREAMED_MUSIC).is_some() {
+            continue;
+        }
+        let ogg = stream_to_ogg(&awc, s, DEFAULT_PRE_SKIP).unwrap();
+        let pages = read_pages(&ogg).unwrap();
+        assert_eq!(pages[0].flags, FLAG_BOS);
+        assert_eq!(&pages[0].packets[0][..8], b"OpusHead");
+        let last = pages.last().unwrap();
+        assert_eq!(last.flags, FLAG_EOS);
+        let frames = declared_frames(fmt.samples, fmt.opus_frames, fmt.channels);
+        assert_eq!(last.granule as u64, u64::from(DEFAULT_PRE_SKIP) + frames);
+        checked += 1;
+        if checked == 20 {
+            break;
+        }
+    }
+    assert!(checked > 0);
+}
