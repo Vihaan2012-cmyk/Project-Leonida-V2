@@ -30,3 +30,13 @@ pub mod names;
 pub mod rules;
 pub mod scan;
 pub mod settings;
+pub mod vfs_link;
+
+pub use blocklist::{BlockEntry, BlockIndex, Blocklist, BlocklistError, Replacement, ResourceKind};
+pub use filter::{
+    ContentFilter, DrawDecision, GpuKind, ResourceDesc, ResourceId, ResourceTag, Verdict,
+};
+pub use rules::CatalogueFile;
+pub use scan::{ScanReport, Scanner};
+pub use settings::{ContentSettings, NudityMode};
+pub use vfs_link::{FilterOutcome, PatchStats, ResourceFilter, ResourceIdentity};
