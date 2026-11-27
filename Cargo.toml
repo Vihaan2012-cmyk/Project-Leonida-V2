@@ -38,6 +38,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 assets = { path = "crates/assets" }
 game-package = { path = "crates/game-package" }
 rpf9 = { path = "crates/rpf9" }
+audio-codec = { path = "crates/audio-codec" }
 shader-container = { path = "crates/shader-container" }
 leonida-ui = { path = "crates/leonida-ui" }
 pe-image = { path = "crates/pe-image" }
