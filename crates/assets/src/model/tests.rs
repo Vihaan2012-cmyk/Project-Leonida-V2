@@ -951,3 +951,69 @@ fn lod_selection_and_dictionary_exports() {
     assert_eq!(lods[0]["models"][0]["geometries"][0]["vertices"], 4);
 }
 
+#[test]
+fn materials_carry_alpha_modes_textures_and_sidecar_links() {
+    let mut spec = DrawableSpec::simple(GeometrySpec::quad());
+    spec.materials = vec![
+        MaterialSpec {
+            shader: 1,
+            bucket: 1,
+            textures: vec![],
+        },
+        MaterialSpec {
+            shader: 2,
+            bucket: 3,
+            textures: vec![
+                TextureSpec {
+                    name_hash: 1,
+                    param: joaat("bumptex"),
+                    id64: 0xB,
+                },
+                TextureSpec {
+                    name_hash: 2,
+                    param: joaat("diffusetex"),
+                    id64: 0xD,
+                },
+            ],
+        },
+        MaterialSpec {
+            shader: 3,
+            bucket: 0,
+            textures: vec![TextureSpec {
+                name_hash: 3,
+                param: joaat("speculartex"),
+                id64: 0xE,
+            }],
+        },
+    ];
+    spec.name = Some("m");
+    let set = decode_resource(&drawable_resource(&spec), None).unwrap();
+    let resolve = |id: u64| (id == 0xD || id == 0xE).then(|| format!("textures/{id:016x}.dds"));
+    let options = ExportOptions {
+        texture_uri: Some(&resolve),
+        ..ExportOptions::default()
+    };
+    let e = export(&set, &options).unwrap().remove(0);
+    let glb = parse_glb(&e.glb);
+    glb.validate();
+    let m = &glb.doc["materials"];
+    assert_eq!(m[0]["alphaMode"], "BLEND");
+    assert_eq!(m[1]["alphaMode"], "MASK");
+    assert_eq!(m[1]["pbrMetallicRoughness"]["baseColorTexture"]["index"], 0);
+    assert!(
+        m[2]["pbrMetallicRoughness"]
+            .get("baseColorTexture")
+            .is_none(),
+        "no fallback to a specular map"
+    );
+    assert_eq!(glb.doc["images"][0]["uri"], "textures/000000000000000d.dds");
+    assert_eq!(glb.doc["images"].as_array().unwrap().len(), 1);
+
+    let sidecar: Value = serde_json::from_str(&e.sidecar).unwrap();
+    let mats = &sidecar["drawables"][0]["materials"];
+    assert_eq!(mats[1]["shader_hash"], "0x00000002");
+    assert_eq!(mats[1]["textures"][1]["parameter_name"], "diffusetex");
+    assert_eq!(mats[1]["textures"][1]["id64"], "0x000000000000000d");
+    assert_eq!(mats[0]["render_bucket"], 1);
+}
+
