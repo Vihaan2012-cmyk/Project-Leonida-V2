@@ -49,6 +49,10 @@ const MAGICS: &[(&str, usize, &[u8])] = &[
     ("XVD image", 0x200, b"msft-xvd"),
 ];
 
+/// Every file the decompiler's export writes carries this text. It is built in two pieces so that no source
+/// file, this one included, contains it whole and trips its own check.
+const GENERATED_MARKER: &str = concat!("leonida-decomp", ":");
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -79,6 +83,54 @@ fn classify(head: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Prints every file that looks like game data, holds generated decompiler output or cannot be read; returns how many.
+fn scan_files(files: &[PathBuf]) -> usize {
+    let mut flagged = 0usize;
+    for path in files {
+        match read_head(path) {
+            Ok(head) => {
+                if let Some(format) = classify(&head) {
+                    println!("{}: looks like {format}", path.display());
+                    flagged += 1;
+                } else if matches!(contains_marker(path), Ok(true)) {
+                    println!(
+                        "{}: holds generated decompiler output (it carries {GENERATED_MARKER})",
+                        path.display()
+                    );
+                    flagged += 1;
+                }
+            }
+            // A tracked file deleted in the working tree has nothing to scan.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                println!("{}: cannot read ({error})", path.display());
+                flagged += 1;
+            }
+        }
+    }
+    flagged
+}
+
+/// Whether the generated-output marker appears anywhere in the file.
+fn contains_marker(path: &Path) -> io::Result<bool> {
+    let marker = GENERATED_MARKER.as_bytes();
+    let mut file = File::open(path)?;
+    let mut buffer = vec![0u8; 1 << 16];
+    let mut kept = 0;
+    loop {
+        let read = file.read(&mut buffer[kept..])?;
+        if read == 0 {
+            return Ok(false);
+        }
+        let filled = kept + read;
+        if buffer[..filled].windows(marker.len()).any(|w| w == marker) {
+            return Ok(true);
+        }
+        kept = (marker.len() - 1).min(filled);
+        buffer.copy_within(filled - kept..filled, 0);
+    }
+}
+
 fn scan_game_data(paths: &[String]) -> ExitCode {
     let files = if paths.is_empty() {
         match tracked_files() {
@@ -91,23 +143,7 @@ fn scan_game_data(paths: &[String]) -> ExitCode {
     } else {
         paths.iter().map(PathBuf::from).collect()
     };
-    let mut flagged = 0usize;
-    for path in &files {
-        match read_head(path) {
-            Ok(head) => {
-                if let Some(format) = classify(&head) {
-                    println!("{}: looks like {format}", path.display());
-                    flagged += 1;
-                }
-            }
-            // A tracked file deleted in the working tree has nothing to scan.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                println!("{}: cannot read ({error})", path.display());
-                flagged += 1;
-            }
-        }
-    }
+    let flagged = scan_files(&files);
     if flagged > 0 {
         eprintln!(
             "{flagged} file(s) look like game data or could not be read. Game data must never be committed."
@@ -148,7 +184,9 @@ fn read_head(path: &Path) -> io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::classify;
+    use super::{GENERATED_MARKER, classify, contains_marker, scan_files};
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn recognises_magic_at_start() {
@@ -187,5 +225,51 @@ mod tests {
             classify(b"RIFF\x10\x00\x00\x00WAVEfmt "),
             Some("RIFF WAVE audio")
         );
+    }
+
+    fn file_with(dir: &Path, name: &str, parts: &[&[u8]]) -> PathBuf {
+        let path = dir.join(name);
+        let mut file = std::fs::File::create(&path).unwrap();
+        for part in parts {
+            file.write_all(part).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn finds_the_generated_marker_anywhere_in_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = GENERATED_MARKER.as_bytes();
+        let filler = vec![b'x'; (1 << 16) - 4];
+        let across = file_with(dir.path(), "across.c", &[&filler, marker, b" generated"]);
+        assert!(contains_marker(&across).unwrap());
+        let start = file_with(dir.path(), "start.md", &[b"// ", marker, b" do not commit"]);
+        assert!(contains_marker(&start).unwrap());
+        let none = file_with(
+            dir.path(),
+            "none.c",
+            &[&filler, b"leonida-decomp", b" nothing"],
+        );
+        assert!(!contains_marker(&none).unwrap());
+    }
+
+    #[test]
+    fn scan_flags_generated_output_but_not_the_check_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let generated = file_with(
+            dir.path(),
+            "out.c",
+            &[b"// ", GENERATED_MARKER.as_bytes(), b" x"],
+        );
+        let clean = file_with(dir.path(), "clean.rs", &[b"fn main() {}"]);
+        assert_eq!(scan_files(&[generated.clone(), clean.clone()]), 1);
+        assert_eq!(scan_files(&[clean]), 0);
+
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let own_sources = [
+            manifest.join("src/main.rs"),
+            manifest.join("../crates/source-export/src/render.rs"),
+        ];
+        assert_eq!(scan_files(&own_sources), 0);
     }
 }

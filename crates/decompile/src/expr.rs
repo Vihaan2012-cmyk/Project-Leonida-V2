@@ -19,6 +19,8 @@ pub enum Loc {
     /// A stack slot, by offset from the stack pointer at entry.
     Stack(i64),
     Flags,
+    /// A variable that stands for one value a register held across a region.
+    Var(u32),
 }
 
 impl Loc {
@@ -423,6 +425,8 @@ fn precedence(e: &Expr) -> u8 {
 
 pub struct Printer<'a> {
     pub stack_name: &'a dyn Fn(i64) -> String,
+    pub var_width: &'a dyn Fn(u32) -> u8,
+    pub var_name: &'a dyn Fn(u32) -> String,
 }
 
 impl Printer<'_> {
@@ -444,6 +448,18 @@ impl Printer<'_> {
             Expr::Var(Loc::Reg(r), w) => out.push_str(&register_name(*r, *w)),
             Expr::Var(Loc::Stack(o), _) => out.push_str(&(self.stack_name)(*o)),
             Expr::Var(Loc::Flags, _) => out.push_str("flags"),
+            Expr::Var(Loc::Var(n), w) => {
+                let width = (self.var_width)(*n);
+                if *w < width && width <= 8 {
+                    out.push_str(&format!(
+                        "({}){}",
+                        type_name(*w, false),
+                        (self.var_name)(*n)
+                    ));
+                } else {
+                    out.push_str(&(self.var_name)(*n));
+                }
+            }
             Expr::Param(n) => out.push_str(&format!("a{n}")),
             Expr::Const(v, w) => out.push_str(&constant(*v, *w)),
             Expr::Name(name) => out.push_str(name),

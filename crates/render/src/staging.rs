@@ -28,7 +28,7 @@ pub struct StagingRing {
     in_flight: VecDeque<(u64, Submission)>,
 }
 
-fn align_up(value: u64, align: u64) -> u64 {
+pub(crate) fn align_up(value: u64, align: u64) -> u64 {
     value.div_ceil(align) * align
 }
 

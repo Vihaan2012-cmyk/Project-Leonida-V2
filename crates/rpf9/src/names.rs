@@ -3,18 +3,7 @@
 const MAX_STEM: usize = 128;
 const MAX_NAMES: usize = 32;
 
-/// Jenkins one-at-a-time hash over the bytes as given.
-pub fn joaat(bytes: &[u8]) -> u32 {
-    let mut hash = 0u32;
-    for &byte in bytes {
-        hash = hash.wrapping_add(u32::from(byte));
-        hash = hash.wrapping_add(hash << 10);
-        hash ^= hash >> 6;
-    }
-    hash = hash.wrapping_add(hash << 3);
-    hash ^= hash >> 11;
-    hash.wrapping_add(hash << 15)
-}
+pub use name_hash::joaat;
 
 /// The hash resources are referred to by: `joaat` of the lower-cased name, without a `.#xx` suffix.
 pub fn name_hash(name: &str) -> u32 {

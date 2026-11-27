@@ -175,6 +175,8 @@ pub struct FrameGenInputs<'a> {
     pub phase: f32,
     /// Relative depth difference up to which two surfaces count as the same.
     pub depth_tolerance: f32,
+    /// How large a colour step still counts as unchanged when looking for the HUD; 0 turns the HUD test off.
+    pub hud_threshold: f32,
     pub reset: bool,
 }
 
@@ -197,6 +199,7 @@ impl<'a> FrameGenInputs<'a> {
             camera_far: f32::INFINITY,
             phase: 0.5,
             depth_tolerance: 0.03,
+            hud_threshold: 0.06,
             reset: false,
         }
     }

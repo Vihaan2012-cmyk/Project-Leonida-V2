@@ -1,7 +1,7 @@
 //! RDS5 texture pools (`.ttpf`): a chunk table, an embedded ETPF texture index and the chunk
 //! data. The pool is parsed over a borrowed byte slice (a memory map or a test buffer).
 
-use super::bcpack::{self, BcPackCodec, BcPackError};
+use super::bcpack::{self, BcPackCodec, BcPackError, DecodeOptions};
 use flate2::read::ZlibDecoder;
 use std::collections::HashMap;
 use std::io::Read;
@@ -92,6 +92,10 @@ impl CodecSet {
             .find(|c| !bcpack::is_supported(*c))
     }
 
+    pub fn has_bcpack(self) -> bool {
+        (1u8..=7).any(|c| self.contains(c))
+    }
+
     /// True when every chunk in the range can be decoded.
     pub fn readable(self) -> bool {
         self.undecodable_bcpack().is_none() && self.0 & !(0x1FF) == 0
@@ -158,6 +162,7 @@ pub struct Pool<'a> {
     textures: u32,
     records: &'a [u8],
     ids: &'a [u8],
+    bcpack: DecodeOptions,
 }
 
 fn u32_at(d: &[u8], at: usize) -> Option<u32> {
@@ -251,7 +256,14 @@ impl<'a> Pool<'a> {
             textures,
             records,
             ids,
+            bcpack: DecodeOptions::from_env(),
         })
+    }
+
+    /// Replace the BCPack options (the default comes from the environment, see [`DecodeOptions::from_env`]).
+    pub fn with_bcpack_options(mut self, opts: DecodeOptions) -> Self {
+        self.bcpack = opts;
+        self
     }
 
     pub fn texture_count(&self) -> u32 {
@@ -357,11 +369,67 @@ impl<'a> Pool<'a> {
             }
             1..=7 => {
                 let codec = BcPackCodec::from_chunk_codec(c.codec).expect("1..=7");
-                bcpack::decode(codec, raw, c.size as usize)
+                bcpack::decode_with(codec, raw, c.size as usize, &self.bcpack)
+                    .map(|d| d.data)
                     .map_err(|source| ReadError::BcPack { chunk: i, source })
             }
             other => Err(ReadError::UnknownCodec(i, other)),
         }
+    }
+
+    /// Decode the chunks of a range into `cache` without copying the range out. Several missing chunks are
+    /// decoded on separate threads (at most four): they are independent.
+    pub fn warm(&self, start: u64, size: u64, cache: &mut ChunkCache) -> Result<(), ReadError> {
+        let missing: Vec<usize> = self
+            .chunks_for(start, size)?
+            .iter()
+            .map(|c| self.chunk_index(c))
+            .filter(|i| !cache.0.contains_key(i))
+            .collect();
+        let threads = missing.len().min(
+            std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(4),
+        );
+        if threads <= 1 {
+            for i in missing {
+                cache.0.insert(i, self.decode_chunk(i)?);
+            }
+            return Ok(());
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let done: Vec<Vec<(usize, Result<Vec<u8>, ReadError>)>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut mine = Vec::new();
+                        loop {
+                            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(&i) = missing.get(at) else { break };
+                            mine.push((i, self.decode_chunk(i)));
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("chunk decoding does not panic"))
+                .collect()
+        });
+        let mut first_error: Option<(usize, ReadError)> = None;
+        for (i, result) in done.into_iter().flatten() {
+            match result {
+                Ok(bytes) => {
+                    cache.0.insert(i, bytes);
+                }
+                Err(e) if first_error.as_ref().is_none_or(|(j, _)| i < *j) => {
+                    first_error = Some((i, e));
+                }
+                Err(_) => {}
+            }
+        }
+        first_error.map_or(Ok(()), |(_, e)| Err(e))
     }
 
     /// Decoded bytes of `[start, start + size)` of the virtual address space.
@@ -371,12 +439,10 @@ impl<'a> Pool<'a> {
         size: u64,
         cache: &mut ChunkCache,
     ) -> Result<Vec<u8>, ReadError> {
+        self.warm(start, size, cache)?;
         let mut out = vec![0u8; size as usize];
         for chunk in self.chunks_for(start, size)? {
             let i = self.chunk_index(chunk);
-            if let std::collections::hash_map::Entry::Vacant(e) = cache.0.entry(i) {
-                e.insert(self.decode_chunk(i)?);
-            }
             let bytes = &cache.0[&i];
             let lo = start.max(chunk.virt);
             let hi = (start + size).min(chunk.virt + chunk.size);
@@ -573,11 +639,11 @@ mod tests {
     fn bcpack_chunk_is_a_typed_unsupported_read() {
         let first = first_page(1, 1);
         let recs = [record(64, 64, 1, 0, 71, 1, 1, 2, first, 0, 0)];
-        let file = pool(&recs, &[1], &[Packed::BcPack(1, vec![0x1f; 100], 2048)]);
+        let file = pool(&recs, &[1], &[Packed::BcPack(6, vec![0x1f; 100], 2048)]);
         let p = Pool::parse(&file).unwrap();
         let base = p.descriptor(0).unwrap().base;
         let set = p.codecs(base, 2048).unwrap();
-        assert_eq!(set.undecodable_bcpack(), Some(BcPackCodec::Bc1));
+        assert_eq!(set.undecodable_bcpack(), Some(BcPackCodec::Bc6h));
         assert!(!set.readable());
         let err = p
             .read_range(base, 2048, &mut ChunkCache::new())
@@ -586,7 +652,7 @@ mod tests {
             err,
             ReadError::BcPack {
                 source: BcPackError::Unsupported {
-                    codec: BcPackCodec::Bc1
+                    codec: BcPackCodec::Bc6h
                 },
                 ..
             }

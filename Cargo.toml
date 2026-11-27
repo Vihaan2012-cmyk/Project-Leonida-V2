@@ -42,6 +42,7 @@ rpf9 = { path = "crates/rpf9" }
 audio-codec = { path = "crates/audio-codec" }
 shader-container = { path = "crates/shader-container" }
 leonida-ui = { path = "crates/leonida-ui" }
+exe-analysis = { path = "crates/exe-analysis" }
 pe-image = { path = "crates/pe-image" }
 pe-loader = { path = "crates/pe-loader" }
 shims = { path = "crates/shims" }
@@ -51,6 +52,7 @@ upscale = { path = "crates/upscale" }
 config = { path = "crates/config" }
 systems = { path = "crates/systems" }
 decompile = { path = "crates/decompile" }
+source-export = { path = "crates/source-export" }
 offline = { path = "crates/offline" }
 gpu = { path = "crates/gpu" }
 gpu-passes = { path = "crates/gpu-passes" }
@@ -59,10 +61,12 @@ rdna = { path = "crates/rdna" }
 shader-ir = { path = "crates/shader-ir" }
 shader-translate = { path = "crates/shader-translate" }
 shader-store = { path = "crates/shader-store" }
+shader-census = { path = "crates/shader-census" }
 testkit = { path = "crates/testkit" }
 content-filter = { path = "crates/content-filter" }
 vfs = { path = "crates/vfs" }
 bvh-build = { path = "crates/bvh-build", default-features = false }
+name-hash = { path = "crates/name-hash" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
