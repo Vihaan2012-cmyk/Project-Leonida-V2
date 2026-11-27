@@ -4,7 +4,7 @@
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use shader_container::testutil;
 use xbox_d3d12::assembly::{Assembly, AssemblyConfig, create_assembled_device_on};
@@ -26,13 +26,19 @@ fn harness() -> Option<Harness> {
     let guard = ONE_GPU_TEST_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let asm = match Assembly::build(&AssemblyConfig::offscreen(256, 256)) {
-        Ok(asm) => asm,
-        Err(e) => {
-            eprintln!("skipped: {e}");
-            return None;
-        }
-    };
+    // One assembly for the whole file: each holds a window-sized sparse buffer, and the process keeps them all.
+    static ASSEMBLY: OnceLock<Option<Arc<Assembly>>> = OnceLock::new();
+    let asm = ASSEMBLY
+        .get_or_init(
+            || match Assembly::build(&AssemblyConfig::offscreen(256, 256)) {
+                Ok(asm) => Some(asm),
+                Err(e) => {
+                    eprintln!("skipped: {e}");
+                    None
+                }
+            },
+        )
+        .clone()?;
     let unknown_iid = [7u8; 16];
     let params = [0u32; 24];
     let mut device = std::ptr::null_mut();
@@ -228,8 +234,13 @@ fn fssm_compute(source: &str) -> Vec<u8> {
 #[test]
 fn a_compute_list_runs_on_the_assembled_device_and_its_result_is_in_game_memory() {
     let Some(h) = harness() else { return };
-    let queue = h.queue();
     let buffer = h.committed(1, &buffer_desc(0x10000, 4), 8);
+    run_ids(&h, buffer);
+}
+
+/// Dispatches the id-storing shader at `buffer` and checks every thread's word in game memory.
+fn run_ids(h: &Harness, buffer: Ptr) {
+    let queue = h.queue();
     // SAFETY: resource slot 11, device slots 16 and 11.
     let (address, root, pipeline) = unsafe {
         let gpu_address: unsafe extern "win64" fn(Ptr) -> u64 = slot(buffer, 11);
@@ -456,5 +467,62 @@ fn a_texture_view_is_written_into_a_heap_slot_and_registered_for_shaders() {
         let copied = std::slice::from_raw_parts((cpu + 32) as usize as *const u32, 8);
         assert_eq!(copied, words);
     }
-    assert_eq!(h.asm.descriptors().registry.texture_count(), 1);
+    assert!(h.asm.descriptors().registry.texture_count() >= 1);
+}
+
+#[test]
+fn a_buffer_placed_in_memory_the_title_mapped_is_that_memory_for_the_gpu() {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+    };
+    let Some(h) = harness() else { return };
+    let mut at = 0usize;
+    for step in 0..28usize {
+        let hint = (1usize << 30) + step * (1 << 26);
+        // SAFETY: a fresh allocation at the hint or nowhere.
+        let p = unsafe {
+            VirtualAlloc(
+                hint as *const c_void,
+                1 << 20,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        if !p.is_null() {
+            at = p as usize;
+            break;
+        }
+    }
+    assert_ne!(at, 0, "no address in the window to place a buffer at");
+    let desc = buffer_desc(0x10000, 4);
+    let mut out = std::ptr::null_mut();
+    // SAFETY: device slot 133, `(va, desc, state, clear, riid, out)`.
+    let result = unsafe {
+        let create: unsafe extern "win64" fn(
+            Ptr,
+            u64,
+            *const u8,
+            u32,
+            *const c_void,
+            *const u8,
+            *mut Ptr,
+        ) -> u32 = slot(h.device, 133);
+        create(
+            h.device,
+            at as u64,
+            desc.as_ptr(),
+            0xFFFF_FFFF,
+            std::ptr::null(),
+            guid(&iid::RESOURCE).as_ptr(),
+            &mut out,
+        )
+    };
+    assert_eq!(result, 0, "notes: {:?}", xbox_d3d12::com::notes());
+    // SAFETY: resource slot 11.
+    let address = unsafe {
+        let gpu_address: unsafe extern "win64" fn(Ptr) -> u64 = slot(out, 11);
+        gpu_address(out)
+    };
+    assert_eq!(address, at as u64);
+    run_ids(&h, out);
 }
