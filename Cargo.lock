@@ -1134,6 +1134,7 @@ dependencies = [
  "content-filter",
  "decompile",
  "embed-manifest",
+ "enhancements",
  "game-package",
  "gpu",
  "iced-x86",
@@ -1152,7 +1153,9 @@ dependencies = [
  "shims",
  "systems",
  "tempfile",
+ "upscale",
  "vfs",
+ "xbox-d3d12",
 ]
 
 [[package]]
