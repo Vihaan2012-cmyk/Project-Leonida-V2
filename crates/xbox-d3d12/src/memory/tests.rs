@@ -452,3 +452,20 @@ fn pages_mapped_from_file_sections_are_seen_at_their_own_address() {
         }
     });
 }
+
+#[test]
+fn host_memory_can_be_seen_at_another_address() {
+    each_gpu(|gpu, space, kernel| {
+        let region = Region::new(2 * PAGE, false);
+        let alias = 0xC000_0000u64;
+        space
+            .map_host_at(alias, region.address, 2 * PAGE, SyncPolicy::Always)
+            .unwrap();
+        assert!(space.is_bound(alias) && !space.is_bound(region.address));
+        region.write(0, 20);
+        kernel.run(gpu, space, &[(alias, alias + PAGE + 4)], (alias, 2 * PAGE));
+        assert_eq!(region.read(PAGE / 4 + 1), 21);
+        space.unmap(alias, 2 * PAGE).unwrap();
+        space.reclaim();
+    });
+}
