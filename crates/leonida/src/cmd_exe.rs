@@ -12,7 +12,7 @@ use crate::cli::{ExeArgs, ExeCommand};
 use crate::game::resolve_game;
 
 /// The executable `MicrosoftGame.Config` names; it is only ever read as data.
-fn executable(game: &Path) -> Result<PathBuf> {
+pub(crate) fn executable(game: &Path) -> Result<PathBuf> {
     let config = std::fs::read_to_string(game.join("MicrosoftGame.Config"))
         .context("reading MicrosoftGame.Config")?;
     let entry = config

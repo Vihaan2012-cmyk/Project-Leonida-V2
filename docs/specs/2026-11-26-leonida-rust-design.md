@@ -497,6 +497,16 @@ Further rules:
   Vulkan synchronization2.
 - Pipeline creation hashes shader bytes and looks them up in the shader store, overrides first.
 
+### 9.5 Where it stands
+
+`pe-loader` maps, relocates, binds and protects 64-bit images and registers their exception tables; images with
+thread-local storage are refused until the TLS mechanism above exists. `shims` binds each import to a shim (the
+`XMem` allocator so far), an allowed Windows DLL, or a stand-in that records the call and returns 0, which is also
+what every import the `offline` crate names gets. Tests build small executables byte by byte and run them through
+all three. `leonida run --dry-run` reads the executable's imports and runs nothing: of its 587 imports, 430 come
+from Windows, 78 are blocked as offline play requires, 4 are shims and 75 are missing (the console graphics,
+memory, audio, video and input libraries). Running without `--dry-run` is refused for now.
+
 ### 9.4 First-boot kit
 
 - `leonida run --dry-run <exe>`: reads the import tables without running anything; prints every import as shimmed,

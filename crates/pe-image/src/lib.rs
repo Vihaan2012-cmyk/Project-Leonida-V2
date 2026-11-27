@@ -82,6 +82,7 @@ pub struct Image<'a> {
     pub image_base: u64,
     pub entry: u32,
     pub image_size: u32,
+    pub headers_size: u32,
     pub subsystem: u16,
     pub dll_characteristics: u16,
     pub sections: Vec<Section>,
@@ -125,6 +126,7 @@ impl<'a> Image<'a> {
         let image_base =
             u64_at(bytes, optional + 24).ok_or(PeError::Truncated("optional header"))?;
         let image_size = field32(optional + 56, "optional header")?;
+        let headers_size = field32(optional + 60, "optional header")?;
         let subsystem = field16(optional + 68, "optional header")?;
         let dll_characteristics = field16(optional + 70, "optional header")?;
         let directory_count = (field32(optional + 108, "optional header")? as usize).min(16);
@@ -161,6 +163,7 @@ impl<'a> Image<'a> {
             image_base,
             entry,
             image_size,
+            headers_size,
             subsystem,
             dll_characteristics,
             sections,
@@ -381,6 +384,31 @@ impl<'a> Image<'a> {
         let functions = self.functions();
         let index = functions.partition_point(|f| f.begin <= rva);
         functions[..index].last().copied().filter(|f| rva < f.end)
+    }
+
+    /// Each base relocation as the RVA it patches and its type (10 is a 64-bit address, 0 is padding).
+    pub fn relocations(&self) -> Vec<(u32, u8)> {
+        let mut out = Vec::new();
+        let Some((rva, size)) = self.directory(DIRECTORY_RELOCATION) else {
+            return out;
+        };
+        let mut at = 0;
+        while at + 8 <= size {
+            let page = self.u32_rva(rva + at).unwrap_or(0);
+            let block = self.u32_rva(rva + at + 4).unwrap_or(0);
+            if block < 8 {
+                break;
+            }
+            let Some(entries) = self.read(rva + at + 8, (block - 8) as usize) else {
+                break;
+            };
+            for pair in entries.chunks_exact(2) {
+                let entry = u16::from_le_bytes([pair[0], pair[1]]);
+                out.push((page + u32::from(entry & 0xFFF), (entry >> 12) as u8));
+            }
+            at += block;
+        }
+        out
     }
 
     pub fn relocation_count(&self) -> usize {

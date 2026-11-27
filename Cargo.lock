@@ -524,10 +524,12 @@ dependencies = [
  "leonida-ui",
  "offline",
  "pe-image",
+ "pe-loader",
  "rdna",
  "shader-container",
  "shader-ir",
  "shader-translate",
+ "shims",
  "tempfile",
 ]
 
@@ -732,6 +734,15 @@ name = "pe-image"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "pe-loader"
+version = "0.1.0"
+dependencies = [
+ "pe-image",
+ "thiserror",
+ "windows-sys",
 ]
 
 [[package]]
@@ -975,6 +986,15 @@ dependencies = [
  "shader-ir",
  "testkit",
  "thiserror",
+]
+
+[[package]]
+name = "shims"
+version = "0.1.0"
+dependencies = [
+ "offline",
+ "pe-loader",
+ "windows-sys",
 ]
 
 [[package]]

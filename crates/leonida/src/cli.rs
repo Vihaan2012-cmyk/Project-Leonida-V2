@@ -20,6 +20,24 @@ pub enum Command {
     Exe(ExeArgs),
     /// Check that every game file is there and the right size; with --full, that its contents are right too.
     Check(CheckArgs),
+    /// Run the game. Only --dry-run works so far: it reads the imports and runs nothing.
+    Run(RunArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// The game folder. Searched for when omitted.
+    #[arg(long)]
+    pub game: Option<PathBuf>,
+    /// Another file in the game folder to look at instead of the executable, such as one of its DLLs.
+    #[arg(long)]
+    pub file: Option<String>,
+    /// List how every import would be provided, without running anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// With --dry-run, also list every function each DLL provides.
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Args)]
