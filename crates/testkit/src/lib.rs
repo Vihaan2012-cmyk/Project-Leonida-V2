@@ -6,7 +6,7 @@ mod valu;
 
 use rdna::Inst;
 
-pub use state::{EXPORT_WORDS, Memory, Wave};
+pub use state::{ATTRIBUTE_SLOTS, EXPORT_WORDS, Memory, Wave};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExecError {

@@ -15,6 +15,7 @@ fn check(source: &str, wave: Wave, memory: Memory) -> bool {
         exports: wave.exports.clone(),
         messages: wave.messages.clone(),
         code_base: wave.code_base,
+        attributes: wave.attributes.clone(),
     };
     let (mut reference, mut reference_memory) = (wave, memory);
     let expected = testkit::run(&code, &mut reference, &mut reference_memory);

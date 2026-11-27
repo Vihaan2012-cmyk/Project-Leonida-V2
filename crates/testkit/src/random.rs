@@ -26,6 +26,11 @@ pub fn start(wave64: bool, seed: u64) -> Wave {
     wave.sgpr[22] = 0x40 + 4 * (rng.word() % 0x80);
     wave.sgpr[24] = 0x400;
     wave.vgpr[9] = [0; 64];
+    for slot in wave.attributes.iter_mut() {
+        for lane in slot.iter_mut() {
+            *lane = rng.value();
+        }
+    }
     wave
 }
 
@@ -75,6 +80,7 @@ pub struct Generator {
     pub rng: Rng,
     pub wave64: bool,
     pub gpu: bool,
+    pub interpolation: bool,
     round: u32,
 }
 
@@ -86,6 +92,7 @@ impl Generator {
             rng,
             wave64,
             gpu,
+            interpolation: true,
             round: 0,
         }
     }
@@ -698,8 +705,39 @@ impl Generator {
         }
     }
 
+    fn interp(&mut self) -> String {
+        let attr = format!(
+            "attr{}.{}",
+            self.rng.below(32),
+            ["x", "y", "z", "w"][self.rng.below(4)]
+        );
+        let high = if self.rng.chance(2) { " high" } else { "" };
+        match self.rng.below(5) {
+            0 | 1 => {
+                let op = self.rng.pick(&["v_interp_p1_f32", "v_interp_p2_f32"]);
+                format!("{op} {}, {}, {attr}", self.fdst(), self.fvreg())
+            }
+            2 => {
+                let param = self.rng.pick(&["p0", "p10", "p20"]);
+                format!("v_interp_mov_f32 {}, {param}, {attr}", self.fdst())
+            }
+            3 => format!(
+                "v_interp_p1ll_f16 {}, {}, {attr}{high}",
+                self.fdst(),
+                self.fvreg()
+            ),
+            _ => format!(
+                "v_interp_p2_f16 {}, {}, {attr}, {}{high}",
+                self.vdst(),
+                self.fvreg(),
+                self.fvreg()
+            ),
+        }
+    }
+
     fn extra(&mut self) -> String {
-        match self.rng.below(8) {
+        match self.rng.below(9) {
+            8 if self.interpolation => self.interp(),
             0 => {
                 if self.rng.chance(2) {
                     format!(

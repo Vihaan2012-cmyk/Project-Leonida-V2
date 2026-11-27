@@ -17,7 +17,8 @@ mod image;
 
 pub const STATE_SCC: u32 = 128;
 pub const STATE_VGPR: u32 = 256;
-pub const STATE_WORDS: usize = 256 + 256 * 64;
+pub const STATE_ATTRIBUTES: u32 = 256 + 256 * 64;
+pub const STATE_WORDS: usize = STATE_ATTRIBUTES as usize + shader_ir::ATTRIBUTES * 12 * 64;
 pub const MESSAGE_BASE: u32 = 64 * 4 * 64;
 pub const MESSAGE_LIMIT: u32 = 64;
 pub const EXPORT_BUFFER_WORDS: usize = MESSAGE_BASE as usize + 1 + 2 * MESSAGE_LIMIT as usize;
@@ -1706,6 +1707,24 @@ impl Emitter {
                 self.load(ptr)?
             }
             Expr::Image(image) => self.image(image)?,
+            Expr::Attribute {
+                attr,
+                channel,
+                vertex,
+            } => {
+                if self.heap.is_some() || self.compute.is_some() {
+                    return Err(EmitError::Unsupported(
+                        "interpolated attributes outside a pixel shader",
+                    ));
+                }
+                let slot = shader_ir::attribute_slot(*attr, *channel, *vertex) as u32;
+                let base = self.u32c(STATE_ATTRIBUTES + 64 * slot);
+                let u32_ = self.t.u32_;
+                let index = ok(self.b.i_add(u32_, None, base, self.lane))?;
+                let state = self.state;
+                let ptr = self.element(state, index)?;
+                self.load(ptr)?
+            }
         })
     }
 

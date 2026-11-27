@@ -1,4 +1,6 @@
-use crate::ir::{Bin, Cmp, Expr, Function, Reg, Stmt, Terminator, Tri, Un};
+use crate::ir::{
+    ATTRIBUTES, Bin, Cmp, Expr, Function, Reg, Stmt, Terminator, Tri, Un, attribute_slot,
+};
 
 const VCC: usize = 106;
 const M0: usize = 124;
@@ -30,6 +32,7 @@ pub struct Machine {
     pub exports: Vec<u32>,
     pub messages: Vec<(u32, u32)>,
     pub code_base: u64,
+    pub attributes: Vec<[u32; 64]>,
 }
 
 pub const EXPORT_WORDS: usize = 64 * 4 * 64;
@@ -51,6 +54,7 @@ impl Machine {
             exports: vec![0; EXPORT_WORDS],
             messages: Vec::new(),
             code_base: 0,
+            attributes: vec![[0; 64]; ATTRIBUTES * 12],
         };
         machine.sgpr[EXEC] = u32::MAX;
         if wave64 {
@@ -453,6 +457,11 @@ impl Run<'_> {
                 )
             }
             Expr::Image(_) => return Err(RunError::Image),
+            Expr::Attribute {
+                attr,
+                channel,
+                vertex,
+            } => u64::from(self.machine.attributes[attribute_slot(*attr, *channel, *vertex)][lane]),
         })
     }
 

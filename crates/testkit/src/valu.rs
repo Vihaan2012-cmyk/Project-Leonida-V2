@@ -273,6 +273,10 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
         compare(name, inst, wave)?;
         return Ok(true);
     }
+    if name.starts_with("v_interp_") {
+        interp(name, inst, wave)?;
+        return Ok(true);
+    }
     match name {
         "v_nop" => return Ok(true),
         "v_cndmask_b32" => {
@@ -513,6 +517,86 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
         wave.write_lane(arg(inst, 0)?, lane, value, inst)?;
     }
     Ok(true)
+}
+
+fn interp(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
+    let unsupported = || crate::ExecError::Unsupported {
+        pc: inst.pc,
+        text: inst.text(),
+    };
+    if inst.mods.iter().any(|m| m.starts_with("op_sel")) {
+        return Err(unsupported());
+    }
+    let Operand::Attr { attr, chan } = arg(inst, 2)?.operand else {
+        return Err(bad(inst));
+    };
+    if attr >= 32 {
+        return Err(unsupported());
+    }
+    let Operand::Vgpr { reg: target, .. } = arg(inst, 0)?.operand else {
+        return Err(bad(inst));
+    };
+    let target = usize::from(target);
+    let high = inst.mods.iter().any(|m| m == "high");
+    let slot = |vertex: usize| (usize::from(attr) * 4 + usize::from(chan)) * 3 + vertex;
+    for lane in wave.active_lanes() {
+        let raw = |vertex: usize| wave.attributes[slot(vertex)][lane];
+        let single = |vertex: usize| wave.flush(f32::from_bits(raw(vertex)));
+        let half = |vertex: usize| {
+            let bits = (if high { raw(vertex) >> 16 } else { raw(vertex) }) & 0xFFFF;
+            wave.flush(f32::from_bits(rdna::format::f16_to_f32(bits, true)))
+        };
+        let delta = |far: f32, near: f32| wave.flush(nan_rule(far - near, &[far, near]));
+        let fma = |a: f32, b: f32, c: f32| wave.flush(nan_rule(a.mul_add(b, c), &[a, b, c]));
+        let value = match name {
+            "v_interp_p1_f32" => {
+                let weight = wave.read_lane_f32(arg(inst, 1)?, lane, inst)?;
+                let p10 = delta(single(1), single(0));
+                output_modifiers(wave, inst, fma(p10, weight, single(0))).to_bits()
+            }
+            "v_interp_p2_f32" => {
+                let weight = wave.read_lane_f32(arg(inst, 1)?, lane, inst)?;
+                let p20 = delta(single(2), single(0));
+                let partial = wave.flush(f32::from_bits(wave.vgpr[target][lane]));
+                output_modifiers(wave, inst, fma(p20, weight, partial)).to_bits()
+            }
+            "v_interp_mov_f32" => {
+                let Operand::Named(param) = &arg(inst, 1)?.operand else {
+                    return Err(bad(inst));
+                };
+                let value = match param.as_str() {
+                    "p0" => raw(0),
+                    "p10" => delta(single(1), single(0)).to_bits(),
+                    "p20" => delta(single(2), single(0)).to_bits(),
+                    _ => return Err(unsupported()),
+                };
+                if output_modified(inst) {
+                    output_modifiers(wave, inst, f32::from_bits(value)).to_bits()
+                } else {
+                    value
+                }
+            }
+            "v_interp_p1ll_f16" => {
+                let weight = wave.read_lane_f32(arg(inst, 1)?, lane, inst)?;
+                let p10 = delta(half(1), half(0));
+                output_modifiers(wave, inst, fma(p10, weight, half(0))).to_bits()
+            }
+            "v_interp_p2_f16" => {
+                if output_modified(inst) {
+                    return Err(unsupported());
+                }
+                let weight = wave.read_lane_f32(arg(inst, 1)?, lane, inst)?;
+                let partial = wave.read_lane_f32(arg(inst, 3)?, lane, inst)?;
+                let p20 = delta(half(2), half(0));
+                let result = fma(p20, weight, partial).to_bits();
+                let rounded = rdna::format::f32_to_f16_round(result, wave.f16_round);
+                (wave.vgpr[target][lane] & 0xFFFF_0000) | rounded
+            }
+            _ => return Err(unsupported()),
+        };
+        wave.vgpr[target][lane] = value;
+    }
+    Ok(())
 }
 
 fn carry(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {

@@ -5,6 +5,13 @@ pub use rdna::format::Round;
 pub type Tmp = u32;
 pub type BlockId = usize;
 
+/// Interpolated parameters a pixel shader can read; each has four channels and a value per triangle vertex.
+pub const ATTRIBUTES: usize = 32;
+
+pub fn attribute_slot(attr: u8, channel: u8, vertex: u8) -> usize {
+    (usize::from(attr) * 4 + usize::from(channel)) * 3 + usize::from(vertex)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Reg {
     S(u8),
@@ -220,6 +227,11 @@ pub enum Expr {
         component: u8,
     },
     Image(Box<Image>),
+    Attribute {
+        attr: u8,
+        channel: u8,
+        vertex: u8,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -299,6 +311,7 @@ impl Expr {
                 | Expr::LdsLoad(_)
                 | Expr::TypedLoad { .. }
                 | Expr::Image(_)
+                | Expr::Attribute { .. }
                 | Expr::Shuffle(..)
                 | Expr::GetRelative(..)
         )

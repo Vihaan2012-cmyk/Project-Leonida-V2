@@ -18,9 +18,13 @@ pub struct Wave {
     pub messages: Vec<(u32, u32)>,
     pub code_base: u64,
     pub f16_round: rdna::format::Round,
+    pub attributes: Vec<[u32; 64]>,
 }
 
 pub const EXPORT_WORDS: usize = 64 * 4 * 64;
+
+/// Parameters a pixel shader interpolates: 32 attributes of four channels, each with three vertex values.
+pub const ATTRIBUTE_SLOTS: usize = 32 * 4 * 3;
 
 impl Wave {
     pub fn new(wave64: bool) -> Wave {
@@ -36,6 +40,7 @@ impl Wave {
             messages: Vec::new(),
             code_base: 0,
             f16_round: rdna::format::Round::Even,
+            attributes: vec![[0; 64]; ATTRIBUTE_SLOTS],
         };
         wave.set_mask(EXEC, wave.full_mask());
         wave

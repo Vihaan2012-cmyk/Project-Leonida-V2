@@ -944,6 +944,9 @@ impl Lifter {
         if let Some(op) = base.strip_suffix("_sdwa") {
             return self.sdwa(op, inst);
         }
+        if base.starts_with("v_interp_") {
+            return self.interp(base, inst);
+        }
         if base.starts_with("v_cmp") {
             return self.vector_compare(base, inst);
         }
@@ -957,6 +960,94 @@ impl Lifter {
             return Ok(());
         }
         Err(unsupported(inst))
+    }
+
+    fn interp(&mut self, name: &str, inst: &Inst) -> Result<(), LiftError> {
+        let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
+        if inst.mods.iter().any(|m| m.starts_with("op_sel")) {
+            return Err(unsupported(inst));
+        }
+        let Operand::Attr { attr, chan } = arg(2)?.operand else {
+            return Err(unsupported(inst));
+        };
+        if usize::from(attr) >= crate::ir::ATTRIBUTES {
+            return Err(unsupported(inst));
+        }
+        let (target, _) = vgprs(arg(0)?, inst)?;
+        let high = inst.mods.iter().any(|m| m == "high");
+        let vertex = |me: &mut Self, vertex: u8| {
+            me.value(Expr::Attribute {
+                attr,
+                channel: chan,
+                vertex,
+            })
+        };
+        let half = |me: &mut Self, vertex_index: u8| {
+            let raw = vertex(me, vertex_index);
+            let raw = if high {
+                let sixteen = me.c(16);
+                me.bin(Bin::ShrU, raw, sixteen)
+            } else {
+                raw
+            };
+            let mask = me.c(0xFFFF);
+            let bits = me.bin(Bin::And, raw, mask);
+            me.un(Un::F16ToF32, bits)
+        };
+        let value = match name {
+            "v_interp_p1_f32" | "v_interp_p2_f32" => {
+                let weight = self.flane(arg(1)?, inst)?;
+                let far = if name == "v_interp_p1_f32" { 1 } else { 2 };
+                let base = vertex(self, 0);
+                let other = vertex(self, far);
+                let delta = self.bin(Bin::FSub, other, base);
+                let start = if far == 1 {
+                    base
+                } else {
+                    self.value(Expr::Get(Reg::V(target)))
+                };
+                let value = self.value(Expr::Tri(Tri::FFma, delta, weight, start));
+                self.output_modifiers(value, inst)
+            }
+            "v_interp_mov_f32" => {
+                let Operand::Named(param) = &arg(1)?.operand else {
+                    return Err(unsupported(inst));
+                };
+                let base = vertex(self, 0);
+                let value = match param.as_str() {
+                    "p0" => base,
+                    "p10" | "p20" => {
+                        let other = vertex(self, if param == "p10" { 1 } else { 2 });
+                        self.bin(Bin::FSub, other, base)
+                    }
+                    _ => return Err(unsupported(inst)),
+                };
+                self.output_modifiers(value, inst)
+            }
+            "v_interp_p1ll_f16" => {
+                let weight = self.flane(arg(1)?, inst)?;
+                let base = half(self, 0);
+                let other = half(self, 1);
+                let delta = self.bin(Bin::FSub, other, base);
+                let value = self.value(Expr::Tri(Tri::FFma, delta, weight, base));
+                self.output_modifiers(value, inst)
+            }
+            "v_interp_p2_f16" => {
+                if has_output_modifiers(inst) {
+                    return Err(unsupported(inst));
+                }
+                let weight = self.flane(arg(1)?, inst)?;
+                let partial = self.flane(arg(3)?, inst)?;
+                let base = half(self, 0);
+                let other = half(self, 2);
+                let delta = self.bin(Bin::FSub, other, base);
+                let value = self.value(Expr::Tri(Tri::FFma, delta, weight, partial));
+                let rounded = self.un(Un::F32ToF16(self.f16_round), value);
+                self.keep_half(target, rounded, false)
+            }
+            _ => return Err(unsupported(inst)),
+        };
+        self.set_lane(arg(0)?, value, inst)
     }
 
     fn image(&mut self, name: &str, inst: &Inst) -> Result<(), LiftError> {

@@ -4,7 +4,7 @@ use common::{gpu, spirv_val};
 use gpu::Gpu;
 use shader_translate::{
     ComputeOptions, EXPORT_BUFFER_WORDS, FloatMode, HarnessOptions, MESSAGE_BASE, MESSAGE_LIMIT,
-    PUSH_HEAP, PUSH_WORDS, STATE_SCC, STATE_VGPR, STATE_WORDS, harness,
+    PUSH_HEAP, PUSH_WORDS, STATE_ATTRIBUTES, STATE_SCC, STATE_VGPR, STATE_WORDS, harness,
 };
 use testkit::random::{Generator, Rng, memory, start};
 use testkit::{Memory, Wave};
@@ -39,6 +39,11 @@ fn without_denormals(wave: &mut Wave, memory: &mut Memory) {
         let value = plain(u32::from_le_bytes(word.try_into().unwrap()));
         word.copy_from_slice(&value.to_le_bytes());
     }
+    for slot in &mut wave.attributes {
+        for lane in slot.iter_mut() {
+            *lane = plain(*lane);
+        }
+    }
 }
 
 fn same(a: u32, b: u32) -> bool {
@@ -63,6 +68,10 @@ fn run(gpu: &Gpu, source: &str, wave: Wave, memory: Memory, name: &str) -> bool 
     state[STATE_SCC as usize] = u32::from(wave.scc);
     for (reg, lanes) in wave.vgpr.iter().enumerate() {
         let at = STATE_VGPR as usize + 64 * reg;
+        state[at..at + 64].copy_from_slice(lanes);
+    }
+    for (slot, lanes) in wave.attributes.iter().enumerate() {
+        let at = STATE_ATTRIBUTES as usize + 64 * slot;
         state[at..at + 64].copy_from_slice(lanes);
     }
     let mut gpu_memory = words(&memory.bytes);
@@ -373,6 +382,7 @@ fn compute_suite(wave64: bool) {
             wave64,
             true,
         );
+        generator.interpolation = false;
         let program = generator.program();
         let body = program
             .strip_suffix("s_endpgm")

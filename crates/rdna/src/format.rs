@@ -322,7 +322,10 @@ mod tests {
         assert_eq!(f32_to_f16_round(0x8000_0000, Round::Down), 0x8000);
         assert_eq!(f64_to_f16_round(1.0e-10f64.to_bits(), Round::Up), 1);
         assert_eq!(f32_to_f16_round(f32::NAN.to_bits(), Round::Zero), 0x7E00);
-        assert_eq!(f32_to_f16_round(f32::INFINITY.to_bits(), Round::Zero), 0x7C00);
+        assert_eq!(
+            f32_to_f16_round(f32::INFINITY.to_bits(), Round::Zero),
+            0x7C00
+        );
         for half in 0..0x7C00u32 {
             let single = f16_to_f32(half, true);
             for mode in [Round::Even, Round::Up, Round::Down, Round::Zero] {

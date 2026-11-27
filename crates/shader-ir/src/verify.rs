@@ -26,6 +26,8 @@ pub enum VerifyError {
     Target { block: usize, target: usize },
     #[error("t{0} is outside the function's {1} temporaries")]
     Range(Tmp, u32),
+    #[error("attribute {0} is beyond the last one")]
+    Attribute(u8),
 }
 
 fn reg_type(reg: Reg) -> Ty {
@@ -100,6 +102,12 @@ impl Checker<'_> {
     fn expr(&self, expr: &Expr) -> Result<Ty, VerifyError> {
         Ok(match expr {
             Expr::Const(_) | Expr::LaneId | Expr::FirstActiveLane => Ty::U32,
+            Expr::Attribute { attr, .. } => {
+                if usize::from(*attr) >= crate::ir::ATTRIBUTES {
+                    return Err(VerifyError::Attribute(*attr));
+                }
+                Ty::U32
+            }
             Expr::Const64(_) | Expr::GetPair(_) | Expr::Active | Expr::CodeBase => Ty::U64,
             Expr::Get(reg) => reg_type(*reg),
             Expr::Un(op, a) => {
