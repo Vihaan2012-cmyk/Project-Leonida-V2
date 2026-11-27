@@ -115,6 +115,24 @@ pub enum ShadersCommand {
     Disasm(DisasmArgs),
     /// Check how much of every shader the translator handles, and list what it can't yet. Writes nothing.
     Report(ReportArgs),
+    /// Translate every shader and have the graphics driver build it into a pipeline. Writes nothing.
+    Verify(VerifyArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct VerifyArgs {
+    /// The game folder. Searched for when omitted.
+    #[arg(long)]
+    pub game: Option<PathBuf>,
+    /// Stop after this many shader containers.
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Only containers of this stage: ps, vs, gs, ms or cs.
+    #[arg(long)]
+    pub stage: Option<String>,
+    /// Print each shader with its size and how long the driver took.
+    #[arg(long)]
+    pub each: bool,
 }
 
 #[derive(Debug, Args)]

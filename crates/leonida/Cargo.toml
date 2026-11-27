@@ -10,6 +10,7 @@ anyhow.workspace = true
 clap.workspace = true
 decompile.workspace = true
 game-package.workspace = true
+gpu.workspace = true
 iced-x86.workspace = true
 leonida-ui.workspace = true
 offline.workspace = true

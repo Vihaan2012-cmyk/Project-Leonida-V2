@@ -354,6 +354,8 @@ pub enum Stmt {
     },
     Message(u32, Tmp),
     FetchVertexInputs,
+    /// `s_barrier`: every wave of the work group arrives before any goes on.
+    Barrier,
     Store {
         when: Option<Tmp>,
         address: Tmp,

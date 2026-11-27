@@ -530,3 +530,47 @@ fn ray_intersections_match_on_the_gpu() {
         }
     }
 }
+
+#[test]
+fn barriers_order_lds_across_the_waves_of_a_group() {
+    let Some(gpu) = gpu() else { return };
+    for wave64 in [false, true] {
+        let threads: u32 = if wave64 { 256 } else { 128 };
+        let source = format!(
+            "v_lshlrev_b32_e32 v1, 2, v0
+             v_add_nc_u32_e32 v2, 0x1000, v0
+             ds_write_b32 v1, v2
+             v_readfirstlane_b32 s4, v0
+             s_cmp_eq_u32 s4, 0
+             s_cbranch_scc1 3
+             v_cmp_lt_u32_e32 {vcc}, 5, v0
+             v_cndmask_b32_e64 v2, 0, 1, {vcc}
+             s_barrier
+             v_add_nc_u32_e32 v3, 64, v0
+             v_and_b32_e32 v3, {mask}, v3
+             v_lshlrev_b32_e32 v3, 2, v3
+             ds_read_b32 v4, v3
+             s_waitcnt lgkmcnt(0)
+             global_store_dword v1, v4, s[0:1]
+             s_endpgm",
+            vcc = if wave64 { "vcc" } else { "vcc_lo" },
+            mask = threads - 1,
+        );
+        let code = rdna::assemble(&source, !wave64).unwrap();
+        let function = shader_ir::lift(&code, wave64).unwrap();
+        let rsrc2 = (2 << 1) | (8 << 15);
+        let options = compute_options(&gpu, [threads, 1, 1], rsrc2);
+        let spirv = shader_translate::compute(&function, &options).unwrap();
+        spirv_val(&spirv, &format!("compute_barrier_{wave64}"));
+        let mut heap = vec![0u32; 1024];
+        run_compute(&gpu, &spirv, &mut heap, &[0x400, 0], [1, 1, 1]);
+        for thread in 0..threads {
+            let want = 0x1000 + (thread + 64) % threads;
+            assert_eq!(
+                heap[0x100 + thread as usize],
+                want,
+                "wave64 {wave64} thread {thread}"
+            );
+        }
+    }
+}

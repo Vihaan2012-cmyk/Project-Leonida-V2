@@ -79,11 +79,7 @@ impl Emitter {
         ok(self.b.branch(merge))?;
         self.begin(merge)?;
         let zero = self.u32c(0);
-        let result = ok(self.b.phi(u32_, None, [(old, end), (zero, before)]))?;
-        if space == Space::Lds && self.lanes == 64 {
-            self.barrier()?;
-        }
-        Ok(result)
+        ok(self.b.phi(u32_, None, [(old, end), (zero, before)]))
     }
 
     fn encode_function(&mut self, d16: bool) -> Word {

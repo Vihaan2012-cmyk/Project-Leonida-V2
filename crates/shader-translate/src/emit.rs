@@ -235,9 +235,15 @@ struct Emitter {
     scc: Word,
     lane: Word,
     local: Word,
-    half: Word,
     lanes: u32,
-    exchange: Word,
+    /// A 64-lane wave runs as 32 invocations that each carry two lanes: lane L in part 0, lane L + 32 in part 1.
+    pair: bool,
+    part: usize,
+    lane_ids: [Word; 2],
+    thread_indexes: [Word; 2],
+    varying: Vec<bool>,
+    values_hi: Vec<Word>,
+    vgpr_hi: HashMap<u8, Word>,
     state: Word,
     memory: Word,
     lds_image: Word,
@@ -251,11 +257,9 @@ struct Emitter {
     heap: Option<Word>,
     code: Option<Word>,
     push: Word,
-    exchange_base: Word,
     label: Word,
     compute: Option<ComputeOptions>,
     group_ids: Word,
-    thread_ids: Word,
     thread_index: Word,
     values: Vec<Word>,
     types: Vec<Ty>,
@@ -266,11 +270,25 @@ struct Emitter {
     compare_samplers: Option<Word>,
     lookups: [Option<Word>; 2],
     encode: [Option<Word>; 2],
-    image_cache: Option<(Image, [Word; 4])>,
+    image_cache: [Option<(Image, [Word; 4])>; 2],
     pixel: Option<pixel::PixelState>,
     geometry: Option<geometry::GeometryState>,
     stage_lds: Option<merged::StageLds>,
     merged: Option<merged::MergedState>,
+    active_cache: [Option<(Word, Word)>; 2],
+}
+
+/// Whether every branch goes forward, so the blocks can run in order, each guarded by whether a branch reached it.
+fn forward_only(function: &Function) -> bool {
+    function
+        .blocks
+        .iter()
+        .enumerate()
+        .all(|(id, block)| match block.terminator {
+            Terminator::Jump(target) => target > id,
+            Terminator::Branch(_, taken, fallthrough) => taken > id && fallthrough > id,
+            Terminator::End => true,
+        })
 }
 
 fn registers(function: &Function) -> (BTreeSet<u8>, BTreeSet<u8>) {
@@ -425,9 +443,10 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         ));
     }
     let padded = threads.next_multiple_of(lanes);
-    let waves = padded / lanes;
-    let declared_size = if compute_entry {
-        [padded, 1, 1]
+    let pair = lanes == 64;
+    let invocations = if pair { padded / 2 } else { padded };
+    let declared_size = if compute_entry || pair {
+        [invocations, 1, 1]
     } else {
         group_size
     };
@@ -530,17 +549,13 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     if pixel_options.is_some() {
         b.decorate(lane_input, Decoration::Flat, []);
     }
-    let (half_input, group_input, thread_input, exchange) = if pixel_mode {
-        (0, 0, 0, 0)
+    let (wave_input, group_input) = if pixel_mode {
+        (0, 0)
     } else {
-        let half_input = input(&mut b, ptr_input_u32, BuiltIn::SubgroupId);
-        let group_input = input(&mut b, ptr_input_uvec3, BuiltIn::WorkgroupId);
-        let thread_input = input(&mut b, ptr_input_uvec3, BuiltIn::LocalInvocationId);
-        let slots = b.constant_bit32(u32_, 64 * waves);
-        let exchange_array = b.type_array(u32_, slots);
-        let ptr_exchange = b.type_pointer(None, StorageClass::Workgroup, exchange_array);
-        let exchange = b.variable(ptr_exchange, None, StorageClass::Workgroup, None);
-        (half_input, group_input, thread_input, exchange)
+        (
+            input(&mut b, ptr_input_u32, BuiltIn::SubgroupId),
+            input(&mut b, ptr_input_uvec3, BuiltIn::WorkgroupId),
+        )
     };
     let t = Types {
         bool_,
@@ -588,9 +603,32 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
             )
         })
         .collect();
+    let vgpr_hi: HashMap<u8, Word> = if pair {
+        vectors
+            .iter()
+            .map(|r| {
+                (
+                    *r,
+                    b.variable(t.ptr_function_u32, None, StorageClass::Function, None),
+                )
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
     let scc = b.variable(t.ptr_function_bool, None, StorageClass::Function, None);
     let current = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let iterations = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
+    let forward = forward_only(function);
+    let reached: Vec<Word> = if forward {
+        function
+            .blocks
+            .iter()
+            .map(|_| b.variable(t.ptr_function_bool, None, StorageClass::Function, None))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let messages = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let alive = b.variable(t.ptr_function_bool, None, StorageClass::Function, None);
     let stage_lds = match (&es_options, &gs_options) {
@@ -603,48 +641,27 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     let subgroup = if pixel_mode {
         b.constant_bit32(u32_, 0)
     } else {
-        ok(b.load(u32_, None, half_input, None, []))?
+        ok(b.load(u32_, None, wave_input, None, []))?
     };
-    let (lane, half, wave) = if function.wave64 {
-        let one = b.constant_bit32(u32_, 1);
-        let half = ok(b.bitwise_and(u32_, None, subgroup, one))?;
-        let wave = ok(b.shift_right_logical(u32_, None, subgroup, one))?;
-        let shift = b.constant_bit32(u32_, 5);
-        let base = ok(b.shift_left_logical(u32_, None, half, shift))?;
-        (ok(b.i_add(u32_, None, base, local))?, half, wave)
-    } else {
-        (local, local, subgroup)
-    };
-    let six = b.constant_bit32(u32_, 6);
-    let exchange_base = ok(b.shift_left_logical(u32_, None, wave, six))?;
+    let upper = b.constant_bit32(u32_, 32);
+    let lane_ids = [local, ok(b.i_add(u32_, None, local, upper))?];
     let lanes_constant = b.constant_bit32(u32_, lanes);
-    let thread_index = ok(b.i_mul(u32_, None, wave, lanes_constant))?;
-    let thread_index = ok(b.i_add(u32_, None, thread_index, lane))?;
-    let (group_ids, thread_ids) = if heap_mode && !pixel_mode {
-        let ids = ok(b.load(uvec3, None, thread_input, None, []))?;
-        let ids = if compute_entry {
-            let flat = ok(b.composite_extract(u32_, None, ids, [0]))?;
-            let width = b.constant_bit32(u32_, group_size[0]);
-            let height = b.constant_bit32(u32_, group_size[1]);
-            let plane = b.constant_bit32(u32_, group_size[0] * group_size[1]);
-            let x = ok(b.u_mod(u32_, None, flat, width))?;
-            let row = ok(b.u_div(u32_, None, flat, width))?;
-            let y = ok(b.u_mod(u32_, None, row, height))?;
-            let z = ok(b.u_div(u32_, None, flat, plane))?;
-            ok(b.composite_construct(uvec3, None, [x, y, z]))?
-        } else {
-            ids
-        };
-        (ok(b.load(uvec3, None, group_input, None, []))?, ids)
+    let first_lane = ok(b.i_mul(u32_, None, subgroup, lanes_constant))?;
+    let mut thread_indexes = [0; 2];
+    for (part, lane) in lane_ids.iter().enumerate() {
+        thread_indexes[part] = ok(b.i_add(u32_, None, first_lane, *lane))?;
+    }
+    let group_ids = if heap_mode && !pixel_mode {
+        ok(b.load(uvec3, None, group_input, None, []))?
     } else {
-        (0, 0)
+        0
     };
     let mut interface = vec![lane_input];
     if !pixel_mode {
-        interface.push(half_input);
+        interface.push(wave_input);
     }
     if heap_mode && !pixel_mode {
-        interface.extend([group_input, thread_input]);
+        interface.push(group_input);
     }
     let compute_options = match entry {
         Entry::Compute(options) => Some(*options),
@@ -662,11 +679,16 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         sgpr,
         vgpr,
         scc,
-        lane,
+        lane: local,
         local,
-        half,
         lanes,
-        exchange,
+        pair,
+        part: 0,
+        lane_ids,
+        thread_indexes,
+        varying: function.varying(),
+        values_hi: vec![0; function.temps as usize],
+        vgpr_hi,
         state,
         memory,
         lds_image,
@@ -680,12 +702,10 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         heap: None,
         code: None,
         push,
-        exchange_base,
         label: entry_label,
         compute: compute_options,
         group_ids,
-        thread_ids,
-        thread_index,
+        thread_index: thread_indexes[0],
         values: vec![0; function.temps as usize],
         types,
         storage_block,
@@ -695,11 +715,12 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         compare_samplers: None,
         lookups: [None; 2],
         encode: [None; 2],
-        image_cache: None,
+        image_cache: [None, None],
         pixel: None,
         geometry: None,
         stage_lds,
         merged: None,
+        active_cache: [None, None],
     };
     if function.ordered && pixel_options.is_none() {
         return Err(EmitError::Unsupported(
@@ -745,7 +766,11 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
             }
         }
     } else {
-        e.dispatch(function, current, iterations)?;
+        if forward {
+            e.sequence(function, &reached)?;
+        } else {
+            e.dispatch(function, current, iterations)?;
+        }
     }
     if !heap_mode {
         e.epilogue()?;
@@ -804,7 +829,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
                         .filter_map(|inst| inst.result_id)
                         .collect();
                 e.b.entry_point(ExecutionModel::MeshEXT, main, "main", everything);
-                e.b.execution_mode(main, ExecutionMode::LocalSize, group_size);
+                e.b.execution_mode(main, ExecutionMode::LocalSize, declared_size);
                 e.b.execution_mode(main, ExecutionMode::OutputVertices, [options.max_vertices]);
                 e.b.execution_mode(
                     main,
@@ -927,13 +952,6 @@ impl Emitter {
         ok(self.b.control_barrier(workgroup, workgroup, semantics))
     }
 
-    /// Orders buffer memory between the two halves of an emulated 64-lane wave, as one instruction would.
-    fn memory_barrier(&mut self) -> Result<(), EmitError> {
-        let workgroup = self.u32c(2);
-        let semantics = self.u32c(0x148);
-        ok(self.b.control_barrier(workgroup, workgroup, semantics))
-    }
-
     fn if_then(
         &mut self,
         condition: Word,
@@ -959,6 +977,20 @@ impl Emitter {
     }
 
     fn copy_lds(&mut self, inward: bool) -> Result<(), EmitError> {
+        for part in self.parts() {
+            self.set_part(part);
+            self.copy_lds_part(inward)?;
+        }
+        self.set_part(0);
+        Ok(())
+    }
+
+    /// The parts each invocation carries: both with lane pairs, else one.
+    pub(super) fn parts(&self) -> std::ops::Range<usize> {
+        0..if self.pair { 2 } else { 1 }
+    }
+
+    fn copy_lds_part(&mut self, inward: bool) -> Result<(), EmitError> {
         let u32_ = self.t.u32_;
         let lanes = self.lanes;
         for chunk in 0..self.lds_words / lanes {
@@ -989,12 +1021,16 @@ impl Emitter {
             let value = self.load(ptr)?;
             self.store(var, value)?;
         }
-        let vectors: Vec<(u8, Word)> = self.vgpr.iter().map(|(r, v)| (*r, *v)).collect();
-        for (reg, var) in vectors {
-            let ptr = self.state_vgpr(reg)?;
-            let value = self.load(ptr)?;
-            self.store(var, value)?;
+        let registers: Vec<u8> = self.vgpr.keys().copied().collect();
+        for part in self.parts() {
+            self.set_part(part);
+            for reg in &registers {
+                let ptr = self.state_vgpr(*reg)?;
+                let value = self.load(ptr)?;
+                self.store(self.vgpr_var(*reg), value)?;
+            }
         }
+        self.set_part(0);
         let index = self.u32c(STATE_SCC);
         let ptr = self.element(state, index)?;
         let raw = self.load(ptr)?;
@@ -1014,12 +1050,16 @@ impl Emitter {
     fn epilogue(&mut self) -> Result<(), EmitError> {
         self.barrier()?;
         self.copy_lds(false)?;
-        let vectors: Vec<(u8, Word)> = self.vgpr.iter().map(|(r, v)| (*r, *v)).collect();
-        for (reg, var) in vectors {
-            let value = self.load(var)?;
-            let ptr = self.state_vgpr(reg)?;
-            self.store(ptr, value)?;
+        let registers: Vec<u8> = self.vgpr.keys().copied().collect();
+        for part in self.parts() {
+            self.set_part(part);
+            for reg in &registers {
+                let value = self.load(self.vgpr_var(*reg))?;
+                let ptr = self.state_vgpr(*reg)?;
+                self.store(ptr, value)?;
+            }
         }
+        self.set_part(0);
         let zero = self.u32c(0);
         let bool_ = self.t.bool_;
         let first = ok(self.b.i_equal(bool_, None, self.lane, zero))?;
@@ -1046,6 +1086,43 @@ impl Emitter {
             let ptr = e.element(exports, index)?;
             e.store(ptr, count)
         })
+    }
+
+    /// Blocks whose branches all go forward, in order: each runs when a branch reached it and marks the blocks
+    /// it branches to. Drivers compile this far faster than a loop over a switch.
+    fn sequence(&mut self, function: &Function, reached: &[Word]) -> Result<(), EmitError> {
+        let (yes, no) = (self.boolc(true), self.boolc(false));
+        for (id, flag) in reached.iter().enumerate() {
+            self.store(*flag, if id == 0 { yes } else { no })?;
+        }
+        let bool_ = self.t.bool_;
+        for (block, flag) in function.blocks.iter().zip(reached) {
+            let here = ok(self.b.load(bool_, None, *flag, None, []))?;
+            self.if_then(here, |e| {
+                for stmt in &block.stmts {
+                    e.stmt(stmt)?;
+                }
+                let mark = |e: &mut Self, target: usize, when: Word| {
+                    let Some(flag) = reached.get(target) else {
+                        return Ok(());
+                    };
+                    let old = ok(e.b.load(bool_, None, *flag, None, []))?;
+                    let new = ok(e.b.logical_or(bool_, None, old, when))?;
+                    e.store(*flag, new)
+                };
+                match block.terminator {
+                    Terminator::Jump(target) => mark(e, target, yes),
+                    Terminator::Branch(condition, taken, fallthrough) => {
+                        let condition = e.val(condition);
+                        let other = ok(e.b.logical_not(bool_, None, condition))?;
+                        mark(e, taken, condition)?;
+                        mark(e, fallthrough, other)
+                    }
+                    Terminator::End => Ok(()),
+                }
+            })?;
+        }
+        Ok(())
     }
 
     fn dispatch(
@@ -1088,7 +1165,7 @@ impl Emitter {
                 Terminator::Jump(target) => self.u32c(target as u32),
                 Terminator::End => self.u32c(END),
                 Terminator::Branch(condition, taken, fallthrough) => {
-                    let condition = self.values[condition as usize];
+                    let condition = self.val(condition);
                     let (taken, fallthrough) =
                         (self.u32c(taken as u32), self.u32c(fallthrough as u32));
                     let u32_ = self.t.u32_;
@@ -1160,25 +1237,18 @@ impl Emitter {
         if self.lanes == 32 {
             return Ok(low);
         }
-        let high = self.load(self.sgpr_var(EXEC + 1))?;
-        let (u32_, bool_) = (self.t.u32_, self.t.bool_);
-        let zero = self.u32c(0);
-        let upper = ok(self.b.i_not_equal(bool_, None, self.half, zero))?;
-        ok(self.b.select(u32_, None, upper, high, low))
-    }
-
-    fn exchange_slot(&mut self, index: Word) -> Result<Word, EmitError> {
-        let ptr = self.t.ptr_workgroup_u32;
-        let exchange = self.exchange;
-        let u32_ = self.t.u32_;
-        let index = ok(self.b.i_add(u32_, None, index, self.exchange_base))?;
-        ok(self.b.access_chain(ptr, None, exchange, [index]))
+        if self.part == 1 {
+            self.load(self.sgpr_var(EXEC + 1))
+        } else {
+            Ok(low)
+        }
     }
 
     fn begin(&mut self, label: Word) -> Result<(), EmitError> {
         ok(self.b.begin_block(Some(label)))?;
         self.label = label;
-        self.image_cache = None;
+        self.image_cache = [None, None];
+        self.active_cache = [None, None];
         Ok(())
     }
 
@@ -1308,33 +1378,47 @@ impl Emitter {
             };
             self.store(var, value)?;
         }
-        let vectors: Vec<(u8, Word)> = self.vgpr.iter().map(|(r, v)| (*r, *v)).collect();
-        for (reg, var) in vectors {
-            let value = if u32::from(reg) < options.thread_ids.min(3) {
-                ok(self
-                    .b
-                    .composite_extract(u32_, None, self.thread_ids, [u32::from(reg)]))?
-            } else {
-                self.u32c(0)
-            };
-            self.store(var, value)?;
+        let registers: Vec<u8> = self.vgpr.keys().copied().collect();
+        let [width, height, _] = options.group_size;
+        for part in self.parts() {
+            self.set_part(part);
+            let flat = self.thread_index;
+            let (width_c, height_c) = (self.u32c(width), self.u32c(height));
+            let plane = self.u32c(width * height);
+            let x = ok(self.b.u_mod(u32_, None, flat, width_c))?;
+            let row = ok(self.b.u_div(u32_, None, flat, width_c))?;
+            let y = ok(self.b.u_mod(u32_, None, row, height_c))?;
+            let z = ok(self.b.u_div(u32_, None, flat, plane))?;
+            for reg in &registers {
+                let value = match reg {
+                    0..=2 if u32::from(*reg) < options.thread_ids.min(3) => {
+                        [x, y, z][*reg as usize]
+                    }
+                    _ => self.u32c(0),
+                };
+                self.store(self.vgpr_var(*reg), value)?;
+            }
         }
         let no = self.boolc(false);
         self.store(self.scc, no)?;
         let zero = self.u32c(0);
         self.store(self.messages, zero)?;
-        for chunk in 0..self.lds_words.div_ceil(threads) {
-            let base = self.u32c(threads * chunk);
-            let index = ok(self.b.i_add(u32_, None, base, self.thread_index))?;
-            let limit = self.u32c(self.lds_words);
-            let bool_ = self.t.bool_;
-            let inside = ok(self.b.u_less_than(bool_, None, index, limit))?;
-            self.if_then(inside, |e| {
-                let ptr = e.lds_element(index)?;
-                let zero = e.u32c(0);
-                e.store(ptr, zero)
-            })?;
+        for part in self.parts() {
+            self.set_part(part);
+            for chunk in 0..self.lds_words.div_ceil(threads) {
+                let base = self.u32c(threads * chunk);
+                let index = ok(self.b.i_add(u32_, None, base, self.thread_index))?;
+                let limit = self.u32c(self.lds_words);
+                let bool_ = self.t.bool_;
+                let inside = ok(self.b.u_less_than(bool_, None, index, limit))?;
+                self.if_then(inside, |e| {
+                    let ptr = e.lds_element(index)?;
+                    let zero = e.u32c(0);
+                    e.store(ptr, zero)
+                })?;
+            }
         }
+        self.set_part(0);
         self.barrier()
     }
 
@@ -1369,14 +1453,22 @@ impl Emitter {
         Ok((low, high))
     }
 
+    /// Whether this lane is on in exec; reused within a block until a register write might change exec.
     fn active(&mut self) -> Result<Word, EmitError> {
+        if let Some((label, value)) = self.active_cache[self.part]
+            && label == self.label
+        {
+            return Ok(value);
+        }
         let exec = self.exec_word()?;
         let (u32_, bool_) = (self.t.u32_, self.t.bool_);
         let shifted = ok(self.b.shift_right_logical(u32_, None, exec, self.local))?;
         let one = self.u32c(1);
         let bit = ok(self.b.bitwise_and(u32_, None, shifted, one))?;
         let zero = self.u32c(0);
-        ok(self.b.i_not_equal(bool_, None, bit, zero))
+        let value = ok(self.b.i_not_equal(bool_, None, bit, zero))?;
+        self.active_cache[self.part] = Some((self.label, value));
+        Ok(value)
     }
 
     fn float(&mut self, value: Word) -> Result<Word, EmitError> {
@@ -1724,53 +1816,156 @@ impl Emitter {
         self.masked_shift(word, self.lds_words - 1)
     }
 
+    /// One statement; with lane pairs, per-lane work runs for part 0 and then part 1, in program order, and
+    /// wave-wide values come from both parts at once.
     fn stmt(&mut self, stmt: &Stmt) -> Result<(), EmitError> {
-        self.stmt_body(stmt)?;
-        let memory = match stmt {
-            Stmt::Store { .. } | Stmt::TypedStore { .. } | Stmt::ImageStore { .. } => true,
-            Stmt::Let(_, expr) => matches!(
-                expr,
-                Expr::Load { .. }
-                    | Expr::TypedLoad { .. }
-                    | Expr::ScalarLoad(_)
-                    | Expr::Atomic {
-                        space: shader_ir::Space::Memory,
-                        ..
-                    }
-            ),
+        if !self.pair {
+            return self.stmt_body(stmt);
+        }
+        let per_lane = match stmt {
+            Stmt::Let(tmp, expr) => {
+                if expr.wave_wide() {
+                    self.set_part(0);
+                    let id = self.pair_expr(expr)?;
+                    self.values[*tmp as usize] = id;
+                    self.values_hi[*tmp as usize] = id;
+                    return Ok(());
+                }
+                self.varying[*tmp as usize]
+            }
+            Stmt::SetLane(..)
+            | Stmt::SetRelative(..)
+            | Stmt::WriteLane(..)
+            | Stmt::LdsStore(..)
+            | Stmt::Store { .. }
+            | Stmt::TypedStore { .. }
+            | Stmt::ImageStore { .. }
+            | Stmt::Export { .. } => true,
             _ => false,
         };
-        if memory && self.lanes == 64 {
-            self.memory_barrier()?;
+        if per_lane {
+            for part in 0..2 {
+                self.set_part(part);
+                self.stmt_body(stmt)?;
+            }
+        } else {
+            self.set_part(0);
+            self.stmt_body(stmt)?;
+            if let Stmt::Let(tmp, _) = stmt {
+                self.values_hi[*tmp as usize] = self.values[*tmp as usize];
+            }
         }
+        self.set_part(0);
         Ok(())
     }
 
+    pub(super) fn set_part(&mut self, part: usize) {
+        self.part = part;
+        self.lane = self.lane_ids[part];
+        self.thread_index = self.thread_indexes[part];
+    }
+
+    /// A temporary's value in the current part.
+    pub(super) fn val(&self, tmp: u32) -> Word {
+        if self.part == 1 && self.varying[tmp as usize] {
+            self.values_hi[tmp as usize]
+        } else {
+            self.values[tmp as usize]
+        }
+    }
+
+    fn set_val(&mut self, tmp: u32, id: Word) {
+        if self.part == 1 {
+            self.values_hi[tmp as usize] = id;
+        } else {
+            self.values[tmp as usize] = id;
+        }
+    }
+
+    /// A temporary's value in both parts.
+    fn both(&self, tmp: u32) -> [Word; 2] {
+        let hi = if self.varying[tmp as usize] {
+            self.values_hi[tmp as usize]
+        } else {
+            self.values[tmp as usize]
+        };
+        [self.values[tmp as usize], hi]
+    }
+
+    pub(super) fn vgpr_var(&self, reg: u8) -> Word {
+        if self.part == 1 {
+            self.vgpr_hi[&reg]
+        } else {
+            self.vgpr[&reg]
+        }
+    }
+
+    /// Wave-wide values of a lane-pair wave, read from both parts of each invocation.
+    fn pair_expr(&mut self, expr: &Expr) -> Result<Word, EmitError> {
+        let (u32_, bool_) = (self.t.u32_, self.t.bool_);
+        let scope = self.u32c(3);
+        Ok(match expr {
+            Expr::Ballot(condition) => {
+                let conditions = self.both(*condition);
+                let mut words = [0; 2];
+                for part in 0..2 {
+                    self.set_part(part);
+                    let active = self.active()?;
+                    let both = ok(self.b.logical_and(bool_, None, conditions[part], active))?;
+                    let uvec4 = self.t.uvec4;
+                    let ballot = ok(self.b.group_non_uniform_ballot(uvec4, None, scope, both))?;
+                    words[part] = ok(self.b.composite_extract(u32_, None, ballot, [0]))?;
+                }
+                self.set_part(0);
+                self.pack(words[0], words[1])?
+            }
+            Expr::ReadLane(source, lane) => {
+                let target = self.masked_shift(self.val(*lane), 63)?;
+                let index = self.masked_shift(target, 31)?;
+                let sources = self.both(*source);
+                let mut values = [0; 2];
+                for (part, source) in sources.into_iter().enumerate() {
+                    values[part] = ok(self
+                        .b
+                        .group_non_uniform_shuffle(u32_, None, scope, source, index))?;
+                }
+                let thirty_two = self.u32c(32);
+                let upper = ok(self.b.u_greater_than_equal(bool_, None, target, thirty_two))?;
+                ok(self.b.select(u32_, None, upper, values[1], values[0]))?
+            }
+            _ => self.expr(expr)?,
+        })
+    }
+
     fn stmt_body(&mut self, stmt: &Stmt) -> Result<(), EmitError> {
-        let v = |e: &Self, t: &u32| e.values[*t as usize];
+        let v = |e: &Self, t: &u32| e.val(*t);
         match stmt {
             Stmt::Let(tmp, expr) => {
                 let id = self.expr(expr)?;
-                self.values[*tmp as usize] = id;
-                if self.lanes == 64 && matches!(expr, Expr::LdsLoad(_)) {
-                    self.barrier()?;
-                }
+                self.set_val(*tmp, id);
             }
+            Stmt::Barrier if self.pixel.is_some() || self.geometry.is_some() => {}
+            Stmt::Barrier if self.stage_lds.is_some() => {}
+            Stmt::Barrier => self.barrier()?,
             Stmt::Set(reg, tmp) => {
+                self.active_cache = [None, None];
                 let value = v(self, tmp);
                 match reg {
                     Reg::S(r) => self.store(self.sgpr_var(*r), value)?,
                     Reg::M0 => self.store(self.sgpr_var(M0), value)?,
-                    Reg::V(r) => self.store(self.vgpr[r], value)?,
+                    Reg::V(r) => self.store(self.vgpr_var(*r), value)?,
                     Reg::Exec => self.set_pair(EXEC, value)?,
                     Reg::Vcc => self.set_pair(VCC, value)?,
                     Reg::Scc => self.store(self.scc, value)?,
                 }
             }
-            Stmt::SetPair(reg, tmp) => self.set_pair(*reg, v(self, tmp))?,
+            Stmt::SetPair(reg, tmp) => {
+                self.active_cache = [None, None];
+                self.set_pair(*reg, v(self, tmp))?
+            }
             Stmt::SetLane(reg, tmp) => {
                 let active = self.active()?;
-                let var = self.vgpr[reg];
+                let var = self.vgpr_var(*reg);
                 let old = self.load(var)?;
                 let u32_ = self.t.u32_;
                 let value = ok(self.b.select(u32_, None, active, v(self, tmp), old))?;
@@ -1792,7 +1987,7 @@ impl Emitter {
                 ok(self.b.switch(at, merge, targets))?;
                 for (reg, label) in labels {
                     self.begin(label)?;
-                    let var = self.vgpr[&reg];
+                    let var = self.vgpr_var(reg);
                     let old = self.load(var)?;
                     let chosen = ok(self.b.select(u32_, None, active, new, old))?;
                     self.store(var, chosen)?;
@@ -1804,7 +1999,7 @@ impl Emitter {
                 let target = self.masked_shift(v(self, lane), self.lanes - 1)?;
                 let bool_ = self.t.bool_;
                 let hit = ok(self.b.i_equal(bool_, None, target, self.lane))?;
-                let var = self.vgpr[reg];
+                let var = self.vgpr_var(*reg);
                 let old = self.load(var)?;
                 let u32_ = self.t.u32_;
                 let new = ok(self.b.select(u32_, None, hit, v(self, value), old))?;
@@ -1816,12 +2011,12 @@ impl Emitter {
                 done,
                 compressed,
             } if self.pixel.is_some() => {
-                let values = values.map(|v| v.map(|t| self.values[t as usize]));
+                let values = values.map(|v| v.map(|t| self.val(t)));
                 self.pixel_export(*target, values, *done, *compressed)?;
             }
             Stmt::Message(..) | Stmt::FetchVertexInputs if self.pixel.is_some() => {}
             Stmt::Export { target, values, .. } if self.geometry.is_some() => {
-                let values = values.map(|v| v.map(|t| self.values[t as usize]));
+                let values = values.map(|v| v.map(|t| self.val(t)));
                 self.geometry_export(*target, values)?;
             }
             Stmt::Message(..) | Stmt::FetchVertexInputs if self.geometry.is_some() => {}
@@ -1856,10 +2051,8 @@ impl Emitter {
                 let active = self.active()?;
                 let values = *values;
                 let target = *target;
-                let resolved: Vec<Option<Word>> = values
-                    .iter()
-                    .map(|v| v.map(|t| self.values[t as usize]))
-                    .collect();
+                let resolved: Vec<Option<Word>> =
+                    values.iter().map(|v| v.map(|t| self.val(t))).collect();
                 self.if_then(active, |e| {
                     let exports = e.exports;
                     for (component, value) in resolved.iter().enumerate() {
@@ -1914,9 +2107,6 @@ impl Emitter {
                     let ptr = e.lds_element(index)?;
                     e.store(ptr, value)
                 })?;
-                if self.lanes == 64 {
-                    self.barrier()?;
-                }
             }
             Stmt::TypedStore {
                 format,
@@ -1962,7 +2152,7 @@ impl Emitter {
     }
 
     fn expr(&mut self, expr: &Expr) -> Result<Word, EmitError> {
-        let v = |e: &Self, t: &u32| e.values[*t as usize];
+        let v = |e: &Self, t: &u32| e.val(*t);
         let (u32_, u64_, bool_) = (self.t.u32_, self.t.u64_, self.t.bool_);
         Ok(match expr {
             Expr::Const(c) => self.u32c(*c),
@@ -1970,7 +2160,7 @@ impl Emitter {
             Expr::Get(reg) => match reg {
                 Reg::S(r) => self.load(self.sgpr_var(*r))?,
                 Reg::M0 => self.load(self.sgpr_var(M0))?,
-                Reg::V(r) => self.load(self.vgpr[r])?,
+                Reg::V(r) => self.load(self.vgpr_var(*r))?,
                 Reg::Exec => self.get_pair(EXEC)?,
                 Reg::Vcc => self.get_pair(VCC)?,
                 Reg::Scc => ok(self.b.load(bool_, None, self.scc, None, []))?,
@@ -2008,43 +2198,27 @@ impl Emitter {
                 let uvec4 = self.t.uvec4;
                 let ballot = ok(self.b.group_non_uniform_ballot(uvec4, None, scope, both))?;
                 let mine = ok(self.b.composite_extract(u32_, None, ballot, [0]))?;
-                if self.lanes == 32 {
-                    ok(self.b.u_convert(u64_, None, mine))?
-                } else {
-                    let zero = self.u32c(0);
-                    let first = ok(self.b.i_equal(bool_, None, self.local, zero))?;
-                    let half = self.half;
-                    self.if_then(first, |e| {
-                        let slot = e.exchange_slot(half)?;
-                        e.store(slot, mine)
-                    })?;
-                    self.barrier()?;
-                    let one = self.u32c(1);
-                    let low = self.exchange_slot(zero)?;
-                    let low = self.load(low)?;
-                    let high = self.exchange_slot(one)?;
-                    let high = self.load(high)?;
-                    self.barrier()?;
-                    self.pack(low, high)?
-                }
+                ok(self.b.u_convert(u64_, None, mine))?
             }
             Expr::Shuffle(source, lane) => {
                 let lane = self.masked_shift(v(self, lane), self.lanes - 1)?;
-                let source = v(self, source);
-                if self.lanes == 32 {
-                    let scope = self.u32c(3);
+                let scope = self.u32c(3);
+                if self.pair {
+                    let index = self.masked_shift(lane, 31)?;
+                    let mut values = [0; 2];
+                    for (part, source) in self.both(*source).into_iter().enumerate() {
+                        values[part] = ok(self
+                            .b
+                            .group_non_uniform_shuffle(u32_, None, scope, source, index))?;
+                    }
+                    let thirty_two = self.u32c(32);
+                    let upper = ok(self.b.u_greater_than_equal(bool_, None, lane, thirty_two))?;
+                    ok(self.b.select(u32_, None, upper, values[1], values[0]))?
+                } else {
+                    let source = v(self, source);
                     ok(self
                         .b
                         .group_non_uniform_shuffle(u32_, None, scope, source, lane))?
-                } else {
-                    let mine = self.lane;
-                    let slot = self.exchange_slot(mine)?;
-                    self.store(slot, source)?;
-                    self.barrier()?;
-                    let slot = self.exchange_slot(lane)?;
-                    let value = self.load(slot)?;
-                    self.barrier()?;
-                    value
                 }
             }
             Expr::GetRelative(base, index) => {
@@ -2054,33 +2228,18 @@ impl Emitter {
                 let inside = ok(self.b.u_less_than(bool_, None, at, limit))?;
                 let zero = self.u32c(0);
                 let at = ok(self.b.select(u32_, None, inside, at, zero))?;
-                let first = self.vgpr[&0];
+                let first = self.vgpr_var(0);
                 let mut value = self.load(first)?;
                 for reg in *base..=255u8 {
                     if reg == 0 {
                         continue;
                     }
-                    let candidate = self.vgpr[&reg];
+                    let candidate = self.vgpr_var(reg);
                     let candidate = self.load(candidate)?;
                     let number = self.u32c(u32::from(reg));
                     let hit = ok(self.b.i_equal(bool_, None, at, number))?;
                     value = ok(self.b.select(u32_, None, hit, candidate, value))?;
                 }
-                value
-            }
-            Expr::ReadLane(source, lane) if self.lanes == 64 => {
-                let target = self.masked_shift(v(self, lane), 63)?;
-                let hit = ok(self.b.i_equal(bool_, None, target, self.lane))?;
-                let source = v(self, source);
-                let zero = self.u32c(0);
-                self.if_then(hit, |e| {
-                    let slot = e.exchange_slot(zero)?;
-                    e.store(slot, source)
-                })?;
-                self.barrier()?;
-                let slot = self.exchange_slot(zero)?;
-                let value = self.load(slot)?;
-                self.barrier()?;
                 value
             }
             Expr::ReadLane(source, lane) => {

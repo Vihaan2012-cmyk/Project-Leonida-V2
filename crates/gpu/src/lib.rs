@@ -5,6 +5,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ash::vk;
 
+mod check;
+
+pub use check::{BindingKind, Check};
+
 #[derive(Debug, thiserror::Error)]
 pub enum GpuError {
     #[error("the Vulkan loader could not be opened: {0}")]
@@ -189,6 +193,7 @@ pub struct Target {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VertexFormat {
     Float32x4,
+    Sint32x4,
     Float32x3,
     Float32x2,
     Uint32x4,
@@ -202,6 +207,7 @@ impl VertexFormat {
             VertexFormat::Float32x3 => vk::Format::R32G32B32_SFLOAT,
             VertexFormat::Float32x2 => vk::Format::R32G32_SFLOAT,
             VertexFormat::Uint32x4 => vk::Format::R32G32B32A32_UINT,
+            VertexFormat::Sint32x4 => vk::Format::R32G32B32A32_SINT,
             VertexFormat::Unorm8x4 => vk::Format::R8G8B8A8_UNORM,
         }
     }
@@ -348,7 +354,8 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
         let float64 = features.features.shader_float64 == vk::TRUE;
         let write_without_format =
             features.features.shader_storage_image_write_without_format == vk::TRUE;
-        let fragment_stores = features.features.fragment_stores_and_atomics == vk::TRUE;
+        let fragment_stores = features.features.fragment_stores_and_atomics == vk::TRUE
+            && features.features.vertex_pipeline_stores_and_atomics == vk::TRUE;
         let geometry_shaders = features.features.geometry_shader == vk::TRUE;
         let min_lod = features.features.shader_resource_min_lod == vk::TRUE;
         let gather_extended = features.features.shader_image_gather_extended == vk::TRUE;
@@ -501,6 +508,7 @@ impl Gpu {
                 .shader_resource_min_lod(chosen.info.min_lod)
                 .shader_image_gather_extended(chosen.info.gather_extended)
                 .fragment_stores_and_atomics(chosen.info.pixel_shaders)
+                .vertex_pipeline_stores_and_atomics(chosen.info.pixel_shaders)
                 .geometry_shader(chosen.info.geometry_shaders);
             let mut atomics64 = vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT::default()
                 .shader_image_int64_atomics(true);
@@ -788,36 +796,7 @@ impl Gpu {
                     subgroup_size,
                     ..
                 } => {
-                    scratch.module = device.create_shader_module(
-                        &vk::ShaderModuleCreateInfo::default().code(spirv),
-                        None,
-                    )?;
-                    let mut required =
-                        vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
-                            .required_subgroup_size(
-                                subgroup_size.unwrap_or(self.info.subgroup_size),
-                            );
-                    let mut stage = vk::PipelineShaderStageCreateInfo::default()
-                        .stage(vk::ShaderStageFlags::COMPUTE)
-                        .module(scratch.module)
-                        .name(c"main");
-                    if let Some(size) = *subgroup_size
-                        && self.info.subgroup_size_control
-                        && (self.info.min_subgroup_size..=self.info.max_subgroup_size)
-                            .contains(&size)
-                    {
-                        stage = stage.push_next(&mut required);
-                        if self.info.full_subgroups {
-                            stage = stage
-                                .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
-                        }
-                    }
-                    let create = vk::ComputePipelineCreateInfo::default()
-                        .stage(stage)
-                        .layout(scratch.pipeline_layout);
-                    scratch.pipeline = device
-                        .create_compute_pipelines(vk::PipelineCache::null(), &[create], None)
-                        .map_err(|(_, error)| error)?[0];
+                    self.compute_pipeline(&mut scratch, spirv, *subgroup_size)?;
                 }
                 Work::Draw {
                     first,
@@ -1107,6 +1086,46 @@ impl Gpu {
     ///
     /// # Safety
     /// `scratch` must belong to `self.device`.
+    /// Builds `scratch.pipeline` from a compute shader, asking for `subgroup_size` lanes when the device can.
+    ///
+    /// # Safety
+    /// `scratch` belongs to this device and its pipeline layout is set.
+    unsafe fn compute_pipeline(
+        &self,
+        scratch: &mut Scratch<'_>,
+        spirv: &[u32],
+        subgroup_size: Option<u32>,
+    ) -> Result<(), GpuError> {
+        let device = &self.device;
+        // SAFETY: as this function's; the module goes into `scratch`.
+        unsafe {
+            scratch.module = device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spirv), None)?;
+            let mut required = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                .required_subgroup_size(subgroup_size.unwrap_or(self.info.subgroup_size));
+            let mut stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(scratch.module)
+                .name(c"main");
+            if let Some(size) = subgroup_size
+                && self.info.subgroup_size_control
+                && (self.info.min_subgroup_size..=self.info.max_subgroup_size).contains(&size)
+            {
+                stage = stage.push_next(&mut required);
+                if self.info.full_subgroups {
+                    stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
+                }
+            }
+            let create = vk::ComputePipelineCreateInfo::default()
+                .stage(stage)
+                .layout(scratch.pipeline_layout);
+            scratch.pipeline = device
+                .create_compute_pipelines(vk::PipelineCache::null(), &[create], None)
+                .map_err(|(_, error)| error)?[0];
+        }
+        Ok(())
+    }
+
     unsafe fn attachment(
         &self,
         scratch: &mut Scratch<'_>,
@@ -1765,6 +1784,8 @@ struct Scratch<'a> {
     pool: vk::DescriptorPool,
     command_pool: vk::CommandPool,
     fence: vk::Fence,
+    /// Whether dropping waits for the device first, as it must once work was submitted.
+    wait: bool,
 }
 
 impl<'a> Scratch<'a> {
@@ -1787,6 +1808,7 @@ impl<'a> Scratch<'a> {
             pool: vk::DescriptorPool::null(),
             command_pool: vk::CommandPool::null(),
             fence: vk::Fence::null(),
+            wait: true,
         }
     }
 }
@@ -1796,7 +1818,9 @@ impl Drop for Scratch<'_> {
         // SAFETY: the handles were created from `self.device`; null handles are ignored by Vulkan.
         unsafe {
             let d = self.device;
-            let _ = d.device_wait_idle();
+            if self.wait {
+                let _ = d.device_wait_idle();
+            }
             d.destroy_fence(self.fence, None);
             d.destroy_command_pool(self.command_pool, None);
             d.destroy_descriptor_pool(self.pool, None);

@@ -519,6 +519,7 @@ dependencies = [
  "decompile",
  "embed-manifest",
  "game-package",
+ "gpu",
  "iced-x86",
  "leonida-ui",
  "offline",

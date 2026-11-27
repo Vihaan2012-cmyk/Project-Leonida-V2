@@ -46,14 +46,15 @@ impl Emitter {
         Ok(())
     }
 
+    /// The current part's VGPRs: `preload`'s values, zero elsewhere.
     pub(super) fn preload_vgprs(&mut self, preload: &BTreeMap<u8, Word>) -> Result<(), EmitError> {
-        let vectors: Vec<(u8, Word)> = self.vgpr.iter().map(|(r, v)| (*r, *v)).collect();
-        for (reg, var) in vectors {
+        let registers: Vec<u8> = self.vgpr.keys().copied().collect();
+        for reg in registers {
             let value = match preload.get(&reg) {
                 Some(value) => *value,
                 None => self.u32c(0),
             };
-            self.store(var, value)?;
+            self.store(self.vgpr_var(reg), value)?;
         }
         let no = self.boolc(false);
         self.store(self.scc, no)?;
@@ -211,7 +212,6 @@ impl Emitter {
         let group = ok(self.b.i_add(u32_, None, group, plane))?;
         let size = self.u32c(options.group_size);
         let first = ok(self.b.i_mul(u32_, None, group, size))?;
-        let dispatch = ok(self.b.i_add(u32_, None, first, self.thread_index))?;
         let lanes = self.u32c(self.lanes);
         let wave = ok(self.b.u_div(u32_, None, self.thread_index, lanes))?;
         let twenty_four = self.u32c(24);
@@ -231,34 +231,42 @@ impl Emitter {
             self.store(var, value)?;
         }
         let threads = options.group_size;
-        for chunk in 0..self.lds_words.div_ceil(threads) {
-            let base = self.u32c(threads * chunk);
-            let index = ok(self.b.i_add(u32_, None, base, self.thread_index))?;
-            let limit = self.u32c(self.lds_words);
-            let inside = ok(self.b.u_less_than(bool_, None, index, limit))?;
-            self.if_then(inside, |e| {
-                let ptr = e.lds_element(index)?;
-                let zero = e.u32c(0);
-                e.store(ptr, zero)
-            })?;
+        for part in self.parts() {
+            self.set_part(part);
+            for chunk in 0..self.lds_words.div_ceil(threads) {
+                let base = self.u32c(threads * chunk);
+                let index = ok(self.b.i_add(u32_, None, base, self.thread_index))?;
+                let limit = self.u32c(self.lds_words);
+                let inside = ok(self.b.u_less_than(bool_, None, index, limit))?;
+                self.if_then(inside, |e| {
+                    let ptr = e.lds_element(index)?;
+                    let zero = e.u32c(0);
+                    e.store(ptr, zero)
+                })?;
+            }
         }
+        self.set_part(0);
         ok(self.b.set_mesh_outputs_ext(vertices, primitives))?;
         let ptr_bool = self.b.type_pointer(None, StorageClass::Output, bool_);
         let ptr_uvec3 = self.b.type_pointer(None, StorageClass::Output, uvec3);
-        for chunk in 0..options.max_primitives.div_ceil(threads) {
-            let base = self.u32c(threads * chunk);
-            let slot = ok(self.b.i_add(u32_, None, base, self.thread_index))?;
-            let inside = ok(self.b.u_less_than(bool_, None, slot, primitives))?;
-            self.if_then(inside, |e| {
-                let ptr = ok(e.b.access_chain(ptr_bool, None, cull, [slot]))?;
-                let yes = e.boolc(true);
-                e.store(ptr, yes)?;
-                let zero = e.u32c(0);
-                let none = ok(e.b.composite_construct(uvec3, None, [zero; 3]))?;
-                let ptr = ok(e.b.access_chain(ptr_uvec3, None, indices, [slot]))?;
-                ok(e.b.store(ptr, none, None, []))
-            })?;
+        for part in self.parts() {
+            self.set_part(part);
+            for chunk in 0..options.max_primitives.div_ceil(threads) {
+                let base = self.u32c(threads * chunk);
+                let slot = ok(self.b.i_add(u32_, None, base, self.thread_index))?;
+                let inside = ok(self.b.u_less_than(bool_, None, slot, primitives))?;
+                self.if_then(inside, |e| {
+                    let ptr = ok(e.b.access_chain(ptr_bool, None, cull, [slot]))?;
+                    let yes = e.boolc(true);
+                    e.store(ptr, yes)?;
+                    let zero = e.u32c(0);
+                    let none = ok(e.b.composite_construct(uvec3, None, [zero; 3]))?;
+                    let ptr = ok(e.b.access_chain(ptr_uvec3, None, indices, [slot]))?;
+                    ok(e.b.store(ptr, none, None, []))
+                })?;
+            }
         }
+        self.set_part(0);
         self.barrier()?;
         self.geometry = Some(GeometryState {
             mesh: Some(options),
@@ -268,8 +276,14 @@ impl Emitter {
             indices,
             cull,
         });
-        let preload = BTreeMap::from([(5, dispatch)]);
-        self.preload_vgprs(&preload)
+        for part in self.parts() {
+            self.set_part(part);
+            let dispatch = ok(self.b.i_add(u32_, None, first, self.thread_index))?;
+            let preload = BTreeMap::from([(5, dispatch)]);
+            self.preload_vgprs(&preload)?;
+        }
+        self.set_part(0);
+        Ok(())
     }
 
     fn parameter(&mut self, number: u8) -> Word {

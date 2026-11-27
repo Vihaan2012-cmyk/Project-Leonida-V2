@@ -975,7 +975,6 @@ impl Lifter {
             base,
             "s_nop"
                 | "s_waitcnt"
-                | "s_barrier"
                 | "v_nop"
                 | "s_waitcnt_vscnt"
                 | "s_clause"
@@ -984,6 +983,10 @@ impl Lifter {
                 | "s_sleep"
                 | "s_setprio"
         ) {
+            return Ok(());
+        }
+        if base == "s_barrier" {
+            self.stmts.push(Stmt::Barrier);
             return Ok(());
         }
         if base.starts_with("s_setreg") {

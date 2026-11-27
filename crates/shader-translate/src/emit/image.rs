@@ -108,6 +108,9 @@ impl Emitter {
         let block = self.storage_block();
         let tables = [images::TEXTURE_TABLE, images::SAMPLER_TABLE]
             .map(|binding| self.global(block, StorageClass::StorageBuffer, binding));
+        for table in tables {
+            self.b.decorate(table, Decoration::NonWritable, []);
+        }
         let types = ImageTypes {
             i32_,
             floats,
@@ -236,23 +239,15 @@ impl Emitter {
         let wide = image.data.len() == 2;
         let view = View::of(image.dim);
         let (index, _) = self.texture_slot(image)?;
-        let coordinates: Vec<Word> = image
-            .coordinates
-            .iter()
-            .map(|t| self.values[*t as usize])
-            .collect();
+        let coordinates: Vec<Word> = image.coordinates.iter().map(|t| self.val(*t)).collect();
         let coordinates = self.load_coordinates(image.dim, &coordinates)?;
-        let words: Vec<Word> = image
-            .data
-            .iter()
-            .map(|t| self.values[*t as usize])
-            .collect();
+        let words: Vec<Word> = image.data.iter().map(|t| self.val(*t)).collect();
         let value = if wide {
             self.pack(words[0], words[1])?
         } else {
             words[0]
         };
-        let compare = image.compare.map(|t| self.values[t as usize]);
+        let compare = image.compare.map(|t| self.val(t));
         let ty = if wide { u64_ } else { u32_ };
         let active = self.active()?;
         let before = self.label;
@@ -418,24 +413,20 @@ impl Emitter {
 
     pub(super) fn image(&mut self, image: &Image) -> Result<Word, EmitError> {
         let component = usize::from(image.component);
-        if let Some((cached, words)) = &self.image_cache
+        if let Some((cached, words)) = &self.image_cache[self.part]
             && cached.same_instruction(image)
         {
             return Ok(words[component]);
         }
         let words = self.image_words(image)?;
-        self.image_cache = Some((image.clone(), words));
+        self.image_cache[self.part] = Some((image.clone(), words));
         Ok(words[component])
     }
 
     /// The bindless index and number type registered for the instruction's T#.
     fn texture_slot(&mut self, image: &Image) -> Result<(Word, Word), EmitError> {
         let u32_ = self.t.u32_;
-        let key: Vec<Word> = image
-            .resource
-            .iter()
-            .map(|t| self.values[*t as usize])
-            .collect();
+        let key: Vec<Word> = image.resource.iter().map(|t| self.val(*t)).collect();
         let lookup = self.lookup_function(0);
         let entry = ok(self.b.function_call(u32_, None, lookup, key))?;
         let mask = self.u32c(images::SLOT_MASK);
@@ -451,7 +442,7 @@ impl Emitter {
         let zero = self.u32c(0);
         let key: Vec<Word> = words
             .iter()
-            .map(|t| self.values[*t as usize])
+            .map(|t| self.val(*t))
             .chain([zero; 4])
             .collect();
         let lookup = self.lookup_function(1);
@@ -537,11 +528,7 @@ impl Emitter {
             Some(words) => Some(self.sampler_handle(words, image.compare.is_some())?),
             None => None,
         };
-        let values: Vec<Word> = image
-            .coordinates
-            .iter()
-            .map(|t| self.values[*t as usize])
-            .collect();
+        let values: Vec<Word> = image.coordinates.iter().map(|t| self.val(*t)).collect();
         let coordinates = match image.op {
             ImageOp::Size => 0,
             _ if sampled => self.sample_coordinates(image.dim, &values)?,
@@ -571,7 +558,7 @@ impl Emitter {
         let types = self.image_types();
         let f32_ = self.t.f32_;
         let float = |e: &mut Self, t: Option<u32>| -> Result<Option<Word>, EmitError> {
-            t.map(|t| e.float(e.values[t as usize])).transpose()
+            t.map(|t| e.float(e.val(t))).transpose()
         };
         let compare = float(self, image.compare)?;
         let clamp = float(self, image.clamp)?;
@@ -584,7 +571,7 @@ impl Emitter {
             for direction in image.gradients.chunks(each) {
                 let mut parts = Vec::new();
                 for t in direction {
-                    parts.push(self.float(self.values[*t as usize])?);
+                    parts.push(self.float(self.val(*t))?);
                 }
                 let zero = self.f32c(0.0);
                 parts.resize(spatial, zero);
@@ -604,7 +591,7 @@ impl Emitter {
         let gather = matches!(image.op, ImageOp::Gather { .. });
         let offset = match image.offset {
             Some(t) if !gather => {
-                let word = self.values[t as usize];
+                let word = self.val(t);
                 let packed = self
                     .constants
                     .iter()
@@ -622,7 +609,7 @@ impl Emitter {
                 Some(self.b.constant_composite(types.ints[2], parts))
             }
             Some(t) => {
-                let packed = self.values[t as usize];
+                let packed = self.val(t);
                 let u32_ = self.t.u32_;
                 let mut parts = Vec::new();
                 for shift in [26, 18] {
@@ -687,7 +674,7 @@ impl Emitter {
         if image.op == ImageOp::SampleBias
             && let Some(bias) = image.lod
         {
-            let bias = self.float(self.values[bias as usize])?;
+            let bias = self.float(self.val(bias))?;
             let scale = self.glsl(f32_, GLOp::Exp2, &[bias])?;
             dx = ok(self.b.vector_times_scalar(ty, None, dx, scale))?;
             dy = ok(self.b.vector_times_scalar(ty, None, dy, scale))?;
@@ -717,7 +704,7 @@ impl Emitter {
             Number::Uint => self.t.uvec4,
             Number::Sint => types.ints[4],
         };
-        let lod = image.lod.map(|t| self.values[t as usize]);
+        let lod = image.lod.map(|t| self.val(t));
         if image.op == ImageOp::Size {
             return self.size_query(image.dim, view, texture, lod);
         }
@@ -865,7 +852,7 @@ impl Emitter {
                     }
                     (ImageOp::Gather { channel }, None) if lod.is_some() => {
                         let words = image.sampler.expect("gathers are sampled");
-                        let modes = self.values[words[0] as usize];
+                        let modes = self.val(words[0]);
                         let level = self.float(lod.expect("checked by the guard"))?;
                         self.gather_at_level(
                             view,
@@ -1118,16 +1105,12 @@ impl Emitter {
         let u32_ = self.t.u32_;
         let view = View::of(image.dim);
         let (index, number) = self.texture_slot(image)?;
-        let coordinates: Vec<Word> = image
-            .coordinates
-            .iter()
-            .map(|t| self.values[*t as usize])
-            .collect();
+        let coordinates: Vec<Word> = image.coordinates.iter().map(|t| self.val(*t)).collect();
         let coordinates = self.load_coordinates(image.dim, &coordinates)?;
         let zero = self.u32c(0);
         let words: Vec<Word> = values
             .iter()
-            .map(|v| v.map_or(zero, |t| self.values[t as usize]))
+            .map(|v| v.map_or(zero, |t| self.val(t)))
             .collect();
         self.per_number(number, |e, number| {
             let ids = e.view(view, number, true);

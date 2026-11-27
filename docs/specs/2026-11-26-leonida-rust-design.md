@@ -266,13 +266,25 @@ Unsupported instructions are errors carrying the instruction address, never gues
 
 ### 4.3 Wave64 on 32-wide GPUs
 
-- **Compute and mesh**: exact. Each logical 64-lane wave runs as two 32-lane subgroups that synchronize through
-  workgroup memory for cross-lane operations (ballot, readlane, permutes, DPP, reductions).
+- **Compute and mesh**: exact. Each logical 64-lane wave runs as one 32-lane subgroup whose invocations carry two
+  lanes each: lane L in part 0 and lane L + 32 in part 1. Per-lane work runs for part 0 then part 1, in program
+  order, so memory needs no extra synchronization; ballots, lane reads and permutes read both parts of every
+  invocation through ordinary subgroup operations. `s_barrier` is a work-group barrier, so waves of one group
+  share LDS correctly.
 - **Vertex, pixel, geometry**: the stage cannot control which invocations share a subgroup, so an analysis proves,
   per operation, whether a cross-lane op can cross the 32-lane boundary. Quad operations and wave-uniform values
   never do. Each shader gets an **exactness label**: `exact` or `approximate(<reasons>)`.
 - On 64-wide hardware (AMD) the lowering is skipped and wave64 runs natively.
 - Exactness labels are stored and reported; approximate shaders are known, never hidden.
+
+**Control flow.** A program whose branches all go forward (every mesh shader in the game, and most others) runs
+its blocks in order, each guarded by a flag its predecessors set; drivers compile this several times faster than
+the general form, a loop over a switch on the current block, which programs with backward branches still use.
+
+**Checking against the driver.** `leonida shaders verify` translates every shader and has the graphics driver build
+each into a pipeline: compute shaders alone, pixel shaders after a vertex shader writing every parameter, vertex and
+mesh shaders before a fragment shader that does nothing, geometry shaders after a first half writing items of their
+size. With `LEONIDA_VALIDATION=1` the Vulkan layers also check the SPIR-V.
 
 ### 4.4 Storage
 

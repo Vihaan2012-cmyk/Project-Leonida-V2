@@ -2,7 +2,9 @@ mod cli;
 mod cmd_check;
 mod cmd_exe;
 mod cmd_shaders;
+mod cmd_verify;
 mod game;
+mod shader_build;
 
 use std::process::ExitCode;
 
@@ -21,6 +23,7 @@ fn main() -> ExitCode {
             ShadersCommand::Scan(args) => cmd_shaders::scan_command(args),
             ShadersCommand::Disasm(args) => cmd_shaders::disasm_command(args),
             ShadersCommand::Report(args) => cmd_shaders::report_command(args),
+            ShadersCommand::Verify(args) => cmd_verify::verify_command(args),
         },
         Some(Command::Exe(exe)) => cmd_exe::exe_command(exe),
         Some(Command::Check(args)) => cmd_check::check_command(args),
