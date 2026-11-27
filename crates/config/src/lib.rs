@@ -9,6 +9,7 @@ pub mod graphics;
 pub mod input;
 pub mod mods;
 mod sampler;
+pub mod save;
 pub mod upscaling;
 pub mod widescreen;
 
@@ -156,6 +157,14 @@ pub trait Section: Serialize + DeserializeOwned + Default + PartialEq {
     fn to_text(&self) -> String {
         toml::to_string_pretty(self).unwrap_or_default()
     }
+
+    /// Writes the settings to `dir/FILE`, changing only the values that differ and keeping the file's comments.
+    fn save(&self, dir: &Path) -> Result<(), ConfigError>
+    where
+        Self: Sized,
+    {
+        save::save(self, dir)
+    }
 }
 
 /// Every settings file, read together.
@@ -193,6 +202,17 @@ impl Config {
             widescreen: Widescreen::load(dir)?,
             upscaling: Upscaling::load(dir)?,
         })
+    }
+
+    /// Writes every file into `dir`, keeping the comments in the ones that exist.
+    pub fn save(&self, dir: &Path) -> Result<(), ConfigError> {
+        self.general.save(dir)?;
+        self.graphics.save(dir)?;
+        self.input.save(dir)?;
+        self.mods.save(dir)?;
+        self.display.save(dir)?;
+        self.widescreen.save(dir)?;
+        self.upscaling.save(dir)
     }
 
     /// Replaces the named files (all of them when `only` is empty) with the documented defaults.
