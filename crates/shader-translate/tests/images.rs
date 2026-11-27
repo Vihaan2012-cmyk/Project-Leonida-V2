@@ -832,6 +832,71 @@ image_sample_lz_o v[4:7], v[9:11], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D"
 type StoreCase = (&'static str, usize, Box<dyn Fn(u32, u32) -> Texel>);
 
 #[test]
+fn gathers_at_a_level_address_the_footprint_like_the_sampler() {
+    let Some(gpu) = image_gpu() else { return };
+    let scene = scene();
+    let t = |i: usize| &scene.textures[i];
+    let red = move |mip: usize, x: u32, y: u32| texel(t(0), mip, x, y, 0)[0];
+    let gather = "image_gather4_l v[4:7], v[10:12], s[0:7], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_2D";
+    let shifted = "v_mov_b32_e32 v9, 1
+         image_gather4_l_o v[4:7], v[9:12], s[0:7], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_2D";
+    let footprint = move |mip: usize, x: [u32; 2], y: [u32; 2]| {
+        [
+            red(mip, x[0], y[1]),
+            red(mip, x[1], y[1]),
+            red(mip, x[1], y[0]),
+            red(mip, x[0], y[0]),
+        ]
+    };
+    let cases = [
+        (
+            "level_one",
+            gather,
+            [0.5, 0.5, 1.0],
+            footprint(1, [0, 1], [0, 1]),
+        ),
+        (
+            "level_rounds_down",
+            gather,
+            [0.5, 0.5, 0.4],
+            footprint(0, [1, 2], [1, 2]),
+        ),
+        (
+            "offset",
+            shifted,
+            [0.5, 0.5, 0.0],
+            footprint(0, [2, 3], [1, 2]),
+        ),
+        (
+            "clamped_edge",
+            gather,
+            [0.5, 0.0, 0.0],
+            footprint(0, [1, 2], [0, 0]),
+        ),
+        (
+            "wrapped_edge",
+            gather,
+            [0.0, 0.5, 0.0],
+            footprint(0, [3, 0], [1, 2]),
+        ),
+    ];
+    for (name, instruction, [u, v, level], expect) in cases {
+        let instruction = format!("{CLEAR}{instruction}");
+        let case = Case {
+            name,
+            instruction: &instruction,
+            texture: t(0).descriptor,
+            sampler: scene.nearest,
+            input: four(move |_| [f(u), f(v), f(level), 0]),
+            expect: Box::new(move |_| expect),
+        };
+        for wave64 in [false, true] {
+            run(&gpu, &scene, &case, wave64);
+        }
+    }
+}
+
+#[test]
 fn compute_shaders_take_implicit_derivatives_from_quads() {
     let Some(gpu) = image_gpu() else { return };
     if !gpu.info.quad_operations {

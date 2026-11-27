@@ -207,7 +207,10 @@ to the third vertically, with a bias scaling both by 2^bias, then samples with t
 the exiting-wave ID until the waves they overlap have finished. The translator runs the whole fragment entry inside a
 pixel interlock instead: the packer write does nothing, the exiting-wave ID reads as zero, and with no overlap
 reported in the input SGPRs the wait is skipped. Sample offsets must be constants the same block wrote to the address
-register, since Vulkan only takes computed offsets on gathers.
+register, since Vulkan only takes computed offsets on gathers. Vulkan has no gather at an explicit level either: the
+translator picks the mip nearest the level, finds the footprint's four texels, brings each inside the mip by the
+sampler's addressing mode (wrap, mirror, mirror once, otherwise clamp to the edge, border colours included) and
+fetches them.
 
 **Images and samplers.** A shader names a texture by its 8-word T# and a sampler by its 4-word S#, both in SGPRs.
 The runtime registers every texture and sampler it creates in two lookup tables, and the shader finds the bindless

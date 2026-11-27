@@ -3584,9 +3584,12 @@ fn image_form(name: &str, dmask: u32) -> Option<ImageForm> {
         }
     }
     form.op = match (gather, level) {
-        (true, None | Some("lz")) if dmask.count_ones() == 1 && !form.clamp => ImageOp::Gather {
-            channel: dmask.trailing_zeros() as u8,
-        },
+        (true, None | Some("lz") | Some("l")) if dmask.count_ones() == 1 && !form.clamp => {
+            form.lod = level == Some("l");
+            ImageOp::Gather {
+                channel: dmask.trailing_zeros() as u8,
+            }
+        }
         (true, _) => return None,
         (false, None) => ImageOp::Sample,
         (false, Some("b")) => {

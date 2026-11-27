@@ -858,6 +858,26 @@ impl Emitter {
                         };
                         ok(self.b.composite_construct(vec4, None, [scalar; 4]))?
                     }
+                    (ImageOp::Gather { .. }, None)
+                        if lod.is_some() && image.dim == ImageDim::Cube =>
+                    {
+                        return Err(EmitError::Unsupported("gathers from cube maps at a level"));
+                    }
+                    (ImageOp::Gather { channel }, None) if lod.is_some() => {
+                        let words = image.sampler.expect("gathers are sampled");
+                        let modes = self.values[words[0] as usize];
+                        let level = self.float(lod.expect("checked by the guard"))?;
+                        self.gather_at_level(
+                            view,
+                            vec4,
+                            texture,
+                            coordinates,
+                            level,
+                            channel,
+                            modes,
+                            extras.offset,
+                        )?
+                    }
                     (ImageOp::Gather { channel }, None) => {
                         let channel = self.u32c(u32::from(channel));
                         ok(self.b.image_gather(
@@ -912,6 +932,131 @@ impl Emitter {
             });
         }
         ok(self.b.composite_construct(self.t.uvec4, None, halves))
+    }
+
+    /// A gather at an explicit level, which Vulkan has no instruction for: the mip nearest the level, the
+    /// footprint's four texels addressed by the sampler's wrap, mirror or clamp modes, then fetched.
+    #[allow(clippy::too_many_arguments)]
+    fn gather_at_level(
+        &mut self,
+        view: View,
+        vec4: Word,
+        texture: Word,
+        coordinates: Word,
+        level: Word,
+        channel: u8,
+        modes: Word,
+        offset: Option<Word>,
+    ) -> Result<Word, EmitError> {
+        let types = self.image_types();
+        let (u32_, f32_, i32_) = (self.t.u32_, self.t.f32_, types.i32_);
+        let half = self.f32c(0.5);
+        let raised = ok(self.b.f_add(f32_, None, level, half))?;
+        let nearest = self.glsl(f32_, GLOp::Floor, &[raised])?;
+        let nearest = ok(self.b.convert_f_to_s(i32_, None, nearest))?;
+        let levels = ok(self.b.image_query_levels(i32_, None, texture))?;
+        let (zero, one) = (self.i32c(0), self.i32c(1));
+        let last = ok(self.b.i_sub(i32_, None, levels, one))?;
+        let mip = self.glsl(i32_, GLOp::SClamp, &[nearest, zero, last])?;
+        let count = if view == View::D2 { 2 } else { 3 };
+        let size = ok(self
+            .b
+            .image_query_size_lod(types.ints[count], None, texture, mip))?;
+        let mut axes = Vec::new();
+        for axis in 0..2u32 {
+            let extent = ok(self.b.composite_extract(i32_, None, size, [axis]))?;
+            let coordinate = ok(self.b.composite_extract(f32_, None, coordinates, [axis]))?;
+            let scale = ok(self.b.convert_s_to_f(f32_, None, extent))?;
+            let texel = ok(self.b.f_mul(f32_, None, coordinate, scale))?;
+            let texel = ok(self.b.f_sub(f32_, None, texel, half))?;
+            let texel = self.glsl(f32_, GLOp::Floor, &[texel])?;
+            let mut first = ok(self.b.convert_f_to_s(i32_, None, texel))?;
+            if let Some(offset) = offset {
+                let shift = ok(self.b.composite_extract(i32_, None, offset, [axis]))?;
+                first = ok(self.b.i_add(i32_, None, first, shift))?;
+            }
+            let second = ok(self.b.i_add(i32_, None, first, one))?;
+            let shift = self.u32c(3 * axis);
+            let mode = ok(self.b.shift_right_logical(u32_, None, modes, shift))?;
+            let seven = self.u32c(7);
+            let mode = ok(self.b.bitwise_and(u32_, None, mode, seven))?;
+            let mut pair = Vec::new();
+            for texel in [first, second] {
+                pair.push(self.address_texel(texel, extent, mode)?);
+            }
+            axes.push(pair);
+        }
+        let layer = if count == 3 {
+            let coordinate = ok(self.b.composite_extract(f32_, None, coordinates, [2]))?;
+            let rounded = self.glsl(f32_, GLOp::RoundEven, &[coordinate])?;
+            let rounded = ok(self.b.convert_f_to_s(i32_, None, rounded))?;
+            let layers = ok(self.b.composite_extract(i32_, None, size, [2]))?;
+            let top = ok(self.b.i_sub(i32_, None, layers, one))?;
+            Some(self.glsl(i32_, GLOp::SClamp, &[rounded, zero, top])?)
+        } else {
+            None
+        };
+        let component = if vec4 == self.t.uvec4 {
+            u32_
+        } else if vec4 == types.ints[4] {
+            i32_
+        } else {
+            f32_
+        };
+        let mut texels = Vec::new();
+        for (x, y) in [(0, 1), (1, 1), (1, 0), (0, 0)] {
+            let mut parts = vec![axes[0][x], axes[1][y]];
+            parts.extend(layer);
+            let at = ok(self.b.composite_construct(types.ints[count], None, parts))?;
+            let fetched = ok(self.b.image_fetch(
+                vec4,
+                None,
+                texture,
+                at,
+                Some(ImageOperands::LOD),
+                [Operand::IdRef(mip)],
+            ))?;
+            texels.push(ok(self.b.composite_extract(
+                component,
+                None,
+                fetched,
+                [u32::from(channel)],
+            ))?);
+        }
+        ok(self.b.composite_construct(vec4, None, texels))
+    }
+
+    /// A texel index brought inside `0..extent` by a sampler addressing mode: 0 wraps, 1 mirrors, 3, 5 and 7
+    /// mirror once, and the rest clamp to the edge.
+    fn address_texel(&mut self, texel: Word, extent: Word, mode: Word) -> Result<Word, EmitError> {
+        let (u32_, bool_, i32_) = (self.t.u32_, self.t.bool_, self.image_types().i32_);
+        let (zero, one) = (self.i32c(0), self.i32c(1));
+        let last = ok(self.b.i_sub(i32_, None, extent, one))?;
+        let wrapped = ok(self.b.s_mod(i32_, None, texel, extent))?;
+        let period = ok(self.b.i_add(i32_, None, extent, extent))?;
+        let cycle = ok(self.b.s_mod(i32_, None, texel, period))?;
+        let back = ok(self.b.i_sub(i32_, None, period, one))?;
+        let back = ok(self.b.i_sub(i32_, None, back, cycle))?;
+        let forward = ok(self.b.s_less_than(bool_, None, cycle, extent))?;
+        let mirrored = ok(self.b.select(i32_, None, forward, cycle, back))?;
+        let negative = ok(self.b.s_less_than(bool_, None, texel, zero))?;
+        let flipped = ok(self.b.i_sub(i32_, None, zero, texel))?;
+        let flipped = ok(self.b.i_sub(i32_, None, flipped, one))?;
+        let once = ok(self.b.select(i32_, None, negative, flipped, texel))?;
+        let once = self.glsl(i32_, GLOp::SClamp, &[once, zero, last])?;
+        let clamped = self.glsl(i32_, GLOp::SClamp, &[texel, zero, last])?;
+        let is = |e: &mut Self, value: u32| {
+            let constant = e.u32c(value);
+            ok(e.b.i_equal(bool_, None, mode, constant))
+        };
+        let wrap = is(self, 0)?;
+        let mirror = is(self, 1)?;
+        let low = self.u32c(1);
+        let low_bit = ok(self.b.bitwise_and(u32_, None, mode, low))?;
+        let odd = ok(self.b.i_equal(bool_, None, low_bit, low))?;
+        let result = ok(self.b.select(i32_, None, odd, once, clamped))?;
+        let result = ok(self.b.select(i32_, None, mirror, mirrored, result))?;
+        ok(self.b.select(i32_, None, wrap, wrapped, result))
     }
 
     /// Width, height, depth or layers, and the mip count; zero sizes past the last mip.

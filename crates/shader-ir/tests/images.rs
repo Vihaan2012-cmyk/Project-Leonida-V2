@@ -140,10 +140,6 @@ fn unsupported_forms_are_named_in_coverage() {
             "image_load msaa",
         ),
         (
-            "image_gather4_l v[0:3], v[4:6], s[0:7], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_2D",
-            "image_gather4_l",
-        ),
-        (
             "image_load v[0:4], v[4:5], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm tfe",
             "image_load tfe",
         ),
