@@ -20,7 +20,7 @@ use xbox_d3d12::execute::{
 use xbox_d3d12::pipeline::shaders::{Link, ShaderSource, TranslatedStage};
 use xbox_d3d12::pipeline::{
     Bytecode, CodeStore, ComputePsoDesc, DirectTranslation, GraphicsPsoDesc, InputElement,
-    Pipeline, PipelineCache, PipelineEnv, PipelineError, bindless_bindings,
+    Pipeline, PipelineCache, PipelineEnv, PipelineError, PipelineKind, bindless_bindings,
 };
 use xbox_d3d12::root::{
     DescriptorRange, ParameterKind, RangeType, RootParameter, RootSignature, RootVersion,
@@ -616,6 +616,7 @@ fn to_general(ctx: &VkContext, images: &[vk::Image]) {
 
 /// A pool and a command buffer to record into over and over.
 struct Recorder {
+    null: VkContext,
     ctx: Arc<VkContext>,
     pool: vk::CommandPool,
     cb: vk::CommandBuffer,
@@ -640,6 +641,7 @@ impl Recorder {
                 )
                 .unwrap()[0];
             Recorder {
+                null: null_context(ctx),
                 ctx: ctx.clone(),
                 pool,
                 cb,
@@ -905,7 +907,7 @@ fn replaying_a_game_frame_costs_microseconds_per_draw() {
     }
     let mut times = Vec::new();
     let mut report = ReplayReport::default();
-    for _ in 0..40 {
+    for _ in 0..200 {
         let (t, r) = recorder.record(&world, &commands);
         times.push(t);
         report = r;
@@ -936,13 +938,132 @@ fn replaying_a_game_frame_costs_microseconds_per_draw() {
         clone_time.as_secs_f64() * 1e3,
         clone_time.as_secs_f64() * 1e6 / draws
     );
-    println!("{}", floor(&world, shape));
+    println!("{}", floor(&world, shape, &report.stats));
+    println!("calls: {:?}", report.stats);
+    let variants: [(&str, Keep); 4] = [
+        ("without barriers", |c| !matches!(c, Command::Barriers(_))),
+        ("without root arguments", |c| {
+            !matches!(
+                c,
+                Command::SetRootConstants { .. }
+                    | Command::SetRootTable { .. }
+                    | Command::SetRootView { .. }
+            )
+        }),
+        (
+            "without pipeline changes",
+            |c| !matches!(c, Command::SetPipeline(p) if p.kind != PipelineKind::Compute),
+        ),
+        ("without clears", |c| {
+            !matches!(c, Command::ClearRenderTarget { .. })
+        }),
+    ];
+    for (name, keep) in variants {
+        let mut kept: Vec<Command> = commands.iter().filter(|c| keep(c)).cloned().collect();
+        if name == "without pipeline changes" {
+            kept.insert(0, Command::SetPipeline(world.graphics[0].clone()));
+        }
+        print_variant(&world, &recorder, name, &kept);
+    }
+    let mut bare = vec![
+        Command::SetRootSignature {
+            bind: BindPoint::Graphics,
+            root: world.graphics_root.clone(),
+        },
+        Command::SetPipeline(world.graphics[0].clone()),
+        Command::SetRenderTargets {
+            colors: vec![world.targets[0].target],
+            depth: None,
+        },
+        Command::SetIndexBuffer(Some(IndexBufferView {
+            va: INDEX_AT,
+            size: 512,
+            format: 57,
+        })),
+        Command::SetVertexBuffers {
+            start: 0,
+            views: vec![
+                VertexBufferView {
+                    va: VERTEX_AT,
+                    size: 1024,
+                    stride: 32,
+                };
+                2
+            ],
+        },
+    ];
+    bare.extend(
+        commands
+            .iter()
+            .filter(|c| matches!(c, Command::DrawIndexed { .. }))
+            .cloned(),
+    );
+    print_variant(&world, &recorder, "draws only", &bare);
+    let null = null_context(&world.ctx);
+    let (per_draw, frame) = cpu_only(&world, &null, &commands, 200);
+    println!("replay's own work (null device): {frame:.2} ms ({per_draw:.3} us/draw)");
     println!("notes: {:?}", report.notes);
     recorder.submit();
 }
 
+extern "system" fn nothing() {}
+
+/// A context whose every Vulkan function does nothing, so recording through it costs only the replay's own work.
+fn null_context(real: &VkContext) -> VkContext {
+    // SAFETY: each loaded function is an empty `extern "system"` function, called with arguments it ignores; the
+    // context is not owned, so dropping it destroys nothing.
+    let device = unsafe {
+        ash::Device::load_with(|_| nothing as *const std::ffi::c_void, vk::Device::null())
+    };
+    let features = xbox_d3d12::execute::Features {
+        mesh_shaders: false,
+        ..real.features
+    };
+    VkContext::from_parts(
+        real.instance.clone(),
+        real.physical,
+        device,
+        vk::Queue::null(),
+        real.family,
+        features,
+    )
+}
+
+/// The median of `runs` replays through the null context, in microseconds per draw, and the frame in ms.
+fn cpu_only(world: &World, null: &VkContext, commands: &[Command], runs: usize) -> (f64, f64) {
+    let draws = commands.iter().filter(|c| c.is_work()).count().max(1);
+    let mut times: Vec<Duration> = (0..runs)
+        .map(|_| {
+            let start = Instant::now();
+            Replayer::new(null, world.env(), vk::CommandBuffer::null())
+                .record(commands)
+                .unwrap();
+            start.elapsed()
+        })
+        .collect();
+    let med = median(&mut times);
+    (
+        med.as_secs_f64() * 1e6 / draws as f64,
+        med.as_secs_f64() * 1e3,
+    )
+}
+
+fn print_variant(world: &World, recorder: &Recorder, name: &str, commands: &[Command]) {
+    let draws = commands.iter().filter(|c| c.is_work()).count().max(1);
+    let mut times: Vec<Duration> = (0..100)
+        .map(|_| recorder.record(world, commands).0)
+        .collect();
+    let med = median(&mut times);
+    let (own, own_frame) = cpu_only(world, &recorder.null, commands, 100);
+    println!(
+        "  {name}: median {:.2} ms ({:.3} us/draw), own work {own_frame:.2} ms ({own:.3} us/draw)",
+        med.as_secs_f64() * 1e3,
+        med.as_secs_f64() * 1e6 / draws as f64
+    );
+}
+
 /// What the driver costs for the same draws with nothing but the draw calls and the minimum state: the floor.
-fn floor(world: &World, shape: Shape) -> String {
+fn floor(world: &World, shape: Shape, stats: &xbox_d3d12::execute::ReplayStats) -> String {
     let recorder = Recorder::new(&world.ctx);
     let d = &world.ctx.device;
     let draws = shape.passes * shape.draws_per_pass;
@@ -984,7 +1105,51 @@ fn floor(world: &World, shape: Shape) -> String {
                 vk::PipelineBindPoint::GRAPHICS,
                 pipeline.handle,
             );
-            for _ in 0..draws {
+            let words = [7u32; 4];
+            let bytes = std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), 8);
+            let buffers = [world.arena.buffer; 2];
+            let offsets = [0x10000u64, 0x14000];
+            let sizes = [1024u64, 512];
+            let strides = [32u64, 16];
+            let total = draws as u64;
+            let due = |count: u32, i: u64| {
+                u64::from(count) * (i + 1) / total > u64::from(count) * i / total
+            };
+            for i in 0..total {
+                if due(stats.pipeline_binds, i) {
+                    d.cmd_bind_pipeline(
+                        recorder.cb,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        pipeline.handle,
+                    );
+                }
+                if due(stats.push_calls, i) {
+                    d.cmd_push_constants(
+                        recorder.cb,
+                        world.env.layout,
+                        vk::ShaderStageFlags::ALL,
+                        0,
+                        bytes,
+                    );
+                }
+                if due(stats.vertex_binds, i) {
+                    d.cmd_bind_vertex_buffers2(
+                        recorder.cb,
+                        0,
+                        &buffers,
+                        &offsets,
+                        Some(&sizes),
+                        Some(&strides),
+                    );
+                }
+                if due(stats.index_binds, i) {
+                    d.cmd_bind_index_buffer(
+                        recorder.cb,
+                        world.arena.buffer,
+                        0x40000,
+                        vk::IndexType::UINT16,
+                    );
+                }
                 d.cmd_draw_indexed(recorder.cb, 36, 1, 0, 0, 0);
             }
             d.cmd_end_rendering(recorder.cb);
@@ -994,8 +1159,447 @@ fn floor(world: &World, shape: Shape) -> String {
     }
     let min = *times.iter().min().unwrap();
     format!(
-        "floor (one pipeline bind, bare draw calls only): min {:.2} ms ({:.3} us/draw)",
+        "floor (the same calls, nothing else): min {:.2} ms ({:.3} us/draw)",
         min.as_secs_f64() * 1e3,
         min.as_secs_f64() * 1e6 / draws as f64
     )
+}
+
+const READBACK: u64 = 0x60000;
+const OUT_A: u64 = 0x61000;
+const OUT_B: u64 = 0x62000;
+
+fn views(va: u64) -> Vec<VertexBufferView> {
+    vec![
+        VertexBufferView {
+            va,
+            size: 1024,
+            stride: 32,
+        },
+        VertexBufferView {
+            va: va + 0x4000,
+            size: 512,
+            stride: 16,
+        },
+    ]
+}
+
+/// The state a graphics draw needs, with the first pipeline, the first target and the root bound.
+fn draw_setup(world: &World) -> Vec<Command> {
+    vec![
+        Command::Barriers(vec![Barrier::Transition {
+            resource: Resource::Image(world.targets[0].image_ref),
+            subresource: None,
+            before: 0,
+            after: RENDER_TARGET,
+        }]),
+        Command::SetRootSignature {
+            bind: BindPoint::Graphics,
+            root: world.graphics_root.clone(),
+        },
+        Command::SetPipeline(world.graphics[0].clone()),
+        Command::SetRenderTargets {
+            colors: vec![world.targets[0].target],
+            depth: None,
+        },
+        Command::SetViewports(vec![viewport()]),
+        Command::SetTopology(4),
+        Command::SetVertexBuffers {
+            start: 0,
+            views: views(VERTEX_AT),
+        },
+        Command::SetIndexBuffer(Some(IndexBufferView {
+            va: INDEX_AT,
+            size: 512,
+            format: 57,
+        })),
+        Command::SetRootConstants {
+            bind: BindPoint::Graphics,
+            param: 0,
+            first: 0,
+            values: vec![1, 2, 3, 4],
+        },
+    ]
+}
+
+fn draw() -> Command {
+    Command::Draw {
+        vertices: 3,
+        instances: 1,
+        first_vertex: 0,
+        first_instance: 0,
+    }
+}
+
+fn indexed() -> Command {
+    Command::DrawIndexed {
+        indices: 3,
+        instances: 1,
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    }
+}
+
+fn replay(world: &World, commands: &[Command]) -> ReplayReport {
+    xbox_d3d12::execute::run(&world.ctx, world.env(), commands).unwrap()
+}
+
+fn readback(world: &World, target: usize) -> Vec<Command> {
+    vec![
+        Command::Barriers(vec![Barrier::Transition {
+            resource: Resource::Image(world.targets[target].image_ref),
+            subresource: None,
+            before: RENDER_TARGET,
+            after: COPY_SOURCE,
+        }]),
+        Command::CopyImageToBuffer {
+            dst: xbox_d3d12::execute::BufferFootprint {
+                va: READBACK,
+                row_pitch: SIZE * 4,
+                slice_rows: 0,
+            },
+            src: world.targets[target].image_ref,
+            sub: xbox_d3d12::execute::Subresource { mip: 0, layer: 0 },
+            region: xbox_d3d12::execute::TexelBox {
+                origin: [0; 3],
+                size: [SIZE, SIZE, 1],
+            },
+        },
+    ]
+}
+
+fn all_pixels(world: &World, want: &[u32]) {
+    for (i, word) in world
+        .arena
+        .words(READBACK, (SIZE * SIZE) as usize)
+        .iter()
+        .enumerate()
+    {
+        assert!(want.contains(word), "pixel {i}: {word:08x}");
+    }
+}
+
+const TRIANGLE: [u32; 2] = [0xFF00_80FF, 0xFF00_7FFF];
+
+#[test]
+fn state_set_again_to_the_same_value_records_nothing() {
+    let Some(world) = World::new(2) else { return };
+    let setup = draw_setup(&world);
+    let mut commands = setup.clone();
+    commands.push(draw());
+    commands.push(indexed());
+    commands.extend(setup[1..].to_vec());
+    commands.push(draw());
+    commands.push(indexed());
+    commands.extend(setup[1..].to_vec());
+    commands.push(indexed());
+    let stats = replay(&world, &commands).stats;
+    assert_eq!(stats.pipeline_binds, 1);
+    assert_eq!(stats.push_calls, 1);
+    assert_eq!(stats.vertex_binds, 1);
+    assert_eq!(stats.index_binds, 1);
+    assert_eq!(stats.topology_sets, 1);
+    assert_eq!(stats.viewport_sets, 1);
+    assert_eq!(stats.scissor_sets, 1);
+    assert_eq!(stats.blend_sets, 1);
+    assert_eq!(stats.stencil_sets, 1);
+    assert_eq!(stats.rendering_scopes, 1);
+}
+
+type Keep = fn(&Command) -> bool;
+
+type Counter = fn(&xbox_d3d12::execute::ReplayStats) -> u32;
+
+#[test]
+fn every_state_that_changes_is_recorded_again() {
+    let Some(world) = World::new(2) else { return };
+    let setup = draw_setup(&world);
+    let second_slot = {
+        let v = views(VERTEX_AT)[1];
+        VertexBufferView { va: v.va + 64, ..v }
+    };
+    let steps: Vec<(&str, Command, Counter)> = vec![
+        (
+            "pipeline",
+            Command::SetPipeline(world.graphics[1].clone()),
+            |s| s.pipeline_binds,
+        ),
+        (
+            "root constants",
+            Command::SetRootConstants {
+                bind: BindPoint::Graphics,
+                param: 0,
+                first: 2,
+                values: vec![9],
+            },
+            |s| s.push_calls,
+        ),
+        (
+            "root table",
+            Command::SetRootTable {
+                bind: BindPoint::Graphics,
+                param: 1,
+                handle: 0x40,
+            },
+            |s| s.push_calls,
+        ),
+        (
+            "root view",
+            Command::SetRootView {
+                bind: BindPoint::Graphics,
+                param: 2,
+                va: 0x4000,
+            },
+            |s| s.push_calls,
+        ),
+        (
+            "second vertex buffer",
+            Command::SetVertexBuffers {
+                start: 1,
+                views: vec![second_slot],
+            },
+            |s| s.vertex_binds,
+        ),
+        (
+            "vertex stride",
+            Command::SetVertexBuffers {
+                start: 0,
+                views: vec![VertexBufferView {
+                    va: VERTEX_AT,
+                    size: 1024,
+                    stride: 48,
+                }],
+            },
+            |s| s.vertex_binds,
+        ),
+        (
+            "index buffer",
+            Command::SetIndexBuffer(Some(IndexBufferView {
+                va: INDEX_AT + 64,
+                size: 512,
+                format: 57,
+            })),
+            |s| s.index_binds,
+        ),
+        (
+            "index format",
+            Command::SetIndexBuffer(Some(IndexBufferView {
+                va: INDEX_AT,
+                size: 512,
+                format: 42,
+            })),
+            |s| s.index_binds,
+        ),
+        ("topology", Command::SetTopology(5), |s| s.topology_sets),
+        (
+            "viewport",
+            Command::SetViewports(vec![Viewport {
+                width: 32.0,
+                ..viewport()
+            }]),
+            |s| s.viewport_sets,
+        ),
+        (
+            "scissor",
+            Command::SetScissors(vec![xbox_d3d12::execute::Rect {
+                left: 0,
+                top: 0,
+                right: 8,
+                bottom: 8,
+            }]),
+            |s| s.scissor_sets,
+        ),
+        ("blend factor", Command::SetBlendFactor([0.5; 4]), |s| {
+            s.blend_sets
+        }),
+        ("stencil reference", Command::SetStencilRef(3), |s| {
+            s.stencil_sets
+        }),
+        (
+            "render targets",
+            Command::SetRenderTargets {
+                colors: vec![world.targets[1].target],
+                depth: None,
+            },
+            |s| s.rendering_scopes,
+        ),
+    ];
+    for (name, change, counter) in steps {
+        let mut commands = setup.clone();
+        commands.push(indexed());
+        let before = counter(&replay(&world, &commands).stats);
+        commands.push(change);
+        commands.push(indexed());
+        let after = counter(&replay(&world, &commands).stats);
+        assert_eq!(after, before + 1, "a changed {name} must be recorded once");
+    }
+}
+
+#[test]
+fn a_pipeline_that_comes_back_binds_again_and_only_changed_push_words_are_pushed() {
+    let Some(world) = World::new(2) else { return };
+    let mut commands = draw_setup(&world);
+    commands.extend([
+        indexed(),
+        Command::SetPipeline(world.graphics[1].clone()),
+        indexed(),
+        Command::SetPipeline(world.graphics[0].clone()),
+        Command::SetRootConstants {
+            bind: BindPoint::Graphics,
+            param: 0,
+            first: 3,
+            values: vec![77],
+        },
+        indexed(),
+    ]);
+    let stats = replay(&world, &commands).stats;
+    assert_eq!(stats.pipeline_binds, 3);
+    assert_eq!(stats.push_calls, 2);
+    assert_eq!(stats.push_words, 40 + 1, "{stats:?}");
+}
+
+#[test]
+fn a_dispatch_between_draws_does_not_leave_its_push_constants_for_the_next_draw_or_dispatch() {
+    let Some(world) = World::new(2) else { return };
+    let mut commands = draw_setup(&world);
+    commands.extend([
+        Command::SetRootSignature {
+            bind: BindPoint::Compute,
+            root: world.compute_root.clone(),
+        },
+        Command::SetPipeline(world.compute[0].clone()),
+        Command::SetRootConstants {
+            bind: BindPoint::Compute,
+            param: 0,
+            first: 0,
+            values: vec![40, 2],
+        },
+        Command::SetRootView {
+            bind: BindPoint::Compute,
+            param: 1,
+            va: OUT_A,
+        },
+        Command::Dispatch([1, 1, 1]),
+        draw(),
+        Command::SetRootView {
+            bind: BindPoint::Compute,
+            param: 1,
+            va: OUT_B,
+        },
+        Command::Dispatch([1, 1, 1]),
+        draw(),
+    ]);
+    let stats = replay(&world, &commands).stats;
+    assert_eq!(world.arena.words(OUT_A, 1), [42]);
+    assert_eq!(world.arena.words(OUT_B, 1), [42]);
+    assert_eq!(stats.push_calls, 4, "{stats:?}");
+}
+
+#[test]
+fn clears_after_the_targets_become_load_operations_and_stay_ordered_before_other_work() {
+    let Some(world) = World::new(2) else { return };
+    let clear = |color| Command::ClearRenderTarget {
+        view: world.targets[0].target,
+        color,
+        rects: Vec::new(),
+    };
+    let mut commands = draw_setup(&world);
+    commands.push(clear([1.0, 0.0, 0.0, 1.0]));
+    commands.push(clear([0.0, 0.0, 1.0, 1.0]));
+    commands.push(draw());
+    commands.extend(readback(&world, 0));
+    let report = replay(&world, &commands);
+    assert_eq!(report.stats.rendering_scopes, 1);
+    all_pixels(&world, &TRIANGLE);
+
+    let mut commands = draw_setup(&world);
+    commands.push(clear([1.0, 0.0, 0.0, 1.0]));
+    commands.extend(readback(&world, 0));
+    let report = replay(&world, &commands);
+    assert_eq!(report.stats.rendering_scopes, 1);
+    all_pixels(&world, &[0xFF00_00FF]);
+
+    let mut commands = draw_setup(&world);
+    commands.push(draw());
+    commands.push(clear([0.0, 1.0, 0.0, 1.0]));
+    commands.extend(readback(&world, 0));
+    replay(&world, &commands);
+    all_pixels(&world, &[0xFF00_FF00]);
+}
+
+fn replay_with_graphics(world: &World, tail: Vec<Command>) -> ReplayReport {
+    let mut commands = vec![
+        Command::SetRootSignature {
+            bind: BindPoint::Graphics,
+            root: world.graphics_root.clone(),
+        },
+        Command::SetPipeline(world.graphics[0].clone()),
+        Command::SetVertexBuffers {
+            start: 0,
+            views: views(VERTEX_AT),
+        },
+    ];
+    commands.extend(tail);
+    replay(world, &commands)
+}
+
+#[test]
+fn barriers_of_consecutive_commands_are_one_call_unless_they_touch_one_image_or_a_draw_sits_between()
+ {
+    let Some(world) = World::new(2) else { return };
+    let transition = |i: usize, before, after| {
+        Command::Barriers(vec![Barrier::Transition {
+            resource: Resource::Image(world.targets[i].image_ref),
+            subresource: None,
+            before,
+            after,
+        }])
+    };
+    let mid = vec![
+        transition(0, 0, RENDER_TARGET),
+        Command::SetRootConstants {
+            bind: BindPoint::Graphics,
+            param: 0,
+            first: 0,
+            values: vec![1],
+        },
+        transition(1, 0, RENDER_TARGET),
+    ];
+    assert_eq!(replay_with_graphics(&world, mid).stats.barrier_calls, 1);
+    let same = vec![
+        transition(0, 0, RENDER_TARGET),
+        transition(0, RENDER_TARGET, PIXEL_SHADER_RESOURCE),
+    ];
+    let report = replay_with_graphics(&world, same);
+    assert_eq!(report.stats.barrier_calls, 2);
+    assert_eq!(report.barriers, 2);
+    let split = vec![
+        transition(0, 0, RENDER_TARGET),
+        Command::SetRenderTargets {
+            colors: vec![world.targets[0].target],
+            depth: None,
+        },
+        draw(),
+        transition(1, 0, RENDER_TARGET),
+    ];
+    assert_eq!(replay_with_graphics(&world, split).stats.barrier_calls, 2);
+}
+
+#[test]
+fn a_game_frame_replays_with_far_fewer_calls_than_draws() {
+    let Some(world) = World::new(8) else { return };
+    let commands = game_frame(
+        &world,
+        Shape {
+            passes: 4,
+            draws_per_pass: 100,
+        },
+    );
+    let report = replay(&world, &commands);
+    assert_eq!(report.draws, 400);
+    assert!(report.stats.vertex_binds < 400, "{:?}", report.stats);
+    assert!(report.stats.index_binds < 400, "{:?}", report.stats);
+    assert!(report.stats.push_calls < 400, "{:?}", report.stats);
+    assert_eq!(report.stats.rendering_scopes, 4);
 }
