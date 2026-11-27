@@ -2327,6 +2327,7 @@ dependencies = [
 name = "shims"
 version = "0.1.0"
 dependencies = [
+ "audio-codec",
  "bvh-build",
  "cpal",
  "gilrs",
