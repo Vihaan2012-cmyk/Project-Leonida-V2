@@ -11,5 +11,8 @@ pe-image.workspace = true
 thiserror.workspace = true
 windows-sys.workspace = true
 
+[dev-dependencies]
+pe-loader.workspace = true
+
 [lints]
 workspace = true
