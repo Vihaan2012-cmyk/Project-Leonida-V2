@@ -28,6 +28,7 @@ systems.workspace = true
 upscale.workspace = true
 rdna.workspace = true
 rpf9.workspace = true
+shader-census.workspace = true
 shader-container.workspace = true
 shader-ir.workspace = true
 shader-store.workspace = true

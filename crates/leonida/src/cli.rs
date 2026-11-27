@@ -342,6 +342,9 @@ pub enum ShadersCommand {
     Disasm(DisasmArgs),
     /// Check how much of every shader the translator handles, and list what it can't yet. Writes nothing.
     Report(ReportArgs),
+    /// Measure which user SGPRs each vertex, pixel, geometry, mesh and compute program reads first and how it
+    /// uses them. Reads only; --json also writes the result under the output folder.
+    Census(CensusArgs),
     /// Translate every shader and have the graphics driver build it into a pipeline. Writes nothing.
     Verify(VerifyArgs),
 }
@@ -400,6 +403,28 @@ pub struct DisasmArgs {
     /// The game folder. Searched for when omitted.
     #[arg(long)]
     pub game: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct CensusArgs {
+    /// The game folder. Searched for when omitted.
+    #[arg(long)]
+    pub game: Option<PathBuf>,
+    /// Only containers of these stages: ps, vs, gs, ms or cs. May be given more than once.
+    #[arg(long)]
+    pub stage: Vec<String>,
+    /// Stop after this many shader containers.
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Read every Nth container.
+    #[arg(long, default_value_t = 1)]
+    pub every: usize,
+    /// Also write the whole census, per program too, as census.json under --output.
+    #[arg(long)]
+    pub json: bool,
+    /// Where census.json goes.
+    #[arg(long, default_value = "Output")]
+    pub output: PathBuf,
 }
 
 #[derive(Debug, Args)]
