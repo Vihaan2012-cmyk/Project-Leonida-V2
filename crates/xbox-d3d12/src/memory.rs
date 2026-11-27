@@ -135,6 +135,8 @@ pub struct Handles {
     pub physical: vk::PhysicalDevice,
     pub device: ash::Device,
     pub queue: vk::Queue,
+    /// The family `queue` belongs to.
+    pub queue_family: u32,
     /// Held while binding, so the queue can also be submitted to by the code that shares it.
     pub queue_lock: Arc<Mutex<()>>,
 }
@@ -465,6 +467,10 @@ impl AddressSpace {
                 type_bits: needs.memory_type_bits,
             })
         }
+    }
+
+    pub fn handles(&self) -> &Handles {
+        &self.h
     }
 
     pub fn support(&self) -> &Support {

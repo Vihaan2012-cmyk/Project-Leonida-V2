@@ -65,6 +65,8 @@ impl TestGpu {
                         physical,
                         device,
                         queue,
+                        queue_family: family as u32,
+                        queue_family: family as u32,
                         queue_lock: Arc::new(Mutex::new(())),
                     },
                     family: family as u32,
