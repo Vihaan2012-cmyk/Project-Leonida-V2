@@ -3,10 +3,12 @@
 
 mod decode;
 mod pages;
+mod sidecar;
 mod skeleton;
 mod types;
 mod vertex;
 
+pub use sidecar::parameter_name;
 pub use skeleton::joaat;
 pub use types::*;
 
