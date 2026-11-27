@@ -3,13 +3,17 @@
 pub mod barrier;
 mod command;
 mod context;
+pub mod parallel;
 mod replay;
+pub mod state;
 
 use ash::vk;
 
 pub use command::*;
 pub use context::{Features, VkContext};
-pub use replay::{Arena, ReplayEnv, ReplayReport, Replayer, SpillAllocator, index_type, run};
+pub use replay::{
+    Arena, ReplayEnv, ReplayReport, ReplayStats, Replayer, SpillAllocator, index_type, run,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReplayError {

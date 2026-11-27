@@ -366,3 +366,21 @@ fn the_vertex_half_of_a_merged_shader_is_a_program_of_its_own() {
     let missing = container(1, &[vertex_blob()]);
     assert!(source.translate(&missing, Stage::Vertex, &half).is_err());
 }
+
+#[test]
+fn the_store_keeps_bytecode_by_hash_for_the_seen_log() {
+    use xbox_d3d12::compile_queue::BytecodeStore;
+    let dir = folder();
+    let store = open(dir.path());
+    let bytes = compute_blob("s_endpgm");
+    let hash = key_of(&bytes);
+    assert!(BytecodeStore::get(&*store, &hash).is_none());
+    BytecodeStore::put(&*store, &hash, &bytes);
+    BytecodeStore::put(&*store, &hash, &bytes);
+    assert_eq!(BytecodeStore::get(&*store, &hash).unwrap(), bytes);
+    drop(store);
+    assert_eq!(
+        BytecodeStore::get(&*open(dir.path()), &hash).unwrap(),
+        bytes
+    );
+}

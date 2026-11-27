@@ -120,21 +120,23 @@ impl Lifter {
         let is_box = self.either(is_box16, is_box32);
         let last_triangle = self.c(3);
         let is_triangle = self.cmp(Cmp::LeU, kind, last_triangle);
-        let load = |me: &mut Self, word: u64, when: Tmp| {
-            let step = me.c64(4 * word);
-            let address = me.bin(Bin::Add64, node, step);
-            me.value(Expr::Load {
-                when: Some(when),
-                address,
+        let addresses: Vec<Tmp> = (0..32)
+            .map(|word| {
+                let step = self.c64(4 * word);
+                self.bin(Bin::Add64, node, step)
             })
-        };
-
-        let mut box_words: Vec<Tmp> = (0..16).map(|i| load(self, i, is_box)).collect();
-        box_words.extend(
-            (16..32)
-                .map(|i| load(self, i, is_box32))
-                .collect::<Vec<_>>(),
-        );
+            .collect();
+        let five = self.c(BOX32);
+        let has_words = self.cmp(Cmp::LeU, kind, five);
+        let mut box_words: Vec<Tmp> = Vec::new();
+        for (words, when) in [(0..16, has_words), (16..32, is_box32)] {
+            for word in words {
+                box_words.push(self.value(Expr::Load {
+                    when: Some(when),
+                    address: addresses[word],
+                }));
+            }
+        }
         let sixteen = self.c(16);
         let zero = self.fc(0.0);
         let infinity = self.fc(f32::INFINITY);
@@ -211,7 +213,7 @@ impl Lifter {
             keys[b] = self.select(swap, key_a, key_b);
         }
 
-        let triangle: Vec<Tmp> = (0..16).map(|i| load(self, i, is_triangle)).collect();
+        let triangle: Vec<Tmp> = box_words[..16].to_vec();
         let vertex = |k: usize| [0, 1, 2].map(|i| triangle[3 * k + i]);
         let one_kind = self.c(1);
         let second = self.cmp(Cmp::Eq, kind, one_kind);

@@ -56,12 +56,34 @@
 //! game runs fast. With the frame events uncapped or capped above the title's own limit that is exactly what
 //! happens, so [`STEP_FLOOR`] points that load at the 1/3000 s floor instead.
 //!
+//! # The clock records
+//!
+//! `sub_02226040` (a leaf outside the exception table, so invisible to `leonida exe xrefs` and to
+//! [`crate::patch::Finder`]; see [`crate::clock_floor`]) updates one clock record per call: `+0` whole
+//! milliseconds, `+4` a **frame counter** (it adds the dword at `0x5f43778`, which holds 1), `+8` the previous
+//! milliseconds, `+0xc` the step in seconds, `+0x10` the step in whole milliseconds, `+0x14` its inverse, `+0x18`
+//! the sub-millisecond remainder. The main game clock is at `0xabbef40`: its step `0xabbef4c` is read by 522
+//! exported source files and its frame counter `0xabbef44` by 745 instructions. Every clock with the clamp flag
+//! uses the same two floors as `sub_022264d0`, so [`CLOCK_FLOOR`] is what frees them all.
+//!
 //! # Other frame-time constants
 //!
-//! 1/30 s (`0x3d088889`) is read by 105 instructions in 80 functions and 1/60 s by 80 more in 65, mostly through shared
-//! literal pools (`0x615b6b4`, `0x6159e10`); 0.1 s and 0.05 s by thousands. They are animation and gameplay
-//! constants of many systems and cannot be told apart statically from the ones that follow the step, so none is
-//! patched. [`Entry`] records them as data.
+//! 1/30 s (`0x3d088889`, pool `0x615b6b4`) is read by 97 instructions in 76 functions, 1/60 s (pool `0x6159e10`)
+//! by 82 in 67 and 1/15 s (pool `0x6159ec0`, the ceiling) by 62 in 50 (a sweep of the whole code section, leaf
+//! functions included). They are shared literals for any value of that size. Reading the functions:
+//!
+//! - 24 functions combine them with the wall-clock fields at `0xab5cdd0..0xab5cddc` (`minutes * 1/60 + hours`, seconds
+//!   to minutes: the in-game time of day, weather and lighting). Not frame time.
+//! - `sub_0257f820`, `sub_00b948e0`, `sub_00b94f70`, `sub_050c5410`, `sub_02371b40` scale the step: `step * 1/30`
+//!   as a per-second rate. They follow the step and are fine.
+//! - `sub_009e5ce0` clamps with `min(1/30, step)`; `sub_04ed92d0` computes `(1/30) / max(x, step)`, a frame
+//!   rate normaliser. Both are fine above 30 fps.
+//! - the rest (143 functions) multiply a counter, a count or a fixed distance by the constant, or compare against it.
+//!   They are in rendering, animation and gameplay code that cannot be told apart without naming each caller;
+//!   none is patched. [`Entry`] records them as data.
+//!
+//! The frame counter is used mostly to mean "updated this or last frame" (83 functions subtract it and compare with 1,
+//! 2 or 3), which does not depend on the rate. A few use it as time: see [`FRAME_COUNTER_TIMERS`].
 
 use crate::patch::{Finder, Patch, PatchError, Pattern, Site};
 use iced_x86::{Mnemonic, OpKind, Register};
@@ -142,6 +164,28 @@ pub const STEP_FLOOR: Entry = Entry {
     find: Some(find_step_floor),
 };
 
+pub const CLOCK_FLOOR: Entry = Entry {
+    id: "clock-floor",
+    summary: "Stop every game clock, not only one, from being held at 1 / the game's frame limit",
+    proof: Proof::Static,
+    activation: Activation::WithCustomLimit,
+    evidence: &[
+        Evidence {
+            rva: 0x0222_6040,
+            what: "sub_02226040, a leaf outside the exception table: clamps with 1/limit loaded at 0x222605a",
+        },
+        Evidence {
+            rva: 0x0222_6190,
+            what: "sub_02226130 stores 1/3000 s and then 1/limit; both stores become 1/3000 s",
+        },
+        Evidence {
+            rva: 0x0224_35e6,
+            what: "sub_022434a0 recomputes 1/limit on a settings change; the store becomes 1/3000 s",
+        },
+    ],
+    find: Some(crate::clock_floor::find),
+};
+
 pub const FRAME_EVENT_INTERVAL: Entry = Entry {
     id: "frame-event-interval",
     summary: "The interval the title registers for the frame events, 8333 to 66667 microseconds",
@@ -170,7 +214,7 @@ pub const FRAME_EVENT_INTERVAL: Entry = Entry {
 
 pub const CEILING: Entry = Entry {
     id: "sim-step-ceiling",
-    summary: "The step ceiling of 1/15 s is a literal read in 49 functions",
+    summary: "The step ceiling of 1/15 s is a literal read in 50 functions; below 15 fps the game runs slow, not fast",
     proof: Proof::Unproven,
     activation: Activation::DataOnly,
     evidence: &[Evidence {
@@ -202,12 +246,58 @@ pub const GAME_LIMITER: Entry = Entry {
     find: None,
 };
 
-pub const FIXED_STEP_CONSTANTS: Entry = Entry {
-    id: "fixed-step-constants",
-    summary: "1/30 s and 1/60 s literals in about 145 functions",
+pub const FRAME_COUNTER_TIMERS: Entry = Entry {
+    id: "frame-counter-timers",
+    summary: "Timers that count frames of the main clock (0xabbef44) instead of time: too fast above 30 or 60 fps",
     proof: Proof::Unproven,
     activation: Activation::DataOnly,
     evidence: &[
+        Evidence {
+            rva: 0x008e_eb30,
+            what: "fade factor min(1, (frame - start) * 1/15): a 15 frame fade",
+        },
+        Evidence {
+            rva: 0x00b0_82c0,
+            what: "re-queues a job when frame > last + 10 or frame > last (mode 2)",
+        },
+        Evidence {
+            rva: 0x0278_8e80,
+            what: "marks an object stale when frame - stamp >= 31",
+        },
+        Evidence {
+            rva: 0x0175_ca40,
+            what: "gives up when frame >= start + a constant",
+        },
+        Evidence {
+            rva: 0x00d6_6c10,
+            what: "does work on every 10th frame (frame * 0xcccccccd test)",
+        },
+        Evidence {
+            rva: 0x0222_6040,
+            what: "the clock update adds 1 to the counter at record +4",
+        },
+    ],
+    find: None,
+};
+
+pub const FIXED_STEP_CONSTANTS: Entry = Entry {
+    id: "fixed-step-constants",
+    summary: "1/30 s and 1/60 s literals in about 140 functions: time of day, step-scaled rates, and unclassified",
+    proof: Proof::Unproven,
+    activation: Activation::DataOnly,
+    evidence: &[
+        Evidence {
+            rva: 0x0257_f820,
+            what: "step * 1/30 as a per-second rate: follows the step",
+        },
+        Evidence {
+            rva: 0x0434_2b70,
+            what: "minutes * 1/60 + hours of the wall clock: not frame time",
+        },
+        Evidence {
+            rva: 0x04ed_92d0,
+            what: "(1/30) / max(x, step): a rate normaliser",
+        },
         Evidence {
             rva: 0x0615_b6b4,
             what: "1/30 s literal pool",
@@ -221,11 +311,13 @@ pub const FIXED_STEP_CONSTANTS: Entry = Entry {
 };
 
 /// Every entry, patches first.
-pub const ENTRIES: [&Entry; 5] = [
+pub const ENTRIES: [&Entry; 7] = [
     &STEP_FLOOR,
+    &CLOCK_FLOOR,
     &FRAME_EVENT_INTERVAL,
     &CEILING,
     &GAME_LIMITER,
+    &FRAME_COUNTER_TIMERS,
     &FIXED_STEP_CONSTANTS,
 ];
 

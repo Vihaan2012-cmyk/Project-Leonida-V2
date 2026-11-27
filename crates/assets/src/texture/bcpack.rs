@@ -178,17 +178,17 @@ impl BcPackError {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DecodeOptions {
-    /// Use built-in history entries upstream marks provisional (fitted, not verified). Off by default.
+    /// Use built-in history entries upstream marks provisional (fitted, not verified). Off in `Default`.
     pub allow_provisional: bool,
 }
 
 impl DecodeOptions {
-    /// The options the runtime uses: provisional entries are enabled by `LEONIDA_BCPACK_PROVISIONAL=1`.
+    /// The options the runtime uses: provisional entries are on, since real textures decoded with them agree with
+    /// their next mip; `LEONIDA_BCPACK_PROVISIONAL=0` turns them off.
     pub fn from_env() -> DecodeOptions {
         static ALLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let allow = *ALLOW.get_or_init(|| {
-            std::env::var("LEONIDA_BCPACK_PROVISIONAL").is_ok_and(|v| v != "0" && !v.is_empty())
-        });
+        let allow = *ALLOW
+            .get_or_init(|| std::env::var("LEONIDA_BCPACK_PROVISIONAL").map_or(true, |v| v != "0"));
         DecodeOptions {
             allow_provisional: allow,
         }

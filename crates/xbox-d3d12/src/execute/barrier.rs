@@ -187,11 +187,8 @@ pub struct Built {
     pub memory: Option<vk::MemoryBarrier2<'static>>,
 }
 
-pub fn build(barriers: &[Barrier]) -> Built {
-    let mut built = Built::default();
-    let mut memory = vk::MemoryBarrier2::default();
-    let mut any_memory = false;
-    for barrier in barriers {
+impl Built {
+    pub fn add(&mut self, barrier: &Barrier) {
         match *barrier {
             Barrier::Transition {
                 resource,
@@ -201,13 +198,13 @@ pub fn build(barriers: &[Barrier]) -> Built {
             } => match resource {
                 Resource::Image(image) => {
                     if before == after {
-                        continue;
+                        return;
                     }
                     let (src, dst) = (
                         map_state(before, image.is_depth()),
                         map_state(after, image.is_depth()),
                     );
-                    built.images.push(
+                    self.images.push(
                         vk::ImageMemoryBarrier2::default()
                             .src_stage_mask(src.stage)
                             .src_access_mask(src.access)
@@ -223,27 +220,37 @@ pub fn build(barriers: &[Barrier]) -> Built {
                 }
                 Resource::Buffer => {
                     if before == after {
-                        continue;
+                        return;
                     }
                     let (src, dst) = (map_state(before, false), map_state(after, false));
+                    let memory = self.memory.get_or_insert_with(Default::default);
                     memory.src_stage_mask |= src.stage;
                     memory.src_access_mask |= src.access;
                     memory.dst_stage_mask |= dst.stage;
                     memory.dst_access_mask |= dst.access;
-                    any_memory = true;
                 }
             },
             Barrier::Uav | Barrier::Aliasing => {
+                let memory = self.memory.get_or_insert_with(Default::default);
                 memory.src_stage_mask |= vk::PipelineStageFlags2::ALL_COMMANDS;
                 memory.src_access_mask |= vk::AccessFlags2::MEMORY_WRITE;
                 memory.dst_stage_mask |= vk::PipelineStageFlags2::ALL_COMMANDS;
                 memory.dst_access_mask |=
                     vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
-                any_memory = true;
             }
         }
     }
-    built.memory = any_memory.then_some(memory);
+
+    pub fn is_empty(&self) -> bool {
+        self.images.is_empty() && self.memory.is_none()
+    }
+}
+
+pub fn build(barriers: &[Barrier]) -> Built {
+    let mut built = Built::default();
+    for barrier in barriers {
+        built.add(barrier);
+    }
     built
 }
 
@@ -253,15 +260,96 @@ pub fn build(barriers: &[Barrier]) -> Built {
 /// `cb` is a command buffer of `device` in the recording state.
 pub unsafe fn record(device: &ash::Device, cb: vk::CommandBuffer, barriers: &[Barrier]) {
     let built = build(barriers);
-    if built.images.is_empty() && built.memory.is_none() {
+    // SAFETY: forwarded from the caller.
+    unsafe { record_built(device, cb, &built) };
+}
+
+/// # Safety
+/// As [`record`].
+unsafe fn record_built(device: &ash::Device, cb: vk::CommandBuffer, built: &Built) {
+    if built.is_empty() {
         return;
     }
-    let memory: Vec<_> = built.memory.into_iter().collect();
     let info = vk::DependencyInfo::default()
-        .memory_barriers(&memory)
+        .memory_barriers(built.memory.as_slice())
         .image_memory_barriers(&built.images);
-    // SAFETY: the caller guarantees `cb` is recording; the info borrows locals alive for the call.
+    // SAFETY: the caller guarantees `cb` is recording; the info borrows data alive for the call.
     unsafe { device.cmd_pipeline_barrier2(cb, &info) };
+}
+
+/// The most image transitions one batch gathers before it is recorded.
+const BATCH_IMAGES: usize = 64;
+
+/// Barriers of consecutive commands gathered into one `vkCmdPipelineBarrier2`, with the buffers reused from
+/// one batch to the next.
+#[derive(Debug, Default)]
+pub struct Batch {
+    built: Built,
+}
+
+impl Batch {
+    pub fn is_empty(&self) -> bool {
+        self.built.is_empty()
+    }
+
+    /// Whether `barriers` cannot join the gathered ones in a single dependency: some transition touches
+    /// subresources an earlier transition does, so the two must happen in order, or the batch is full.
+    pub fn conflicts(&self, barriers: &[Barrier]) -> bool {
+        let gathered = &self.built.images;
+        if gathered.is_empty() {
+            return false;
+        }
+        if gathered.len() >= BATCH_IMAGES {
+            return true;
+        }
+        barriers.iter().any(|barrier| match *barrier {
+            Barrier::Transition {
+                resource: Resource::Image(image),
+                subresource,
+                before,
+                after,
+            } if before != after => {
+                let wanted = range(&image, subresource);
+                gathered
+                    .iter()
+                    .any(|g| g.image == image.image && overlap(&g.subresource_range, &wanted))
+            }
+            _ => false,
+        })
+    }
+
+    pub fn add(&mut self, barriers: &[Barrier]) {
+        for barrier in barriers {
+            self.built.add(barrier);
+        }
+    }
+
+    /// Records what is gathered and starts over. Returns whether a call was recorded.
+    ///
+    /// # Safety
+    /// As [`record`].
+    pub unsafe fn flush(&mut self, device: &ash::Device, cb: vk::CommandBuffer) -> bool {
+        if self.built.is_empty() {
+            return false;
+        }
+        // SAFETY: forwarded from the caller.
+        unsafe { record_built(device, cb, &self.built) };
+        self.built.images.clear();
+        self.built.memory = None;
+        true
+    }
+}
+
+fn overlap(a: &vk::ImageSubresourceRange, b: &vk::ImageSubresourceRange) -> bool {
+    let span = |base: u32, count: u32| (base, base.saturating_add(count));
+    let crosses = |(a0, a1): (u32, u32), (b0, b1): (u32, u32)| a0 < b1 && b0 < a1;
+    crosses(
+        span(a.base_mip_level, a.level_count),
+        span(b.base_mip_level, b.level_count),
+    ) && crosses(
+        span(a.base_array_layer, a.layer_count),
+        span(b.base_array_layer, b.layer_count),
+    )
 }
 
 #[cfg(test)]

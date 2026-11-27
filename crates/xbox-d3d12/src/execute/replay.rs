@@ -1,9 +1,18 @@
 //! Plays a recorded command stream onto a Vulkan command buffer.
 //!
 //! State a command list sets (root arguments, pipeline, viewports, targets) is kept here and applied when a draw
-//! or dispatch needs it: pipelines bind lazily, the push-constant block is rebuilt when a root argument or the
-//! pipeline changed, and a dynamic-rendering scope opens at the first draw after the targets changed and closes
-//! before anything that cannot run inside one.
+//! or dispatch needs it, and only where it differs from what the command buffer already holds:
+//! - pipelines bind lazily, and the push-constant range is rewritten only in the words that changed;
+//! - viewports, scissors, blend factor, stencil reference, topology, vertex and index buffers are set once per
+//!   change, not once per draw;
+//! - a dynamic-rendering scope opens at the first draw after the targets changed, takes clears that came right
+//!   after the targets as its load operations, and closes only before something that cannot run inside one;
+//! - barriers of consecutive commands are recorded in one call.
+
+mod draw;
+mod plan;
+mod rendering;
+mod util;
 
 use std::sync::Arc;
 
@@ -11,10 +20,13 @@ use ash::vk;
 
 use super::barrier;
 use super::command::*;
+use super::state::{PushShadow, VertexBinder};
 use super::{ReplayError, VkContext};
-use crate::pipeline::state::{block_size, dxgi_to_vk, format_bytes, has_stencil, vk_topology};
+use crate::pipeline::state::dxgi_to_vk;
 use crate::pipeline::{Pipeline, PipelineKind};
-use crate::root::{self, HeapBases, RootArguments, RootSignature};
+use crate::root::{HeapBases, RootArgument, RootArguments, RootSignature};
+use plan::Plan;
+use util::{buffer_image_region, extent3, layers_of, offset3};
 
 /// The arena: one buffer whose offsets are console VAs, and its device address (the heap base shaders add).
 #[derive(Debug, Clone, Copy)]
@@ -38,24 +50,115 @@ pub struct ReplayEnv<'a> {
     pub spill: Option<&'a mut dyn SpillAllocator>,
 }
 
+/// How many Vulkan calls of each kind the replay made, for the ones the replay tries to keep rare.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReplayStats {
+    pub pipeline_binds: u32,
+    pub push_calls: u32,
+    pub push_words: u32,
+    pub viewport_sets: u32,
+    pub scissor_sets: u32,
+    pub blend_sets: u32,
+    pub stencil_sets: u32,
+    pub topology_sets: u32,
+    pub vertex_binds: u32,
+    pub index_binds: u32,
+    pub rendering_scopes: u32,
+    pub barrier_calls: u32,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReplayReport {
     pub draws: u32,
     pub dispatches: u32,
     pub copies: u32,
     pub barriers: u32,
+    pub stats: ReplayStats,
     /// What was approximated or skipped.
     pub notes: Vec<String>,
 }
 
-#[derive(Default)]
+pub(crate) const PUSH_WORDS: usize = shader_translate::PUSH_WORDS as usize;
+
 struct Bound {
     root: Option<Arc<RootSignature>>,
     args: RootArguments,
     pipeline: Option<Arc<Pipeline>>,
     handle: vk::Pipeline,
-    push_dirty: bool,
+    /// The push block these arguments and this pipeline make; stale when `block_valid` is false.
+    block: [u32; PUSH_WORDS],
+    block_valid: bool,
+    /// The block changed since it was last compared with what the command buffer holds.
+    block_changed: bool,
+    /// Where the arguments land for the bound pipeline, when a change can be patched into the block.
+    plan: Plan,
+    plan_ok: bool,
     bindless: bool,
+}
+
+impl Bound {
+    fn new() -> Bound {
+        Bound {
+            root: None,
+            args: RootArguments::default(),
+            pipeline: None,
+            handle: vk::Pipeline::null(),
+            block: [0; PUSH_WORDS],
+            block_valid: false,
+            block_changed: false,
+            plan: Plan::default(),
+            plan_ok: false,
+            bindless: false,
+        }
+    }
+
+    /// An argument changed: patch it into the block, or have the block packed again.
+    fn argument_changed(&mut self, param: u32) -> Result<(), ReplayError> {
+        if !self.block_valid {
+            return Ok(());
+        }
+        if self.plan_ok {
+            self.plan
+                .patch(&mut self.block[..32], param, self.args.get(param))?;
+            self.block_changed = true;
+        } else {
+            self.block_valid = false;
+        }
+        Ok(())
+    }
+}
+
+/// Dynamic state the list set that the command buffer does not hold yet.
+#[derive(Default)]
+struct DynamicDirty {
+    viewport: bool,
+    scissor: bool,
+    blend: bool,
+    stencil: bool,
+}
+
+impl DynamicDirty {
+    fn all() -> DynamicDirty {
+        DynamicDirty {
+            viewport: true,
+            scissor: true,
+            blend: true,
+            stencil: true,
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.viewport || self.scissor || self.blend || self.stencil
+    }
+}
+
+/// Clears that came right after the targets were set, which become load operations of the scope that opens.
+#[derive(Default)]
+struct PendingClears {
+    colors: [Option<[f32; 4]>; 8],
+    depth: Option<f32>,
+    stencil: Option<u8>,
+    any: bool,
 }
 
 pub struct Replayer<'a> {
@@ -65,18 +168,27 @@ pub struct Replayer<'a> {
     report: ReplayReport,
     graphics: Bound,
     compute: Bound,
+    /// Push constants are one range for both bind points; this is what the command buffer holds, and which bind
+    /// point's block it was last made equal to.
+    pushed: PushShadow<PUSH_WORDS>,
+    pushed_by: Option<BindPoint>,
     heaps: HeapBases,
     viewports: Vec<Viewport>,
     scissors: Vec<Rect>,
     blend_factor: [f32; 4],
     stencil_ref: u32,
     topology: Option<u32>,
-    vertex: Vec<Option<VertexBufferView>>,
+    dirty: DynamicDirty,
+    /// The topology the command buffer holds; `None` when the bound pipeline does not take it dynamically.
+    topology_applied: Option<vk::PrimitiveTopology>,
+    vertex: VertexBinder,
     index: Option<IndexBufferView>,
+    index_applied: Option<(u64, vk::IndexType)>,
     colors: Vec<TargetView>,
     depth: Option<TargetView>,
     rendering: bool,
-    dynamic_dirty: bool,
+    clears: PendingClears,
+    barriers: barrier::Batch,
 }
 
 impl<'a> Replayer<'a> {
@@ -86,20 +198,26 @@ impl<'a> Replayer<'a> {
             env,
             cb,
             report: ReplayReport::default(),
-            graphics: Bound::default(),
-            compute: Bound::default(),
+            graphics: Bound::new(),
+            compute: Bound::new(),
+            pushed: PushShadow::default(),
+            pushed_by: None,
             heaps: HeapBases::default(),
             viewports: Vec::new(),
             scissors: Vec::new(),
             blend_factor: [1.0; 4],
             stencil_ref: 0,
             topology: None,
-            vertex: Vec::new(),
+            dirty: DynamicDirty::all(),
+            topology_applied: None,
+            vertex: VertexBinder::default(),
             index: None,
+            index_applied: None,
             colors: Vec::new(),
             depth: None,
             rendering: false,
-            dynamic_dirty: true,
+            clears: PendingClears::default(),
+            barriers: barrier::Batch::default(),
         }
     }
 
@@ -114,10 +232,21 @@ impl<'a> Replayer<'a> {
     /// Returns what was done.
     pub fn record(mut self, commands: &[Command]) -> Result<ReplayReport, ReplayError> {
         for command in commands {
+            if !command.is_lazy() {
+                self.flush_barriers();
+            }
             self.command(command)?;
         }
+        self.flush_barriers();
         self.end_rendering();
         Ok(self.report)
+    }
+
+    fn flush_barriers(&mut self) {
+        // SAFETY: `cb` is recording and outside a rendering scope: a scope never opens with barriers gathered.
+        if unsafe { self.barriers.flush(&self.ctx.device, self.cb) } {
+            self.report.stats.barrier_calls += 1;
+        }
     }
 
     fn bound(&mut self, bind: BindPoint) -> &mut Bound {
@@ -136,8 +265,8 @@ impl<'a> Replayer<'a> {
                 if !bound.root.as_ref().is_some_and(|r| Arc::ptr_eq(r, root)) {
                     bound.args = RootArguments::new(root);
                     bound.root = Some(root.clone());
+                    bound.block_valid = false;
                 }
-                bound.push_dirty = true;
             }
             Command::SetPipeline(pipeline) => {
                 let bind = if pipeline.kind == PipelineKind::Compute {
@@ -146,9 +275,14 @@ impl<'a> Replayer<'a> {
                     BindPoint::Graphics
                 };
                 let bound = self.bound(bind);
-                bound.pipeline = Some(pipeline.clone());
-                bound.push_dirty = true;
-                self.dynamic_dirty = true;
+                if !bound
+                    .pipeline
+                    .as_ref()
+                    .is_some_and(|p| Arc::ptr_eq(p, pipeline))
+                {
+                    bound.pipeline = Some(pipeline.clone());
+                    bound.block_valid = false;
+                }
             }
             Command::SetRootConstants {
                 bind,
@@ -157,13 +291,23 @@ impl<'a> Replayer<'a> {
                 values,
             } => {
                 let bound = self.bound(*bind);
-                bound.args.set_constants(*param, *first, values)?;
-                bound.push_dirty = true;
+                let end = *first as usize + values.len();
+                let same = matches!(
+                    bound.args.get(*param),
+                    Some(RootArgument::Constants(list))
+                        if list.get(*first as usize..end) == Some(values.as_slice())
+                );
+                if !same {
+                    bound.args.set_constants(*param, *first, values)?;
+                    bound.argument_changed(*param)?;
+                }
             }
             Command::SetRootView { bind, param, va } => {
                 let bound = self.bound(*bind);
-                bound.args.set_view(*param, *va)?;
-                bound.push_dirty = true;
+                if bound.args.get(*param) != Some(&RootArgument::View(*va)) {
+                    bound.args.set_view(*param, *va)?;
+                    bound.argument_changed(*param)?;
+                }
             }
             Command::SetRootTable {
                 bind,
@@ -171,48 +315,60 @@ impl<'a> Replayer<'a> {
                 handle,
             } => {
                 let bound = self.bound(*bind);
-                bound.args.set_table(*param, *handle)?;
-                bound.push_dirty = true;
+                if bound.args.get(*param) != Some(&RootArgument::Table(*handle)) {
+                    bound.args.set_table(*param, *handle)?;
+                    bound.argument_changed(*param)?;
+                }
             }
             Command::SetDescriptorHeaps(bases) => {
-                self.heaps = *bases;
-                self.graphics.push_dirty = true;
-                self.compute.push_dirty = true;
+                if self.heaps != *bases {
+                    self.heaps = *bases;
+                    self.graphics.block_valid = false;
+                    self.compute.block_valid = false;
+                }
             }
             Command::SetViewports(list) => {
-                self.viewports = list.clone();
-                self.dynamic_dirty = true;
+                if self.viewports != *list {
+                    self.viewports.clear();
+                    self.viewports.extend_from_slice(list);
+                    self.dirty.viewport = true;
+                }
             }
             Command::SetScissors(list) => {
-                self.scissors = list.clone();
-                self.dynamic_dirty = true;
+                if self.scissors != *list {
+                    self.scissors.clear();
+                    self.scissors.extend_from_slice(list);
+                    self.dirty.scissor = true;
+                }
             }
             Command::SetBlendFactor(factor) => {
-                self.blend_factor = *factor;
-                self.dynamic_dirty = true;
+                if self.blend_factor != *factor {
+                    self.blend_factor = *factor;
+                    self.dirty.blend = true;
+                }
             }
             Command::SetStencilRef(value) => {
-                self.stencil_ref = *value;
-                self.dynamic_dirty = true;
-            }
-            Command::SetTopology(value) => {
-                self.topology = Some(*value);
-                self.dynamic_dirty = true;
-            }
-            Command::SetVertexBuffers { start, views } => {
-                let end = *start as usize + views.len();
-                if self.vertex.len() < end {
-                    self.vertex.resize(end, None);
+                if self.stencil_ref != *value {
+                    self.stencil_ref = *value;
+                    self.dirty.stencil = true;
                 }
-                for (k, view) in views.iter().enumerate() {
-                    self.vertex[*start as usize + k] = Some(*view);
+            }
+            Command::SetTopology(value) => self.topology = Some(*value),
+            Command::SetVertexBuffers { start, views } => {
+                if self.vertex.set(*start, views) {
+                    self.note("vertex buffers past slot 31 are ignored");
                 }
             }
             Command::SetIndexBuffer(view) => self.index = *view,
             Command::SetRenderTargets { colors, depth } => {
-                self.end_rendering();
-                self.colors = colors.clone();
-                self.depth = *depth;
+                if self.colors != *colors || self.depth != *depth {
+                    self.end_rendering();
+                    self.colors.clear();
+                    self.colors.extend_from_slice(colors);
+                    self.depth = *depth;
+                    self.dirty.viewport |= self.viewports.is_empty();
+                    self.dirty.scissor |= self.scissors.is_empty();
+                }
             }
             Command::ClearRenderTarget { view, color, rects } => {
                 self.clear_target(*view, Some(*color), None, rects)
@@ -419,8 +575,10 @@ impl<'a> Replayer<'a> {
             }
             Command::Barriers(list) => {
                 self.end_rendering();
-                // SAFETY: `cb` is recording and outside a rendering scope.
-                unsafe { barrier::record(d, cb, list) };
+                if self.barriers.conflicts(list) {
+                    self.flush_barriers();
+                }
+                self.barriers.add(list);
                 self.report.barriers += list.len() as u32;
             }
             Command::BeginQuery { pool, kind, index } => {
@@ -479,533 +637,6 @@ impl<'a> Replayer<'a> {
         }
         Ok(())
     }
-
-    fn end_rendering(&mut self) {
-        if self.rendering {
-            // SAFETY: a rendering scope is open on `cb`.
-            unsafe { self.ctx.device.cmd_end_rendering(self.cb) };
-            self.rendering = false;
-        }
-    }
-
-    fn render_area(&self, views: &[TargetView]) -> vk::Rect2D {
-        let (w, h) = views.iter().fold((u32::MAX, u32::MAX), |(w, h), v| {
-            (w.min(v.extent[0]), h.min(v.extent[1]))
-        });
-        vk::Rect2D {
-            offset: vk::Offset2D::default(),
-            extent: vk::Extent2D {
-                width: if w == u32::MAX { 1 } else { w },
-                height: if h == u32::MAX { 1 } else { h },
-            },
-        }
-    }
-
-    /// Opens a rendering scope on the bound targets.
-    fn begin_rendering(&mut self) {
-        if self.rendering {
-            return;
-        }
-        let all: Vec<TargetView> = self.colors.iter().copied().chain(self.depth).collect();
-        let colors: Vec<_> = self
-            .colors
-            .iter()
-            .map(|v| attachment(v.view, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, None))
-            .collect();
-        let depth = self.depth.map(|v| {
-            attachment(
-                v.view,
-                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                None,
-            )
-        });
-        let stencil = self.depth.filter(|v| has_stencil(v.format)).map(|v| {
-            attachment(
-                v.view,
-                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                None,
-            )
-        });
-        self.open_rendering(&all, &colors, depth.as_ref(), stencil.as_ref());
-    }
-
-    fn open_rendering(
-        &mut self,
-        all: &[TargetView],
-        colors: &[vk::RenderingAttachmentInfo<'_>],
-        depth: Option<&vk::RenderingAttachmentInfo<'_>>,
-        stencil: Option<&vk::RenderingAttachmentInfo<'_>>,
-    ) {
-        let mut info = vk::RenderingInfo::default()
-            .render_area(self.render_area(all))
-            .layer_count(1)
-            .color_attachments(colors);
-        if let Some(d) = depth {
-            info = info.depth_attachment(d);
-        }
-        if let Some(s) = stencil {
-            info = info.stencil_attachment(s);
-        }
-        // SAFETY: `cb` is recording outside a rendering scope; the views outlive the list.
-        unsafe { self.ctx.device.cmd_begin_rendering(self.cb, &info) };
-        self.rendering = true;
-    }
-
-    fn clear_target(
-        &mut self,
-        view: TargetView,
-        color: Option<[f32; 4]>,
-        ds: Option<(Option<f32>, Option<u8>)>,
-        rects: &[Rect],
-    ) {
-        let is_bound = self.colors.iter().any(|v| v.view == view.view)
-            || self.depth.is_some_and(|v| v.view == view.view);
-        let was_open = self.rendering;
-        if !(was_open && is_bound) {
-            self.end_rendering();
-            let (colors, depth, stencil);
-            let ready = |v: vk::ImageView, layout, clear| attachment(v, layout, clear);
-            if let Some(c) = color {
-                let value = vk::ClearValue {
-                    color: vk::ClearColorValue { float32: c },
-                };
-                colors = vec![ready(
-                    view.view,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    rects.is_empty().then_some(value),
-                )];
-                depth = None;
-                stencil = None;
-            } else {
-                let (d, s) = ds.unwrap_or((None, None));
-                colors = Vec::new();
-                let value = |d: f32, s: u8| vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: d,
-                        stencil: u32::from(s),
-                    },
-                };
-                let layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-                depth = Some(ready(
-                    view.view,
-                    layout,
-                    (rects.is_empty() && d.is_some()).then(|| value(d.unwrap_or(0.0), 0)),
-                ));
-                stencil = has_stencil(view.format).then(|| {
-                    ready(
-                        view.view,
-                        layout,
-                        (rects.is_empty() && s.is_some()).then(|| value(0.0, s.unwrap_or(0))),
-                    )
-                });
-            }
-            self.open_rendering(&[view], &colors, depth.as_ref(), stencil.as_ref());
-            if rects.is_empty() {
-                self.end_rendering();
-                return;
-            }
-        }
-        let area = vk::Rect2D {
-            offset: vk::Offset2D::default(),
-            extent: vk::Extent2D {
-                width: view.extent[0],
-                height: view.extent[1],
-            },
-        };
-        let regions: Vec<vk::ClearRect> = if rects.is_empty() {
-            vec![vk::ClearRect {
-                rect: area,
-                base_array_layer: 0,
-                layer_count: 1,
-            }]
-        } else {
-            rects
-                .iter()
-                .map(|r| vk::ClearRect {
-                    rect: rect2d(*r),
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .collect()
-        };
-        let mut attachments = Vec::new();
-        if let Some(c) = color {
-            let index = self
-                .colors
-                .iter()
-                .position(|v| v.view == view.view)
-                .unwrap_or(0) as u32;
-            attachments.push(vk::ClearAttachment {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                color_attachment: if was_open && is_bound { index } else { 0 },
-                clear_value: vk::ClearValue {
-                    color: vk::ClearColorValue { float32: c },
-                },
-            });
-        } else if let Some((d, s)) = ds {
-            let mut aspect = vk::ImageAspectFlags::empty();
-            if d.is_some() {
-                aspect |= vk::ImageAspectFlags::DEPTH;
-            }
-            if s.is_some() && has_stencil(view.format) {
-                aspect |= vk::ImageAspectFlags::STENCIL;
-            }
-            attachments.push(vk::ClearAttachment {
-                aspect_mask: aspect,
-                color_attachment: 0,
-                clear_value: vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: d.unwrap_or(0.0),
-                        stencil: u32::from(s.unwrap_or(0)),
-                    },
-                },
-            });
-        }
-        // SAFETY: a rendering scope with the view is open on `cb`.
-        unsafe {
-            self.ctx
-                .device
-                .cmd_clear_attachments(self.cb, &attachments, &regions)
-        };
-        if !(was_open && is_bound) {
-            self.end_rendering();
-        }
-    }
-
-    /// Makes a draw legal: scope open, pipeline bound, push block and dynamic state current, buffers bound.
-    fn prepare_draw(&mut self, indexed: bool) -> Result<(), ReplayError> {
-        let Some(pipeline) = self.graphics.pipeline.clone() else {
-            return Err(ReplayError::NoPipeline("graphics"));
-        };
-        self.begin_rendering();
-        if pipeline.render_targets.len() != self.colors.len() {
-            self.note("a draw with a different number of render targets than its pipeline has");
-        }
-        self.bind(BindPoint::Graphics, &pipeline)?;
-        let d = &self.ctx.device;
-        let cb = self.cb;
-        let mesh = pipeline.kind == PipelineKind::Mesh;
-        if self.dynamic_dirty {
-            let area = self.render_area(
-                &self
-                    .colors
-                    .iter()
-                    .copied()
-                    .chain(self.depth)
-                    .collect::<Vec<_>>(),
-            );
-            let viewports: Vec<vk::Viewport> = if self.viewports.is_empty() {
-                vec![flip(Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: area.extent.width as f32,
-                    height: area.extent.height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                })]
-            } else {
-                self.viewports.iter().copied().map(flip).collect()
-            };
-            let scissors: Vec<vk::Rect2D> = if self.scissors.is_empty() {
-                vec![area]
-            } else {
-                self.scissors.iter().copied().map(rect2d).collect()
-            };
-            // SAFETY: `cb` is recording; the pipeline declares these states dynamic.
-            unsafe {
-                d.cmd_set_viewport_with_count(cb, &viewports);
-                d.cmd_set_scissor_with_count(cb, &scissors);
-                d.cmd_set_blend_constants(cb, &self.blend_factor);
-                d.cmd_set_stencil_reference(
-                    cb,
-                    vk::StencilFaceFlags::FRONT_AND_BACK,
-                    self.stencil_ref,
-                );
-            }
-            self.dynamic_dirty = false;
-        }
-        if !mesh {
-            let topology = self.topology.and_then(vk_topology).unwrap_or_else(|| {
-                crate::pipeline::state::default_topology(pipeline.topology, pipeline.has_geometry)
-            });
-            // SAFETY: the pipeline declares topology dynamic.
-            unsafe { d.cmd_set_primitive_topology(cb, topology) };
-            for slot in &pipeline.vertex_slots {
-                match self.vertex.get(slot.slot as usize).copied().flatten() {
-                    Some(view) => {
-                        let size = u64::from(view.size);
-                        // SAFETY: the stride is dynamic state of this pipeline; the range is in the arena.
-                        unsafe {
-                            d.cmd_bind_vertex_buffers2(
-                                cb,
-                                slot.slot,
-                                &[self.env.arena.buffer],
-                                &[view.va],
-                                Some(&[size.max(1)]),
-                                Some(&[u64::from(view.stride)]),
-                            )
-                        };
-                    }
-                    None => self.note(format!(
-                        "a draw with vertex buffer slot {} unbound",
-                        slot.slot
-                    )),
-                }
-            }
-            if indexed {
-                match self.index {
-                    Some(view) => {
-                        let ty = if view.format == 57 {
-                            vk::IndexType::UINT16
-                        } else {
-                            vk::IndexType::UINT32
-                        };
-                        // SAFETY: the index range is in the arena.
-                        unsafe { d.cmd_bind_index_buffer(cb, self.env.arena.buffer, view.va, ty) };
-                    }
-                    None => return Err(ReplayError::NoIndexBuffer),
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn prepare_dispatch(&mut self) -> Result<(), ReplayError> {
-        let Some(pipeline) = self.compute.pipeline.clone() else {
-            return Err(ReplayError::NoPipeline("compute"));
-        };
-        self.end_rendering();
-        self.bind(BindPoint::Compute, &pipeline)
-    }
-
-    /// Binds the pipeline, the image set and a push block current with the root arguments.
-    fn bind(&mut self, bind: BindPoint, pipeline: &Arc<Pipeline>) -> Result<(), ReplayError> {
-        let point = pipeline.bind_point();
-        let (d, cb, layout) = (&self.ctx.device, self.cb, self.env.layout);
-        let bound = match bind {
-            BindPoint::Graphics => &mut self.graphics,
-            BindPoint::Compute => &mut self.compute,
-        };
-        if bound.handle != pipeline.handle {
-            // SAFETY: `cb` is recording and the pipeline outlives the list.
-            unsafe { d.cmd_bind_pipeline(cb, point, pipeline.handle) };
-            bound.handle = pipeline.handle;
-            bound.push_dirty = true;
-        }
-        if !bound.bindless
-            && let Some(set) = self.env.bindless
-        {
-            // SAFETY: the set matches set 1 of the shared layout.
-            unsafe { d.cmd_bind_descriptor_sets(cb, point, layout, 1, &[set], &[]) };
-            bound.bindless = true;
-        }
-        if !bound.push_dirty {
-            return Ok(());
-        }
-        if bound.root.is_none() {
-            bound.args = RootArguments::new(&pipeline.root);
-        }
-        let layouts = pipeline.stage_layouts();
-        let mut user = root::pack(&layouts, &bound.args, self.heaps)?;
-        if !user.spill.is_empty() {
-            let va = self
-                .env
-                .spill
-                .as_mut()
-                .and_then(|s| s.store(&user.spill))
-                .ok_or(ReplayError::NoSpillSpace)?;
-            user.sgprs[0] = va as u32;
-            user.sgprs[1] = (va >> 32) as u32 & 0xFF;
-        }
-        let words = pipeline.push_words(&user, self.env.arena.device_address);
-        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        // SAFETY: the layout's one range covers every stage and these bytes.
-        unsafe { d.cmd_push_constants(cb, layout, vk::ShaderStageFlags::ALL, 0, &bytes) };
-        bound.push_dirty = false;
-        Ok(())
-    }
-
-    fn indirect(
-        &mut self,
-        kind: IndirectKind,
-        max: u32,
-        args: u64,
-        stride: u32,
-        count: Option<u64>,
-    ) -> Result<(), ReplayError> {
-        let width = match kind {
-            IndirectKind::Draw => 16,
-            IndirectKind::DrawIndexed => 20,
-            IndirectKind::Dispatch | IndirectKind::DispatchMesh => 12,
-        };
-        let stride = if stride == 0 { width } else { stride };
-        match kind {
-            IndirectKind::Dispatch => self.prepare_dispatch()?,
-            IndirectKind::DispatchMesh => {
-                if self.ctx.mesh.is_none() {
-                    self.note("DispatchMesh on a GPU without mesh shaders");
-                    return Ok(());
-                }
-                self.prepare_draw(false)?;
-            }
-            IndirectKind::Draw => self.prepare_draw(false)?,
-            IndirectKind::DrawIndexed => self.prepare_draw(true)?,
-        }
-        let (d, cb, buffer) = (&self.ctx.device, self.cb, self.env.arena.buffer);
-        let multi = self.ctx.features.multi_draw_indirect;
-        // SAFETY: the pipeline, state and arena ranges are as the draw or dispatch needs.
-        unsafe {
-            match (kind, count) {
-                (IndirectKind::Draw, Some(c)) => {
-                    d.cmd_draw_indirect_count(cb, buffer, args, buffer, c, max, stride)
-                }
-                (IndirectKind::DrawIndexed, Some(c)) => {
-                    d.cmd_draw_indexed_indirect_count(cb, buffer, args, buffer, c, max, stride)
-                }
-                (IndirectKind::DispatchMesh, Some(c)) => {
-                    if let Some(mesh) = &self.ctx.mesh {
-                        mesh.cmd_draw_mesh_tasks_indirect_count(
-                            cb, buffer, args, buffer, c, max, stride,
-                        )
-                    }
-                }
-                (IndirectKind::DispatchMesh, None) => {
-                    if let Some(mesh) = &self.ctx.mesh {
-                        mesh.cmd_draw_mesh_tasks_indirect(cb, buffer, args, max, stride)
-                    }
-                }
-                (IndirectKind::Draw, None) if multi || max <= 1 => {
-                    d.cmd_draw_indirect(cb, buffer, args, max, stride)
-                }
-                (IndirectKind::DrawIndexed, None) if multi || max <= 1 => {
-                    d.cmd_draw_indexed_indirect(cb, buffer, args, max, stride)
-                }
-                (IndirectKind::Draw, None) => {
-                    for i in 0..max {
-                        d.cmd_draw_indirect(cb, buffer, args + u64::from(i * stride), 1, stride)
-                    }
-                }
-                (IndirectKind::DrawIndexed, None) => {
-                    for i in 0..max {
-                        d.cmd_draw_indexed_indirect(
-                            cb,
-                            buffer,
-                            args + u64::from(i * stride),
-                            1,
-                            stride,
-                        )
-                    }
-                }
-                (IndirectKind::Dispatch, _) => {
-                    for i in 0..max {
-                        d.cmd_dispatch_indirect(cb, buffer, args + u64::from(i * stride))
-                    }
-                }
-            }
-        }
-        if count.is_some() && kind == IndirectKind::Dispatch {
-            self.note("an indirect dispatch with a count buffer runs every record");
-        }
-        match kind {
-            IndirectKind::Dispatch => self.report.dispatches += max,
-            _ => self.report.draws += max,
-        }
-        Ok(())
-    }
-}
-
-fn attachment(
-    view: vk::ImageView,
-    layout: vk::ImageLayout,
-    clear: Option<vk::ClearValue>,
-) -> vk::RenderingAttachmentInfo<'static> {
-    let info = vk::RenderingAttachmentInfo::default()
-        .image_view(view)
-        .image_layout(layout)
-        .store_op(vk::AttachmentStoreOp::STORE);
-    match clear {
-        Some(value) => info.load_op(vk::AttachmentLoadOp::CLEAR).clear_value(value),
-        None => info.load_op(vk::AttachmentLoadOp::LOAD),
-    }
-}
-
-/// A D3D viewport as a Vulkan one with the y axis flipped, so clip space keeps D3D's orientation.
-fn flip(v: Viewport) -> vk::Viewport {
-    vk::Viewport {
-        x: v.x,
-        y: v.y + v.height,
-        width: v.width,
-        height: -v.height,
-        min_depth: v.min_depth,
-        max_depth: v.max_depth,
-    }
-}
-
-fn rect2d(r: Rect) -> vk::Rect2D {
-    vk::Rect2D {
-        offset: vk::Offset2D {
-            x: r.left,
-            y: r.top,
-        },
-        extent: vk::Extent2D {
-            width: (r.right - r.left).max(0) as u32,
-            height: (r.bottom - r.top).max(0) as u32,
-        },
-    }
-}
-
-fn offset3(o: [u32; 3]) -> vk::Offset3D {
-    vk::Offset3D {
-        x: o[0] as i32,
-        y: o[1] as i32,
-        z: o[2] as i32,
-    }
-}
-
-fn extent3(e: [u32; 3]) -> vk::Extent3D {
-    vk::Extent3D {
-        width: e[0],
-        height: e[1],
-        depth: e[2],
-    }
-}
-
-fn copy_aspect(image: &ImageRef) -> vk::ImageAspectFlags {
-    if image.aspect.contains(vk::ImageAspectFlags::DEPTH) {
-        vk::ImageAspectFlags::DEPTH
-    } else {
-        image.aspect
-    }
-}
-
-fn layers_of(image: &ImageRef, sub: Subresource) -> vk::ImageSubresourceLayers {
-    vk::ImageSubresourceLayers::default()
-        .aspect_mask(copy_aspect(image))
-        .mip_level(sub.mip)
-        .base_array_layer(sub.layer)
-        .layer_count(1)
-}
-
-fn buffer_image_region(
-    image: &ImageRef,
-    sub: Subresource,
-    origin: [u32; 3],
-    size: [u32; 3],
-    buffer: &BufferFootprint,
-) -> vk::BufferImageCopy {
-    let block = block_size(image.format);
-    let row_texels = buffer.row_pitch / format_bytes(image.format).max(1) * block;
-    vk::BufferImageCopy::default()
-        .buffer_offset(buffer.va)
-        .buffer_row_length(row_texels)
-        .buffer_image_height(if buffer.slice_rows == 0 {
-            0
-        } else {
-            buffer.slice_rows * block
-        })
-        .image_subresource(layers_of(image, sub))
-        .image_offset(offset3(origin))
-        .image_extent(extent3(size))
 }
 
 /// Records `commands` into a one-shot command buffer, submits it and waits: for tests and tools. The device

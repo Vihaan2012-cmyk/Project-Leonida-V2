@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use iced_x86::code_asm::*;
-use iced_x86::{Code, Instruction, MemoryOperand, Register};
+use iced_x86::{BlockEncoderOptions, Code, Instruction, MemoryOperand, Register};
 
 use super::*;
 
@@ -115,7 +115,10 @@ fn early_return() {
         a.xor(eax, eax)?;
         a.ret()
     });
-    assert!(text.contains("u32 sub_00001000(u64 a1)"), "{text}");
+    assert!(
+        text.contains("uint32_t sub_00001000(uint64_t a1)"),
+        "{text}"
+    );
     assert!(
         text.contains(
             "if (a1 == 0) {
@@ -124,7 +127,7 @@ fn early_return() {
         ),
         "{text}"
     );
-    assert!(text.contains("return (u32)(a1 + 1);"), "{text}");
+    assert!(text.contains("return (uint32_t)(a1 + 1);"), "{text}");
     assert!(!text.contains("goto"), "{text}");
 }
 
@@ -212,7 +215,7 @@ fn windows_arguments_and_stack_locals() {
     image.code.resize(0x90, 0xCC);
     let text = decompile(&image, START).expect("decompiles");
     assert!(
-        text.contains("(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5)"),
+        text.contains("(uint64_t a1, uint32_t a2, uint64_t a3, uint64_t a4, uint32_t a5)"),
         "{text}"
     );
     assert!(text.contains("v_28 = a3 + a4;"), "{text}");
@@ -229,7 +232,7 @@ fn float_result_comes_from_xmm0() {
         a.ret()
     });
     assert!(
-        text.contains("f32 sub_00001000(u64 a1, u64 a2, u64 a3)"),
+        text.contains("float sub_00001000(float a1, float a2, float a3)"),
         "{text}"
     );
     assert!(text.contains("return a1 * a2 + a3;"), "{text}");
@@ -246,8 +249,8 @@ fn one_register_holding_two_values_gives_two_variables() {
         a.mov(qword_ptr(rcx + 0x30), rax)?;
         a.ret()
     });
-    assert!(text.contains("v1 = *(u64 *)a1;"), "{text}");
-    assert!(text.contains("v2 = *(u64 *)(a1 + 0x20);"), "{text}");
+    assert!(text.contains("v1 = a1->f_0;"), "{text}");
+    assert!(text.contains("v2 = a1->f_20;"), "{text}");
     assert!(!text.contains("rax"), "{text}");
 }
 
@@ -270,4 +273,321 @@ fn a_value_merged_at_a_join_is_one_variable() {
     assert!(text.contains("v1 = 1;"), "{text}");
     assert!(text.contains("v1 = a2;"), "{text}");
     assert!(text.contains("return v1 * v1;"), "{text}");
+}
+
+#[test]
+fn types_follow_width_float_and_dereference() {
+    let text = run(|a| {
+        a.mulsd(xmm1, xmm1)?;
+        a.movsd_2(qword_ptr(rcx + 8), xmm1)?;
+        a.movzx(eax, byte_ptr(rcx + 3))?;
+        a.ret()
+    });
+    assert!(
+        text.contains("uint32_t sub_00001000(struct S1 *a1, double a2)"),
+        "{text}"
+    );
+    assert!(text.contains("a1->f_8 = a2 * a2;"), "{text}");
+    assert!(text.contains("return a1->f_3;"), "{text}");
+}
+
+#[test]
+fn vectors_and_integer_locals_are_declared() {
+    let text = run(|a| {
+        let mut skip = a.create_label();
+        a.movaps(xmm0, xmmword_ptr(rcx))?;
+        a.test(edx, edx)?;
+        a.je(skip)?;
+        a.movaps(xmm0, xmmword_ptr(rcx + 0x10))?;
+        a.set_label(&mut skip)?;
+        a.movaps(xmmword_ptr(rcx + 0x20), xmm0)?;
+        a.movaps(xmmword_ptr(rcx + 0x30), xmm0)?;
+        a.ret()
+    });
+    assert!(text.contains("(struct S1 *a1, uint32_t a2)"), "{text}");
+    assert!(text.contains("__m128 v1;"), "{text}");
+}
+
+#[test]
+fn pointer_locals_to_structures_are_declared() {
+    let text = run(|a| {
+        let mut other = a.create_label();
+        a.mov(rax, qword_ptr(rcx + 8))?;
+        a.mov(rdx, qword_ptr(rcx + 0x10))?;
+        a.cmp(dword_ptr(rax), 0)?;
+        a.je(other)?;
+        a.mov(eax, dword_ptr(rdx + 4))?;
+        a.ret()?;
+        a.set_label(&mut other)?;
+        a.mov(eax, dword_ptr(rax + 4))?;
+        a.add(eax, dword_ptr(rdx + 8))?;
+        a.ret()
+    });
+    assert!(text.contains("struct S2 *v1;"), "{text}");
+    assert!(text.contains("struct S3 *v2;"), "{text}");
+    assert!(text.contains("struct S2 *f_8;"), "{text}");
+}
+
+#[test]
+fn one_pointer_read_at_several_offsets_becomes_a_structure() {
+    let text = run(|a| {
+        a.mov(eax, dword_ptr(rcx + 0x10))?;
+        a.add(eax, dword_ptr(rcx + 0x14))?;
+        a.mov(rdx, qword_ptr(rcx + 0x20))?;
+        a.add(eax, dword_ptr(rdx + 4))?;
+        a.add(eax, dword_ptr(rdx + 8))?;
+        a.ret()
+    });
+    assert!(text.contains("struct S1 {"), "{text}");
+    assert!(text.contains("uint32_t f_10;"), "{text}");
+    assert!(text.contains("struct S2 *f_20;"), "{text}");
+    assert!(text.contains("(struct S1 *a1)"), "{text}");
+    assert!(
+        text.contains("a1->f_10 + a1->f_14 + v1->f_4 + v1->f_8"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_virtual_call_on_the_first_argument_is_a_method_call() {
+    let text = run(|a| {
+        a.push(rbx)?;
+        a.sub(rsp, 0x20)?;
+        a.mov(rbx, rcx)?;
+        a.mov(rax, qword_ptr(rcx))?;
+        a.mov(edx, 7)?;
+        a.call(qword_ptr(rax + 0x70))?;
+        a.mov(rcx, qword_ptr(rbx + 0x18))?;
+        a.mov(rax, qword_ptr(rcx))?;
+        a.add(rsp, 0x20)?;
+        a.pop(rbx)?;
+        a.jmp(qword_ptr(rax + 8))
+    });
+    assert!(text.contains("struct S1 *this"), "{text}");
+    assert!(text.contains("void **vtable;"), "{text}");
+    assert!(text.contains("this->vf14(7);"), "{text}");
+    assert!(text.contains("v1->vf1()"), "{text}");
+}
+
+#[test]
+fn a_pointer_read_at_one_offset_stays_void() {
+    let text = run(|a| {
+        a.mov(eax, dword_ptr(rcx + 8))?;
+        a.ret()
+    });
+    assert!(text.contains("uint32_t sub_00001000(void *a1)"), "{text}");
+    assert!(text.contains("return *(uint32_t *)(a1 + 8);"), "{text}");
+    assert!(!text.contains("struct"), "{text}");
+}
+
+#[test]
+fn a_function_over_the_block_limit_is_a_stub() {
+    let image = Image::new(assemble(|a| {
+        for _ in 0..5 {
+            let mut next = a.create_label();
+            a.test(rcx, rcx)?;
+            a.je(next)?;
+            a.inc(rax)?;
+            a.set_label(&mut next)?;
+        }
+        a.ret()
+    }));
+    let options = Options {
+        max_blocks: 3,
+        ..Options::default()
+    };
+    let text = decompile_with(&image, START, &options).expect("a stub");
+    assert!(text.contains("/* too large: "), "{text}");
+    assert!(text.contains(" blocks */"), "{text}");
+}
+
+#[test]
+fn garbage_bytes_never_panic() {
+    for seed in 0u32..200 {
+        let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        let code: Vec<u8> = (0..96)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        let _ = decompile(&Image::new(code), START);
+    }
+}
+
+#[test]
+fn a_counted_loop_with_a_guard_is_a_for_loop() {
+    // for (i = 0; i < a2; i += 1) *(a1 + i * 4) = 0
+    let text = run(|a| {
+        let mut done = a.create_label();
+        let mut top = a.create_label();
+        a.xor(eax, eax)?;
+        a.cmp(eax, edx)?;
+        a.jae(done)?;
+        a.set_label(&mut top)?;
+        a.mov(dword_ptr(rcx + rax * 4), 0)?;
+        a.inc(eax)?;
+        a.cmp(eax, edx)?;
+        a.jb(top)?;
+        a.set_label(&mut done)?;
+        a.ret()
+    });
+    assert!(text.contains("for (v1 = 0; v1 < a2; v1 += 1) {"), "{text}");
+    assert!(!text.contains("do {"), "{text}");
+}
+
+#[test]
+fn packed_float_math_and_intrinsics_read_as_such() {
+    let text = run(|a| {
+        a.movaps(xmm0, xmmword_ptr(rcx))?;
+        a.mulps(xmm0, xmmword_ptr(rdx))?;
+        a.addps(xmm0, xmm0)?;
+        a.sqrtps(xmm0, xmm0)?;
+        a.vhaddps(ymm1, ymm0, ymm0)?;
+        a.vmovaps(ymmword_ptr(r8), ymm1)?;
+        a.ret()
+    });
+    assert!(text.contains("_mm_sqrt_ps("), "{text}");
+    assert!(text.contains("_mm256_hadd_ps("), "{text}");
+    assert!(text.contains(" * "), "{text}");
+}
+
+#[test]
+fn division_by_a_magic_multiplier_is_a_division() {
+    let text = run(|a| {
+        a.mov(eax, ecx)?;
+        a.mov(edx, 0xAAAA_AAABu32)?;
+        a.imul_2(rax, rdx)?;
+        a.shr(rax, 33)?;
+        a.ret()
+    });
+    assert!(text.contains("return a1 / 3;"), "{text}");
+}
+
+#[test]
+fn string_literals_and_flag_folding() {
+    let mut image = Image::new(assemble(|a| {
+        a.sub(rsp, 0x28)?;
+        ip_load(a, Code::Lea_r64_m, Register::RCX, DATA)?;
+        a.mov(rbx, rdx)?;
+        a.call(START + 0x80)?;
+        a.cmp(ebx, 5)?;
+        a.setl(al)?;
+        a.mov(edx, 9)?;
+        a.cmp(ebx, 100)?;
+        a.cmovg(ebx, edx)?;
+        a.movzx(eax, al)?;
+        a.add(eax, ebx)?;
+        a.add(rsp, 0x28)?;
+        a.ret()
+    }));
+    image.function_len = 0x80;
+    image.code.resize(0x90, 0xCC);
+    image.data = b"hello\0".to_vec();
+    image.texts.insert(DATA, "hello".into());
+    let text = decompile(&image, START).expect("decompiles");
+    assert!(text.contains("sub_00001080(\"hello\")"), "{text}");
+    assert!(text.contains("(int32_t)"), "{text}");
+    assert!(text.contains("< 5"), "{text}");
+    assert!(text.contains("> 0x64 ? 9 :"), "{text}");
+}
+
+#[test]
+fn a_jump_table_becomes_a_switch() {
+    let mut a = CodeAssembler::new(64).expect("assembler");
+    let mut default = a.create_label();
+    let mut cases = [a.create_label(), a.create_label(), a.create_label()];
+    a.mov(eax, ecx).unwrap();
+    a.cmp(eax, 2).unwrap();
+    a.ja(default).unwrap();
+    ip_load(&mut a, Code::Lea_r64_m, Register::RDX, BASE).unwrap();
+    a.mov(eax, dword_ptr(rdx + rax * 4 + 0x8000)).unwrap();
+    a.add(rax, rdx).unwrap();
+    a.jmp(rax).unwrap();
+    for (k, label) in cases.iter_mut().enumerate() {
+        a.set_label(label).unwrap();
+        a.mov(eax, 10 * (k as i32 + 1)).unwrap();
+        a.ret().unwrap();
+    }
+    a.set_label(&mut default).unwrap();
+    a.mov(eax, 99).unwrap();
+    a.ret().unwrap();
+    let result = a
+        .assemble_options(START, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS)
+        .expect("encodes");
+    let mut image = Image::new(result.inner.code_buffer.clone());
+    image.data = cases
+        .iter()
+        .flat_map(|l| ((result.label_ip(l).unwrap() - BASE) as u32).to_le_bytes())
+        .collect();
+    let text = decompile(&image, START).expect("decompiles");
+    assert!(text.contains("switch (a1) {"), "{text}");
+    assert!(text.contains("case 0:"), "{text}");
+    assert!(text.contains("return 0x1e;"), "{text}");
+    assert!(text.contains("return 0x63;"), "{text}");
+    assert!(!text.contains("goto"), "{text}");
+}
+
+#[test]
+fn short_circuit_conditions_and_else_if_chains_need_no_goto() {
+    let text = run(|a| {
+        let mut no = a.create_label();
+        let mut second = a.create_label();
+        let mut third = a.create_label();
+        a.test(rcx, rcx)?;
+        a.je(no)?;
+        a.test(rdx, rdx)?;
+        a.je(no)?;
+        a.mov(eax, 1)?;
+        a.ret()?;
+        a.set_label(&mut no)?;
+        a.cmp(r8d, 5)?;
+        a.jne(second)?;
+        a.mov(eax, 2)?;
+        a.ret()?;
+        a.set_label(&mut second)?;
+        a.cmp(r8d, 6)?;
+        a.jne(third)?;
+        a.mov(eax, 3)?;
+        a.ret()?;
+        a.set_label(&mut third)?;
+        a.xor(eax, eax)?;
+        a.ret()
+    });
+    assert!(text.contains("if (a1 == 0 || a2 == 0) {"), "{text}");
+    assert!(!text.contains("goto"), "{text}");
+}
+
+#[test]
+fn break_and_continue_inside_a_loop() {
+    // while (true) { if (a1 == 0) break; a1 = *(a1); if (a1 == a2) continue; sub(a1) }
+    let mut image = Image::new(assemble(|a| {
+        let mut top = a.create_label();
+        let mut out = a.create_label();
+        a.push(rbx)?;
+        a.sub(rsp, 0x20)?;
+        a.mov(rbx, rcx)?;
+        a.mov(rsi, rdx)?;
+        a.set_label(&mut top)?;
+        a.test(rbx, rbx)?;
+        a.je(out)?;
+        a.mov(rbx, qword_ptr(rbx))?;
+        a.cmp(rbx, rsi)?;
+        a.je(top)?;
+        a.mov(rcx, rbx)?;
+        a.call(START + 0x80)?;
+        a.jmp(top)?;
+        a.set_label(&mut out)?;
+        a.add(rsp, 0x20)?;
+        a.pop(rbx)?;
+        a.ret()
+    }));
+    image.function_len = 0x80;
+    image.code.resize(0x90, 0xCC);
+    let text = decompile(&image, START).expect("decompiles");
+    assert!(!text.contains("goto"), "{text}");
+    assert!(text.contains("while (v1 != 0) {"), "{text}");
+    assert!(text.contains("if (v1 != a2) {"), "{text}");
 }

@@ -3,7 +3,8 @@
 //!
 //! The executable imports `SetThreadGroupAffinity`, `GetThreadGroupAffinity`, `GetLogicalProcessorInformation`,
 //! `SetThreadPriority` and `GetThreadPriority` for this; `CreateThread`, `SetProcessPriorityBoost` and
-//! `IsProcessorFeaturePresent` also appear and go to Windows unchanged. `SetThreadAffinityMask`,
+//! `IsProcessorFeaturePresent` also appear and go to Windows unchanged. `Sleep` is shimmed too, see
+//! [`sleep_plan`]. `SetThreadAffinityMask`,
 //! `SetThreadIdealProcessor(Ex)`, `GetSystemInfo`, `GetNativeSystemInfo`, `GetCurrentProcessorNumber` and
 //! `GetActiveProcessorCount` are not imported by the executable but are shimmed too, since the satellite DLLs
 //! may use them.
@@ -18,6 +19,9 @@ use crate::Shim;
 pub const CONSOLE_CORES: usize = 8;
 pub const CONSOLE_LOGICAL: usize = CONSOLE_CORES * 2;
 /// The affinity mask with every console logical processor.
+/// Fewest fastest-class cores for the console layout to leave the slower ones out of it.
+const MIN_LAYOUT_CORES: usize = 4;
+
 pub const CONSOLE_MASK: u64 = (1 << CONSOLE_LOGICAL) - 1;
 
 /// One physical core of the PC: the logical processors it runs (bits of `mask`, within one processor
@@ -32,11 +36,18 @@ pub struct PcCore {
 /// Maps console logical processors onto PC ones.
 ///
 /// Only one processor group is used for pinned threads (the one with the most logical processors), so a
-/// thread's mask never spans groups. Within it, cores are taken fastest class first and, inside a core, its
-/// logical processors in order, so the console's `2k`/`2k + 1` pairs land on SMT siblings where the PC has
-/// them and on separate cores where it does not; a PC with fewer logical processors than the console wraps
-/// around. Efficiency cores come after every performance core, so the low-numbered processors, where the
-/// game's main threads live, avoid them.
+/// thread's mask never spans groups. Console core `k` (logical processors `2k` and `2k + 1`) lands on:
+///
+/// - PC core `k` when the PC has at least [`CONSOLE_CORES`] cores of the fastest efficiency class (the
+///   extra cores stay free for threads the game leaves unpinned), with its two logical processors in order;
+/// - PC core `k * cores / 8` when it has fewer, so the game's pinned groups (for example console cores 4 to 6
+///   for rendering, core 0 for its own thread) stay apart from each other instead of wrapping around onto
+///   the same few cores;
+/// - on a PC with 16 or more fastest-class logical processors but no SMT, each console processor takes its
+///   own core.
+///
+/// Efficiency cores take part in the layout only when the fastest class has fewer than four cores; otherwise
+/// only masks that cover every console processor reach them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mapper {
     group: u16,
@@ -59,17 +70,35 @@ impl Mapper {
             .copied()
             .filter(|c| c.group == group && c.mask != 0)
             .collect();
-        cores.sort_by_key(|c| std::cmp::Reverse(c.efficiency));
-        let order: Vec<u8> = cores
-            .iter()
-            .flat_map(|c| (0..64u8).filter(|bit| c.mask >> bit & 1 == 1))
-            .collect();
-        if order.is_empty() {
+        if cores.is_empty() {
             return None;
         }
+        cores.sort_by_key(|c| std::cmp::Reverse(c.efficiency));
+        let fastest = cores[0].efficiency;
+        let fast = cores.iter().take_while(|c| c.efficiency == fastest).count();
+        let layout = if fast >= MIN_LAYOUT_CORES {
+            &cores[..fast]
+        } else {
+            &cores[..]
+        };
+        let bits = |core: &PcCore| -> Vec<u8> {
+            (0..64u8).filter(|bit| core.mask >> bit & 1 == 1).collect()
+        };
+        let order: Vec<u8> = layout.iter().flat_map(bits).collect();
         let mut table = [0; CONSOLE_LOGICAL];
         for (i, slot) in table.iter_mut().enumerate() {
-            *slot = order[i % order.len()];
+            *slot = if order.len() >= CONSOLE_LOGICAL {
+                order[i]
+            } else {
+                let k = i / 2;
+                let core = &layout[if layout.len() >= CONSOLE_CORES {
+                    k
+                } else {
+                    k * layout.len() / CONSOLE_CORES
+                }];
+                let threads = bits(core);
+                threads[(i % 2).min(threads.len() - 1)]
+            };
         }
         Some(Mapper {
             group,
@@ -253,14 +282,42 @@ pub fn host_priority(requested: i32) -> i32 {
     }
 }
 
+/// How `Sleep` is carried out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepPlan {
+    /// Windows' own `Sleep`: yields the time slice for 0, waits forever for `INFINITE`, and is precise
+    /// enough for long waits.
+    Host,
+    /// A high-resolution timer wait: a negative count of 100 ns ticks, relative to now.
+    Timer(i64),
+}
+
+const SLEEP_INFINITE: u32 = u32::MAX;
+const SLEEP_TIMER_LIMIT_MS: u32 = 100;
+
+/// The game never raises the timer resolution but spins on `Sleep(1)`, `Sleep(2)` and `Sleep(5)` in its
+/// thread start-up, frame hand-over and streaming waits. Windows rounds those up to its timer tick
+/// (15.6 ms by default), which at a high frame rate stalls a thread for whole frames, so short sleeps wait
+/// on a high-resolution timer instead.
+pub fn sleep_plan(milliseconds: u32) -> SleepPlan {
+    if milliseconds == 0 || milliseconds == SLEEP_INFINITE || milliseconds > SLEEP_TIMER_LIMIT_MS {
+        SleepPlan::Host
+    } else {
+        SleepPlan::Timer(-i64::from(milliseconds) * 10_000)
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::collections::BTreeMap;
     use std::ffi::c_void;
     use std::sync::{Mutex, OnceLock};
 
-    use windows_sys::Win32::Foundation::SetLastError;
-    use windows_sys::Win32::System::Threading::{GetThreadPriority, SetThreadPriority};
+    use windows_sys::Win32::Foundation::{CloseHandle, SetLastError};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, GetThreadPriority, INFINITE,
+        SetThreadPriority, SetWaitableTimer, Sleep, TIMER_ALL_ACCESS, WaitForSingleObject,
+    };
 
     use super::*;
     use crate::trace::note;
@@ -606,6 +663,63 @@ mod imp {
         }
     }
 
+    /// A thread's high-resolution timer; `None` when Windows lacks them, which makes `Sleep` pass through.
+    struct SleepTimer(Option<Handle>);
+
+    impl SleepTimer {
+        fn new() -> SleepTimer {
+            // SAFETY: null attributes and name are allowed; the handle is closed in `drop`.
+            let handle = unsafe {
+                CreateWaitableTimerExW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_ALL_ACCESS,
+                )
+            };
+            SleepTimer((!handle.is_null()).then_some(handle))
+        }
+
+        fn wait(&self, due: i64) -> bool {
+            let Some(handle) = self.0 else {
+                return false;
+            };
+            // SAFETY: `handle` is a live timer; `due` outlives the call; no completion routine is given.
+            unsafe {
+                if SetWaitableTimer(handle, &due, 0, None, std::ptr::null(), 0) == 0 {
+                    return false;
+                }
+                WaitForSingleObject(handle, INFINITE);
+            }
+            true
+        }
+    }
+
+    impl Drop for SleepTimer {
+        fn drop(&mut self) {
+            if let Some(handle) = self.0 {
+                // SAFETY: the handle came from `CreateWaitableTimerExW` and is closed once.
+                unsafe { CloseHandle(handle) };
+            }
+        }
+    }
+
+    thread_local! {
+        static SLEEP_TIMER: SleepTimer = SleepTimer::new();
+    }
+
+    pub extern "win64" fn sleep(milliseconds: u32) {
+        if let SleepPlan::Timer(due) = sleep_plan(milliseconds)
+            && SLEEP_TIMER
+                .try_with(|timer| timer.wait(due))
+                .unwrap_or(false)
+        {
+            return;
+        }
+        // SAFETY: a plain wait on the calling thread.
+        unsafe { Sleep(milliseconds) };
+    }
+
     pub extern "win64" fn set_thread_priority(thread: Handle, priority: i32) -> i32 {
         // SAFETY: Windows validates the handle and value.
         let ok = unsafe { SetThreadPriority(thread, host_priority(priority)) };
@@ -642,6 +756,16 @@ const DLLS: &[&str] = &[
     "api-ms-win-core-sysinfo-l1-1-0.dll",
     "api-ms-win-core-sysinfo-l1-2-0.dll",
     "api-ms-win-core-sysinfo-l1-2-1.dll",
+];
+
+/// The names `Sleep` is imported under.
+#[cfg(windows)]
+const SLEEP_DLLS: &[&str] = &[
+    "kernel32.dll",
+    "kernelbase.dll",
+    "api-ms-win-core-synch-l1-1-0.dll",
+    "api-ms-win-core-synch-l1-2-0.dll",
+    "api-ms-win-core-synch-l1-2-1.dll",
 ];
 
 pub fn shims() -> Vec<Shim> {
@@ -698,9 +822,16 @@ pub fn shims() -> Vec<Shim> {
                 imp::get_thread_priority as *const () as usize,
             ),
         ];
-        list.into_iter()
+        let mut shims: Vec<Shim> = list
+            .into_iter()
             .flat_map(|(name, address)| DLLS.iter().map(move |dll| Shim { dll, name, address }))
-            .collect()
+            .collect();
+        shims.extend(SLEEP_DLLS.iter().map(|dll| Shim {
+            dll,
+            name: "Sleep",
+            address: imp::sleep as *const () as usize,
+        }));
+        shims
     }
     #[cfg(not(windows))]
     {
@@ -744,27 +875,51 @@ mod tests {
     }
 
     #[test]
-    fn six_cores_with_smt_wrap_the_last_console_cores_onto_the_first() {
+    fn six_cores_with_smt_share_cores_between_neighbouring_console_cores() {
         let cores = pc(&[&[(0, 2); 6]]);
         assert_eq!(
             table(&cores),
-            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3]
+            vec![0, 1, 0, 1, 2, 3, 4, 5, 6, 7, 6, 7, 8, 9, 10, 11]
         );
         let m = Mapper::new(&cores).unwrap();
         assert_eq!(m.map_mask(CONSOLE_MASK), Some(0xFFF));
-        assert_eq!(m.map_mask(0xF000), Some(0b1111));
+        assert_eq!(m.map_mask(0xF000), Some(0xF00));
     }
 
     #[test]
-    fn eight_cores_without_smt_put_each_console_processor_on_its_own_core() {
+    fn the_games_render_and_main_masks_stay_apart_on_small_pcs() {
+        let render = 0x3F00;
+        let first_core = 0b1;
+        for cores in [
+            pc(&[&[(0, 2); 6]]),
+            pc(&[&[(0, 2); 4]]),
+            pc(&[&[(0, 1); 6]]),
+            pc(&[&[(0, 2); 5]]),
+        ] {
+            let m = Mapper::new(&cores).unwrap();
+            let on_render = m.map_mask(render).unwrap();
+            assert_eq!(on_render & m.map_mask(first_core).unwrap(), 0);
+            assert!(on_render.count_ones() >= 2);
+            assert_ne!(on_render, m.all());
+        }
+    }
+
+    #[test]
+    fn eight_cores_without_smt_put_both_console_threads_of_a_core_on_it() {
         let cores = pc(&[&[(0, 1); 8]]);
         assert_eq!(
             table(&cores),
-            vec![0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7]
+            vec![0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7]
         );
         let m = Mapper::new(&cores).unwrap();
-        assert_eq!(m.map_mask(0b0101), Some(0b0101));
-        assert_eq!(m.map_mask(0b1_0000_0001), Some(0b1));
+        assert_eq!(m.map_mask(0b0101), Some(0b11));
+        assert_eq!(m.map_mask(0b1_0000_0001), Some(0b1_0001));
+    }
+
+    #[test]
+    fn sixteen_cores_without_smt_give_every_console_processor_its_own() {
+        let cores = pc(&[&[(0, 1); 16]]);
+        assert_eq!(table(&cores), (0..16).collect::<Vec<u8>>());
     }
 
     #[test]
@@ -778,44 +933,46 @@ mod tests {
     }
 
     #[test]
-    fn efficiency_cores_come_after_the_performance_cores() {
+    fn efficiency_cores_are_left_to_unpinned_threads() {
         let mut list = vec![(1, 2); 6];
         list.extend([(0, 1); 8]);
         let cores = pc(&[&list]);
         let m = Mapper::new(&cores).unwrap();
-        let performance_mask = 0xFFF;
-        for console in 0..12 {
-            assert_eq!(
-                1u64 << m.map_processor(console) & performance_mask,
-                1u64 << m.map_processor(console)
-            );
+        for console in 0..16 {
+            assert!(m.map_processor(console) < 12);
         }
-        for console in 12..16 {
-            assert!(m.map_processor(console) >= 12);
-        }
-        assert_eq!(m.map_mask(0x0FFF), Some(performance_mask));
+        assert_eq!(m.map_mask(0x0FFF), Some(0xFF));
         assert_eq!(m.map_mask(CONSOLE_MASK), Some((1 << 20) - 1));
     }
 
     #[test]
-    fn efficiency_cores_listed_first_still_come_last() {
+    fn efficiency_cores_listed_first_are_still_left_out() {
         let mut list = vec![(0, 1); 4];
         list.extend([(1, 2); 4]);
         let m = Mapper::new(&pc(&[&list])).unwrap();
         assert_eq!(m.map_processor(0), 4);
         assert_eq!(m.map_processor(1), 5);
-        assert_eq!(m.map_processor(8), 0);
+        assert_eq!(m.map_processor(8), 8);
+        for console in 0..16 {
+            assert!(m.map_processor(console) >= 4);
+        }
     }
 
     #[test]
-    fn a_small_pc_wraps_around() {
+    fn too_few_fast_cores_bring_the_slow_ones_into_the_layout() {
+        let mut list = vec![(1, 2); 2];
+        list.extend([(0, 1); 6]);
+        let m = Mapper::new(&pc(&[&list])).unwrap();
+        assert_eq!(m.map_processor(0), 0);
+        assert_eq!(m.map_processor(15), 9);
+    }
+
+    #[test]
+    fn a_two_core_pc_splits_the_console_in_halves() {
         let cores = pc(&[&[(0, 2); 2]]);
-        assert_eq!(
-            table(&cores),
-            vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]
-        );
         let m = Mapper::new(&cores).unwrap();
-        assert_eq!(m.map_mask(0b1111_1110), Some(0b1111));
+        assert_eq!(m.map_mask(0x00FF), Some(0b0011));
+        assert_eq!(m.map_mask(0xFF00), Some(0b1100));
         assert_eq!(m.map_mask(0b10), Some(0b10));
     }
 
@@ -865,8 +1022,8 @@ mod tests {
     #[test]
     fn host_processors_report_as_console_ones() {
         let m = Mapper::new(&pc(&[&[(0, 2); 4]])).unwrap();
-        assert_eq!(m.console_processor(0, 3), 3);
-        assert_eq!(m.console_processor(0, 6), 6);
+        assert_eq!(m.console_processor(0, 3), 5);
+        assert_eq!(m.console_processor(0, 6), 12);
         assert_eq!(m.console_processor(1, 6), 6);
         let big = Mapper::new(&pc(&[&[(0, 2); 16]])).unwrap();
         assert_eq!(big.console_processor(0, 29), 13);
@@ -974,6 +1131,36 @@ mod tests {
     }
 
     #[test]
+    fn short_sleeps_use_the_timer_and_the_rest_pass_through() {
+        assert_eq!(sleep_plan(0), SleepPlan::Host);
+        assert_eq!(sleep_plan(1), SleepPlan::Timer(-10_000));
+        assert_eq!(sleep_plan(5), SleepPlan::Timer(-50_000));
+        assert_eq!(sleep_plan(100), SleepPlan::Timer(-1_000_000));
+        assert_eq!(sleep_plan(101), SleepPlan::Host);
+        assert_eq!(sleep_plan(u32::MAX), SleepPlan::Host);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_one_millisecond_sleep_does_not_wait_for_the_system_tick() {
+        let mut times: Vec<std::time::Duration> = (0..20)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                imp::sleep(1);
+                start.elapsed()
+            })
+            .collect();
+        times.sort();
+        assert!(times[0] >= std::time::Duration::from_micros(500));
+        assert!(
+            times[10] < std::time::Duration::from_millis(8),
+            "median {:?}",
+            times[10]
+        );
+        imp::sleep(0);
+    }
+
+    #[test]
     fn time_critical_is_lowered_and_the_rest_passes() {
         assert_eq!(host_priority(15), 2);
         for p in [-15, -2, -1, 0, 1, 2] {
@@ -1018,6 +1205,7 @@ mod tests {
                 "GetThreadPriority",
             ),
             ("kernel32.dll", "SetThreadAffinityMask"),
+            ("api-ms-win-core-synch-l1-2-0.dll", "Sleep"),
         ] {
             assert!(
                 shims.iter().any(|s| s.dll == dll && s.name == name),

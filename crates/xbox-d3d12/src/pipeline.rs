@@ -501,7 +501,11 @@ impl PipelineEnv {
             let vs = source.translate(&desc.vs.0, Stage::Vertex, &link)?;
             stages.push(self.stage_info(
                 vs.clone(),
-                UserStage::Vertex,
+                if has_geometry {
+                    UserStage::GeometryVertex
+                } else {
+                    UserStage::Vertex
+                },
                 vk::ShaderStageFlags::VERTEX,
             )?);
             vs

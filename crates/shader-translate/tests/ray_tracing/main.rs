@@ -1,3 +1,4 @@
+mod bench;
 #[path = "../common/mod.rs"]
 mod common;
 mod harness;
