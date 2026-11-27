@@ -2,10 +2,13 @@
 //! fills it once the config crate lands.
 
 use super::abi::{buttons, mouse_buttons};
+use super::analog::Movement;
+use super::curve::LookSettings;
 
 /// Virtual-key codes the default bindings use.
 pub mod vk {
     pub const BACK: u8 = 0x08;
+    pub const MENU: u8 = 0x12;
     pub const TAB: u8 = 0x09;
     pub const RETURN: u8 = 0x0D;
     pub const SHIFT: u8 = 0x10;
@@ -55,11 +58,19 @@ pub enum Direction {
     Right,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelDir {
+    Up,
+    Down,
+}
+
 /// What the player presses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     Key(u8),
     Mouse(MouseButton),
+    /// One notch of the mouse wheel is a short press.
+    Wheel(WheelDir),
 }
 
 /// What it does on the virtual pad.
@@ -84,8 +95,11 @@ pub enum VirtualPadMode {
     Off,
     Always,
     /// Present only while no physical gamepad is connected.
-    #[default]
     Auto,
+    /// The only gamepad the title sees: connected controllers are folded into it with the keyboard and mouse, and
+    /// whichever was used last wins where both push the same stick or trigger.
+    #[default]
+    Merged,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,6 +108,8 @@ pub struct InputConfig {
     pub bindings: Vec<Binding>,
     /// Scales how far mouse movement pushes the right stick.
     pub mouse_sensitivity: f32,
+    pub look: LookSettings,
+    pub movement: Movement,
     /// Whether the mouse moves the right stick at all.
     pub mouse_look: bool,
     /// Turns every rumble output off when false.
@@ -108,6 +124,8 @@ impl Default for InputConfig {
             virtual_pad: VirtualPadMode::default(),
             bindings: default_bindings(),
             mouse_sensitivity: 1.0,
+            look: LookSettings::default(),
+            movement: Movement::default(),
             mouse_look: true,
             rumble: true,
             rumble_scale: 1.0,

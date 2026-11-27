@@ -12,10 +12,12 @@ use super::abi::{
     GAMEINPUT_E_REFERENCE_READING_TOO_OLD, GamepadState, KeyState, MouseState, RumbleParams, kind,
     status,
 };
+use super::analog::{AnalogMove, WheelPulses};
 use super::com;
 use super::config::{InputConfig, MouseButton, VirtualPadMode};
+use super::curve::MouseLook;
 use super::device::{self, Class, InfoBlock};
-use super::mapping::{self, MouseStick};
+use super::mapping::{self, LastUsed};
 
 pub type Job = Box<dyn FnOnce() + Send>;
 
@@ -136,8 +138,10 @@ struct Inner {
     mouse_buttons: u32,
     mouse_position: (i64, i64),
     mouse_wheel: (i64, i64),
-    mouse_pending: (i64, i64),
-    stick: MouseStick,
+    look: MouseLook,
+    walk: AnalogMove,
+    wheel_pulses: WheelPulses,
+    last_used: LastUsed,
     dispatcher: Option<Dispatcher>,
     queue: VecDeque<Job>,
     pending_async: Vec<Job>,
@@ -198,8 +202,10 @@ impl Hub {
                 mouse_buttons: 0,
                 mouse_position: (0, 0),
                 mouse_wheel: (0, 0),
-                mouse_pending: (0, 0),
-                stick: MouseStick::default(),
+                look: MouseLook::default(),
+                walk: AnalogMove::default(),
+                wheel_pulses: WheelPulses::default(),
+                last_used: LastUsed::None,
                 dispatcher: None,
                 queue: VecDeque::new(),
                 pending_async: Vec::new(),
@@ -216,6 +222,17 @@ impl Hub {
         }
         hub.deliver(jobs);
         hub
+    }
+
+    /// In merged mode the controllers feed the keyboard and mouse pad and the title never sees them itself.
+    fn is_hidden(inner: &Inner, d: usize) -> bool {
+        inner.config.virtual_pad == VirtualPadMode::Merged
+            && inner.devices.get(d).is_some_and(|x| x.class == Class::Pad)
+    }
+
+    /// Which device the player touched last.
+    pub fn last_used(&self) -> LastUsed {
+        self.lock().last_used
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -344,7 +361,11 @@ impl Hub {
         }
         let timestamp = self.now();
         let supported = inner.devices[d].class.supported_input();
+        let hidden = Self::is_hidden(inner, d);
         for cb in &inner.callbacks {
+            if hidden {
+                break;
+            }
             let Func::Device {
                 kinds,
                 filter,
@@ -404,7 +425,7 @@ impl Hub {
             .any(|d| d.class == Class::Pad && d.status & status::CONNECTED != 0);
         let wanted = match inner.config.virtual_pad {
             VirtualPadMode::Off => status::NONE,
-            VirtualPadMode::Always => status::ONLINE,
+            VirtualPadMode::Always | VirtualPadMode::Merged => status::ONLINE,
             VirtualPadMode::Auto if physical => status::NONE,
             VirtualPadMode::Auto => status::ONLINE,
         };
@@ -422,6 +443,7 @@ impl Hub {
         force: bool,
         change: impl FnOnce(&mut Reading),
     ) -> Vec<Job> {
+        let hidden = Self::is_hidden(inner, d);
         let mut next = inner.devices[d].template.clone();
         change(&mut next);
         if !force && next.same_input(&inner.devices[d].template) {
@@ -446,6 +468,9 @@ impl Hub {
         Self::prune(device, timestamp);
         let kinds = reading.kinds;
         let mut jobs = Vec::new();
+        if hidden {
+            return jobs;
+        }
         for cb in &inner.callbacks {
             let Func::Reading(func) = cb.func else {
                 continue;
@@ -490,7 +515,7 @@ impl Hub {
         match device {
             Some(d) => {
                 let dev = inner.devices.get(d).ok_or(GAMEINPUT_E_READING_NOT_FOUND)?;
-                if dev.class.supported_input() & kinds == 0 {
+                if dev.class.supported_input() & kinds == 0 || Self::is_hidden(inner, d) {
                     return Err(GAMEINPUT_E_READING_NOT_FOUND);
                 }
                 if dev.status & status::CONNECTED == 0 {
@@ -502,8 +527,10 @@ impl Hub {
                 .devices
                 .iter()
                 .enumerate()
-                .filter(|(_, x)| {
-                    x.status & status::CONNECTED != 0 && x.class.supported_input() & kinds != 0
+                .filter(|(i, x)| {
+                    x.status & status::CONNECTED != 0
+                        && x.class.supported_input() & kinds != 0
+                        && !Self::is_hidden(inner, *i)
                 })
                 .map(|(i, _)| i)
                 .collect()),
@@ -613,6 +640,7 @@ impl Hub {
             };
             let mut jobs = self.set_status(&mut inner, d, status::ONLINE);
             jobs.extend(self.refresh_virtual_status(&mut inner));
+            jobs.extend(self.update_virtual_pad(&mut inner));
             (d, jobs)
         };
         self.deliver(jobs);
@@ -629,6 +657,7 @@ impl Hub {
             inner.devices[d].rumble = RumbleParams::default();
             inner.devices[d].rumble_dirty = false;
             jobs.extend(self.refresh_virtual_status(&mut inner));
+            jobs.extend(self.update_virtual_pad(&mut inner));
             jobs
         };
         self.deliver(jobs);
@@ -640,7 +669,14 @@ impl Hub {
             let Some(d) = inner.devices.iter().position(|x| x.source == Some(source)) else {
                 return;
             };
-            self.push_reading(&mut inner, d, false, |r| r.pad = state)
+            let mut jobs = self.push_reading(&mut inner, d, false, |r| r.pad = state);
+            if Self::is_hidden(&inner, d) {
+                if mapping::is_activity(&state) {
+                    inner.last_used = LastUsed::Pad;
+                }
+                jobs.extend(self.update_virtual_pad(&mut inner));
+            }
+            jobs
         };
         self.deliver(jobs);
     }
@@ -655,9 +691,12 @@ impl Hub {
     pub fn guide_button(&self, source: u64, pressed: bool) {
         let jobs = {
             let inner = self.lock();
-            let Some(d) = inner.devices.iter().position(|x| x.source == Some(source)) else {
+            let Some(mut d) = inner.devices.iter().position(|x| x.source == Some(source)) else {
                 return;
             };
+            if Self::is_hidden(&inner, d) {
+                d = VIRTUAL_PAD;
+            }
             let timestamp = self.now();
             let mut jobs: Vec<Job> = Vec::new();
             for cb in &inner.callbacks {
@@ -723,15 +762,33 @@ impl Hub {
     /// Rumble levels that changed since the last call, by backend source.
     pub fn take_rumble(&self) -> Vec<(u64, RumbleParams)> {
         let mut inner = self.lock();
-        inner
-            .devices
-            .iter_mut()
-            .filter(|d| d.rumble_dirty)
-            .filter_map(|d| {
+        let mut out = Vec::new();
+        if inner.config.virtual_pad == VirtualPadMode::Merged
+            && inner.devices[VIRTUAL_PAD].rumble_dirty
+        {
+            let params = inner.devices[VIRTUAL_PAD].rumble;
+            inner.devices[VIRTUAL_PAD].rumble_dirty = false;
+            for d in inner
+                .devices
+                .iter_mut()
+                .filter(|d| d.class == Class::Pad && d.status & status::CONNECTED != 0)
+            {
+                d.rumble = params;
                 d.rumble_dirty = false;
-                Some((d.source?, d.rumble))
-            })
-            .collect()
+                out.extend(d.source.map(|s| (s, params)));
+            }
+        }
+        out.extend(
+            inner
+                .devices
+                .iter_mut()
+                .filter(|d| d.rumble_dirty)
+                .filter_map(|d| {
+                    d.rumble_dirty = false;
+                    Some((d.source?, d.rumble))
+                }),
+        );
+        out
     }
 
     // ---- keyboard and mouse ----------------------------------------------------------------------------
@@ -747,6 +804,17 @@ impl Hub {
                         jobs.extend(self.release_all(&mut inner));
                     }
                 }
+                RawInput::MouseMove { dx, dy } if inner.focus => {
+                    inner.mouse_position.0 += i64::from(dx);
+                    inner.mouse_position.1 += i64::from(dy);
+                    let now = self.now();
+                    inner.look.push(now, i64::from(dx), i64::from(dy));
+                    if dx.abs() + dy.abs() >= 2 {
+                        inner.last_used = LastUsed::KeyboardMouse;
+                    }
+                    jobs.extend(self.publish_mouse(&mut inner));
+                }
+                RawInput::MouseMove { .. } => {}
                 _ if !inner.focus => {}
                 RawInput::Key {
                     virtual_key,
@@ -757,6 +825,10 @@ impl Hub {
                     if down != held {
                         inner.keys[virtual_key as usize] = down;
                         if down {
+                            inner.last_used = LastUsed::KeyboardMouse;
+                        }
+                        Self::sync_modifiers(&mut inner.keys, virtual_key);
+                        if down {
                             inner.pressed.push((virtual_key, scan_code));
                         } else {
                             inner.pressed.retain(|(k, _)| *k != virtual_key);
@@ -765,15 +837,9 @@ impl Hub {
                         jobs.extend(self.update_virtual_pad(&mut inner));
                     }
                 }
-                RawInput::MouseMove { dx, dy } => {
-                    inner.mouse_position.0 += i64::from(dx);
-                    inner.mouse_position.1 += i64::from(dy);
-                    inner.mouse_pending.0 += i64::from(dx);
-                    inner.mouse_pending.1 += i64::from(dy);
-                    jobs.extend(self.publish_mouse(&mut inner));
-                }
                 RawInput::MouseButton { button, down } => {
                     if down {
+                        inner.last_used = LastUsed::KeyboardMouse;
                         inner.mouse_buttons |= button.bit();
                     } else {
                         inner.mouse_buttons &= !button.bit();
@@ -784,6 +850,11 @@ impl Hub {
                 RawInput::MouseWheel { dx, dy } => {
                     inner.mouse_wheel.0 += i64::from(dx);
                     inner.mouse_wheel.1 += i64::from(dy);
+                    if dy != 0 {
+                        let notches = (dy.unsigned_abs() / 120).max(1);
+                        inner.wheel_pulses.push(usize::from(dy < 0), notches);
+                        inner.last_used = LastUsed::KeyboardMouse;
+                    }
                     jobs.extend(self.publish_mouse(&mut inner));
                 }
             }
@@ -796,8 +867,9 @@ impl Hub {
         inner.keys = [false; 256];
         inner.pressed.clear();
         inner.mouse_buttons = 0;
-        inner.mouse_pending = (0, 0);
-        inner.stick.reset();
+        inner.look.reset();
+        inner.walk.reset();
+        inner.wheel_pulses.reset();
         let mut jobs = self.publish_keys(inner);
         jobs.extend(self.publish_mouse(inner));
         jobs.extend(self.update_virtual_pad(inner));
@@ -829,20 +901,56 @@ impl Hub {
         self.push_reading(inner, MOUSE, false, |r| r.mouse = mouse)
     }
 
+    /// A generic Shift, Control or Alt is down while either side is.
+    fn sync_modifiers(keys: &mut [bool; 256], changed: u8) {
+        for (generic, left, right) in [(0x10, 0xA0, 0xA1), (0x11, 0xA2, 0xA3), (0x12, 0xA4, 0xA5)] {
+            if changed == left || changed == right {
+                keys[generic as usize] = keys[left as usize] || keys[right as usize];
+            }
+        }
+    }
+
     fn update_virtual_pad(&self, inner: &mut Inner) -> Vec<Job> {
-        let state =
-            mapping::virtual_pad(&inner.config, &inner.keys, inner.mouse_buttons, inner.stick);
+        let now = self.now();
+        let target = mapping::move_target(&inner.config, &inner.keys);
+        let movement = inner.config.movement.clone();
+        let left = inner.walk.step(now, target, &movement);
+        let look = Self::look_settings(&inner.config);
+        let right = inner.look.step(now, &look);
+        let wheel = inner.wheel_pulses.step(now);
+        let kbm = mapping::virtual_pad(
+            &inner.config,
+            &inner.keys,
+            inner.mouse_buttons,
+            wheel,
+            left,
+            right,
+        );
+        let state = if inner.config.virtual_pad == VirtualPadMode::Merged {
+            let pads: Vec<GamepadState> = inner
+                .devices
+                .iter()
+                .filter(|d| d.class == Class::Pad && d.status & status::CONNECTED != 0)
+                .map(|d| d.template.pad)
+                .collect();
+            mapping::merge(&kbm, &pads, inner.last_used)
+        } else {
+            kbm
+        };
         self.push_reading(inner, VIRTUAL_PAD, false, |r| r.pad = state)
     }
 
-    /// Advances the mouse-driven stick by the movement since the last tick, publishes what changed, and runs
-    /// asynchronous enumerations. Call it at a steady rate (every 2 ms).
+    fn look_settings(config: &InputConfig) -> super::curve::LookSettings {
+        let mut look = config.look;
+        look.sensitivity = look.sensitivity.map(|v| v * config.mouse_sensitivity);
+        look
+    }
+
+    /// Advances the keyboard and mouse sticks to now, publishes what changed, and runs asynchronous
+    /// enumerations. Call it at a steady rate (every 2 ms).
     pub fn tick(&self) {
         let jobs = {
             let mut inner = self.lock();
-            let (dx, dy) = std::mem::take(&mut inner.mouse_pending);
-            let sensitivity = inner.config.mouse_sensitivity;
-            inner.stick.step(dx, dy, sensitivity);
             let mut jobs = self.update_virtual_pad(&mut inner);
             jobs.append(&mut inner.pending_async);
             jobs
@@ -933,6 +1041,7 @@ impl Hub {
                 let timestamp = self.now();
                 for (d, dev) in inner.devices.iter().enumerate() {
                     if dev.class.supported_input() & kinds != 0
+                        && !Self::is_hidden(&inner, d)
                         && device.is_none_or(|x| x == d)
                         && dev.status & status_filter != 0
                     {
