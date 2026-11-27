@@ -546,6 +546,7 @@ dependencies = [
  "shader-translate",
  "shims",
  "tempfile",
+ "vfs",
 ]
 
 [[package]]

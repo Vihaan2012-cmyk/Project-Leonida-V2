@@ -22,6 +22,7 @@ rdna.workspace = true
 shader-container.workspace = true
 shader-ir.workspace = true
 shader-translate.workspace = true
+vfs.workspace = true
 
 [build-dependencies]
 embed-manifest = "1.5"

@@ -24,6 +24,35 @@ pub enum Command {
     Run(RunArgs),
     /// Look at every file in the game folder for signs of tampering, without running or loading anything.
     Triage(TriageArgs),
+    /// List the packages in Mods/ and the contested files between them.
+    Mods(ModsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ModsArgs {
+    /// Leonida's folder, the one holding Mods/ and Config/.
+    #[arg(long, global = true, default_value = ".")]
+    pub root: PathBuf,
+    /// The game version packages are checked against. Defaults to the newest version Leonida knows.
+    #[arg(long, global = true)]
+    pub game_version: Option<String>,
+    /// Leonida's own fixes package. Defaults to Fixes/ in the root when that folder exists.
+    #[arg(long, global = true)]
+    pub fixes: Option<PathBuf>,
+    #[command(subcommand)]
+    pub command: ModsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModsCommand {
+    /// Every package in load order, lowest priority first, and why any package does not load.
+    List,
+    /// Every file two or more packages provide, and which one wins.
+    Conflicts {
+        /// The game folder. When given, files that packages replace from the base game are listed too.
+        #[arg(long)]
+        game: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Args)]
