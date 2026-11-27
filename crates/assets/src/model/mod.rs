@@ -10,6 +10,8 @@ mod types;
 mod vertex;
 
 #[cfg(test)]
+mod real_data;
+#[cfg(test)]
 mod testdata;
 #[cfg(test)]
 mod tests;
