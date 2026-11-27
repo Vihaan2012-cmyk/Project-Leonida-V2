@@ -1018,6 +1018,7 @@ dependencies = [
 name = "shims"
 version = "0.1.0"
 dependencies = [
+ "bvh-build",
  "offline",
  "pe-loader",
  "windows-sys",

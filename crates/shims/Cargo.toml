@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bvh-build.workspace = true
 offline.workspace = true
 pe-loader.workspace = true
 
