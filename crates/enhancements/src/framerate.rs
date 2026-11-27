@@ -86,6 +86,8 @@ pub enum Activation {
     DataOnly,
 }
 
+type Locate = fn(&Finder) -> Result<Vec<Patch>, PatchError>;
+
 /// One address with what is known about it.
 #[derive(Debug, Clone, Copy)]
 pub struct Evidence {
@@ -100,7 +102,7 @@ pub struct Entry {
     pub proof: Proof,
     pub activation: Activation,
     pub evidence: &'static [Evidence],
-    find: Option<fn(&Finder) -> Result<Vec<Patch>, PatchError>>,
+    find: Option<Locate>,
 }
 
 impl Entry {
