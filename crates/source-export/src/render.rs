@@ -5,7 +5,7 @@ use pe_image::Image;
 use crate::image_data::{ImportTable, text_at};
 use crate::plan::Plan;
 use crate::scan::Facts;
-use crate::symbols::{ClassInfo, Symbols, default_name};
+use crate::symbols::{ClassInfo, Symbols};
 
 /// The first line of every generated file.
 pub const MARKER: &str = concat!(
@@ -152,7 +152,7 @@ impl View<'_> {
     pub fn function_text(&self, index: usize, outcome: &Outcome) -> String {
         let mut out = self.function_header(index);
         match outcome {
-            Outcome::Decompiled(code) => out.push_str(&self.name_calls(code)),
+            Outcome::Decompiled(code) => out.push_str(code),
             Outcome::Stub(reason) => {
                 let _ = writeln!(out, "// stub: {}", reason.replace('\n', " "));
                 let _ = writeln!(out, "void {}(void);", self.name(index));
@@ -165,52 +165,6 @@ impl View<'_> {
         out.push('\n');
         out
     }
-
-    /// Replaces `sub_<rva>` in decompiled text with the function's name when it has one.
-    fn name_calls(&self, code: &str) -> String {
-        let mut out = String::with_capacity(code.len());
-        let mut rest = code;
-        while let Some(at) = rest.find("sub_") {
-            let (before, after) = rest.split_at(at);
-            out.push_str(before);
-            let digits = &after[4..];
-            let hex = digits
-                .bytes()
-                .take(8)
-                .take_while(u8::is_ascii_hexdigit)
-                .count();
-            let boundary = before
-                .bytes()
-                .next_back()
-                .is_none_or(|b| !(b.is_ascii_alphanumeric() || b == b'_'));
-            let after_ok = digits
-                .as_bytes()
-                .get(8)
-                .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
-            let replacement = (hex == 8 && boundary && after_ok)
-                .then(|| u32::from_str_radix(&digits[..8], 16).ok())
-                .flatten()
-                .and_then(|rva| self.facts.index_of(rva))
-                .map(|i| self.name(i))
-                .filter(|name| *name != default_name_of(&digits[..8]));
-            match replacement {
-                Some(name) => {
-                    out.push_str(name);
-                    rest = &digits[8..];
-                }
-                None => {
-                    out.push_str("sub_");
-                    rest = digits;
-                }
-            }
-        }
-        out.push_str(rest);
-        out
-    }
-}
-
-fn default_name_of(digits: &str) -> String {
-    u32::from_str_radix(digits, 16).map_or_else(|_| String::new(), default_name)
 }
 
 pub fn identifier(text: &str) -> String {

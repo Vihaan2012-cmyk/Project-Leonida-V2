@@ -459,7 +459,7 @@ fn run(
             imports: &imports,
             symbols,
         },
-        program: ImageProgram::new(image, &functions, &imports),
+        program: ImageProgram::new(image, &functions, &imports, symbols),
         progress: Progress {
             started,
             total,
