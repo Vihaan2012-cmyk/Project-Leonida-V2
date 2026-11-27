@@ -18,6 +18,18 @@ pub enum Command {
     Shaders(ShadersArgs),
     /// Read the game executable's structure and code without running it.
     Exe(ExeArgs),
+    /// Check that every game file is there and the right size; with --full, that its contents are right too.
+    Check(CheckArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CheckArgs {
+    /// The game folder. Searched for when omitted.
+    #[arg(long)]
+    pub game: Option<PathBuf>,
+    /// Also read every file and compare it with the known copy. Slow: it reads the whole game.
+    #[arg(long)]
+    pub full: bool,
 }
 
 #[derive(Debug, Args)]
