@@ -8,6 +8,11 @@ const SHADERS: &[(&str, &[&str])] = &[
     ("FG_KEY", &["fg_common.wgsl", "fg_key.wgsl"]),
     ("FG_FIELD", &["fg_common.wgsl", "fg_field.wgsl"]),
     ("FG_INTERP", &["fg_common.wgsl", "fg_interp.wgsl"]),
+    ("FG_LOAD_COLOR", &["fg_load_color.wgsl"]),
+    ("FG_LOAD_DEPTH", &["fg_load_depth.wgsl"]),
+    ("FG_LOAD_SCALAR", &["fg_load_scalar.wgsl"]),
+    ("FG_LOAD_MOTION", &["fg_load_motion.wgsl"]),
+    ("FG_STORE", &["fg_store.wgsl"]),
 ];
 
 fn main() {
