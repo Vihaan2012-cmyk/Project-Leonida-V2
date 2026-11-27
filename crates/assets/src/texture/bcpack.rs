@@ -1,12 +1,26 @@
 //! BCPack: the console's entropy-coded preconditioner for BCn data.
 //!
-//! What the measured documentation gives is the container side (chunk codec ids, decoded sizes,
-//! the lane layout per codec and the fragment header). It does not give the rANS probability
-//! tables, the index codebooks or the built-in endpoint histories a decoder needs, so
-//! [`decode`] returns [`BcPackError::Unsupported`] and the caller substitutes a placeholder.
-//! Nothing here guesses block data.
+//! A chunk is one interleaved rANS lane array (12 lanes for BC1/BC3/BC4/BC5, 16 for BC6H/BC7) followed by a
+//! block stage that turns the lane symbols into BCn blocks: endpoint deltas against an earlier block or a built-in
+//! history entry, and index codebooks. [`decode`] runs both. Codecs whose block stage is not covered by the
+//! measured facts return [`BcPackError::Unsupported`] so the caller keeps its placeholder; a chunk that needs a
+//! built-in history entry that is only provisional, or not recovered, returns [`BcPackError::History`].
 
 use thiserror::Error;
+
+mod blocks;
+mod codebooks;
+#[cfg(test)]
+mod lane_tests;
+mod lanes;
+mod model;
+#[cfg(test)]
+mod real_tests;
+mod tables;
+#[cfg(test)]
+mod testenc;
+
+pub use lanes::LaneError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BcPackCodec {
@@ -108,25 +122,103 @@ pub fn symbol_band(symbol: u32) -> u32 {
     32 - symbol.leading_zeros()
 }
 
+/// How much a missing built-in history entry is known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryStatus {
+    /// Fitted but not verified; usable only with [`DecodeOptions::allow_provisional`].
+    Provisional,
+    /// Not recovered at all.
+    Unknown,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BcPackError {
     #[error("BCPack {codec:?}: decoded size {size} is not a whole number of blocks")]
     BadSize { codec: BcPackCodec, size: usize },
     #[error("BCPack stream is shorter than its 48-byte lane header")]
     Truncated,
-    #[error(
-        "BCPack {codec:?} decoding needs probability tables and codebooks the measured documentation does not provide"
-    )]
+    #[error("BCPack {codec:?} has no block stage in the measured facts")]
     Unsupported { codec: BcPackCodec },
+    #[error("BCPack lane array: {0}")]
+    Lanes(#[from] LaneError),
+    #[error("BCPack {codec:?} lane {lane} is non-zero")]
+    UnexpectedLane { codec: BcPackCodec, lane: usize },
+    #[error("BCPack {codec:?} block {block} needs built-in history entry {entry} ({status:?})")]
+    History {
+        codec: BcPackCodec,
+        block: usize,
+        entry: u8,
+        status: HistoryStatus,
+    },
 }
 
-/// Whether [`decode`] can produce data for this codec.
-pub fn is_supported(_codec: BcPackCodec) -> bool {
-    false
+impl BcPackError {
+    /// The codec of the chunk the error is about (BC1 for stream-level errors that name none).
+    pub fn codec(&self) -> BcPackCodec {
+        match self {
+            BcPackError::BadSize { codec, .. }
+            | BcPackError::Unsupported { codec }
+            | BcPackError::UnexpectedLane { codec, .. }
+            | BcPackError::History { codec, .. } => *codec,
+            BcPackError::Truncated | BcPackError::Lanes(_) => BcPackCodec::Bc1,
+        }
+    }
+
+    /// True when the chunk is a valid stream that this decoder cannot finish for lack of recovered constants,
+    /// as opposed to a corrupt one.
+    pub fn is_missing_constants(&self) -> bool {
+        matches!(
+            self,
+            BcPackError::Unsupported { .. } | BcPackError::History { .. }
+        )
+    }
 }
 
-/// Decode one BCPack chunk into `out_size` bytes of tiled BCn blocks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecodeOptions {
+    /// Use built-in history entries upstream marks provisional (fitted, not verified). Off by default.
+    pub allow_provisional: bool,
+}
+
+impl DecodeOptions {
+    /// The options the runtime uses: provisional entries are enabled by `LEONIDA_BCPACK_PROVISIONAL=1`.
+    pub fn from_env() -> DecodeOptions {
+        static ALLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let allow = *ALLOW.get_or_init(|| {
+            std::env::var("LEONIDA_BCPACK_PROVISIONAL").is_ok_and(|v| v != "0" && !v.is_empty())
+        });
+        DecodeOptions {
+            allow_provisional: allow,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Decoded {
+    pub data: Vec<u8>,
+    /// Blocks whose endpoints trace back to a provisional history entry.
+    pub provisional_blocks: usize,
+}
+
+/// Whether [`decode`] has a block stage for this codec (a given chunk can still need missing history).
+pub fn is_supported(codec: BcPackCodec) -> bool {
+    matches!(
+        codec,
+        BcPackCodec::Bc1 | BcPackCodec::Bc3 | BcPackCodec::Bc4 | BcPackCodec::Bc5
+    )
+}
+
+/// Decode one BCPack chunk into `out_size` bytes of tiled BCn blocks, with provisional entries refused.
 pub fn decode(codec: BcPackCodec, packed: &[u8], out_size: usize) -> Result<Vec<u8>, BcPackError> {
+    decode_with(codec, packed, out_size, &DecodeOptions::default()).map(|d| d.data)
+}
+
+pub fn decode_with(
+    codec: BcPackCodec,
+    packed: &[u8],
+    out_size: usize,
+    opts: &DecodeOptions,
+) -> Result<Decoded, BcPackError> {
     if out_size == 0 || !out_size.is_multiple_of(codec.block_bytes()) {
         return Err(BcPackError::BadSize {
             codec,
@@ -136,7 +228,21 @@ pub fn decode(codec: BcPackCodec, packed: &[u8], out_size: usize) -> Result<Vec<
     if packed.len() < 48 {
         return Err(BcPackError::Truncated);
     }
-    Err(BcPackError::Unsupported { codec })
+    let stage = match codec {
+        BcPackCodec::Bc1 => blocks::bc1,
+        BcPackCodec::Bc3 => blocks::bc3,
+        BcPackCodec::Bc4 => blocks::bc4,
+        BcPackCodec::Bc5 => blocks::bc5,
+        _ => return Err(BcPackError::Unsupported { codec }),
+    };
+    let widths = codec.lane_widths().expect("supported codecs have lanes");
+    let symbols = lanes::decode_slice(packed, widths, out_size / 8)?;
+    let mut data = vec![0u8; out_size];
+    let provisional_blocks = stage(&symbols, &mut data, opts)?;
+    Ok(Decoded {
+        data,
+        provisional_blocks,
+    })
 }
 
 #[cfg(test)]
@@ -194,15 +300,15 @@ mod tests {
     }
 
     #[test]
-    fn decode_is_unsupported_not_guessed() {
-        assert_eq!(
-            decode(BcPackCodec::Bc1, &[0; 64], 4096),
-            Err(BcPackError::Unsupported {
-                codec: BcPackCodec::Bc1
-            })
-        );
+    fn codecs_without_a_block_stage_stay_unsupported() {
+        for codec in [BcPackCodec::Bc2, BcPackCodec::Bc6h, BcPackCodec::Bc7] {
+            assert_eq!(
+                decode(codec, &[0; 64], 4096),
+                Err(BcPackError::Unsupported { codec })
+            );
+        }
         assert!(matches!(
-            decode(BcPackCodec::Bc7, &[0; 64], 100),
+            decode(BcPackCodec::Bc1, &[0; 64], 100),
             Err(BcPackError::BadSize { .. })
         ));
         assert_eq!(
