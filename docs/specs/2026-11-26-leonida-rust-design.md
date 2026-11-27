@@ -271,9 +271,13 @@ Unsupported instructions are errors carrying the instruction address, never gues
   order, so memory needs no extra synchronization; ballots, lane reads and permutes read both parts of every
   invocation through ordinary subgroup operations. `s_barrier` is a work-group barrier, so waves of one group
   share LDS correctly.
-- **Vertex, pixel, geometry**: the stage cannot control which invocations share a subgroup, so an analysis proves,
-  per operation, whether a cross-lane op can cross the 32-lane boundary. Quad operations and wave-uniform values
-  never do. Each shader gets an **exactness label**: `exact` or `approximate(<reasons>)`.
+- **Vertex, pixel, geometry**: each invocation is one pixel or vertex, so a 64-lane program runs as a wave of 32
+  whose lanes 32-63 hold nothing, a state the console also reaches when fewer than 33 pixels are present. That is
+  exact for every cross-lane operation that stays within lanes 0-31 (DPP, swizzles, 16-lane permutes, ballots,
+  first-lane reads). Programs that name lanes 32-63 (`v_readlane_b32`/`v_writelane_b32` past lane 31 or at a
+  computed lane, `ds_bpermute_b32`) get those lanes as part 1 of lane pairs, inactive and zeroed at the start, so a
+  reduction that reads lane 32 finds the empty upper half's value rather than another pixel's. The game has 749
+  such programs among 13,405 64-lane pixel, vertex and geometry shaders.
 - On 64-wide hardware (AMD) the lowering is skipped and wave64 runs natively.
 - Exactness labels are stored and reported; approximate shaders are known, never hidden.
 

@@ -254,6 +254,7 @@ struct Verify {
 
 impl Verify {
     fn fail(&mut self, error: String, name: &str) {
+        println!("failed: {name}: {error}");
         let entry = self.failures.entry(error).or_default();
         entry.0 += 1;
         if entry.1.is_empty() {
@@ -379,7 +380,7 @@ impl Verify {
 
 pub fn verify_command(args: &VerifyArgs) -> Result<ExitCode> {
     let gpu = Gpu::new().context("opening the GPU")?;
-    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
     let started = Instant::now();
     let (sender, receiver) = mpsc::sync_channel::<CarvedShader>(4 * workers);
     let receiver = Mutex::new(receiver);
@@ -414,6 +415,9 @@ pub fn verify_command(args: &VerifyArgs) -> Result<ExitCode> {
                     return ControlFlow::Continue(());
                 }
                 sent += 1;
+                if sent % 2000 == 0 {
+                    println!("progress: {sent} containers sent");
+                }
                 match sender.send(shader) {
                     Ok(()) => ControlFlow::Continue(()),
                     Err(_) => ControlFlow::Break(()),

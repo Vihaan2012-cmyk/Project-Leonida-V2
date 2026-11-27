@@ -238,6 +238,9 @@ struct Emitter {
     lanes: u32,
     /// A 64-lane wave runs as 32 invocations that each carry two lanes: lane L in part 0, lane L + 32 in part 1.
     pair: bool,
+    /// Lane pairs where part 1 holds lanes with no pixel or vertex behind them, inactive until the program
+    /// turns them on, so programs that read lanes 32-63 see an empty upper half as on the console.
+    phantom: bool,
     part: usize,
     lane_ids: [Word; 2],
     thread_indexes: [Word; 2],
@@ -399,7 +402,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         || vertex_options.is_some()
         || es_options.is_some()
         || gs_options.is_some();
-    let lanes: u32 = if function.wave64 && !pixel_mode {
+    let lanes: u32 = if function.wave64 && (!pixel_mode || function.upper_lanes) {
         64
     } else {
         32
@@ -421,10 +424,10 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
             }
             (options.float, options.group_size, words)
         }
-        Entry::Pixel(options) => (options.float, [32, 1, 1], 32),
-        Entry::Vertex(options) => (options.float, [32, 1, 1], 32),
-        Entry::Es(options) => (options.float, [32, 1, 1], 32),
-        Entry::Gs(options) => (options.float, [32, 1, 1], 32),
+        Entry::Pixel(options) => (options.float, [lanes, 1, 1], 32),
+        Entry::Vertex(options) => (options.float, [lanes, 1, 1], 32),
+        Entry::Es(options) => (options.float, [lanes, 1, 1], 32),
+        Entry::Gs(options) => (options.float, [lanes, 1, 1], 32),
         Entry::Mesh(options) => {
             let words = (options.lds_bytes / 4).max(lanes).next_power_of_two();
             if words > 6 * 1024 {
@@ -683,6 +686,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         local,
         lanes,
         pair,
+        phantom: pair && pixel_mode,
         part: 0,
         lane_ids,
         thread_indexes,
@@ -746,6 +750,13 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         e.compute_prologue()?;
     } else {
         e.prologue()?;
+    }
+    if e.phantom {
+        let zero = e.u32c(0);
+        let upper: Vec<Word> = e.vgpr_hi.values().copied().collect();
+        for var in upper {
+            e.store(var, zero)?;
+        }
     }
     let linear = function
         .blocks
@@ -1843,8 +1854,12 @@ impl Emitter {
             | Stmt::Export { .. } => true,
             _ => false,
         };
+        let parts = match stmt {
+            Stmt::Export { .. } if self.phantom => 1,
+            _ => 2,
+        };
         if per_lane {
-            for part in 0..2 {
+            for part in 0..parts {
                 self.set_part(part);
                 self.stmt_body(stmt)?;
             }

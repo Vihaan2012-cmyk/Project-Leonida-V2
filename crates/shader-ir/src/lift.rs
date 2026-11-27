@@ -25,6 +25,7 @@ pub fn lift(code: &[u8], wave64: bool) -> Result<Function, LiftError> {
         return Err(LiftError::Invalid);
     }
     let insts = long_jumps(decoded.insts);
+    let upper_lanes = wave64 && !crate::halves::hazards_of(&insts).is_empty();
     let mut leaders = BTreeSet::from([0usize]);
     for (index, inst) in insts.iter().enumerate() {
         if let Some(target) = branch_target(inst) {
@@ -109,6 +110,7 @@ pub fn lift(code: &[u8], wave64: bool) -> Result<Function, LiftError> {
         blocks,
         temps: lifter.next,
         ordered: lifter.ordered,
+        upper_lanes,
     })
 }
 

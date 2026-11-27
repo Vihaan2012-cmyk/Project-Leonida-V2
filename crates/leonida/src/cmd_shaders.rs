@@ -148,6 +148,9 @@ struct Report {
     mesh_entries: usize,
     first_halves: usize,
     geometry_entries: usize,
+    narrow: usize,
+    approximate: BTreeMap<&'static str, usize>,
+    approximate_shaders: usize,
     instructions: usize,
     unsupported: usize,
     missing: BTreeMap<String, (usize, usize, String, String)>,
@@ -172,6 +175,14 @@ impl Report {
         self.shaders += 1;
         self.wave64 += usize::from(wave64);
         let coverage = shader_ir::coverage(code, wave64);
+        if wave64 && matches!(stage, Some(Stage::Pixel | Stage::Vertex | Stage::Geometry)) {
+            self.narrow += 1;
+            let hazards = shader_ir::upper_lane_hazards(code);
+            self.approximate_shaders += usize::from(!hazards.is_empty());
+            for hazard in hazards {
+                *self.approximate.entry(hazard.describe()).or_default() += 1;
+            }
+        }
         self.instructions += coverage.instructions;
         self.unsupported += coverage.unsupported.len();
         self.invalid += usize::from(coverage.invalid_words > 0);
@@ -273,6 +284,13 @@ impl Report {
         );
         for (error, count) in &self.lift_errors {
             println!("  {count} stopped at: {error}");
+        }
+        println!(
+            "64-lane pixel, vertex and geometry shaders, which run 32 at a time: {}, of which {} name lanes 32-63 and so carry an empty upper half",
+            self.narrow, self.approximate_shaders
+        );
+        for (reason, count) in &self.approximate {
+            println!("  {count} {reason}");
         }
         let mut missing: Vec<_> = self.missing.iter().collect();
         missing.sort_by(|a, b| (b.1.0, b.1.1).cmp(&(a.1.0, a.1.1)).then(a.0.cmp(b.0)));

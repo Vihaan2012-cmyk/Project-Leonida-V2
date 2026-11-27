@@ -537,3 +537,28 @@ fn ordered_pixel_shaders_run_inside_an_interlock() {
         run(&gpu, &case, wave64, &[], &[], &mut []);
     }
 }
+
+#[test]
+fn programs_reading_upper_lanes_see_an_empty_upper_half() {
+    let Some(gpu) = pixel_gpu() else { return };
+    let case = Case {
+        name: "upper_lanes",
+        source: "v_mov_b32_e32 v6, 1.0
+             s_mov_b32 s0, 2.0
+             v_writelane_b32 v6, s0, 40
+             v_readlane_b32 s1, v6, 40
+             v_readlane_b32 s2, v2, 32
+             v_mov_b32_e32 v4, s1
+             v_mov_b32_e32 v5, s2
+             exp mrt0 v4, v5, v6, v6 done vm
+             s_endpgm",
+        inputs: 0x302,
+        user_sgprs: 0,
+        number: Number::Float,
+        depth: None,
+        expect: Box::new(|_, _| [f(2.0), 0, f(1.0), f(1.0)]),
+        expect_depth: None,
+        close: false,
+    };
+    run(&gpu, &case, true, &[], &[], &mut []);
+}

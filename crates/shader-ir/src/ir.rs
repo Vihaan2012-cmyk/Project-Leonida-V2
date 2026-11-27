@@ -397,6 +397,9 @@ pub struct Function {
     pub temps: u32,
     /// Uses the hardware's ordered pixel shading: overlapping pixels must run one after another, in order.
     pub ordered: bool,
+    /// A 64-lane program that reads or writes lanes 32-63 by number, so it needs those lanes even where the
+    /// GPU runs 32 pixels or vertices together.
+    pub upper_lanes: bool,
 }
 
 impl Expr {
