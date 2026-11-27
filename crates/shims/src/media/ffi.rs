@@ -14,8 +14,8 @@ use super::source::{ByteSource, FileSource, MemorySource, loader, read_fully};
 use crate::trace::note;
 
 const WORDS: usize = 0x1C0;
-const WIDTH: usize = 0x00 / 4;
-const HEIGHT: usize = 0x04 / 4;
+const WIDTH: usize = 0;
+const HEIGHT: usize = 1;
 const FRAMES: usize = 0x08 / 4;
 const FRAME_NUM: usize = 0x0C / 4;
 const LAST_FRAME_NUM: usize = 0x10 / 4;

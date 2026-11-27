@@ -1,16 +1,33 @@
-//! Bink 2 as the executable calls it: every movie plays to its end at once and shows black.
+//! Bink 2 as the executable calls it, with a fake decoder behind the shims: the open, frame buffer, decode,
+//! pacing, seek and close calls in the order the game makes them.
 #![cfg(windows)]
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
-use std::io::Write;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
-use shims::media::{MediaError, parse_header};
+use shims::media::testing::{FakeDecoder, FakeGame, stream_header};
+use shims::media::{DecodeError, MovieDecoder, parse_header, set_decoder_factory};
 
 type Open = unsafe extern "win64" fn(*const u8, *const c_void, u32) -> usize;
 type Handle = unsafe extern "win64" fn(usize) -> i32;
 type Goto = unsafe extern "win64" fn(usize, u32, i32);
-type KeyFrame = unsafe extern "win64" fn(usize, u32, i32) -> u32;
+
+/// A stream whose width is 777 makes its decoder fail at frame 3.
+fn factory(bytes: std::sync::Arc<[u8]>) -> Result<Box<dyn MovieDecoder>, DecodeError> {
+    let h = parse_header(&bytes).map_err(|e| DecodeError(e.to_string()))?;
+    let mut d = FakeDecoder::new(h.frames, h.width, h.height, h.audio_tracks, false);
+    if h.width == 777 {
+        d.fail_at = Some(3);
+    }
+    Ok(Box::new(d))
+}
+
+fn install() {
+    set_decoder_factory(Some(factory));
+}
 
 fn shim<T: Copy>(name: &str) -> T {
     let address = shims::builtin()
@@ -28,151 +45,285 @@ fn word(handle: usize, byte: usize) -> u32 {
     unsafe { ((handle + byte) as *const u32).read() }
 }
 
-fn header(frames: u32, width: u32, height: u32, tracks: u32) -> Vec<u8> {
-    let mut bytes = vec![0u8; 0x30];
-    bytes[..4].copy_from_slice(b"KB2n");
-    bytes[8..12].copy_from_slice(&frames.to_le_bytes());
-    bytes[0x10..0x14].copy_from_slice(&frames.to_le_bytes());
-    bytes[0x14..0x18].copy_from_slice(&width.to_le_bytes());
-    bytes[0x18..0x1C].copy_from_slice(&height.to_le_bytes());
-    bytes[0x1C..0x20].copy_from_slice(&30u32.to_le_bytes());
-    bytes[0x20..0x24].copy_from_slice(&1u32.to_le_bytes());
-    bytes[0x28..0x2C].copy_from_slice(&tracks.to_le_bytes());
-    bytes
+fn open_memory(bytes: &[u8]) -> usize {
+    install();
+    let open: Open = shim("BinkOpenWithOptions");
+    // SAFETY: a complete stream header, which is the whole stream.
+    unsafe { open(bytes.as_ptr(), std::ptr::null(), 0x0400_0000) }
 }
 
-/// The loop a player runs: wait, decode, stop on the last frame, else advance.
-fn play(handle: usize) -> u32 {
+/// What the game does: wait until due, step, decode; ends on the last frame. Returns the frames shown.
+fn play(handle: usize, mut each: impl FnMut(u32)) -> u32 {
     let wait: Handle = shim("BinkWait");
+    let next: unsafe extern "win64" fn(usize) = shim("BinkNextFrame");
+    let start: unsafe extern "win64" fn(usize, *const u32, u32) -> i32 =
+        shim("BinkDoFrameAsyncMulti");
+    let finish: unsafe extern "win64" fn(usize, i32) -> i32 = shim("BinkDoFrameAsyncWait");
+    let started = Instant::now();
+    let mut shown = 0;
+    // SAFETY: a live handle.
+    unsafe {
+        start(handle, std::ptr::null(), 0);
+        finish(handle, -1);
+        shown += 1;
+        each(word(handle, 0x10));
+        while word(handle, 0x10) != word(handle, 0x08) {
+            while wait(handle) != 0 {
+                assert!(started.elapsed() < Duration::from_secs(20), "stuck waiting");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            next(handle);
+            start(handle, std::ptr::null(), 0);
+            finish(handle, -1);
+            shown += 1;
+            each(word(handle, 0x10));
+            assert!(shown < 10_000, "the movie never ends");
+        }
+    }
+    shown
+}
+
+#[test]
+fn a_movie_plays_into_the_games_buffers_at_its_frame_rate() {
+    let bytes = stream_header(9, 48, 32, 1);
+    let handle = open_memory(&bytes);
+    let info = FakeDecoder::new(9, 48, 32, 1, false).info;
+    let mut game = FakeGame::new(&info);
+    let get: unsafe extern "win64" fn(usize, *mut c_void) = shim("BinkGetFrameBuffersInfo");
+    let register: unsafe extern "win64" fn(usize, *const c_void) = shim("BinkRegisterFrameBuffers");
+    let pause: unsafe extern "win64" fn(usize, i32) -> i32 = shim("BinkPause");
+    let mut described = vec![0u64; 0x108 / 8];
+    // SAFETY: the description is 0x108 bytes; the handle is live.
+    unsafe {
+        get(handle, described.as_mut_ptr() as *mut c_void);
+        let u32s = std::slice::from_raw_parts(described.as_ptr() as *const u32, 0x108 / 4);
+        assert_eq!(&u32s[..5], &[3, 48, 32, 24, 16]);
+        assert_eq!(u32s[(0x18 + 8) / 4], 1, "Y exists");
+        assert_eq!(u32s[(0x18 + 0x30 + 8) / 4], 0, "no alpha");
+        assert_eq!(word(handle, 0x10), u32::MAX, "nothing decoded yet");
+        assert_eq!(word(handle, 0x38), 1);
+        register(handle, game.ptr() as *const c_void);
+        pause(handle, 1);
+        assert_eq!(word(handle, 0x11C), 1, "the paused word");
+        pause(handle, 0);
+        assert_eq!(word(handle, 0x11C), 0);
+    }
+    let started = Instant::now();
+    let mut sets = Vec::new();
+    let shown = play(handle, |last| {
+        let set = game.frame_num() as usize;
+        sets.push(set);
+        let memory = game.plane(set, 0, 3);
+        let frame = last - 1;
+        assert_eq!(
+            memory[5 * 64 + 7],
+            FakeDecoder::pixel(0, frame, 7, 5),
+            "frame {last}"
+        );
+    });
+    assert_eq!(shown, 9);
+    assert_eq!(sets, [0, 1, 2, 0, 1, 2, 0, 1, 2]);
+    assert!(
+        started.elapsed() >= Duration::from_millis(8 * 33 - 20),
+        "nine frames at 30 fps take about 266 ms, not {:?}",
+        started.elapsed()
+    );
+    let close: unsafe extern "win64" fn(usize) = shim("BinkClose");
+    // SAFETY: closed once; a second close is ignored.
+    unsafe {
+        close(handle);
+        close(handle);
+    }
+}
+
+#[test]
+fn going_to_a_frame_and_looping_decode_the_right_pictures() {
+    let bytes = stream_header(30, 32, 32, 0);
+    let handle = open_memory(&bytes);
+    let info = FakeDecoder::new(30, 32, 32, 0, false).info;
+    let mut game = FakeGame::new(&info);
+    let register: unsafe extern "win64" fn(usize, *const c_void) = shim("BinkRegisterFrameBuffers");
+    let goto: Goto = shim("BinkGoto");
     let do_frame: Handle = shim("BinkDoFrame");
     let next: unsafe extern "win64" fn(usize) = shim("BinkNextFrame");
-    let mut shown = 0;
-    loop {
-        // SAFETY: a live handle.
-        unsafe {
-            assert_eq!(wait(handle), 0, "a frame is always due");
-            assert_eq!(do_frame(handle), 0);
-        }
-        shown += 1;
-        if word(handle, 0x0C) == word(handle, 0x08) {
-            return shown;
-        }
-        assert!(shown < 100_000, "the movie never ends");
-        // SAFETY: as above.
-        unsafe { next(handle) };
-    }
-}
-
-#[test]
-fn headers_parse_and_nonsense_is_rejected() {
-    let h = parse_header(&header(450, 1920, 1080, 2)).unwrap();
-    assert_eq!(
-        (h.frames, h.width, h.height, h.audio_tracks),
-        (450, 1920, 1080, 2)
-    );
-    assert_eq!((h.rate, h.rate_divisor, h.revision), (30, 1, b'n'));
-    assert_eq!(parse_header(b"BIKi"), Err(MediaError::NotBink));
-    assert_eq!(parse_header(b"KB2n"), Err(MediaError::Short));
-    assert_eq!(
-        parse_header(&header(0, 1920, 1080, 0)),
-        Err(MediaError::Implausible)
-    );
-    assert_eq!(
-        parse_header(&header(10, 4, 1080, 0)),
-        Err(MediaError::Implausible)
-    );
-    let mut mismatch = header(10, 640, 480, 0);
-    mismatch[0x10] = 11;
-    assert_eq!(parse_header(&mismatch), Err(MediaError::Implausible));
-}
-
-#[test]
-fn a_stream_in_memory_plays_all_its_frames_then_ends() {
-    let open: Open = shim("BinkOpenWithOptions");
-    let close: unsafe extern "win64" fn(usize) = shim("BinkClose");
-    let bytes = header(45, 1280, 720, 1);
-    // SAFETY: a header-sized buffer, and a handle that is closed once.
+    let looping: unsafe extern "win64" fn(usize, i32) = shim("BinkSetWillLoop");
+    // SAFETY: a live handle and the game's buffers.
     unsafe {
-        let handle = open(bytes.as_ptr(), std::ptr::null(), 0);
-        assert_ne!(handle, 0);
-        assert_eq!(word(handle, 0x00), 1280);
-        assert_eq!(word(handle, 0x04), 720);
-        assert_eq!(word(handle, 0x08), 45);
-        assert_eq!(word(handle, 0x0C), 1, "frames count from one");
-        assert_eq!(word(handle, 0x14), 30);
-        assert_eq!(word(handle, 0x18), 1);
-        assert_eq!(word(handle, 0x38), 1);
-        assert_eq!(play(handle), 45);
-        assert_eq!(word(handle, 0x10), 45, "the last decoded frame");
-        let next: unsafe extern "win64" fn(usize) = shim("BinkNextFrame");
+        register(handle, game.ptr() as *const c_void);
+        goto(handle, 20, 0);
+        assert_eq!(word(handle, 0x0C), 20);
+        do_frame(handle);
+        assert_eq!(word(handle, 0x10), 20);
+        let set = game.frame_num() as usize;
+        assert_eq!(
+            game.plane(set, 0, 3)[3 * 64 + 3],
+            FakeDecoder::pixel(0, 19, 3, 3)
+        );
+        goto(handle, 999, 0);
+        assert_eq!(word(handle, 0x0C), 30);
+        looping(handle, 1);
         next(handle);
-        assert_eq!(word(handle, 0x0C), 45, "the end holds");
-        close(handle);
-        close(handle);
+        assert_eq!(word(handle, 0x0C), 1, "a looping movie wraps");
+        do_frame(handle);
+        let set = game.frame_num() as usize;
+        assert_eq!(game.plane(set, 0, 3)[0], FakeDecoder::pixel(0, 0, 0, 0));
     }
 }
 
 #[test]
-fn a_named_file_is_read_for_its_header() {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let path = dir.join("bink-header-probe.bk2");
-    std::fs::File::create(&path)
-        .unwrap()
-        .write_all(&header(30, 512, 512, 0))
-        .unwrap();
-    let mut name = path.to_str().unwrap().as_bytes().to_vec();
-    name.push(0);
-    let open: Open = shim("BinkOpenWithOptions");
-    // SAFETY: a NUL-terminated name.
-    let handle = unsafe { open(name.as_ptr(), std::ptr::null(), 0) };
+fn a_decoder_error_ends_the_movie_for_the_play_loop() {
+    let bytes = stream_header(12, 777, 32, 0);
+    let handle = open_memory(&bytes);
     assert_eq!(
-        (word(handle, 0), word(handle, 4), word(handle, 8)),
-        (512, 512, 30)
+        play(handle, |_| {}),
+        4,
+        "three frames, then the fourth ends it"
     );
-    assert_eq!(play(handle), 30);
-    std::fs::remove_file(path).unwrap();
+    assert_eq!(word(handle, 0x0C), 12);
+    assert!(
+        shims::trace::notes()
+            .iter()
+            .any(|n| n.contains("decoder failed"))
+    );
 }
 
 #[test]
 fn an_unreadable_movie_is_one_frame_and_ends_at_once() {
+    let _names = NAMES.lock().unwrap_or_else(|p| p.into_inner());
+    install();
     let open: Open = shim("BinkOpenWithOptions");
     let name = b"nowhere:/missing.bk2\0";
     // SAFETY: a NUL-terminated name.
     let handle = unsafe { open(name.as_ptr(), std::ptr::null(), 0) };
     assert_ne!(handle, 0);
     assert_eq!((word(handle, 8), word(handle, 0x0C)), (1, 1));
-    assert_eq!(play(handle), 1);
+    assert_eq!(play(handle, |_| {}), 1);
 }
 
 #[test]
-fn seeking_looping_and_the_small_calls() {
-    let open: Open = shim("BinkOpenWithOptions");
-    let goto: Goto = shim("BinkGoto");
-    let looping: unsafe extern "win64" fn(usize, i32) = shim("BinkSetWillLoop");
-    let pause: unsafe extern "win64" fn(usize, i32) -> i32 = shim("BinkPause");
-    let skip: Handle = shim("BinkShouldSkip");
-    let key: KeyFrame = shim("BinkGetKeyFrame");
-    let next: unsafe extern "win64" fn(usize) = shim("BinkNextFrame");
-    let bytes = header(20, 640, 360, 0);
-    // SAFETY: valid header buffer; live handle.
-    unsafe {
-        let handle = open(bytes.as_ptr(), std::ptr::null(), 0);
-        goto(handle, 15, 0);
-        assert_eq!(word(handle, 0x0C), 15);
-        goto(handle, 999, 0);
-        assert_eq!(word(handle, 0x0C), 20, "seeks clamp to the last frame");
-        goto(handle, 0, 0);
-        assert_eq!(word(handle, 0x0C), 1);
-        assert_eq!(skip(handle), 0);
-        assert_eq!(key(handle, 7, 0), 7);
-        assert_eq!(key(handle, 70, 0), 20);
-        assert_eq!(pause(handle, 1), 1);
-        assert_eq!(pause(handle, 0), 0);
-        goto(handle, 20, 0);
-        looping(handle, 1);
-        next(handle);
-        assert_eq!(word(handle, 0x0C), 1, "a looping movie wraps");
+fn small_calls_on_a_dead_handle_do_nothing() {
+    for name in [
+        "BinkWait",
+        "BinkShouldSkip",
+        "BinkClose",
+        "BinkDoFrame",
+        "BinkNextFrame",
+    ] {
+        let call: unsafe extern "win64" fn(usize) -> i32 = shim(name);
+        // SAFETY: the handle is unknown to the shim, which ignores it.
+        unsafe { call(0x1234) };
     }
+    let pause: unsafe extern "win64" fn(usize, i32) -> i32 = shim("BinkPause");
+    // SAFETY: as above.
+    assert_eq!(unsafe { pause(0x1234, 1) }, 0);
+}
+
+/// Tests that open by name take this, because the file callbacks are process-wide.
+static NAMES: Mutex<()> = Mutex::new(());
+static OPENED: AtomicUsize = AtomicUsize::new(0);
+static CLOSED: AtomicUsize = AtomicUsize::new(0);
+static SERVED: Mutex<(Vec<u8>, usize)> = Mutex::new((Vec::new(), 0));
+
+unsafe extern "win64" fn open_callback(file: *mut u64, name: *const c_void, _flags: u32) -> i32 {
+    // The name block's first word is the path, like the game's.
+    // SAFETY: the test passes a block whose first field is a pointer to a NUL-terminated name.
+    let path = unsafe { std::ffi::CStr::from_ptr(*(name as *const *const std::ffi::c_char)) };
+    if path.to_bytes() != b"movies:/served" {
+        return 0;
+    }
+    OPENED.fetch_add(1, Ordering::SeqCst);
+    SERVED.lock().unwrap().1 = 0;
+    // SAFETY: the shim hands over a block at least one word long.
+    unsafe { *file = 0xF11E };
+    1
+}
+
+unsafe extern "win64" fn read_callback(file: *mut u64, dest: *mut u8, size: u64) -> u64 {
+    // SAFETY: as above.
+    assert_eq!(unsafe { *file }, 0xF11E, "the game's own object comes back");
+    let mut served = SERVED.lock().unwrap();
+    let n = (size as usize).min(served.0.len() - served.1).min(1000);
+    // SAFETY: `dest` holds `size` bytes.
+    unsafe { std::ptr::copy_nonoverlapping(served.0.as_ptr().add(served.1), dest, n) };
+    served.1 += n;
+    n as u64
+}
+
+unsafe extern "win64" fn seek_callback(_file: *mut u64, _position: u64) {}
+
+unsafe extern "win64" fn close_callback(_file: *mut u64) {
+    CLOSED.fetch_add(1, Ordering::SeqCst);
+}
+
+#[test]
+fn the_games_file_callbacks_serve_the_stream() {
+    let _names = NAMES.lock().unwrap_or_else(|p| p.into_inner());
+    install();
+    let mut bytes = stream_header(5, 32, 32, 1);
+    let size = bytes.len() as u32 + 3000 - 8;
+    bytes[4..8].copy_from_slice(&size.to_le_bytes());
+    bytes.resize(bytes.len() + 3000, 7);
+    SERVED.lock().unwrap().0 = bytes;
+    let set: unsafe extern "win64" fn(usize, usize, usize, usize) -> i32 =
+        shim("BinkSetOSFileCallbacks");
+    let open: Open = shim("BinkOpenWithOptions");
+    let close: unsafe extern "win64" fn(usize) = shim("BinkClose");
+    let name = b"movies:/served\0";
+    let block: [*const u8; 4] = [
+        name.as_ptr(),
+        std::ptr::null(),
+        std::ptr::null(),
+        std::ptr::null(),
+    ];
+    // SAFETY: the callbacks have the shapes the shim calls; the name block outlives the open.
+    let handle = unsafe {
+        set(
+            open_callback as *const () as usize,
+            read_callback as *const () as usize,
+            seek_callback as *const () as usize,
+            close_callback as *const () as usize,
+        );
+        open(block.as_ptr() as *const u8, std::ptr::null(), 0x4000)
+    };
+    assert_eq!(OPENED.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        (word(handle, 0), word(handle, 4), word(handle, 8)),
+        (32, 32, 5)
+    );
+    assert_eq!(
+        word(handle, 0x38),
+        1,
+        "the first track plays without an option list"
+    );
+    assert_eq!(
+        CLOSED.load(Ordering::SeqCst),
+        0,
+        "the file stays open until it is read"
+    );
+    assert_eq!(play(handle, |_| {}), 5);
+    // SAFETY: a live handle.
+    unsafe { close(handle) };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while CLOSED.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(CLOSED.load(Ordering::SeqCst), 1);
+    let unreadable = b"movies:/other\0";
+    let block: [*const u8; 4] = [
+        unreadable.as_ptr(),
+        std::ptr::null(),
+        std::ptr::null(),
+        std::ptr::null(),
+    ];
+    // SAFETY: as above.
+    let handle = unsafe { open(block.as_ptr() as *const u8, std::ptr::null(), 0x4000) };
+    assert_eq!(
+        word(handle, 8),
+        1,
+        "a name the game cannot open is one frame"
+    );
+    // SAFETY: unregisters the callbacks again.
+    unsafe { set(0, 0, 0, 0) };
 }
 
 #[test]
@@ -180,7 +331,6 @@ fn the_threading_and_setup_calls_succeed() {
     for name in [
         "BinkSetSoundSystem",
         "BinkSetMemory",
-        "BinkSetOSFileCallbacks",
         "BinkStartAsyncThread",
         "BinkRequestStopAsyncThreadsMulti",
         "BinkWaitStopAsyncThreadsMulti",

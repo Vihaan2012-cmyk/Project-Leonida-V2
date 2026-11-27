@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 
 use super::decoder::{DecodeError, DecodedFrame, MovieDecoder};
 
+/// How far past the decoder's position a frame is still reached by decoding on rather than seeking.
+const REACH: u32 = 8;
+
 /// Frames decoded ahead of the one playing.
 pub const QUEUE_FRAMES: usize = 4;
 
@@ -206,11 +209,11 @@ impl Worker {
         self.shared.room.notify_all();
     }
 
-    /// Whether `frame` is queued or is the one being decoded, so reaching it needs no seek.
+    /// Whether `frame` is queued or close enough ahead of the decoder that decoding on is cheaper than a seek.
     pub fn reaches(&self, frame: u32) -> bool {
         let state = self.shared.lock();
         let front = state.queue.front().map_or(state.next, |i| i.index);
-        frame >= front && frame <= state.next
+        frame >= front && frame <= state.next + REACH
     }
 
     /// Takes frame `wanted`, dropping the earlier ones. Waits at most `patience` for it to be decoded.
