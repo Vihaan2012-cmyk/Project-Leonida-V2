@@ -1453,6 +1453,7 @@ dependencies = [
  "cpal",
  "offline",
  "pe-loader",
+ "tempfile",
  "thiserror 2.0.21",
  "windows-sys",
 ]
