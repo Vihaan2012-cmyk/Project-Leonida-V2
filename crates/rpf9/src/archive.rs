@@ -276,7 +276,7 @@ pub(crate) mod testutil {
 
         /// Pad with zeros to a multiple of `unit`, then add 16 zero bytes, so the next stream starts a resource.
         pub fn start_resource(&mut self) {
-            while self.bytes.len() % 4096 != 0 {
+            while !self.bytes.len().is_multiple_of(4096) {
                 self.bytes.push(0);
             }
             self.bytes.extend_from_slice(&[0u8; 16]);
@@ -296,7 +296,7 @@ pub(crate) mod testutil {
         }
 
         pub fn finish(mut self, trailer: usize) -> Archive {
-            while self.bytes.len() % 4096 != 0 {
+            while !self.bytes.len().is_multiple_of(4096) {
                 self.bytes.push(0);
             }
             let trailer = trailer / 16 * 16;

@@ -155,7 +155,10 @@ enum Rule {
     /// Continues while the last stream is exactly 64 KiB.
     Chunked,
     /// A system page: `spill_open` while a spill stream may still follow the first stream.
-    Paged { spill_open: bool, graphics: bool },
+    Paged {
+        spill_open: bool,
+        graphics: bool,
+    },
     PageDir {
         buffer: Vec<u8>,
         span: Option<u64>,
@@ -210,11 +213,17 @@ impl Open {
                 spill_open,
                 graphics,
             } => {
-                let spill =
-                    *spill_open && !*graphics && head != Head::Graphics && data.len() % CHUNK != 0;
+                let spill = *spill_open
+                    && !*graphics
+                    && head != Head::Graphics
+                    && !data.len().is_multiple_of(CHUNK);
                 *spill_open = false;
                 *graphics = !spill;
-                if spill { Space::Virtual } else { Space::Physical }
+                if spill {
+                    Space::Virtual
+                } else {
+                    Space::Physical
+                }
             }
             Rule::PageDir { buffer, span } => {
                 let done = span.is_some_and(|span| covered >= span);
@@ -390,7 +399,7 @@ fn start(offset: u64, stored: u32, data: &[u8], head: Head) -> Open {
                 _ => Kind::SystemPage,
             };
             rule = Rule::Paged {
-                spill_open: data.len() % CHUNK == 0,
+                spill_open: data.len().is_multiple_of(CHUNK),
                 graphics: false,
             };
         }
