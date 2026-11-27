@@ -311,6 +311,16 @@ pub fn dxgi_to_vk(format: u32) -> Option<vk::Format> {
         63 => F::R8_SNORM,
         64 => F::R8_SINT,
         65 => F::A8_UNORM_KHR,
+        70..=72 => F::BC1_RGBA_UNORM_BLOCK,
+        73..=75 => F::BC2_UNORM_BLOCK,
+        76..=78 => F::BC3_UNORM_BLOCK,
+        79..=80 => F::BC4_UNORM_BLOCK,
+        81 => F::BC4_SNORM_BLOCK,
+        82..=83 => F::BC5_UNORM_BLOCK,
+        84 => F::BC5_SNORM_BLOCK,
+        94..=95 => F::BC6H_UFLOAT_BLOCK,
+        96 => F::BC6H_SFLOAT_BLOCK,
+        97..=99 => F::BC7_UNORM_BLOCK,
         67 => F::E5B9G9R9_UFLOAT_PACK32,
         87..=88 | 90 => F::B8G8R8A8_UNORM,
         91 => F::B8G8R8A8_SRGB,
@@ -350,7 +360,33 @@ pub fn format_bytes(format: vk::Format) -> u32 {
         | F::D32_SFLOAT_S8_UINT => 8,
         F::R32G32B32_UINT | F::R32G32B32_SINT | F::R32G32B32_SFLOAT => 12,
         F::R32G32B32A32_UINT | F::R32G32B32A32_SINT | F::R32G32B32A32_SFLOAT => 16,
+        F::BC1_RGBA_UNORM_BLOCK | F::BC4_UNORM_BLOCK | F::BC4_SNORM_BLOCK => 8,
+        F::BC2_UNORM_BLOCK
+        | F::BC3_UNORM_BLOCK
+        | F::BC5_UNORM_BLOCK
+        | F::BC5_SNORM_BLOCK
+        | F::BC6H_UFLOAT_BLOCK
+        | F::BC6H_SFLOAT_BLOCK
+        | F::BC7_UNORM_BLOCK => 16,
         _ => 4,
+    }
+}
+
+/// Texels along one side of a block: 4 for the block-compressed formats, 1 for the rest.
+pub fn block_size(format: vk::Format) -> u32 {
+    use vk::Format as F;
+    match format {
+        F::BC1_RGBA_UNORM_BLOCK
+        | F::BC2_UNORM_BLOCK
+        | F::BC3_UNORM_BLOCK
+        | F::BC4_UNORM_BLOCK
+        | F::BC4_SNORM_BLOCK
+        | F::BC5_UNORM_BLOCK
+        | F::BC5_SNORM_BLOCK
+        | F::BC6H_UFLOAT_BLOCK
+        | F::BC6H_SFLOAT_BLOCK
+        | F::BC7_UNORM_BLOCK => 4,
+        _ => 1,
     }
 }
 
@@ -383,6 +419,14 @@ mod tests {
         assert_eq!(dxgi_to_vk(0), None);
         assert!(is_depth_format(vk::Format::D32_SFLOAT));
         assert_eq!(format_bytes(vk::Format::R32G32B32_SFLOAT), 12);
+        assert_eq!(dxgi_to_vk(98), Some(vk::Format::BC7_UNORM_BLOCK));
+        assert_eq!(
+            (
+                format_bytes(vk::Format::BC7_UNORM_BLOCK),
+                block_size(vk::Format::BC7_UNORM_BLOCK)
+            ),
+            (16, 4)
+        );
         assert_eq!(format_bytes(vk::Format::R16G16B16A16_SFLOAT), 8);
         assert!(has_stencil(vk::Format::D24_UNORM_S8_UINT));
     }
