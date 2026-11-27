@@ -46,20 +46,28 @@ pub fn lift(code: &[u8], wave64: bool) -> Result<Function, LiftError> {
             .position(|l| *l == pc)
             .ok_or(LiftError::BadBranch { pc: at })
     };
+    let bodies: Vec<Vec<&Inst>> = leaders
+        .iter()
+        .enumerate()
+        .map(|(id, start)| {
+            let end = leaders.get(id + 1).copied().unwrap_or(usize::MAX);
+            insts
+                .iter()
+                .filter(|i| i.pc >= *start && i.pc < end)
+                .collect()
+        })
+        .collect();
+    let modes = rounding_modes(&bodies, &leaders);
     let mut lifter = Lifter::new(wave64);
     let mut blocks = Vec::new();
     for (id, start) in leaders.iter().enumerate() {
-        let end = leaders.get(id + 1).copied().unwrap_or(usize::MAX);
-        let body: Vec<&Inst> = insts
-            .iter()
-            .filter(|i| i.pc >= *start && i.pc < end)
-            .collect();
+        let body = &bodies[id];
         let mut terminator = match leaders.get(id + 1) {
             Some(_) => Terminator::Jump(id + 1),
             None => Terminator::End,
         };
-        lifter.entry = id == 0;
-        for inst in body {
+        lifter.f16_round = modes[id].unwrap_or(Some(Round::Even));
+        for inst in body.iter().copied() {
             if is_end(inst) {
                 terminator = Terminator::End;
                 break;
@@ -99,6 +107,58 @@ pub fn lift(code: &[u8], wave64: bool) -> Result<Function, LiftError> {
         blocks,
         temps: lifter.next,
     })
+}
+
+/// The half rounding mode each block starts with: `Some(None)` when paths into it disagree.
+fn rounding_modes(bodies: &[Vec<&Inst>], leaders: &[usize]) -> Vec<Option<Option<Round>>> {
+    let mut modes: Vec<Option<Option<Round>>> = vec![None; bodies.len()];
+    if bodies.is_empty() {
+        return modes;
+    }
+    modes[0] = Some(Some(Round::Even));
+    let mut work = vec![0];
+    while let Some(id) = work.pop() {
+        let mut mode = modes[id].expect("queued blocks have a mode");
+        let mut next = vec![id + 1];
+        for inst in &bodies[id] {
+            if is_end(inst) {
+                next.clear();
+                break;
+            }
+            if let Some(target) = branch_target(inst) {
+                let taken = leaders.iter().position(|l| *l == target);
+                next = taken.into_iter().collect();
+                if inst.name != "s_branch" {
+                    next.push(id + 1);
+                }
+                break;
+            }
+            if inst.name.starts_with("s_setreg")
+                && let Some((mask, bits)) = rounding_write(inst)
+            {
+                mode = match (mode, mask >> 2 & 3) {
+                    (_, 3) => Some(Round::from_field(bits >> 2)),
+                    (Some(old), 0) => Some(old),
+                    (Some(old), part) => Some(Round::from_field(
+                        ((old as u32) & !part) | (bits >> 2 & part),
+                    )),
+                    (None, _) => None,
+                };
+            }
+        }
+        for successor in next.into_iter().filter(|s| *s < bodies.len()) {
+            let merged = match modes[successor] {
+                None => Some(mode),
+                Some(existing) if existing == mode => continue,
+                Some(_) => Some(None),
+            };
+            if modes[successor] != merged {
+                modes[successor] = merged;
+                work.push(successor);
+            }
+        }
+    }
+    modes
 }
 
 #[derive(Debug, Clone, Default)]
@@ -161,8 +221,7 @@ struct Lifter {
     overrides: Vec<(*const Arg, Tmp)>,
     destination: Option<(Select, Select)>,
     write_when: Option<Tmp>,
-    f16_round: Round,
-    entry: bool,
+    f16_round: Option<Round>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,8 +281,7 @@ impl Lifter {
             overrides: Vec::new(),
             destination: None,
             write_when: None,
-            f16_round: Round::Even,
-            entry: true,
+            f16_round: Some(Round::Even),
         }
     }
 
@@ -1042,7 +1100,7 @@ impl Lifter {
                 let other = half(self, 2);
                 let delta = self.bin(Bin::FSub, other, base);
                 let value = self.value(Expr::Tri(Tri::FFma, delta, weight, partial));
-                let rounded = self.un(Un::F32ToF16(self.f16_round), value);
+                let rounded = self.un(Un::F32ToF16(self.half_round(inst)?), value);
                 self.keep_half(target, rounded, false)
             }
             _ => return Err(unsupported(inst)),
@@ -1241,13 +1299,20 @@ impl Lifter {
         if bits & 3 != 0 {
             return Err(unsupported(inst));
         }
-        let old = (self.f16_round as u32) << 2;
-        let round = Round::from_field(((old & !mask) | bits) >> 2);
-        if round != self.f16_round && !self.entry {
-            return Err(unsupported(inst));
-        }
-        self.f16_round = round;
+        self.f16_round = match (self.f16_round, mask & 0xC) {
+            (_, 0xC) => Some(Round::from_field(bits >> 2)),
+            (Some(old), _) => {
+                let old = (old as u32) << 2;
+                Some(Round::from_field(((old & !mask) | bits) >> 2))
+            }
+            (None, _) => None,
+        };
         Ok(())
+    }
+
+    /// The rounding mode half results use here; refused where paths into the block set different ones.
+    fn half_round(&self, inst: &Inst) -> Result<Round, LiftError> {
+        self.f16_round.ok_or_else(|| unsupported(inst))
     }
 
     fn flag(&mut self, flag: Flag, value: Tmp) {
@@ -1988,7 +2053,7 @@ impl Lifter {
                 }
                 let (target, _) = vgprs(arg(0)?, inst)?;
                 let single = self.flane(arg(1)?, inst)?;
-                let half = self.un(Un::F32ToF16(self.f16_round), single);
+                let half = self.un(Un::F32ToF16(self.half_round(inst)?), single);
                 if self.destination.is_some() {
                     half
                 } else {
@@ -2032,7 +2097,7 @@ impl Lifter {
                     value
                 } else {
                     let (target, _) = vgprs(arg(0)?, inst)?;
-                    let half = self.un(Un::F32ToF16(self.f16_round), value);
+                    let half = self.un(Un::F32ToF16(self.half_round(inst)?), value);
                     self.keep_half(target, half, name == "v_fma_mixhi_f16")
                 }
             }
