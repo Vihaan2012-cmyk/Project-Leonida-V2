@@ -110,7 +110,9 @@ fn vertex(format: u32, bytes: &[u8]) -> [f32; 3] {
 }
 
 pub fn transform_point(m: &[f32; 12], p: [f32; 3]) -> [f32; 3] {
-    [0, 1, 2].map(|row| m[4 * row] * p[0] + m[4 * row + 1] * p[1] + m[4 * row + 2] * p[2] + m[4 * row + 3])
+    [0, 1, 2].map(|row| {
+        m[4 * row] * p[0] + m[4 * row + 1] * p[1] + m[4 * row + 2] * p[2] + m[4 * row + 3]
+    })
 }
 
 /// The triangles of a geometry. An index past the vertices, or the all-ones index, makes its triangle inactive.
@@ -118,11 +120,11 @@ pub fn read_triangles(source: &TriangleSource<'_>) -> Result<Vec<Triangle>> {
     let size = vertex_bytes(source.vertex_format).ok_or(BuildError::Unsupported(
         "a vertex format other than the DXR ones",
     ))?;
-    let index_size = index_bytes(source.index_format)
-        .ok_or(BuildError::Unsupported("an index format other than 16 or 32-bit"))?;
+    let index_size = index_bytes(source.index_format).ok_or(BuildError::Unsupported(
+        "an index format other than 16 or 32-bit",
+    ))?;
     let stride = source.vertex_stride;
-    if source.vertex_count > 0
-        && source.vertices.len() < stride * (source.vertex_count - 1) + size
+    if source.vertex_count > 0 && source.vertices.len() < stride * (source.vertex_count - 1) + size
     {
         return Err(BuildError::Malformed("vertex data shorter than its count"));
     }

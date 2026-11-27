@@ -36,7 +36,9 @@ impl Walk<'_> {
             TRI0 | INSTANCE => {
                 let at = (unit * 64)
                     .checked_sub(self.elements)
-                    .ok_or(BuildError::Malformed("an element before the element region"))?;
+                    .ok_or(BuildError::Malformed(
+                        "an element before the element region",
+                    ))?;
                 self.boxes
                     .get(at / self.stride)
                     .copied()

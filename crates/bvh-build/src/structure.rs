@@ -76,9 +76,8 @@ pub fn triangle_elements(geometries: &[Geometry]) -> ElementSet {
 
 fn inverse(m: &[f32; 12]) -> Option<[f32; 12]> {
     let a = |r: usize, c: usize| f64::from(m[4 * r + c]);
-    let cof = |r0: usize, r1: usize, c0: usize, c1: usize| {
-        a(r0, c0) * a(r1, c1) - a(r0, c1) * a(r1, c0)
-    };
+    let cof =
+        |r0: usize, r1: usize, c0: usize, c1: usize| a(r0, c0) * a(r1, c1) - a(r0, c1) * a(r1, c0);
     let c = [
         [cof(1, 2, 1, 2), -cof(1, 2, 0, 2), cof(1, 2, 0, 1)],
         [-cof(0, 2, 1, 2), cof(0, 2, 0, 2), -cof(0, 2, 0, 1)],
@@ -173,11 +172,7 @@ fn bounds_of(boxes: &[[f32; 6]]) -> [f32; 6] {
     boxes.iter().fold(EMPTY_BOX, |a, b| union(&a, b))
 }
 
-pub(crate) fn node_params(
-    count: usize,
-    kind: ElementKind,
-    node: NodeKind,
-) -> Result<NodeParams> {
+pub(crate) fn node_params(count: usize, kind: ElementKind, node: NodeKind) -> Result<NodeParams> {
     let l = layout(count, kind, node, 0)?;
     Ok(NodeParams {
         element_base: (l.elements / 64) as u32,
@@ -222,7 +217,9 @@ pub fn build_elements(
     if output.nodes.len() != output.node_count as usize * node.words()
         || output.parents.len() != l.node_table_base + output.node_count as usize * node.units()
     {
-        return Err(BuildError::Malformed("a node builder returned the wrong sizes"));
+        return Err(BuildError::Malformed(
+            "a node builder returned the wrong sizes",
+        ));
     }
     let mut bytes = vec![0u8; l.total];
     let unit_words = set.kind.words();
@@ -230,7 +227,11 @@ pub fn build_elements(
     if set.kind == ElementKind::Instance {
         for i in 0..count {
             let parent = output.parents[i * set.kind.units()];
-            put(&mut bytes, l.elements + 4 * unit_words * i + 4 * 29, &[parent]);
+            put(
+                &mut bytes,
+                l.elements + 4 * unit_words * i + 4 * 29,
+                &[parent],
+            );
         }
     }
     put(&mut bytes, l.nodes, &output.nodes);
@@ -280,7 +281,11 @@ pub fn build_tlas(
     lookup: &dyn Fn(u64) -> Option<BlasInfo>,
     builder: &mut dyn NodeBuilder,
 ) -> Result<Vec<u8>> {
-    build_elements(&instance_elements(instances, lookup), NodeKind::Box32, builder)
+    build_elements(
+        &instance_elements(instances, lookup),
+        NodeKind::Box32,
+        builder,
+    )
 }
 
 /// The most a build of `count` elements can write: what a prebuild-info query answers.

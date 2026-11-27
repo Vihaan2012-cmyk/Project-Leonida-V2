@@ -167,7 +167,8 @@ impl Header {
         if bytes.len() < HEADER_BYTES {
             return Err(BuildError::Malformed("shorter than a header"));
         }
-        let word = |i: usize| u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().expect("4 bytes"));
+        let word =
+            |i: usize| u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().expect("4 bytes"));
         let header = Header {
             flags: word(0),
             total_nodes: word(1),
