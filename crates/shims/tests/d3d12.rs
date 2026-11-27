@@ -37,8 +37,8 @@ fn the_console_device_notes_each_method_it_does_not_have() {
         0
     );
     assert!(!device.is_null());
-    // SAFETY: slot 62 of the trapped device takes `this` and any three arguments.
-    let method: Method = unsafe { std::mem::transmute(slot(device, 62)) };
+    // SAFETY: slot 45 of the device takes `this` and any three arguments.
+    let method: Method = unsafe { std::mem::transmute(slot(device, 45)) };
     // SAFETY: as above.
     assert_eq!(unsafe { method(device, 1, 2, 3) }, 0x8000_4001);
     // SAFETY: slot 0 is QueryInterface.
@@ -55,9 +55,9 @@ fn the_console_device_notes_each_method_it_does_not_have() {
         "{notes:?}"
     );
     assert!(
-        notes
-            .iter()
-            .any(|n| n.starts_with("ID3D12Device slot 62 (CreateComputePipelineStateX, measured)")),
+        notes.iter().any(|n| n.starts_with(
+            "ID3D12Device slot 45 (SetEventOnMultipleFenceCompletion, assumed from the PC order)"
+        )),
         "{notes:?}"
     );
     assert!(

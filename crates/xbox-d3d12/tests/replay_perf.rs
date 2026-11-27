@@ -1455,8 +1455,10 @@ fn a_pipeline_that_comes_back_binds_again_and_only_changed_push_words_are_pushed
     ]);
     let stats = replay(&world, &commands).stats;
     assert_eq!(stats.pipeline_binds, 3);
-    assert_eq!(stats.push_calls, 2);
-    assert_eq!(stats.push_words, 40 + 1, "{stats:?}");
+    assert_eq!(stats.push_calls, 3);
+    // The whole block, then words 34..39 (each pipeline has its own vertex and pixel code base), then words 11..39:
+    // the constant and the first pipeline's code bases coming back.
+    assert_eq!(stats.push_words, 40 + 5 + 28, "{stats:?}");
 }
 
 #[test]

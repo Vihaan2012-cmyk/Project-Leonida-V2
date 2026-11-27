@@ -1,7 +1,9 @@
 //! The audio coprocessor libraries: `AcpHal.dll`, `xapu.dll` and `chad.dll`.
 
 use iced_x86::Register;
+use iced_x86::code_asm::eax;
 
+use super::SLEEP;
 use crate::emit::{Arg, Emitter, Res};
 use crate::script::{Script, Stage};
 
@@ -28,16 +30,18 @@ pub fn add(script: Script) -> Script {
 fn hal(e: &mut Emitter) -> Res {
     let create = e.import(ACP, "AcpHalCreate");
     let shapes = e.import(ACP, "AcpHalAllocateShapeContexts");
-    let handle = e.buffer("acp_handle", 8);
-    let contexts = e.buffer("acp_contexts", 8);
-    e.call(create, &[Arg::addr(handle), Arg::Imm(0)])?;
+    let object = e.buffer("acp_object", 8);
+    let info = e.buffer("acp_shape_info", 0x40);
+    e.call(create, &[Arg::addr(object), Arg::Imm(0)])?;
     e.fail_if_hresult_failed()?;
-    e.call(
-        shapes,
-        &[Arg::addr(contexts), Arg::Imm(1), Arg::Imm(1), Arg::Imm(0)],
-    )?;
+    e.load64(Register::RAX, object)?;
+    e.fail_if_zero64()?;
+    e.vcall(object, 0, &[Arg::Imm(0x1000), Arg::Imm(0x1000)])?;
     e.fail_if_hresult_failed()?;
-    e.load64(Register::RAX, contexts)?;
+    e.store32_imm(info.at(0x10), 1)?;
+    e.call(shapes, &[Arg::addr(info)])?;
+    e.fail_if_hresult_failed()?;
+    e.load64(Register::RAX, info.at(0x38))?;
     e.fail_if_zero64()
 }
 
@@ -83,18 +87,43 @@ fn apu_queue(e: &mut Emitter) -> Res {
     let dequeue = e.import(XAPU, "XApuDequeueResult");
     let disconnect = e.import(XAPU, "XApuDisconnect");
     let handle = e.buffer("apu_handle", 8);
-    let command = e.bytes("apu_command", &[0x11; 64]);
+    let info = e.buffer("apu_connect_info", 16);
+    let region = e.buffer("apu_region", 8);
+    let counter = e.buffer("apu_polls", 4);
+    let sleep = e.import(SLEEP, "Sleep");
+    let mut command = [0u8; 64];
+    command[0] = 1;
+    command[4] = 5;
+    command[0x18] = 2;
+    let command = e.bytes("apu_command", &command);
     let result = e.buffer("apu_result", 8);
-    e.call(connect, &[])?;
+    e.call(
+        connect,
+        &[Arg::addr(info), Arg::addr(region), Arg::addr(handle)],
+    )?;
+    e.fail_if_hresult_failed()?;
+    e.load64(Register::RAX, handle)?;
     e.fail_if_zero64()?;
-    e.store64(handle, Register::RAX)?;
     e.call(
         enqueue,
         &[Arg::load64(handle), Arg::addr(command), Arg::Imm(0)],
     )?;
     e.fail_if_hresult_failed()?;
+    // The coprocessor's worker answers on its own thread: poll the result count for up to five seconds.
+    let mut again = e.label();
+    let mut ready = e.label();
+    e.store32_imm(counter, 0)?;
+    e.place(&mut again)?;
     e.call(count, &[])?;
-    e.fail_if_zero32()?;
+    e.asm.test(eax, eax)?;
+    e.asm.jnz(ready)?;
+    e.add32_imm(counter, 1)?;
+    e.call(sleep, &[Arg::Imm(1)])?;
+    e.load32(Register::EAX, counter)?;
+    e.asm.cmp(eax, 5000)?;
+    e.asm.jb(again)?;
+    e.fail()?;
+    e.place(&mut ready)?;
     e.call(dequeue, &[Arg::load64(handle), Arg::addr(result)])?;
     e.fail_if_hresult_failed()?;
     e.call(disconnect, &[Arg::load64(handle), Arg::Imm(0x20)])?;
