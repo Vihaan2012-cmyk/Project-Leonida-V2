@@ -7,10 +7,19 @@ use std::sync::Mutex;
 
 use pe_loader::{ImportRef, Resolver};
 
+pub mod audio;
+pub mod bvh_builder;
 #[cfg(windows)]
 mod code;
 pub mod d3d12;
+pub mod dstorage;
+pub mod fidelityfx;
+pub mod files;
+pub mod gameinput;
+pub mod loader;
+pub mod media;
 pub mod trace;
+pub mod xg;
 mod xmem;
 
 /// A function we provide in place of a console one.
@@ -25,6 +34,15 @@ pub struct Shim {
 pub fn builtin() -> Vec<Shim> {
     let mut shims = xmem::shims();
     shims.extend(d3d12::shims());
+    shims.extend(audio::shims());
+    shims.extend(bvh_builder::shims());
+    shims.extend(dstorage::shims());
+    shims.extend(fidelityfx::shims());
+    shims.extend(files::shims());
+    shims.extend(gameinput::shims());
+    shims.extend(loader::shims());
+    shims.extend(media::shims());
+    shims.extend(xg::shims());
     shims
 }
 
