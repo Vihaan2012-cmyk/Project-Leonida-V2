@@ -29,6 +29,7 @@ mod apu;
 mod engine;
 pub mod hal;
 mod mixer;
+pub mod opus;
 mod output;
 pub mod xapu;
 mod xma;
