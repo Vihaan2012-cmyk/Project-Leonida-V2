@@ -2,7 +2,14 @@
 #![cfg(windows)]
 #![allow(unsafe_code)]
 
-use pe_loader::{ImportRef, LoadError, Placement, load};
+use pe_loader::{ImportRef, LoadError, LoadOptions, Placement, load};
+
+fn anywhere() -> LoadOptions {
+    LoadOptions {
+        placement: Placement::Anywhere,
+        helpers: None,
+    }
+}
 use shims::{Binder, Binding, Shim, Trap, take_calls};
 
 const BASE: u64 = 0x1_4000_0000;
@@ -183,7 +190,7 @@ fn test_shims() -> Vec<Shim> {
 fn a_synthetic_executable_runs_through_shims_host_functions_and_stand_ins() {
     let bytes = image(0x6000_0020);
     let mut binder = Binder::new(&test_shims());
-    let module = load(&bytes, &mut binder, Placement::Anywhere).expect("loads");
+    let module = load(&bytes, &mut binder, &anywhere()).expect("loads");
     assert_ne!(
         module.base() as u64,
         BASE,
@@ -217,7 +224,7 @@ fn a_synthetic_executable_runs_through_shims_host_functions_and_stand_ins() {
 #[test]
 fn writable_code_is_refused() {
     let bytes = image(0xE000_0020);
-    let error = load(&bytes, &mut Binder::new(&[]), Placement::Anywhere).err();
+    let error = load(&bytes, &mut Binder::new(&[]), &anywhere()).err();
     assert!(matches!(error, Some(LoadError::WritableCode(name)) if name == ".text"));
 }
 

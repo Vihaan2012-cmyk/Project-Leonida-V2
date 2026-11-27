@@ -2,7 +2,11 @@
 //! the exception table and page protections. What each import becomes is up to a [`Resolver`].
 #![allow(unsafe_code)]
 
+use std::path::PathBuf;
+
 use pe_image::{DIRECTORY_EXCEPTION, DIRECTORY_TLS, Image, PeError};
+
+mod tls;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -10,8 +14,10 @@ pub enum LoadError {
     Pe(#[from] PeError),
     #[error("not an x64 executable (machine {0:#x})")]
     Machine(u16),
-    #[error("thread-local storage is not supported yet")]
-    ThreadLocalStorage,
+    #[error("the image uses thread-local storage but no folder for its helper was given")]
+    NoHelperFolder,
+    #[error("thread-local storage: {0}")]
+    ThreadLocalStorage(String),
     #[error("could not reserve {0} bytes for the image")]
     Reserve(usize),
     #[error("the image cannot move from its preferred address: it has no relocations")]
@@ -52,12 +58,21 @@ pub enum Placement {
     Anywhere,
 }
 
-/// A mapped image. Dropping it removes its exception table and frees its memory.
+/// How to load an image.
+#[derive(Debug, Clone)]
+pub struct LoadOptions {
+    pub placement: Placement,
+    /// Where helper DLLs for thread-local storage are written; needed only by images that use it.
+    pub helpers: Option<PathBuf>,
+}
+
+/// A mapped image. Dropping it unloads its TLS helper, removes its exception table and frees its memory.
 pub struct Module {
     base: usize,
     size: usize,
     entry: u32,
     exception_table: Option<usize>,
+    tls_helper: Option<(usize, PathBuf)>,
 }
 
 impl Module {
@@ -90,10 +105,13 @@ impl Module {
 mod windows {
     use super::*;
     use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::FreeLibrary;
     use windows_sys::Win32::System::Diagnostics::Debug::{
         FlushInstructionCache, IMAGE_RUNTIME_FUNCTION_ENTRY, RtlAddFunctionTable,
         RtlDeleteFunctionTable,
     };
+    use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_PROTECTION_FLAGS,
         PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
@@ -107,15 +125,16 @@ mod windows {
     pub fn load(
         bytes: &[u8],
         resolver: &mut dyn Resolver,
-        placement: Placement,
+        options: &LoadOptions,
     ) -> Result<Module, LoadError> {
         let image = Image::parse(bytes)?;
         if image.machine != 0x8664 {
             return Err(LoadError::Machine(image.machine));
         }
-        if image.directory(DIRECTORY_TLS).is_some() {
-            return Err(LoadError::ThreadLocalStorage);
+        if image.directory(DIRECTORY_TLS).is_some() && options.helpers.is_none() {
+            return Err(LoadError::NoHelperFolder);
         }
+        let placement = options.placement;
         for section in &image.sections {
             if section.executable() && section.writable() {
                 return Err(LoadError::WritableCode(section.name.clone()));
@@ -204,7 +223,83 @@ mod windows {
             }
             FlushInstructionCache(GetCurrentProcess(), base as *const c_void, size);
         }
+        if let (Some((rva, _)), Some(folder)) = (image.directory(DIRECTORY_TLS), &options.helpers) {
+            module.tls_helper = Some(thread_storage(&module, &image, rva, folder)?);
+        }
         Ok(module)
+    }
+
+    static HELPERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Loads a helper DLL carrying the image's TLS directory; see the `tls` module.
+    fn thread_storage(
+        module: &Module,
+        image: &Image<'_>,
+        rva: u32,
+        folder: &std::path::Path,
+    ) -> Result<(usize, PathBuf), LoadError> {
+        let fail = |what: &str| LoadError::ThreadLocalStorage(what.to_string());
+        let field = |k: u32| {
+            read_u64(module, rva + 8 * k).ok_or_else(|| fail("directory outside the image"))
+        };
+        let (start, end, index, callbacks) = (field(0)?, field(1)?, field(2)?, field(3)?);
+        let sizes = field(4)?;
+        let inside = |va: u64| {
+            va.checked_sub(module.base as u64)
+                .and_then(|at| u32::try_from(at).ok())
+                .filter(|at| (*at as usize) < module.size)
+        };
+        let writable = inside(index)
+            .and_then(|at| image.section_of(at))
+            .is_some_and(|section| section.writable());
+        if !writable {
+            return Err(fail(
+                "the index variable is not in a writable section of the image",
+            ));
+        }
+        let template = match (inside(start), end.checked_sub(start)) {
+            (Some(at), Some(length)) if (at as u64 + length) as usize <= module.size => {
+                // SAFETY: a range of the mapped image, checked above.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        (module.base + at as usize) as *const u8,
+                        length as usize,
+                    )
+                }
+                .to_vec()
+            }
+            _ => return Err(fail("the template lies outside the image")),
+        };
+        let mut list = Vec::new();
+        if let Some(mut at) = inside(callbacks) {
+            while let Some(callback) = read_u64(module, at).filter(|c| *c != 0) {
+                if inside(callback).is_none() || list.len() == 64 {
+                    return Err(fail("a callback lies outside the image"));
+                }
+                list.push(callback);
+                at += 8;
+            }
+        }
+        let directory = tls::Directory {
+            template,
+            zero_fill: sizes as u32,
+            characteristics: (sizes >> 32) as u32,
+            index,
+            callbacks: list,
+        };
+        std::fs::create_dir_all(folder).map_err(|e| fail(&e.to_string()))?;
+        let number = HELPERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = folder.join(format!("tls-{}-{number}.dll", std::process::id()));
+        std::fs::write(&path, tls::helper(&directory)).map_err(|e| fail(&e.to_string()))?;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: the helper has no code of its own; loading it runs only the image's TLS callbacks, mapped
+        // read-execute by now.
+        let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
+        if handle.is_null() {
+            let _ = std::fs::remove_file(&path);
+            return Err(fail("Windows did not load the helper DLL"));
+        }
+        Ok((handle as usize, path))
     }
 
     fn reserve(image: &Image<'_>, size: usize, placement: Placement) -> Result<Module, LoadError> {
@@ -234,6 +329,7 @@ mod windows {
             size,
             entry: image.entry,
             exception_table: None,
+            tls_helper: None,
         };
         let moved = module.base as u64 != image.image_base;
         if moved
@@ -293,6 +389,10 @@ mod windows {
         fn drop(&mut self) {
             // SAFETY: the table and mapping were made by `load` and are released once.
             unsafe {
+                if let Some((handle, path)) = self.tls_helper.take() {
+                    FreeLibrary(handle as _);
+                    let _ = std::fs::remove_file(path);
+                }
                 if let Some(table) = self.exception_table {
                     RtlDeleteFunctionTable(table as *const IMAGE_RUNTIME_FUNCTION_ENTRY);
                 }
@@ -306,15 +406,15 @@ mod windows {
 pub fn load(
     bytes: &[u8],
     resolver: &mut dyn Resolver,
-    placement: Placement,
+    options: &LoadOptions,
 ) -> Result<Module, LoadError> {
     #[cfg(windows)]
     {
-        windows::load(bytes, resolver, placement)
+        windows::load(bytes, resolver, options)
     }
     #[cfg(not(windows))]
     {
-        let _ = (bytes, resolver, placement);
+        let _ = (bytes, resolver, options);
         Err(LoadError::Unsupported)
     }
 }
