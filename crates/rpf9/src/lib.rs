@@ -4,5 +4,7 @@
 //! area, validating every stream by inflating it, and joining streams by the rules of the measured formats.
 
 mod error;
+mod model;
 
 pub use error::Rpf9Error;
+pub use model::{Codec, Kind, Layout, Resource, Segment, Space, hex};
