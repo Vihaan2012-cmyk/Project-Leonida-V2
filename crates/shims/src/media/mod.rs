@@ -20,6 +20,7 @@
 
 mod decoder;
 mod header;
+pub mod layout;
 #[doc(hidden)]
 pub mod testing;
 
