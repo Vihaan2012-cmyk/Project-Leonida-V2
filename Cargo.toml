@@ -61,6 +61,7 @@ rdna = { path = "crates/rdna" }
 shader-ir = { path = "crates/shader-ir" }
 shader-translate = { path = "crates/shader-translate" }
 shader-store = { path = "crates/shader-store" }
+shader-census = { path = "crates/shader-census" }
 testkit = { path = "crates/testkit" }
 content-filter = { path = "crates/content-filter" }
 vfs = { path = "crates/vfs" }
