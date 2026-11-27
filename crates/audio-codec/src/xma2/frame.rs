@@ -255,13 +255,6 @@ impl FrameDecoder {
         &self.pcm[channel]
     }
 
-    /// The overlap tail the next frame would have been added to; the last 256 samples a stream still owes.
-    pub fn flush_tail(&self, channel: usize) -> [f32; SAMPLES_PER_FRAME] {
-        let mut out = [0.0; SAMPLES_PER_FRAME];
-        out[..SAMPLES_PER_FRAME / 2].copy_from_slice(&self.channels[channel].out[..SAMPLES_PER_FRAME / 2]);
-        out
-    }
-
     fn decode_subframe_length(&self, br: &mut BitReader<'_>, offset: usize) -> Result<usize> {
         if offset == SAMPLES_PER_FRAME - MIN_SUBFRAME {
             return Ok(MIN_SUBFRAME);

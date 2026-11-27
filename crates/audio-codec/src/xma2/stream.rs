@@ -9,8 +9,12 @@ use crate::{Error, Result};
 pub const PACKET_SIZE: usize = 2048;
 const HEADER_BITS: usize = 32;
 const LENGTH_PREFIX_BITS: usize = 15;
-/// Samples dropped from the start of a decoded stream: the priming frame plus the 64 samples of decoder delay.
-pub const DEFAULT_LEAD_IN: usize = SAMPLES_PER_FRAME + 64;
+/// Samples dropped from the start by default: none. The three real streams measured declare exactly
+/// `frames * 512` samples, so the decoded length equals the declared one and the stream's own first samples
+/// are silence.
+pub const DEFAULT_LEAD_IN: usize = 0;
+/// What FFmpeg drops: the first frame and 64 samples of decoder delay. Set it as `lead_in` to match its output.
+pub const FFMPEG_LEAD_IN: usize = SAMPLES_PER_FRAME + 64;
 
 /// The 32-bit header at the start of every packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,9 +184,9 @@ impl StreamDecoder {
 pub struct Xma2Config {
     pub sample_rate: u32,
     pub channels: usize,
-    /// Samples per channel the stream declares; output stops there. `None` returns everything decoded.
+    /// Samples per channel the stream declares (after the lead-in); output stops there. `None` returns all.
     pub total_samples: Option<u64>,
-    /// Samples dropped from the start, see [`DEFAULT_LEAD_IN`].
+    /// Samples dropped from the start, see [`DEFAULT_LEAD_IN`] and [`FFMPEG_LEAD_IN`].
     pub lead_in: usize,
 }
 
@@ -211,7 +215,6 @@ pub struct Xma2Decoder {
     streams: Vec<StreamDecoder>,
     packet_index: usize,
     emitted: u64,
-    finished: bool,
 }
 
 impl Xma2Decoder {
@@ -227,7 +230,6 @@ impl Xma2Decoder {
             streams: Vec::new(),
             packet_index: 0,
             emitted: 0,
-            finished: false,
         };
         d.reset()?;
         Ok(d)
@@ -265,8 +267,25 @@ impl Xma2Decoder {
             .collect::<Result<_>>()?;
         self.packet_index = packet;
         self.emitted = 0;
-        self.finished = false;
         Ok(())
+    }
+
+    /// Position the decoder so the output continues at `sample` (per channel, counted from the start of the
+    /// stream) using a seek table of per-packet start samples (tag `0xa3`). Returns the packet index to push
+    /// next. Decoding restarts one packet early so the overlap state is warm at `sample`.
+    pub fn seek(&mut self, table: &[u32], sample: u64) -> Result<usize> {
+        if table.is_empty() {
+            return Err(Error::Invalid("empty seek table".into()));
+        }
+        let block = crate::awc::seek_block(table, sample.min(u64::from(u32::MAX)) as u32);
+        let start = block.saturating_sub(1);
+        self.restart_at_packet(start)?;
+        let drop = sample.saturating_sub(u64::from(table[start])) as usize;
+        for s in &mut self.streams {
+            s.to_skip += drop;
+        }
+        self.emitted = sample;
+        Ok(start)
     }
 
     /// Next packet index `push_packet` expects.
@@ -345,30 +364,10 @@ impl Xma2Decoder {
         n
     }
 
-    /// Declare the end of the packets. The overlap tail of the last frame becomes available (only when the
-    /// stream does not declare its length, because the tail is the half-windowed end of the signal).
-    pub fn finish(&mut self) {
-        if self.finished {
-            return;
-        }
-        self.finished = true;
-        if self.config.total_samples.is_none() {
-            for s in &mut self.streams {
-                let tails: Vec<_> = (0..s.channels).map(|c| s.frames.flush_tail(c)).collect();
-                let refs: Vec<&[f32]> = tails
-                    .iter()
-                    .map(|t| &t[..SAMPLES_PER_FRAME / 2])
-                    .collect();
-                s.emit(&refs);
-            }
-        }
-    }
-
     /// Decode a complete stream held in memory.
     pub fn decode_all(config: Xma2Config, data: &[u8]) -> Result<Pcm> {
         let mut d = Self::new(config.clone())?;
         d.push_data(data)?;
-        d.finish();
         let frames = d.available();
         let mut samples = vec![0f32; frames * config.channels];
         d.pull_f32(&mut samples);
