@@ -332,6 +332,86 @@ impl Image {
         (regions, offset)
     }
 
+    /// Uploads `data` laid out as `packed_layout` describes, and leaves the image in `final_layout`. Blocks until
+    /// the copy is done. For tools and setup; frames use a [`crate::StagingRing`].
+    pub fn upload_packed(
+        &self,
+        queue: &Queue,
+        data: &[u8],
+        final_layout: vk::ImageLayout,
+    ) -> Result<()> {
+        let (regions, _) = self.packed_layout();
+        if (data.len() as u64) < self.packed_data_end(&regions) {
+            return Err(RenderError::Invalid(
+                "image data is shorter than its mips and layers".into(),
+            ));
+        }
+        let staging = Buffer::new(
+            queue.device(),
+            &BufferDesc {
+                name: "image upload",
+                size: data.len() as u64,
+                usage: vk::BufferUsageFlags::empty(),
+                location: MemoryLocation::Upload,
+            },
+        )?;
+        staging.write(0, data)?;
+        queue.immediate(|cb| {
+            cb.transition(
+                self,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
+            cb.copy_buffer_to_image(
+                &staging,
+                self,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &regions,
+            );
+            cb.transition(self, vk::ImageLayout::TRANSFER_DST_OPTIMAL, final_layout);
+            Ok(())
+        })
+    }
+
+    fn packed_data_end(&self, regions: &[vk::BufferImageCopy]) -> u64 {
+        regions
+            .last()
+            .map(|r| {
+                r.buffer_offset
+                    + self
+                        .inner
+                        .format
+                        .level_bytes(self.inner.extent, r.image_subresource.mip_level)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Reads every layer and mip back in `packed_layout` order. The image must be in `layout`; it is left there.
+    pub fn read_back(&self, queue: &Queue, layout: vk::ImageLayout) -> Result<Vec<u8>> {
+        let (regions, total) = self.packed_layout();
+        let staging = Buffer::new(
+            queue.device(),
+            &BufferDesc {
+                name: "image readback",
+                size: total,
+                usage: vk::BufferUsageFlags::empty(),
+                location: MemoryLocation::Readback,
+            },
+        )?;
+        queue.immediate(|cb| {
+            cb.transition(self, layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            cb.copy_image_to_buffer(
+                self,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                &staging,
+                &regions,
+            );
+            cb.transition(self, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, layout);
+            Ok(())
+        })?;
+        staging.read_vec(0, self.packed_data_end(&regions) as usize)
+    }
+
     pub fn create_view(&self, desc: &ViewDesc) -> Result<ImageView> {
         let inner = &self.inner;
         let format = desc.format.unwrap_or(inner.format);
