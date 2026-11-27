@@ -13,11 +13,11 @@ use xbox_d3d12::execute::{
 };
 use xbox_d3d12::pipeline::shaders::{Link, ShaderSource, TranslatedStage};
 use xbox_d3d12::pipeline::{
-    Bytecode, CodeStore, ComputePsoDesc, DirectTranslation, GraphicsPsoDesc, PipelineCache,
-    PipelineEnv, PipelineError, Slot67Parts, bindless_bindings,
+    Bytecode, CodeStore, ComputePsoDesc, DirectTranslation, GraphicsPsoDesc, Pipeline,
+    PipelineCache, PipelineEnv, PipelineError, Slot67Parts, bindless_bindings,
 };
 use xbox_d3d12::root::{
-    ParameterKind, RootParameter, RootSignature, RootVersion, UserStage, Visibility,
+    ParameterKind, RootParameter, RootSignature, RootVersion, UserData, UserStage, Visibility,
 };
 
 const ARENA_BYTES: u64 = 1 << 20;
@@ -393,6 +393,16 @@ fn lifted(source: &str) -> shader_ir::Function {
 }
 
 fn stage(tag: u8, stage: shader_container::Stage, spirv: Vec<u32>) -> Arc<TranslatedStage> {
+    stage_with_code(tag, stage, spirv, vec![0; 16], false)
+}
+
+fn stage_with_code(
+    tag: u8,
+    stage: shader_container::Stage,
+    spirv: Vec<u32>,
+    code: Vec<u8>,
+    uses_code_base: bool,
+) -> Arc<TranslatedStage> {
     Arc::new(TranslatedStage {
         stage,
         first_half: false,
@@ -410,8 +420,8 @@ fn stage(tag: u8, stage: shader_container::Stage, spirv: Vec<u32>) -> Arc<Transl
         }],
         writes_depth: false,
         mesh: None,
-        uses_code_base: false,
-        code: vec![0; 16],
+        uses_code_base,
+        code,
         code_start: 0,
         hash: [tag; 32],
     })
@@ -477,6 +487,144 @@ fn triangle_stages() -> Vec<(u8, Arc<TranslatedStage>)> {
     ]
 }
 
+/// A program that takes its own address and loads the float stored right after its last instruction into s10:
+/// `s_getpc_b64` returns the address of the instruction after it. Returns the program with the constant
+/// appended, which is where a console shader keeps it.
+fn program_with_constant(body: impl Fn(&str) -> String, constant: f32) -> Vec<u8> {
+    let assemble = |offset: u32| {
+        let source = format!(
+            "s_getpc_b64 s[8:9]
+             s_load_dword s10, s[8:9], 0x{offset:x}
+             s_waitcnt lgkmcnt(0)
+             {}",
+            body("s10")
+        );
+        rdna::assemble(&source, true).unwrap_or_else(|e| {
+            panic!(
+                "{e:?}
+{source}"
+            )
+        })
+    };
+    let length = assemble(0).len() as u32;
+    let mut code = assemble(length - 4);
+    assert_eq!(code.len() as u32, length);
+    code.extend(constant.to_le_bytes());
+    code
+}
+
+/// The triangle's vertex shader scaling its corners by a constant read through its own address, and a pixel
+/// shader writing a constant read through its own address as green, each from a blob of its own.
+fn code_base_stages() -> Vec<(u8, Arc<TranslatedStage>)> {
+    let vertex_code = program_with_constant(
+        |scale| {
+            format!(
+                "v_and_b32_e32 v1, 1, v0
+                 v_lshrrev_b32_e32 v2, 1, v0
+                 v_and_b32_e32 v2, 1, v2
+                 v_cvt_f32_u32_e32 v1, v1
+                 v_cvt_f32_u32_e32 v2, v2
+                 v_mul_f32_e32 v1, {scale}, v1
+                 v_mul_f32_e32 v2, {scale}, v2
+                 v_add_f32_e32 v1, -1.0, v1
+                 v_add_f32_e32 v2, -1.0, v2
+                 v_mov_b32_e32 v3, 0
+                 v_mov_b32_e32 v4, 1.0
+                 exp pos0 v1, v2, v3, v4 done
+                 s_endpgm"
+            )
+        },
+        4.0,
+    );
+    let pixel_code = program_with_constant(
+        |green| {
+            format!(
+                "v_mov_b32_e32 v4, 1.0
+                 v_mov_b32_e32 v5, {green}
+                 v_mov_b32_e32 v6, 0
+                 v_mov_b32_e32 v7, 1.0
+                 exp mrt0 v4, v5, v6, v7 done vm
+                 s_endpgm"
+            )
+        },
+        0.5,
+    );
+    let float = FloatMode::default();
+    let vertex = shader_translate::vertex(
+        &shader_ir::lift(&vertex_code[..vertex_code.len() - 4], false).unwrap(),
+        &shader_translate::VertexOptions {
+            user_sgprs: 0,
+            inputs: Vec::new(),
+            float,
+        },
+    )
+    .unwrap();
+    let pixel = shader_translate::pixel(
+        &shader_ir::lift(&pixel_code[..pixel_code.len() - 4], false).unwrap(),
+        &shader_translate::PixelOptions {
+            user_sgprs: 0,
+            inputs: 0x2,
+            outputs: vec![shader_translate::PixelOutput {
+                target: 0,
+                number: shader_translate::images::Number::Float,
+            }],
+            depth: None,
+            attribute_locations: Vec::new(),
+            float,
+        },
+    )
+    .unwrap();
+    vec![
+        (
+            3,
+            stage_with_code(
+                3,
+                shader_container::Stage::Vertex,
+                vertex,
+                vertex_code,
+                true,
+            ),
+        ),
+        (
+            4,
+            stage_with_code(4, shader_container::Stage::Pixel, pixel, pixel_code, true),
+        ),
+    ]
+}
+
+#[test]
+fn vertex_and_pixel_stages_each_read_constants_after_their_own_code() {
+    let Some(setup) = setup(Arc::new(Fixed(code_base_stages())), None) else {
+        return;
+    };
+    let Some((pipeline, pixels)) = draw_triangle(&setup, 3, 4) else {
+        return;
+    };
+    let [vertex, pixel] = &pipeline.stages[..] else {
+        panic!("{:?}", pipeline.stages);
+    };
+    assert_ne!(vertex.code_va, pixel.code_va);
+    let words = pipeline.push_words(
+        &UserData {
+            sgprs: [0; 32],
+            spill: Vec::new(),
+        },
+        0,
+    );
+    let at =
+        |index: u32| u64::from(words[index as usize]) | u64::from(words[index as usize + 1]) << 32;
+    assert_eq!(at(shader_translate::PUSH_CODE), vertex.code_va);
+    assert_eq!(at(shader_translate::PUSH_CODE_PIXEL), pixel.code_va);
+    // The vertex shader's 4.0 covers the target and the pixel shader's 0.5 is green; either constant read
+    // from the other blob would give 0.0 (nothing there) or clamp to 1.0.
+    for (i, word) in pixels.iter().enumerate() {
+        assert!(
+            *word == 0xFF00_80FF || *word == 0xFF00_7FFF,
+            "pixel {i}: {word:08x}"
+        );
+    }
+}
+
 /// Moves a fresh image out of `UNDEFINED`, the state the resource layer hands images over in.
 fn to_general(ctx: &VkContext, image: vk::Image) {
     // SAFETY: handles are made and destroyed here, after the fence wait.
@@ -528,16 +676,15 @@ fn to_general(ctx: &VkContext, image: vk::Image) {
     }
 }
 
-#[test]
-fn a_draw_replays_through_a_graphics_pipeline_and_fills_the_target() {
-    let Some(setup) = setup(Arc::new(Fixed(triangle_stages())), None) else {
-        return;
-    };
+const SIZE: u32 = 8;
+
+/// Draws the full-target triangle of the `vertex` and `pixel` test shaders into a cleared 8x8 target and
+/// returns the pipeline with the pixels read back.
+fn draw_triangle(setup: &Setup, vertex: u8, pixel: u8) -> Option<(Arc<Pipeline>, Vec<u32>)> {
     if !setup.ctx.features.pixel_shaders {
         eprintln!("skipping: no translated pixel shaders on this GPU");
-        return;
+        return None;
     }
-    const SIZE: u32 = 8;
     let d = &setup.ctx.device;
     // SAFETY: handles are destroyed at the end of the test after the replay's fence wait.
     let (image, memory, view) = unsafe {
@@ -611,8 +758,8 @@ fn a_draw_replays_through_a_graphics_pipeline_and_fills_the_target() {
     };
     let root = root_with(Vec::new());
     let mut desc = GraphicsPsoDesc::new(root.clone());
-    desc.vs = Bytecode(vec![1]);
-    desc.ps = Bytecode(vec![2]);
+    desc.vs = Bytecode(vec![vertex]);
+    desc.ps = Bytecode(vec![pixel]);
     desc.render_targets = vec![28];
     desc.raster.cull = 1;
     desc.depth_stencil.depth_enable = false;
@@ -635,7 +782,7 @@ fn a_draw_replays_through_a_graphics_pipeline_and_fills_the_target() {
             bind: BindPoint::Graphics,
             root,
         },
-        Command::SetPipeline(pipeline),
+        Command::SetPipeline(pipeline.clone()),
         Command::SetRenderTargets {
             colors: vec![target],
             depth: None,
@@ -667,25 +814,32 @@ fn a_draw_replays_through_a_graphics_pipeline_and_fills_the_target() {
             },
         },
     ];
-    let report = execute::run(&setup.ctx, replay(&setup), &commands).unwrap();
+    let report = execute::run(&setup.ctx, replay(setup), &commands).unwrap();
     assert_eq!((report.draws, report.copies), (1, 1));
-    for (i, word) in setup
-        .arena
-        .words(readback, (SIZE * SIZE) as usize)
-        .iter()
-        .enumerate()
-    {
-        // 0.5 in unorm8 is 127 or 128 depending on the driver's rounding.
-        assert!(
-            *word == 0xFF00_80FF || *word == 0xFF00_7FFF,
-            "pixel {i}: {word:08x}"
-        );
-    }
+    let pixels = setup.arena.words(readback, (SIZE * SIZE) as usize);
     // SAFETY: the replay has finished with the image.
     unsafe {
         d.destroy_image_view(view, None);
         d.destroy_image(image, None);
         d.free_memory(memory, None);
+    }
+    Some((pipeline, pixels))
+}
+
+#[test]
+fn a_draw_replays_through_a_graphics_pipeline_and_fills_the_target() {
+    let Some(setup) = setup(Arc::new(Fixed(triangle_stages())), None) else {
+        return;
+    };
+    let Some((_, pixels)) = draw_triangle(&setup, 1, 2) else {
+        return;
+    };
+    for (i, word) in pixels.iter().enumerate() {
+        // 0.5 in unorm8 is 127 or 128 depending on the driver's rounding.
+        assert!(
+            *word == 0xFF00_80FF || *word == 0xFF00_7FFF,
+            "pixel {i}: {word:08x}"
+        );
     }
 }
 
