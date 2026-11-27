@@ -857,3 +857,54 @@ fn external_skeleton_binds_character_parts() {
     assert_eq!(sidecar["drawables"][0]["skeleton"]["bones"], 2);
 }
 
+#[test]
+fn skinned_rest_pose_reproduces_vertices() {
+    let set = skinned_character();
+    let (_, glb) = export_one(&set);
+    let skin = &glb.doc["skins"][0];
+    let joints: Vec<usize> = skin["joints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j.as_u64().unwrap() as usize)
+        .collect();
+    let ibm = glb.floats(skin["inverseBindMatrices"].as_u64().unwrap() as usize);
+    let world = world_matrices(&glb);
+    let attrs = &glb.doc["meshes"][0]["primitives"][0]["attributes"];
+    let pos = glb.floats(attrs["POSITION"].as_u64().unwrap() as usize);
+    let sets: Vec<(Vec<u32>, Vec<f32>)> = (0..2)
+        .map(|s| {
+            (
+                glb.uints(attrs[format!("JOINTS_{s}")].as_u64().unwrap() as usize),
+                glb.floats(attrs[format!("WEIGHTS_{s}")].as_u64().unwrap() as usize),
+            )
+        })
+        .collect();
+    for v in 0..4 {
+        let mut out = [0.0f32; 3];
+        for (j, w) in &sets {
+            for k in 0..4 {
+                let joint = j[4 * v + k] as usize;
+                let m = mul(
+                    &world[joints[joint]],
+                    &ibm[16 * joint..16 * joint + 16].try_into().unwrap(),
+                );
+                for r in 0..3 {
+                    let t = m[r] * pos[3 * v]
+                        + m[4 + r] * pos[3 * v + 1]
+                        + m[8 + r] * pos[3 * v + 2]
+                        + m[12 + r];
+                    out[r] += w[4 * v + k] * t;
+                }
+            }
+        }
+        for r in 0..3 {
+            assert!(
+                close(out[r], pos[3 * v + r], 1e-4),
+                "vertex {v}: {out:?} vs {:?}",
+                &pos[3 * v..3 * v + 3]
+            );
+        }
+    }
+}
+
