@@ -74,6 +74,11 @@ pub fn configure(plan: &RuntimePlan) -> Result<()> {
     }
     let line = content::configure(plan).context("setting up the nudity filter")?;
     println!("{line}");
+    // The title reserves its GPU-visible memory before it creates the device, so the device's address space and
+    // memory hooks must exist first.
+    shims::d3d12::prepare()
+        .map_err(|error| anyhow::anyhow!("{error}"))
+        .context("setting up the graphics device")?;
     Ok(())
 }
 
