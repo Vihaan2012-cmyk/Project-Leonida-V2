@@ -60,6 +60,7 @@ shader-store = { path = "crates/shader-store" }
 testkit = { path = "crates/testkit" }
 content-filter = { path = "crates/content-filter" }
 vfs = { path = "crates/vfs" }
+bvh-build = { path = "crates/bvh-build", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

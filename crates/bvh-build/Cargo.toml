@@ -1,0 +1,22 @@
+[package]
+name = "bvh-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["gpu"]
+gpu = ["dep:gpu", "dep:naga"]
+
+[dependencies]
+thiserror.workspace = true
+gpu = { workspace = true, optional = true }
+naga = { workspace = true, optional = true }
+
+[dev-dependencies]
+testkit.workspace = true
+rdna.workspace = true
+
+[lints]
+workspace = true

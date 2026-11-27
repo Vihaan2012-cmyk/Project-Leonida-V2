@@ -252,6 +252,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87a0cf66fd1eb2fb7b822cb78370d82303750809bc6ba855f3f58e517d3238db"
 
 [[package]]
+name = "bvh-build"
+version = "0.1.0"
+dependencies = [
+ "gpu",
+ "naga",
+ "rdna",
+ "testkit",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "bytemuck"
 version = "1.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2305,6 +2316,7 @@ dependencies = [
 name = "shims"
 version = "0.1.0"
 dependencies = [
+ "bvh-build",
  "cpal",
  "gilrs",
  "offline",
