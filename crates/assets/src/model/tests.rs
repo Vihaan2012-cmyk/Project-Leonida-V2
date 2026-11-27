@@ -718,3 +718,30 @@ fn export_one(set: &ModelSet) -> (ExportedModel, Glb) {
     (e, glb)
 }
 
+#[test]
+fn static_model_exports_valid_gltf_in_y_up() {
+    let mut g = GeometrySpec::quad();
+    g.form = PositionForm::Float;
+    g.normals = Some(vec![[0.0, 0.0, 1.0]; 4]);
+    g.uvs = Some(vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+    g.colors = Some(vec![[9, 8, 7, 255]; 4]);
+    let set = decode_resource(&drawable_resource(&DrawableSpec::simple(g)), Some("quad")).unwrap();
+    let (e, glb) = export_one(&set);
+    assert_eq!(e.stem, "quad");
+    let prim = &glb.doc["meshes"][0]["primitives"][0];
+    let attrs = &prim["attributes"];
+    let pos = glb.floats(attrs["POSITION"].as_u64().unwrap() as usize);
+    assert_eq!(&pos[3..6], &[1.0, 0.0, 0.0]);
+    assert_eq!(&pos[6..9], &[1.0, 0.0, -2.0]);
+    assert_eq!(&pos[9..12], &[0.0, 0.5, -2.0]);
+    let normals = glb.floats(attrs["NORMAL"].as_u64().unwrap() as usize);
+    assert_eq!(&normals[0..3], &[0.0, 1.0, 0.0]);
+    assert!(attrs.get("TEXCOORD_0").is_some() && attrs.get("COLOR_0").is_some());
+    assert!(glb.doc.get("skins").is_none());
+    assert_eq!(glb.doc["materials"][0]["alphaMode"], Value::Null);
+    assert_eq!(
+        glb.doc["materials"][0]["extras"]["shader_hash"],
+        "0xdeadbeef"
+    );
+}
+
