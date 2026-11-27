@@ -4,6 +4,13 @@
 //! and runs the helper's TLS callbacks: the first copies the slot number into the image's own index
 //! variable, the rest are the image's callbacks, so they run as threads start and end. (Windows skips all
 //! of this for a DLL that imports nothing or has no entry point, so the helper has both.)
+//!
+//! Code built with `/GA`, as the game is, does not read its index variable: it assumes its TLS is slot 0, the
+//! slot Windows gives the process's executable. Ours already holds slot 0, so the first callback swaps the
+//! two slots' blocks in each thread as it starts and points our own index variable at the helper's slot:
+//! after that the image finds its block in slot 0 and our code finds its own in the helper's slot. The swap
+//! covers the loading thread and every thread started later; threads that already exist keep the old order,
+//! so no other thread may run our code while an image with TLS is loaded or unloaded.
 
 const BASE: u64 = 0x1_8000_0000;
 const TEXT: u32 = 0x1000;
@@ -13,7 +20,7 @@ const TLS: u32 = 0x4000;
 const FILE_ALIGN: usize = 0x200;
 const PAGE: u32 = 0x1000;
 /// Windows runs TLS callbacks only for DLLs with an entry point; this one returns TRUE.
-const ENTRY: u32 = 0x20;
+const ENTRY: u32 = 0x80;
 /// Windows sets up TLS only for DLLs that import something, so the helper imports `GetLastError`.
 const IMPORTS: u32 = 0x800;
 
@@ -23,6 +30,9 @@ pub struct Directory {
     pub characteristics: u32,
     /// Where the image keeps its slot number.
     pub index: u64,
+    /// Where our executable keeps its slot number when it holds slot 0, or 0 when it does not; without it the
+    /// slots are not swapped and the image gets the helper's slot.
+    pub host_index: u64,
     /// The image's callbacks.
     pub callbacks: Vec<u64>,
 }
@@ -38,17 +48,63 @@ fn align(value: usize, to: usize) -> usize {
     value.div_ceil(to) * to
 }
 
+/// The first TLS callback: on process and thread attach (reasons 1 and 2) it reads the helper's slot `k`;
+/// when our executable holds slot 0 it swaps slots 0 and `k` of the thread's TLS array, stores `k` in our
+/// index variable and 0 in the image's, otherwise it stores `k` in the image's.
+fn callback(host_index: u64, image_index: u64) -> Vec<u8> {
+    let mut code = Vec::new();
+    let mut fixups: Vec<(usize, &str)> = Vec::new();
+    let mut labels: Vec<(&str, usize)> = Vec::new();
+    let mut jump = |code: &mut Vec<u8>, opcode: u8, label: &'static str| {
+        code.extend_from_slice(&[opcode, 0]);
+        fixups.push((code.len() - 1, label));
+    };
+    code.extend_from_slice(&[0x83, 0xFA, 0x01]);
+    jump(&mut code, 0x74, "go");
+    code.extend_from_slice(&[0x83, 0xFA, 0x02]);
+    jump(&mut code, 0x75, "done");
+    labels.push(("go", code.len()));
+    let next = TEXT + code.len() as u32 + 6;
+    code.extend_from_slice(&[0x8B, 0x05]);
+    code.extend_from_slice(&(DATA.wrapping_sub(next) as i32).to_le_bytes());
+    code.extend_from_slice(&[0x49, 0xB9]);
+    code.extend_from_slice(&host_index.to_le_bytes());
+    code.extend_from_slice(&[0x4D, 0x85, 0xC9]);
+    jump(&mut code, 0x74, "image");
+    code.extend_from_slice(&[0x85, 0xC0]);
+    jump(&mut code, 0x74, "zero");
+    code.extend_from_slice(&[0x65, 0x48, 0x8B, 0x0C, 0x25, 0x58, 0, 0, 0]);
+    code.extend_from_slice(&[0x48, 0x8B, 0x11]);
+    code.extend_from_slice(&[0x4C, 0x8B, 0x04, 0xC1]);
+    code.extend_from_slice(&[0x4C, 0x89, 0x01]);
+    code.extend_from_slice(&[0x48, 0x89, 0x14, 0xC1]);
+    code.extend_from_slice(&[0x41, 0x89, 0x01]);
+    labels.push(("zero", code.len()));
+    code.extend_from_slice(&[0x31, 0xC0]);
+    labels.push(("image", code.len()));
+    code.extend_from_slice(&[0x49, 0xBA]);
+    code.extend_from_slice(&image_index.to_le_bytes());
+    code.extend_from_slice(&[0x41, 0x89, 0x02]);
+    labels.push(("done", code.len()));
+    code.push(0xC3);
+    for (at, label) in fixups {
+        let target = labels.iter().find(|(l, _)| *l == label).expect("label").1;
+        code[at] = u8::try_from(target - (at + 1)).expect("short jump");
+    }
+    code
+}
+
 pub fn helper(directory: &Directory) -> Vec<u8> {
     let template_size = directory.template.len().max(1);
     let tls_pages = align(template_size, PAGE as usize) as u32;
     let reloc = TLS + tls_pages;
     let image_size = reloc + PAGE;
     let va = |rva: u32| BASE + u64::from(rva);
-    let mut stub = vec![0x8B, 0x05];
-    stub.extend_from_slice(&(DATA.wrapping_sub(TEXT + 6) as i32).to_le_bytes());
-    stub.extend_from_slice(&[0x48, 0xB9]);
-    stub.extend_from_slice(&directory.index.to_le_bytes());
-    stub.extend_from_slice(&[0x89, 0x01, 0xC3]);
+    let mut stub = callback(directory.host_index, directory.index);
+    assert!(
+        stub.len() <= ENTRY as usize,
+        "the callback fits before the entry point"
+    );
     stub.resize(ENTRY as usize, 0xCC);
     stub.extend_from_slice(&[0xB8, 1, 0, 0, 0, 0xC3]);
     let callbacks_at = RDATA + 0x40;

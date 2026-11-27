@@ -116,10 +116,19 @@ fn thread_local_storage_reads_its_template_in_every_thread() {
     };
     let module = load(&image(), &mut NoImports, &options).expect("loads");
     let base = module.base();
-    assert_ne!(
+    assert_eq!(
         read_u32(base, INDEX),
         0,
-        "a slot of its own, not the test's"
+        "the image finds its TLS in slot 0, as /GA code assumes"
+    );
+    thread_local! {
+        static OURS: std::cell::Cell<u32> = const { std::cell::Cell::new(5) };
+    }
+    OURS.with(|v| v.set(v.get() + 1));
+    assert_eq!(
+        OURS.with(|v| v.get()),
+        6,
+        "our own TLS still works after the swap"
     );
     assert_eq!(
         read_u32(base, REASON),
@@ -132,13 +141,16 @@ fn thread_local_storage_reads_its_template_in_every_thread() {
     let other = std::thread::spawn(move || {
         // SAFETY: as above, on a thread started after the image was loaded.
         let read: extern "win64" fn() -> usize = unsafe { std::mem::transmute(entry) };
-        read()
+        OURS.with(|v| v.set(9));
+        (read(), OURS.with(|v| v.get()))
     })
     .join()
     .expect("thread ran");
-    assert_eq!(other, 0x1234);
+    assert_eq!(other, (0x1234, 9));
     assert!(
         read_u32(base, CALLS) >= 3,
         "attach, thread attach and thread detach"
     );
+    drop(module);
+    assert_eq!(OURS.with(|v| v.get()), 6, "our TLS is back in slot 0");
 }

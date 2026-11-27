@@ -73,6 +73,8 @@ pub struct Module {
     entry: u32,
     exception_table: Option<usize>,
     tls_helper: Option<(usize, PathBuf)>,
+    /// The helper's TLS slot and our executable's index variable, when the two swapped slots.
+    tls_swap: Option<(u32, usize)>,
 }
 
 impl Module {
@@ -111,7 +113,7 @@ mod windows {
         FlushInstructionCache, IMAGE_RUNTIME_FUNCTION_ENTRY, RtlAddFunctionTable,
         RtlDeleteFunctionTable,
     };
-    use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_PROTECTION_FLAGS,
         PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
@@ -224,12 +226,68 @@ mod windows {
             FlushInstructionCache(GetCurrentProcess(), base as *const c_void, size);
         }
         if let (Some((rva, _)), Some(folder)) = (image.directory(DIRECTORY_TLS), &options.helpers) {
-            module.tls_helper = Some(thread_storage(&module, &image, rva, folder)?);
+            let host = host_tls_index();
+            module.tls_helper = Some(thread_storage(&module, &image, rva, folder, host)?);
+            if let Some(host) = host {
+                // SAFETY: our executable's index variable, which the helper's callback has just written.
+                let slot = unsafe { std::ptr::read_volatile(host as *const u32) };
+                if slot != 0 {
+                    module.tls_swap = Some((slot, host as usize));
+                }
+            }
         }
         Ok(module)
     }
 
     static HELPERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Our executable's TLS index variable, when it has static TLS and holds slot 0.
+    fn host_tls_index() -> Option<u64> {
+        // SAFETY: reads the headers of our own executable as Windows mapped them.
+        unsafe {
+            let base = GetModuleHandleW(std::ptr::null()) as usize;
+            if base == 0 {
+                return None;
+            }
+            let header = base + std::ptr::read_unaligned((base + 0x3C) as *const u32) as usize;
+            let optional = header + 24;
+            if std::ptr::read_unaligned(optional as *const u16) != 0x20B
+                || std::ptr::read_unaligned((optional + 108) as *const u32) <= 9
+            {
+                return None;
+            }
+            let rva = std::ptr::read_unaligned((optional + 112 + 72) as *const u32) as usize;
+            if rva == 0 {
+                return None;
+            }
+            let index = std::ptr::read_unaligned((base + rva + 16) as *const u64);
+            (index != 0 && std::ptr::read_volatile(index as *const u32) == 0).then_some(index)
+        }
+    }
+
+    /// Puts our executable's TLS back in slot 0 for the calling thread, undoing the helper's swap.
+    ///
+    /// # Safety
+    /// `slot` is the helper's slot, swapped with slot 0 in this thread, and `host` our index variable.
+    unsafe fn unswap(slot: u32, host: usize) {
+        // SAFETY: one instruction sequence, so no code of ours reads TLS between the swap and the index write.
+        unsafe {
+            std::arch::asm!(
+                "mov rcx, gs:[0x58]",
+                "mov rdx, [rcx]",
+                "mov r8, [rcx + r9 * 8]",
+                "mov [rcx], r8",
+                "mov [rcx + r9 * 8], rdx",
+                "mov dword ptr [r10], 0",
+                in("r9") u64::from(slot),
+                in("r10") host,
+                out("rcx") _,
+                out("rdx") _,
+                out("r8") _,
+                options(nostack),
+            );
+        }
+    }
 
     /// Loads a helper DLL carrying the image's TLS directory; see the `tls` module.
     fn thread_storage(
@@ -237,6 +295,7 @@ mod windows {
         image: &Image<'_>,
         rva: u32,
         folder: &std::path::Path,
+        host_index: Option<u64>,
     ) -> Result<(usize, PathBuf), LoadError> {
         let fail = |what: &str| LoadError::ThreadLocalStorage(what.to_string());
         let field = |k: u32| {
@@ -285,6 +344,7 @@ mod windows {
             zero_fill: sizes as u32,
             characteristics: (sizes >> 32) as u32,
             index,
+            host_index: host_index.unwrap_or(0),
             callbacks: list,
         };
         std::fs::create_dir_all(folder).map_err(|e| fail(&e.to_string()))?;
@@ -330,6 +390,7 @@ mod windows {
             entry: image.entry,
             exception_table: None,
             tls_helper: None,
+            tls_swap: None,
         };
         let moved = module.base as u64 != image.image_base;
         if moved
@@ -389,6 +450,9 @@ mod windows {
         fn drop(&mut self) {
             // SAFETY: the table and mapping were made by `load` and are released once.
             unsafe {
+                if let Some((slot, host)) = self.tls_swap.take() {
+                    unswap(slot, host);
+                }
                 if let Some((handle, path)) = self.tls_helper.take() {
                     FreeLibrary(handle as _);
                     let _ = std::fs::remove_file(path);
