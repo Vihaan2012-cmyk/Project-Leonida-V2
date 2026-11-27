@@ -10,6 +10,9 @@ rust-version = "1.97"
 
 [workspace.dependencies]
 anyhow = "1"
+gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
+raw-window-handle = "0.6"
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland"] }
 ash = "0.38"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
@@ -38,6 +41,7 @@ config = { path = "crates/config" }
 decompile = { path = "crates/decompile" }
 offline = { path = "crates/offline" }
 gpu = { path = "crates/gpu" }
+render = { path = "crates/render" }
 rdna = { path = "crates/rdna" }
 shader-ir = { path = "crates/shader-ir" }
 shader-translate = { path = "crates/shader-translate" }
