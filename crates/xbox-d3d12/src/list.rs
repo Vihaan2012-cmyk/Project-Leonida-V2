@@ -1138,6 +1138,62 @@ unsafe extern "win64" fn l_allocate_upload(
     address
 }
 
+/// Slots the executable calls whose meaning is not measured: they record nothing and say so once.
+fn unmeasured_call(slot: usize, shape: &str) {
+    com::note_once(format!(
+        "ID3D12GraphicsCommandList slot {slot} ({shape}): meaning not measured, ignored"
+    ));
+}
+
+/// Slot 29, `(ptr, u32, u32)`, seen at one site.
+unsafe extern "win64" fn l_unmeasured_29(
+    _this: *mut c_void,
+    _p: *const c_void,
+    _a: u32,
+    _b: u32,
+) -> u32 {
+    unmeasured_call(29, "ptr, u32, u32");
+    S_OK
+}
+
+/// Slot 30, `(ptr, u32, first, count, ptr, byte offset)`, seen at one site.
+unsafe extern "win64" fn l_unmeasured_30(
+    _this: *mut c_void,
+    _p: *const c_void,
+    _a: u32,
+    _first: u32,
+    _count: u32,
+    _q: *const c_void,
+    _offset: u32,
+) -> u32 {
+    unmeasured_call(30, "ptr, u32, first, count, ptr, byte offset");
+    S_OK
+}
+
+/// Slot 131, `(a, b, c, mask)`: called once per list just before `Close` at boot.
+unsafe extern "win64" fn l_unmeasured_131(
+    _this: *mut c_void,
+    _a: u64,
+    _b: u64,
+    _c: u64,
+    _mask: u64,
+) -> u32 {
+    unmeasured_call(131, "a, b, c, mask");
+    S_OK
+}
+
+/// Slot 132, `(a, b, c, mask)`: called once per list just before `Close` at boot.
+unsafe extern "win64" fn l_unmeasured_132(
+    _this: *mut c_void,
+    _a: u64,
+    _b: u64,
+    _c: u64,
+    _mask: u64,
+) -> u32 {
+    unmeasured_call(132, "a, b, c, mask");
+    S_OK
+}
+
 fn list_vtable(core: &DeviceCore) -> *const usize {
     macro_rules! f {
         ($f:expr) => {
@@ -1167,6 +1223,8 @@ fn list_vtable(core: &DeviceCore) -> *const usize {
         (24, f!(l_set_stencil_ref)),
         (25, f!(l_set_pipeline_state)),
         (26, f!(l_resource_barrier)),
+        (29, f!(l_unmeasured_29)),
+        (30, f!(l_unmeasured_30)),
         (32, f!(l_set_descriptor_heaps)),
         (33, f!(l_set_compute_root_signature)),
         (34, f!(l_set_graphics_root_signature)),
@@ -1197,6 +1255,8 @@ fn list_vtable(core: &DeviceCore) -> *const usize {
         (73, f!(l_wait_value)),
         (80, f!(l_dispatch_x)),
         (85, f!(l_copy_texture_region)),
+        (131, f!(l_unmeasured_131)),
+        (132, f!(l_unmeasured_132)),
         (141, f!(l_set_scratch_buffer)),
         (146, f!(l_barrier)),
         (148, f!(l_allocate_upload)),

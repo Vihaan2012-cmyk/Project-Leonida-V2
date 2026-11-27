@@ -133,6 +133,8 @@ ID3D12GraphicsCommandList 23 OMSetBlendFactor pc sites=1
 ID3D12GraphicsCommandList 24 OMSetStencilRef pc sites=1
 ID3D12GraphicsCommandList 25 SetPipelineState measured sites=3
 ID3D12GraphicsCommandList 26 ResourceBarrier measured
+ID3D12GraphicsCommandList 29 Unnamed29 measured (called as (ptr, u32, u32); meaning unknown, ignored)
+ID3D12GraphicsCommandList 30 Unnamed30 measured (called as (ptr, u32, first, count, ptr, byte offset); meaning unknown, ignored)
 ID3D12GraphicsCommandList 32 SetDescriptorHeaps measured
 ID3D12GraphicsCommandList 33 SetComputeRootSignature measured sites=2
 ID3D12GraphicsCommandList 34 SetGraphicsRootSignature inferred sites=1
@@ -163,6 +165,8 @@ ID3D12GraphicsCommandList 71 WriteValueX inferred
 ID3D12GraphicsCommandList 73 WaitValueX inferred
 ID3D12GraphicsCommandList 80 DispatchX inferred
 ID3D12GraphicsCommandList 85 CopyTextureRegion inferred
+ID3D12GraphicsCommandList 131 Unnamed131 measured (called as (a, b, c, mask) once per list before Close; meaning unknown, ignored)
+ID3D12GraphicsCommandList 132 Unnamed132 measured (called as (a, b, c, mask) once per list before Close; meaning unknown, ignored)
 ID3D12GraphicsCommandList 141 SetScratchBufferX measured
 ID3D12GraphicsCommandList 146 Barrier measured
 ID3D12GraphicsCommandList 148 AllocateUploadMemoryX measured
