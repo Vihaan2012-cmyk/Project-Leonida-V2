@@ -13,6 +13,8 @@
 
 fn pf(i: u32) -> f32 { return bitcast<f32>(P[i]); }
 
+const NARROW = 8.0;
+
 fn compress(c: vec3<f32>) -> vec3<f32> {
     let v = max(c, vec3<f32>(0.0));
     return v / (1.0 + luma(v));
@@ -59,6 +61,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var csum = vec3<f32>(0.0);
     var wsum = 0.0;
+    var nsum = vec3<f32>(0.0);
+    var nwsum = 0.0;
     var m1 = vec3<f32>(0.0);
     var m2 = vec3<f32>(0.0);
     var near_d = -1.0;
@@ -72,6 +76,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             let c = load_color(t.x, t.y);
             csum += c * w;
             wsum += w;
+            let wn = exp(-NARROW * dot(d, d));
+            nsum += c * wn;
+            nwsum += wn;
             m1 += c;
             m2 += c * c;
             if (flags & 2u) != 0u {
@@ -84,7 +91,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
         }
     }
-    let cur = csum / wsum;
+    let cur_wide = csum / wsum;
+    let cur_narrow = nsum / nwsum;
     m1 = m1 / 9.0;
     let sigma = sqrt(max(m2 / 9.0 - m1 * m1, vec3<f32>(0.0)));
     let box_lo = m1 - 1.5 * sigma;
@@ -97,7 +105,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let prev_o = (vec2<f32>(f32(id.x), f32(id.y)) + 0.5) + mv / scale;
     let inside = prev_o.x >= 0.0 && prev_o.y >= 0.0 && prev_o.x <= os.x && prev_o.y <= os.y;
 
-    var h = cur;
+    var h = cur_wide;
     var count = 0.0;
     if (flags & 1u) == 0u && inside {
         let s = prev_o - 0.5;
@@ -133,6 +141,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     var alpha = 1.0 / (eff + 1.0);
     alpha = max(alpha, 0.15 * sat(speed / 2.0));
     if eff <= 0.0 { alpha = 1.0; }
+    let cur = select(cur_narrow, cur_wide, eff <= 0.0);
     let out_c = mix(hc, cur, alpha);
     let new_count = min(eff + 1.0, pf(10u));
     let i = id.y * P[2] + id.x;

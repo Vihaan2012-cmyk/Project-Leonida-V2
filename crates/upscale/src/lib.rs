@@ -18,6 +18,7 @@ pub mod dlss;
 pub mod framegen;
 pub mod fsr1;
 pub mod image;
+pub mod temporal;
 
 pub use compute::{Compute, SharedCompute};
 pub use image::{Image, ImageRef, PixelFormat};
@@ -273,7 +274,10 @@ mod tests {
 
     #[test]
     fn presets_and_jitter_follow_the_amd_conventions() {
-        assert_eq!(QualityMode::Performance.render_size([3840, 2160]), [1920, 1080]);
+        assert_eq!(
+            QualityMode::Performance.render_size([3840, 2160]),
+            [1920, 1080]
+        );
         assert_eq!(QualityMode::Quality.render_size([1920, 1080]), [1280, 720]);
         assert_eq!(jitter_phase_count(1920, 1920), 8);
         assert_eq!(jitter_phase_count(1280, 1920), 18);
