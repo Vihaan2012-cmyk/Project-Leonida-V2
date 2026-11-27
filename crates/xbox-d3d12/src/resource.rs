@@ -3,6 +3,7 @@
 pub mod desc;
 pub mod layout;
 pub mod tiling;
+pub mod va;
 
 #[cfg(test)]
 mod tiling_tests;
@@ -12,3 +13,6 @@ mod layout_tests;
 
 #[cfg(test)]
 mod desc_tests;
+
+#[cfg(test)]
+mod va_tests;
