@@ -6,9 +6,11 @@
 //! [`Unsupported`] reason; nothing is guessed.
 
 pub mod bcn;
+pub mod bcpack;
 pub mod format;
 pub mod layout;
 pub mod tiling;
 
+pub use bcpack::BcPackCodec;
 pub use format::{FormatInfo, format_info};
 
