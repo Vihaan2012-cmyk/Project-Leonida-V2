@@ -358,3 +358,57 @@ fn parent_cycles_are_rejected() {
     ));
 }
 
+#[test]
+fn garbage_and_truncation_never_panic() {
+    assert!(matches!(
+        decode_pages(&[], &[], None),
+        Err(ModelError::NotAModel)
+    ));
+    assert!(matches!(
+        decode_pages(&[0u8; 400], &[], None),
+        Err(ModelError::NotAModel)
+    ));
+    let mut g = GeometrySpec::quad();
+    g.normals = Some(vec![[0.0, 0.0, 1.0]; 4]);
+    let r = drawable_resource(&DrawableSpec::simple(g));
+    for cut in (0..r.system.len()).step_by(7) {
+        let _ = decode_pages(&r.system[..cut], &r.graphics, None);
+    }
+    for cut in 0..r.graphics.len() {
+        let _ = decode_pages(&r.system, &r.graphics[..cut], None);
+    }
+    let mut state = 0x1234_5678u32;
+    for _ in 0..300 {
+        let mut system = r.system.clone();
+        let mut graphics = r.graphics.clone();
+        for _ in 0..4 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let at = (state >> 8) as usize % (system.len() + graphics.len());
+            if at < system.len() {
+                system[at] ^= (state >> 3) as u8 | 1;
+            } else {
+                graphics[at - system.len()] ^= (state >> 3) as u8 | 1;
+            }
+        }
+        let _ = decode_pages(&system, &graphics, None);
+    }
+}
+
+#[test]
+fn decode_splits_joined_bytes() {
+    let r = drawable_resource(&DrawableSpec::simple(GeometrySpec::quad()));
+    let mut joined = r.system.clone();
+    joined.extend_from_slice(&r.graphics);
+    let info = ResourceInfo {
+        name: Some("x".into()),
+        system_len: r.system.len(),
+    };
+    let set = decode(&joined, &info).unwrap();
+    assert_eq!(set.name.as_deref(), Some("x"));
+    let bad = ResourceInfo {
+        name: None,
+        system_len: joined.len() + 1,
+    };
+    assert!(decode(&joined, &bad).is_err());
+}
+
