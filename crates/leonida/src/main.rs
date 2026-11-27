@@ -3,6 +3,7 @@ mod cmd_check;
 mod cmd_config;
 mod cmd_content;
 mod cmd_exe;
+mod cmd_mods;
 mod cmd_package;
 mod cmd_pipelines;
 mod cmd_run;
@@ -41,6 +42,7 @@ fn main() -> ExitCode {
         Some(Command::Content(content)) => match &content.command {
             ContentCommand::Scan(args) => cmd_content::scan_command(args),
         },
+        Some(Command::Mods(args)) => cmd_mods::mods_command(args),
     };
     result.unwrap_or_else(|error| {
         eprintln!("error: {error:#}");

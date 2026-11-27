@@ -27,6 +27,7 @@ shader-container.workspace = true
 shader-ir.workspace = true
 shader-store.workspace = true
 shader-translate.workspace = true
+vfs.workspace = true
 
 [build-dependencies]
 embed-manifest = "1.5"

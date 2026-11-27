@@ -25,9 +25,9 @@ rayon = "1"
 rspirv = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.9"
 sha2 = "0.10"
 tempfile = "3"
-toml = "0.9"
 thiserror = "2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Kernel", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 game-package = { path = "crates/game-package" }
@@ -50,6 +50,7 @@ shader-translate = { path = "crates/shader-translate" }
 shader-store = { path = "crates/shader-store" }
 testkit = { path = "crates/testkit" }
 content-filter = { path = "crates/content-filter" }
+vfs = { path = "crates/vfs" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
