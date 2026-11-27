@@ -283,19 +283,21 @@ impl Xma2Decoder {
         Ok(())
     }
 
-    /// Position the decoder so the output continues at `sample` (per channel, counted from the start of the
-    /// stream) using a seek table of per-packet start samples (tag `0xa3`). Returns the packet index to push
-    /// next. Decoding restarts one packet early so the overlap state is warm at `sample`.
+    /// Position the decoder so the output continues at `sample` (per channel, counted from the first output
+    /// sample, that is after the lead-in) using a seek table of per-packet start samples (tag `0xa3`). Returns
+    /// the packet index to push next. Decoding restarts one packet early so the overlap state is warm at
+    /// `sample`.
     pub fn seek(&mut self, table: &[u32], sample: u64) -> Result<usize> {
         if table.is_empty() {
             return Err(Error::Invalid("empty seek table".into()));
         }
-        let block = crate::awc::seek_block(table, sample.min(u64::from(u32::MAX)) as u32);
+        let position = sample + self.config.lead_in as u64;
+        let block = crate::awc::seek_block(table, position.min(u64::from(u32::MAX)) as u32);
         let start = block.saturating_sub(1);
         self.restart_at_packet(start)?;
-        let drop = sample.saturating_sub(u64::from(table[start])) as usize;
+        let drop = position.saturating_sub(u64::from(table[start])) as usize;
         for s in &mut self.streams {
-            s.to_skip += drop;
+            s.to_skip = drop;
         }
         self.emitted = sample;
         Ok(start)
