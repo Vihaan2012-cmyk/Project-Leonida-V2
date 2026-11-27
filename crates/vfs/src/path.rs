@@ -143,18 +143,7 @@ pub fn fold(text: &str) -> String {
     text.to_lowercase()
 }
 
-/// The one-at-a-time hash the engine uses for names, over the bytes given as they are.
-pub fn joaat(bytes: &[u8]) -> u32 {
-    let mut hash = 0u32;
-    for &byte in bytes {
-        hash = hash.wrapping_add(u32::from(byte));
-        hash = hash.wrapping_add(hash << 10);
-        hash ^= hash >> 6;
-    }
-    hash = hash.wrapping_add(hash << 3);
-    hash ^= hash >> 11;
-    hash.wrapping_add(hash << 15)
-}
+pub use name_hash::joaat;
 
 /// Matches a folded, `/`-separated pattern against a folded path. `*` is any run inside one part, `?` one
 /// character, and a part that is exactly `**` any number of whole parts, including none.

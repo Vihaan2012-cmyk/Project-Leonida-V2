@@ -76,18 +76,7 @@ fn reject_cycles(bones: &[Bone]) -> Result<(), ModelError> {
     Ok(())
 }
 
-/// `joaat32` of a lowercased name, the hash the game stores for bones and shader parameters.
-pub fn joaat(name: &str) -> u32 {
-    let mut h: u32 = 0;
-    for b in name.bytes() {
-        h = h.wrapping_add(b.to_ascii_lowercase() as u32);
-        h = h.wrapping_add(h << 10);
-        h ^= h >> 6;
-    }
-    h = h.wrapping_add(h << 3);
-    h ^= h >> 11;
-    h.wrapping_add(h << 15)
-}
+pub use name_hash::joaat_lower as joaat;
 
 impl Skeleton {
     /// Index of the bone with the given name hash; the first one when several share it.

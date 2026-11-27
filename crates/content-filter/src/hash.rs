@@ -6,18 +6,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-/// Jenkins one-at-a-time over the lower-cased bytes: the 32-bit name hash the game's data uses.
-pub fn joaat_lower(text: &str) -> u32 {
-    let mut hash = 0u32;
-    for byte in text.bytes() {
-        hash = hash.wrapping_add(u32::from(byte.to_ascii_lowercase()));
-        hash = hash.wrapping_add(hash << 10);
-        hash ^= hash >> 6;
-    }
-    hash = hash.wrapping_add(hash << 3);
-    hash ^= hash >> 11;
-    hash.wrapping_add(hash << 15)
-}
+pub use name_hash::joaat_lower;
 
 /// Low 64 bits of MurmurHash3 x64 128 with seed 0 over the exact bytes: the 64-bit key of names and assets.
 pub fn murmur64(data: &[u8]) -> u64 {

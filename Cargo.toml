@@ -62,6 +62,7 @@ testkit = { path = "crates/testkit" }
 content-filter = { path = "crates/content-filter" }
 vfs = { path = "crates/vfs" }
 bvh-build = { path = "crates/bvh-build", default-features = false }
+name-hash = { path = "crates/name-hash" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
