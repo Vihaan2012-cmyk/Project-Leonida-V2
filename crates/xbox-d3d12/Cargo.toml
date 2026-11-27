@@ -6,7 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ash.workspace = true
+naga.workspace = true
 thiserror.workspace = true
+winit.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [lints]
 workspace = true
