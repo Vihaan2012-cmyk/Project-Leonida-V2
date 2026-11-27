@@ -3,6 +3,10 @@
 
 pub mod format;
 pub mod gfx10;
+pub mod registry;
 
 #[cfg(test)]
 mod gfx10_tests;
+
+#[cfg(test)]
+mod registry_tests;
