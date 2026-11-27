@@ -23,6 +23,7 @@ mod header;
 pub mod layout;
 pub mod player;
 pub mod sound;
+pub mod source;
 #[doc(hidden)]
 pub mod testing;
 pub mod worker;
