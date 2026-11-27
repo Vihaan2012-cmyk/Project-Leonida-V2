@@ -5,6 +5,8 @@
 //! default and cites the addresses it was derived from in `EVIDENCE`.
 
 
+use std::f32::consts::PI;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Size {
     pub width: u32,
@@ -189,6 +191,62 @@ pub fn native_render_size(window: Size, max_height: u32, align: u32) -> Size {
     Size::new(round(ideal_width), round(f64::from(height)))
 }
 
+/// The eight aspect ratios the game's shape snapping knows, in its table order.
+pub const GAME_ASPECTS: [f32; 8] = [
+    16.0 / 9.0,
+    1.6,
+    4.0 / 3.0,
+    7.0 / 3.0,
+    17.0 / 9.0,
+    1.25,
+    1.5,
+    5.0 / 3.0,
+];
+
+/// The table entry closest to `aspect` by ratio.
+pub fn nearest_game_aspect(aspect: f32) -> f32 {
+    GAME_ASPECTS
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            let da = (aspect / a).ln().abs();
+            let db = (aspect / b).ln().abs();
+            da.total_cmp(&db)
+        })
+        .unwrap_or(16.0 / 9.0)
+}
+
+pub fn horizontal_fov(vertical_degrees: f32, aspect: f32) -> f32 {
+    2.0 * ((vertical_degrees.to_radians() / 2.0).tan() * aspect)
+        .atan()
+        .to_degrees()
+}
+
+pub fn vertical_fov(horizontal_degrees: f32, aspect: f32) -> f32 {
+    2.0 * ((horizontal_degrees.to_radians() / 2.0).tan() / aspect)
+        .atan()
+        .to_degrees()
+}
+
+/// The factor on the game's vertical field of view that gives `target_horizontal` degrees at `aspect`.
+pub fn fov_scale_for_horizontal(
+    base_vertical: f32,
+    target_horizontal: f32,
+    aspect: f32,
+) -> Option<f32> {
+    let scale = vertical_fov(target_horizontal, aspect) / base_vertical;
+    (scale.is_finite() && scale > 0.0).then_some(scale)
+}
+
+/// The game turns a field of view in degrees into a half-angle in radians with this constant (pi / 360).
+pub const HALF_ANGLE_PER_DEGREE: f32 = PI / 360.0;
+
+/// The same constant for a field of view scaled by `scale`.
+pub fn scaled_half_angle(scale: f32) -> f32 {
+    HALF_ANGLE_PER_DEGREE * scale
+}
+
+pub const FOV_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=1.8;
 
 #[cfg(test)]
 mod tests {
@@ -332,6 +390,40 @@ mod tests {
         );
         assert_eq!(fill.dest, Rect::whole(window));
         assert_eq!(fill.source.width, 1920);
+    }
+
+    #[test]
+    fn game_aspect_table_snaps_nearby_shapes() {
+        assert!(near(nearest_game_aspect(1.78), 16.0 / 9.0));
+        assert!(near(nearest_game_aspect(2.39), 7.0 / 3.0));
+        assert!(near(nearest_game_aspect(1.33), 4.0 / 3.0));
+        assert!(near(nearest_game_aspect(1.59), 1.6));
+        assert!(near(nearest_game_aspect(1.26), 1.25));
+    }
+
+    #[test]
+    fn fov_conversions_round_trip() {
+        let horizontal = horizontal_fov(60.0, 16.0 / 9.0);
+        assert!((horizontal - 91.49).abs() < 0.05, "{horizontal}");
+        assert!((vertical_fov(horizontal, 16.0 / 9.0) - 60.0).abs() < 1e-3);
+        assert!((horizontal_fov(60.0, 1.0) - 60.0).abs() < 1e-3);
+        assert!(horizontal_fov(60.0, 7.0 / 3.0) > horizontal);
+    }
+
+    #[test]
+    fn fov_scale_for_a_target_horizontal_angle() {
+        let scale = fov_scale_for_horizontal(60.0, 91.49, 16.0 / 9.0).unwrap();
+        assert!((scale - 1.0).abs() < 0.001);
+        let wide = fov_scale_for_horizontal(60.0, 120.0, 16.0 / 9.0).unwrap();
+        assert!(wide > 1.0);
+        assert!(fov_scale_for_horizontal(0.0, 90.0, 1.0).is_none());
+    }
+
+    #[test]
+    fn half_angle_constant_is_the_games() {
+        assert_eq!(HALF_ANGLE_PER_DEGREE.to_bits(), 0x3c0e_fa35);
+        assert_eq!(scaled_half_angle(1.0), HALF_ANGLE_PER_DEGREE);
+        assert!(near(scaled_half_angle(2.0) / HALF_ANGLE_PER_DEGREE, 2.0));
     }
 
 }
