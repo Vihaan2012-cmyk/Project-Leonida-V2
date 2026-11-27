@@ -21,6 +21,7 @@
 mod decoder;
 mod header;
 pub mod layout;
+mod sound;
 #[doc(hidden)]
 pub mod testing;
 mod worker;
