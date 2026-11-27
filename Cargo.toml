@@ -16,6 +16,9 @@ flate2 = "1"
 iced-x86 = { version = "1.22", default-features = false, features = ["std", "decoder", "intel", "instr_info"] }
 memchr = "2"
 memmap2 = "0.9"
+postcard = { version = "1", features = ["use-std"] }
+redb = "5"
+ruzstd = "0.9"
 naga = { version = "30", features = ["wgsl-in", "spv-out"] }
 rayon = "1"
 rspirv = "0.13"
@@ -41,6 +44,7 @@ gpu = { path = "crates/gpu" }
 rdna = { path = "crates/rdna" }
 shader-ir = { path = "crates/shader-ir" }
 shader-translate = { path = "crates/shader-translate" }
+shader-store = { path = "crates/shader-store" }
 testkit = { path = "crates/testkit" }
 
 [workspace.lints.rust]

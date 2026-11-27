@@ -13,7 +13,7 @@ use shader_container::{
 
 use crate::cli::{DisasmArgs, ReportArgs, ScanArgs};
 use crate::game::resolve_game;
-use crate::shader_build::{Built, build, build_first_half};
+use shader_store::translate::{Built, build, build_first_half};
 
 pub(crate) fn with_archive<T>(
     game: Option<&std::path::PathBuf>,

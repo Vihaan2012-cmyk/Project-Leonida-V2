@@ -1,10 +1,11 @@
-//! One shader container's programs as the Vulkan shaders the runtime will use, with the options each needs.
+//! A shader program as the Vulkan shader the runtime will use, with the options its pipeline needs.
 
 use shader_container::{Fssm, Interface, SignatureElement, Stage};
 use shader_ir::Function;
 use shader_translate::{EsOptions, GsOptions, PixelOptions, VertexOptions};
 
 /// A translated program and what its pipeline needs.
+#[derive(Debug, Clone)]
 pub enum Built {
     Compute(Vec<u32>),
     Pixel(Vec<u32>, PixelOptions),
@@ -39,6 +40,17 @@ impl Built {
         options.hash(&mut hasher);
         self.spirv().hash(&mut hasher);
         hasher.finish()
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Built::Compute(_) => "compute",
+            Built::Pixel(..) => "pixel",
+            Built::Vertex(..) => "vertex",
+            Built::Mesh(_) => "mesh",
+            Built::Geometry(..) => "geometry",
+            Built::FirstHalf(..) => "vertex half of geometry",
+        }
     }
 
     pub fn spirv_mut(&mut self) -> &mut Vec<u32> {
