@@ -6,6 +6,7 @@ pub mod gfx10;
 pub mod registry;
 pub mod sampler;
 pub mod views;
+pub mod vulkan;
 
 #[cfg(test)]
 mod gfx10_tests;
@@ -18,3 +19,6 @@ mod sampler_tests;
 
 #[cfg(test)]
 mod views_tests;
+
+#[cfg(test)]
+mod vulkan_tests;
