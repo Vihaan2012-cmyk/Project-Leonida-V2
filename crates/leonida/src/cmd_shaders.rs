@@ -41,8 +41,13 @@ pub fn scan_command(args: &ScanArgs) -> Result<ExitCode> {
 pub fn disasm_command(args: &DisasmArgs) -> Result<ExitCode> {
     with_archive(args.game.as_ref(), |archive| {
         let mut container = None;
+        let mut seen = 0;
         carve(archive, |shader| {
             if shader.name == args.name {
+                seen += 1;
+                if seen < args.nth {
+                    return ControlFlow::Continue(());
+                }
                 container = Some(shader.dxbc);
                 ControlFlow::Break(())
             } else {

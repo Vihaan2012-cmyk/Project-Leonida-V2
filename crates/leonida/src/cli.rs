@@ -167,6 +167,9 @@ pub struct ReportArgs {
 pub struct DisasmArgs {
     /// The shader's name, as shown by the scan or the shader report.
     pub name: String,
+    /// Which of the containers with this name, counting from 1.
+    #[arg(long, default_value_t = 1)]
+    pub nth: usize,
     /// The game folder. Searched for when omitted.
     #[arg(long)]
     pub game: Option<PathBuf>,
