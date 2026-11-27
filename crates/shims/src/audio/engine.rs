@@ -6,9 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::apu::ApuSpace;
+use super::hal::Hal;
 use super::mixer::{Buffer, BufferId, Completion, Looping, Mixer, VoiceId, VoiceParams};
 use super::output::{Output, SharedMixer};
-use super::queue::CommandQueue;
+use super::xapu::XApu;
 use super::xma::{self, DecodeError, XmaRequest};
 
 /// Rate the mixer runs at until a device sets its own.
@@ -16,8 +17,10 @@ pub const DEFAULT_RATE: u32 = 48_000;
 /// Longest stretch the silent clock renders in one catch-up.
 const MAX_CATCH_UP: Duration = Duration::from_secs(1);
 const CHUNK_FRAMES: usize = 2048;
+#[cfg(not(windows))]
 const ACP_BYTES: usize = 4096;
-const CONTEXT_BYTES: usize = 64 * 1024;
+const CONTEXT_BYTES: usize = 64;
+const MAX_CONTEXTS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
@@ -29,13 +32,17 @@ pub enum OutputMode {
 
 pub struct Engine {
     pub apu: ApuSpace,
-    pub queue: CommandQueue,
+    pub xapu: XApu,
+    hal: Hal,
+    #[cfg(windows)]
+    hal_object: Option<Box<super::hal::object::Object>>,
     mixer: SharedMixer,
     output: Option<Output>,
     mode: OutputMode,
     active: bool,
     started: Option<Instant>,
     silent_frames: u64,
+    #[cfg(not(windows))]
     acp: Option<Box<[u64]>>,
     contexts: Option<Box<[u64]>>,
     next_buffer: BufferId,
@@ -51,13 +58,17 @@ impl Engine {
     pub fn new(mode: OutputMode) -> Engine {
         Engine {
             apu: ApuSpace::new(),
-            queue: CommandQueue::default(),
+            xapu: XApu::default(),
+            hal: Hal::default(),
+            #[cfg(windows)]
+            hal_object: None,
             mixer: Arc::new(Mutex::new(Mixer::new(DEFAULT_RATE))),
             output: None,
             mode,
             active: false,
             started: None,
             silent_frames: 0,
+            #[cfg(not(windows))]
             acp: None,
             contexts: None,
             next_buffer: 1,
@@ -81,15 +92,28 @@ impl Engine {
         self.mixer.clone()
     }
 
-    /// The address of the hardware layer's handle block: allocated on first use, stable until reset.
-    pub fn acp_create(&mut self) -> usize {
-        self.acp.get_or_insert_with(|| zeroed(ACP_BYTES)).as_ptr() as usize
+    pub fn hal_mut(&mut self) -> &mut Hal {
+        &mut self.hal
     }
 
-    pub fn allocate_shape_contexts(&mut self) -> usize {
-        self.contexts
-            .get_or_insert_with(|| zeroed(CONTEXT_BYTES))
-            .as_ptr() as usize
+    /// The address of the hardware layer's object: allocated on first use, stable until reset. On Windows it
+    /// starts with the vtable the title calls through; elsewhere it is a zeroed block.
+    pub fn acp_create(&mut self) -> usize {
+        #[cfg(windows)]
+        {
+            let object = self.hal_object.get_or_insert_with(super::hal::object::new);
+            &**object as *const super::hal::object::Object as usize
+        }
+        #[cfg(not(windows))]
+        {
+            self.acp.get_or_insert_with(|| zeroed(ACP_BYTES)).as_ptr() as usize
+        }
+    }
+
+    /// Zeroed coprocessor contexts: 64 bytes each, `count` of them.
+    pub fn allocate_shape_contexts(&mut self, count: usize) -> usize {
+        let bytes = count.clamp(1, MAX_CONTEXTS) * CONTEXT_BYTES;
+        self.contexts.get_or_insert_with(|| zeroed(bytes)).as_ptr() as usize
     }
 
     pub fn release_shape_contexts(&mut self) {
@@ -214,13 +238,13 @@ mod tests {
         let mut e = Engine::new(OutputMode::Off);
         let a = e.acp_create();
         assert_eq!(a, e.acp_create());
-        let c = e.allocate_shape_contexts();
+        let c = e.allocate_shape_contexts(350);
         assert_ne!(a, c);
-        // SAFETY: the context block is CONTEXT_BYTES long and owned by the engine.
-        let bytes = unsafe { std::slice::from_raw_parts(c as *const u8, CONTEXT_BYTES) };
+        // SAFETY: the context block is 350 contexts long and owned by the engine.
+        let bytes = unsafe { std::slice::from_raw_parts(c as *const u8, 350 * CONTEXT_BYTES) };
         assert!(bytes.iter().all(|b| *b == 0));
         e.release_shape_contexts();
-        assert_ne!(e.allocate_shape_contexts(), 0);
+        assert_ne!(e.allocate_shape_contexts(1), 0);
     }
 
     #[test]

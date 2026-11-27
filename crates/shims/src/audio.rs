@@ -1,23 +1,25 @@
 //! The console audio libraries: `AcpHal.dll`, `xapu.dll` and `chad.dll` (XDsp).
 //!
-//! The shapes come from how the executable calls them (`audio_hal_exe_calls`); everything the sites do not show
-//! is noted with [`crate::trace::note`] the first time it matters and answered with the result that lets the title
-//! carry on:
+//! The shapes come from how the executable calls them (`audio_hal_exe_calls`, refined by reading its code);
+//! everything the sites do not show is noted with [`crate::trace::note`] the first time it matters:
 //!
-//! - `AcpHalCreate(&handle, 0)` and `AcpHalAllocateShapeContexts(&contexts, ...)` write a pointer to zeroed
-//!   host memory and return `S_OK`; `AcpHalReleaseShapeContexts(handle)` frees the contexts.
+//! - `AcpHalCreate(&object, 0)` writes a pointer to an object whose first word is a vtable (see [`hal`]).
+//!   `AcpHalAllocateShapeContexts(&info)` reads the context count from `info + 0x10` and writes the address of
+//!   that many zeroed 64-byte XMA contexts to `info + 0x38`; `AcpHalReleaseShapeContexts()` frees them.
 //! - `ApuCreateHeap(kind, size)`, `ApuAlloc(&virtual, &apu_or_null, size, alignment)` and `ApuFree(address)`
 //!   hand out zeroed host memory with a 32-bit coprocessor address (alignment at least 0x800).
 //!   `ApuIsVirtualAddressValid(address, size)` is true for any non-null address; `ApuMapVirtualAddress(address,
 //!   size)` gives the coprocessor address of any CPU buffer and `ApuMapApuAddress(apu)` the way back (null when
 //!   unmapped).
-//! - `XApuConnect()` returns a positive handle; `XApuEnqueueCommand(handle, command, 0)` takes a command that
-//!   completes at once; `XApuGetResultCount()` is the number of results waiting and `XApuDequeueResult(handle,
-//!   &result)` takes one (negative `E_PENDING` when there is none); `XApuDisconnect(handle, 0x20)` ends it.
-//! - `XDspConnectWithMaximumStreamLimit(..., 0x80)`, `XDspActivate`, `XDspSubmitCommand(a, b)`,
+//! - `XApuConnect(&info, &region, &handle)` starts the Opus decoder worker of [`xapu`] and writes the shared
+//!   region's address and a positive handle; `XApuEnqueueCommand(handle, command, 0)` hands it a 0x40-byte
+//!   command; `XApuGetResultCount()` is the number of results waiting and `XApuDequeueResult(handle, &result)`
+//!   takes one (0x40 bytes, negative `E_PENDING` when there is none); `XApuDisconnect(handle, 0x20)` ends it.
+//! - `XDspConnectWithMaximumStreamLimit(..., 0x80, 1, &out)`, `XDspActivate`, `XDspSubmitCommand(a, b)`,
 //!   `XDspDeactivate` and `XDspDisconnect` return 0. Activating opens the output device.
 //!
-//! Voices reach the mixer through [`Engine`]; the layouts of the commands that would start them are unmeasured.
+//! Voices reach the mixer through [`Engine`]; the layout of the final mix the title submits through
+//! `XDspSubmitCommand` is unmeasured.
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -25,16 +27,17 @@ use crate::Shim;
 
 mod apu;
 mod engine;
+pub mod hal;
 mod mixer;
 mod output;
-mod queue;
+pub mod xapu;
 mod xma;
 
 pub use apu::{ApuError, ApuSpace};
 pub use engine::{DEFAULT_RATE, Engine, OutputMode};
 pub use mixer::{Buffer, BufferId, Completion, Looping, Mixer, VoiceId, VoiceParams};
 pub use output::{Output, OutputError, SharedMixer};
-pub use queue::{Command, CommandQueue, CommandResult};
+pub use xapu::{OpusFactory, OpusStream, XApu, XApuResult, set_opus_factory};
 pub use xma::{DecodeError, Decoded, Decoder, XmaRequest, decode as decode_xma, set_decoder};
 
 static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
@@ -64,7 +67,7 @@ pub fn set_output_mode(mode: OutputMode) {
 #[cfg(windows)]
 mod ffi {
     use super::engine;
-    use super::queue::COMMAND_BYTES;
+    use super::xapu::{COMMAND_BYTES, RESULT_BYTES};
 
     const S_OK: i32 = 0;
     const E_PENDING: i32 = 0x8000_000Au32 as i32;
@@ -87,23 +90,19 @@ mod ffi {
         S_OK
     }
 
-    pub extern "win64" fn acp_hal_allocate_shape_contexts(
-        out: *mut usize,
-        a: u64,
-        b: u64,
-        c: u64,
-    ) -> i32 {
-        let mut e = engine();
-        e.note_once("shape-contexts", || {
-            format!(
-                "AcpHalAllocateShapeContexts further arguments {a:#x} {b:#x} {c:#x}: the count and size of contexts are unmeasured"
-            )
-        });
-        let contexts = e.allocate_shape_contexts();
-        if !out.is_null() {
-            // SAFETY: the title passes the address of its context variable.
-            unsafe { out.write_unaligned(contexts) };
+    pub extern "win64" fn acp_hal_allocate_shape_contexts(info: *mut u8) -> i32 {
+        if info.is_null() {
+            return E_POINTER;
         }
+        // SAFETY: the title passes the address of its context description, at least 0x40 bytes: the count is read
+        // from +0x10 and the contexts' address written to +0x38.
+        let count = unsafe { info.add(0x10).cast::<u64>().read_unaligned() };
+        if count == 0 || count > 4096 {
+            return E_INVALIDARG;
+        }
+        let contexts = engine().allocate_shape_contexts(count as usize);
+        // SAFETY: as above.
+        unsafe { info.add(0x38).cast::<usize>().write_unaligned(contexts) };
         S_OK
     }
 
@@ -171,58 +170,71 @@ mod ffi {
         engine().apu.map_apu(apu).unwrap_or(0)
     }
 
-    pub extern "win64" fn xapu_connect() -> u64 {
-        engine().queue.connect()
+    pub extern "win64" fn xapu_connect(
+        _info: *mut u8,
+        region: *mut usize,
+        handle: *mut u64,
+    ) -> i32 {
+        let (h, base) = engine().xapu.connect();
+        if !region.is_null() {
+            // SAFETY: the title passes the address of its region pointer variable.
+            unsafe { region.write_unaligned(base) };
+        }
+        if !handle.is_null() {
+            // SAFETY: the title passes the address of its handle variable.
+            unsafe { handle.write_unaligned(h) };
+        }
+        let mut e = engine();
+        e.note_once("xapu-info", || {
+            "XApuConnect first argument is left untouched: what the coprocessor writes there is unmeasured".into()
+        });
+        S_OK
     }
 
     pub extern "win64" fn xapu_disconnect(_handle: u64, _size: u64) -> i32 {
-        engine().queue.disconnect();
+        engine().xapu.disconnect();
         S_OK
     }
 
     pub extern "win64" fn xapu_enqueue_command(
         _handle: u64,
         command: *const u8,
-        flags: u64,
+        _flags: u64,
     ) -> i32 {
         if command.is_null() {
             return E_POINTER;
         }
-        // SAFETY: the title passes the address of a command it built; every command is longer than its header.
-        let head = unsafe { command.cast::<[u8; COMMAND_BYTES]>().read_unaligned() };
+        // SAFETY: the title passes the address of a command it built on its stack; commands are 0x40 bytes
+        // or shorter with the rest of the frame behind them.
+        let bytes = unsafe { command.cast::<[u8; COMMAND_BYTES]>().read_unaligned() };
         let mut e = engine();
-        let sequence = e.queue.enqueue(head, flags);
-        let word = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
-        e.note_once(&format!("xapu-command-{word:#x}"), || {
-            format!(
-                "XApuEnqueueCommand command {sequence} starts {word:#010x} (flags {flags:#x}): the layout is unmeasured, so it completes without effect"
-            )
-        });
-        e.pump();
-        S_OK
+        match e.xapu.enqueue(&bytes) {
+            Some(op) => {
+                if !(1..=3).contains(&op) && op != 5 {
+                    e.note_once(&format!("xapu-op-{op}"), || {
+                        format!("XApuEnqueueCommand operation {op}: not one the title has been seen to use")
+                    });
+                }
+                S_OK
+            }
+            None => E_PENDING,
+        }
     }
 
-    pub extern "win64" fn xapu_dequeue_result(_handle: u64, out: *mut u32) -> i32 {
-        let mut e = engine();
-        e.pump();
-        let Some(result) = e.queue.dequeue() else {
+    pub extern "win64" fn xapu_dequeue_result(_handle: u64, out: *mut u8) -> i32 {
+        let Some(result) = engine().xapu.dequeue() else {
             return E_PENDING;
         };
-        e.note_once("xapu-result", || {
-            "XApuDequeueResult writes only a zero 32-bit status: the result layout is unmeasured"
-                .into()
-        });
         if !out.is_null() {
-            // SAFETY: a non-null second argument is the title's result variable, at least 32 bits wide.
-            unsafe { out.write_unaligned(result.status) };
+            let bytes: [u8; RESULT_BYTES] = result.to_bytes();
+            // SAFETY: a non-null second argument is the title's 0x40-byte result variable.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, RESULT_BYTES) };
         }
         S_OK
     }
 
     pub extern "win64" fn xapu_get_result_count() -> u32 {
-        let mut e = engine();
-        e.pump();
-        e.queue.result_count() as u32
+        engine().xapu.result_count() as u32
     }
 
     pub extern "win64" fn xdsp_connect(a: u64, b: u64, c: u64, limit: u64) -> u32 {
