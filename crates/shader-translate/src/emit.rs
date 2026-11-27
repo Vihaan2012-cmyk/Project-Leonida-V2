@@ -334,12 +334,19 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         }
     };
     let threads: u32 = group_size.iter().product();
-    if threads == 0 || !threads.is_multiple_of(lanes) {
+    let compute_entry = matches!(entry, Entry::Compute(_));
+    if threads == 0 || (!compute_entry && !threads.is_multiple_of(lanes)) {
         return Err(EmitError::Unsupported(
             "thread-group size is not a whole number of waves",
         ));
     }
-    let waves = threads / lanes;
+    let padded = threads.next_multiple_of(lanes);
+    let waves = padded / lanes;
+    let declared_size = if compute_entry {
+        [padded, 1, 1]
+    } else {
+        group_size
+    };
     let heap_mode = !matches!(entry, Entry::Harness(_));
     if !lds_words.is_power_of_two() {
         return Err(EmitError::LdsSize);
@@ -524,10 +531,21 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     let thread_index = ok(b.i_mul(u32_, None, wave, lanes_constant))?;
     let thread_index = ok(b.i_add(u32_, None, thread_index, lane))?;
     let (group_ids, thread_ids) = if heap_mode && !pixel_mode {
-        (
-            ok(b.load(uvec3, None, group_input, None, []))?,
-            ok(b.load(uvec3, None, thread_input, None, []))?,
-        )
+        let ids = ok(b.load(uvec3, None, thread_input, None, []))?;
+        let ids = if compute_entry {
+            let flat = ok(b.composite_extract(u32_, None, ids, [0]))?;
+            let width = b.constant_bit32(u32_, group_size[0]);
+            let height = b.constant_bit32(u32_, group_size[1]);
+            let plane = b.constant_bit32(u32_, group_size[0] * group_size[1]);
+            let x = ok(b.u_mod(u32_, None, flat, width))?;
+            let row = ok(b.u_div(u32_, None, flat, width))?;
+            let y = ok(b.u_mod(u32_, None, row, height))?;
+            let z = ok(b.u_div(u32_, None, flat, plane))?;
+            ok(b.composite_construct(uvec3, None, [x, y, z]))?
+        } else {
+            ids
+        };
+        (ok(b.load(uvec3, None, group_input, None, []))?, ids)
     } else {
         (0, 0)
     };
@@ -677,7 +695,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         }
     } else {
         e.b.entry_point(ExecutionModel::GLCompute, main, "main", interface);
-        e.b.execution_mode(main, ExecutionMode::LocalSize, group_size);
+        e.b.execution_mode(main, ExecutionMode::LocalSize, declared_size);
     }
     if float.nan_preserve {
         e.b.execution_mode(main, ExecutionMode::SignedZeroInfNanPreserve, [32]);
@@ -1122,11 +1140,19 @@ impl Emitter {
                 group_slots.push(axis as u32);
             }
         }
+        let threads: u32 = options.group_size.iter().product();
+        let exec = if threads.is_multiple_of(self.lanes) {
+            None
+        } else {
+            Some(self.partial_exec(threads)?)
+        };
         let scalars: Vec<(u8, Word)> = self.sgpr.iter().map(|(r, v)| (*r, *v)).collect();
         for (reg, var) in scalars {
             let index = u32::from(reg);
             let value = if index < options.user_sgprs.min(32) {
                 self.push_word(index)?
+            } else if let (Some((low, high)), true) = (exec, reg == EXEC || reg == EXEC + 1) {
+                if reg == EXEC { low } else { high }
             } else if let Some(axis) = index
                 .checked_sub(options.user_sgprs)
                 .and_then(|k| group_slots.get(k as usize))
@@ -1156,7 +1182,6 @@ impl Emitter {
         self.store(self.scc, no)?;
         let zero = self.u32c(0);
         self.store(self.messages, zero)?;
-        let threads: u32 = options.group_size.iter().product();
         for chunk in 0..self.lds_words.div_ceil(threads) {
             let base = self.u32c(threads * chunk);
             let index = ok(self.b.i_add(u32_, None, base, self.thread_index))?;
@@ -1170,6 +1195,37 @@ impl Emitter {
             })?;
         }
         self.barrier()
+    }
+
+    /// Exec for a group that ends partway through a wave: one bit per lane holding one of the group's threads.
+    fn partial_exec(&mut self, threads: u32) -> Result<(Word, Word), EmitError> {
+        let (u32_, bool_) = (self.t.u32_, self.t.bool_);
+        let lanes = self.u32c(self.lanes);
+        let wave = ok(self.b.u_div(u32_, None, self.thread_index, lanes))?;
+        let first = ok(self.b.i_mul(u32_, None, wave, lanes))?;
+        let total = self.u32c(threads);
+        let remaining = ok(self.b.i_sub(u32_, None, total, first))?;
+        let mask = |e: &mut Self, count: Word| -> Result<Word, EmitError> {
+            let thirty_two = e.u32c(32);
+            let full = ok(e.b.u_greater_than_equal(bool_, None, count, thirty_two))?;
+            let one = e.u32c(1);
+            let bit = ok(e.b.shift_left_logical(u32_, None, one, count))?;
+            let below = ok(e.b.i_sub(u32_, None, bit, one))?;
+            let all = e.u32c(u32::MAX);
+            ok(e.b.select(u32_, None, full, all, below))
+        };
+        let low = mask(self, remaining)?;
+        let thirty_two = self.u32c(32);
+        let over = ok(self.b.u_greater_than(bool_, None, remaining, thirty_two))?;
+        let rest = ok(self.b.i_sub(u32_, None, remaining, thirty_two))?;
+        let zero = self.u32c(0);
+        let rest = ok(self.b.select(u32_, None, over, rest, zero))?;
+        let high = if self.lanes == 64 {
+            mask(self, rest)?
+        } else {
+            zero
+        };
+        Ok((low, high))
     }
 
     fn active(&mut self) -> Result<Word, EmitError> {

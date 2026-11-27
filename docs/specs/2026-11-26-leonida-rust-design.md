@@ -197,6 +197,12 @@ the limits at the start and culls every primitive slot; thread T's `pos0` and `p
 `prim` export (three 9-bit indices at bits 0, 10 and 20, bit 31 for none) fills primitive T. In both stages `pos0` is
 `Position` and `paramN` the raw words at location N; `pos1`-`pos3` and allocation messages are ignored for now.
 
+**Compute groups.** A compute entry declares a flat group of whole waves and rebuilds the thread IDs from the flat
+index, x fastest, as the hardware packs threads into waves. A group that ends partway through a wave starts that wave
+with exec holding only the lanes that carry its threads. Implicit-LOD sampling outside pixel shaders takes its
+derivatives the way the hardware does: across each quad of lanes, from the first lane to the second horizontally and
+to the third vertically, with a bias scaling both by 2^bias, then samples with those gradients.
+
 **Images and samplers.** A shader names a texture by its 8-word T# and a sampler by its 4-word S#, both in SGPRs.
 The runtime registers every texture and sampler it creates in two lookup tables, and the shader finds the bindless
 slot by looking its descriptor up:

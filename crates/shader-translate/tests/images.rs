@@ -816,6 +816,82 @@ fn compare_gradient_size_and_sixteen_bit_forms() {
 type StoreCase = (&'static str, usize, Box<dyn Fn(u32, u32) -> Texel>);
 
 #[test]
+fn compute_shaders_take_implicit_derivatives_from_quads() {
+    let Some(gpu) = image_gpu() else { return };
+    if !gpu.info.quad_operations {
+        eprintln!("skipping: {} lacks quad operations", gpu.info.name);
+        return;
+    }
+    let scene = scene();
+    let t = |i: usize| &scene.textures[i];
+    let corner = |lane: u32| (lane & 1, lane >> 1 & 1);
+    let spaced = |start: f32, step: f32| {
+        move |lane: u32| {
+            let (x, y) = corner(lane);
+            [f(start + step * x as f32), f(start + step * y as f32)]
+        }
+    };
+    let instructions: Vec<String> = [
+        "image_sample v[4:7], v[10:11], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+        "image_sample_b v[4:7], v[10:12], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+    ]
+    .iter()
+    .map(|i| format!("{CLEAR}{i}"))
+    .collect();
+    let two_texels = spaced(0.25, 0.5);
+    let one_texel = spaced(0.375, 0.25);
+    let cases = vec![
+        Case {
+            name: "quad_spacing_picks_the_mip",
+            instruction: &instructions[0],
+            texture: t(0).descriptor,
+            sampler: scene.nearest,
+            input: four(move |lane| {
+                let [u, v] = two_texels(lane);
+                [u, v, 0, 0]
+            }),
+            expect: Box::new(move |lane| {
+                let (x, y) = corner(lane);
+                texel(t(0), 1, x, y, 0)
+            }),
+        },
+        Case {
+            name: "quad_spacing_of_one_texel",
+            instruction: &instructions[0],
+            texture: t(0).descriptor,
+            sampler: scene.nearest,
+            input: four(move |lane| {
+                let [u, v] = one_texel(lane);
+                [u, v, 0, 0]
+            }),
+            expect: Box::new(move |lane| {
+                let (x, y) = corner(lane);
+                texel(t(0), 0, 1 + x, 1 + y, 0)
+            }),
+        },
+        Case {
+            name: "quad_bias",
+            instruction: &instructions[1],
+            texture: t(0).descriptor,
+            sampler: scene.nearest,
+            input: four(move |lane| {
+                let [u, v] = one_texel(lane);
+                [f(1.0), u, v, 0]
+            }),
+            expect: Box::new(move |lane| {
+                let (x, y) = corner(lane);
+                texel(t(0), 1, x, y, 0)
+            }),
+        },
+    ];
+    for case in &cases {
+        for wave64 in [false, true] {
+            run(&gpu, &scene, case, wave64);
+        }
+    }
+}
+
+#[test]
 fn stores_write_storage_textures() {
     let Some(gpu) = image_gpu() else { return };
     let targets = [

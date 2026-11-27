@@ -352,6 +352,45 @@ fn compute_entry_reads_user_sgprs_group_ids_and_thread_ids() {
     }
 }
 
+#[test]
+fn compute_entry_runs_groups_that_end_partway_through_a_wave() {
+    let Some(gpu) = gpu() else { return };
+    for wave64 in [false, true] {
+        let source = "v_lshlrev_b32_e32 v3, 3, v1
+             v_mad_u32_u24 v3, v2, 24, v3
+             v_add_nc_u32_e32 v3, v3, v0
+             v_lshlrev_b32_e32 v4, 16, v2
+             v_lshlrev_b32_e32 v5, 8, v1
+             v_or3_b32 v4, v4, v5, v0
+             v_or_b32_e32 v4, 0x80000000, v4
+             s_lshl_b32 s3, s2, 8
+             v_lshl_add_u32 v6, v3, 2, s3
+             global_store_dword v6, v4, s[0:1]
+             s_endpgm";
+        let code = rdna::assemble(source, !wave64).unwrap();
+        let function = shader_ir::lift(&code, wave64).unwrap();
+        let rsrc2 = (2 << 1) | (1 << 7) | (2 << 11);
+        let options = compute_options(&gpu, [8, 3, 2], rsrc2);
+        let spirv = shader_translate::compute(&function, &options).unwrap();
+        spirv_val(&spirv, &format!("compute_partial_{wave64}"));
+        let sentinel = 0x5A5A_5A5A;
+        let mut heap = vec![sentinel; 1024];
+        run_compute(&gpu, &spirv, &mut heap, &[0x100, 0], [2, 1, 1]);
+        for group in 0..2u32 {
+            for slot in 0..64u32 {
+                let at = (0x100 + group * 256 + slot * 4) as usize / 4;
+                let want = if slot < 48 {
+                    let (x, y, z) = (slot % 8, slot / 8 % 3, slot / 24);
+                    0x8000_0000 | z << 16 | y << 8 | x
+                } else {
+                    sentinel
+                };
+                assert_eq!(heap[at], want, "wave64 {wave64} group {group} slot {slot}");
+            }
+        }
+    }
+}
+
 fn dump(wave64: bool) -> String {
     let mut lines = vec![
         if wave64 {

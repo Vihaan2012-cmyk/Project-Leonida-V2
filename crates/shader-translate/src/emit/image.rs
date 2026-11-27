@@ -507,9 +507,16 @@ impl Emitter {
             return self.image_atomic(image, op);
         }
         if image.op.implicit() && self.pixel.is_none() {
-            return Err(EmitError::Unsupported(
-                "implicit-LOD sampling outside a pixel shader",
-            ));
+            if image.op == ImageOp::QueryLod {
+                return Err(EmitError::Unsupported(
+                    "level-of-detail query outside a pixel shader",
+                ));
+            }
+            if image.unnormalized {
+                return Err(EmitError::Unsupported(
+                    "implicit-LOD sampling at unnormalized coordinates outside a pixel shader",
+                ));
+            }
         }
         let sampled = image.sampler.is_some();
         if sampled
@@ -540,7 +547,7 @@ impl Emitter {
             _ if sampled => self.sample_coordinates(image.dim, &values)?,
             _ => self.load_coordinates(image.dim, &values)?,
         };
-        let extras = self.sample_extras(image, view)?;
+        let extras = self.sample_extras(image, view, coordinates)?;
         let result = self.per_number(number, |e, number| {
             e.image_arm(image, view, number, index, sampler, coordinates, &extras)
                 .map(Some)
@@ -555,7 +562,12 @@ impl Emitter {
         Ok(words)
     }
 
-    fn sample_extras(&mut self, image: &Image, view: View) -> Result<Extras, EmitError> {
+    fn sample_extras(
+        &mut self,
+        image: &Image,
+        view: View,
+        coordinates: Word,
+    ) -> Result<Extras, EmitError> {
         let types = self.image_types();
         let f32_ = self.t.f32_;
         let float = |e: &mut Self, t: Option<u32>| -> Result<Option<Word>, EmitError> {
@@ -583,6 +595,11 @@ impl Emitter {
                 ))?);
             }
             Some((directions[0], directions[1]))
+        };
+        let gradients = if image.op.implicit() && self.pixel.is_none() {
+            Some(self.quad_gradients(image, view, coordinates)?)
+        } else {
+            gradients
         };
         let offset = match image.offset {
             Some(t) => {
@@ -613,6 +630,50 @@ impl Emitter {
             gradients,
             offset,
         })
+    }
+
+    /// The hardware's implicit derivatives outside a pixel shader: across each quad of lanes, horizontal from
+    /// its first lane to the second and vertical from the first to the third, scaled by 2^bias.
+    fn quad_gradients(
+        &mut self,
+        image: &Image,
+        view: View,
+        coordinates: Word,
+    ) -> Result<(Word, Word), EmitError> {
+        let types = self.image_types();
+        let f32_ = self.t.f32_;
+        self.b.capability(Capability::GroupNonUniformQuad);
+        let spatial = if view == View::D3 { 3 } else { 2 };
+        let ty = types.floats[spatial];
+        let width = image.coordinates.len()
+            + usize::from(matches!(image.dim, ImageDim::D1 | ImageDim::D1Array));
+        let point = if width == spatial {
+            coordinates
+        } else {
+            let parts: Vec<u32> = (0..spatial as u32).collect();
+            ok(self
+                .b
+                .vector_shuffle(ty, None, coordinates, coordinates, parts))?
+        };
+        let scope = self.u32c(3);
+        let corner = |e: &mut Self, lane: u32| {
+            let lane = e.u32c(lane);
+            ok(e.b.group_non_uniform_quad_broadcast(ty, None, scope, point, lane))
+        };
+        let first = corner(self, 0)?;
+        let right = corner(self, 1)?;
+        let below = corner(self, 2)?;
+        let mut dx = ok(self.b.f_sub(ty, None, right, first))?;
+        let mut dy = ok(self.b.f_sub(ty, None, below, first))?;
+        if image.op == ImageOp::SampleBias
+            && let Some(bias) = image.lod
+        {
+            let bias = self.float(self.values[bias as usize])?;
+            let scale = self.glsl(f32_, GLOp::Exp2, &[bias])?;
+            dx = ok(self.b.vector_times_scalar(ty, None, dx, scale))?;
+            dy = ok(self.b.vector_times_scalar(ty, None, dy, scale))?;
+        }
+        Ok((dx, dy))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -690,7 +751,10 @@ impl Emitter {
                         (mask, operands)
                     };
                     Ok(match (op, extras.gradients) {
-                        (ImageOp::SampleGrad, Some((dx, dy))) => {
+                        (
+                            ImageOp::SampleGrad | ImageOp::Sample | ImageOp::SampleBias,
+                            Some((dx, dy)),
+                        ) => {
                             let (mask, operands) = with_clamp(
                                 ImageOperands::GRAD,
                                 vec![Operand::IdRef(dx), Operand::IdRef(dy)],

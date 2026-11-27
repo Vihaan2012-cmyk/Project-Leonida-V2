@@ -75,6 +75,7 @@ pub struct DeviceInfo {
     pub image_int64_atomics: bool,
     pub pixel_shaders: bool,
     pub mesh_shaders: bool,
+    pub quad_operations: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,6 +389,9 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
                 image_int64_atomics,
                 pixel_shaders: pixel_shaders && f13.dynamic_rendering == vk::TRUE,
                 mesh_shaders,
+                quad_operations: v11
+                    .subgroup_supported_operations
+                    .contains(vk::SubgroupFeatureFlags::QUAD),
             },
         })
     }
