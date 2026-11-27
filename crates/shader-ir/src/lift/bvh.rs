@@ -1,7 +1,7 @@
 use rdna::{Inst, Operand};
 
 use super::{LiftError, Lifter, unsupported, vgprs};
-use crate::ir::{Bin, Cmp, Expr, Reg, Stmt, Tmp, Un};
+use crate::ir::{Bin, Cmp, Expr, Reg, Stmt, Tmp, Tri, Un};
 
 const INVALID: u32 = u32::MAX;
 const BOX16: u32 = 4;
@@ -33,6 +33,23 @@ impl Lifter {
             let second = self.fop(Bin::FMul, p[j], q[i]);
             self.fop(Bin::FSub, first, second)
         })
+    }
+
+    /// One over `x`, rounded to nearest wherever the result is a finite nonzero float: the GPU's own division
+    /// may be a few ULP off, and the barycentric range tests below flip on one ULP.
+    fn reciprocal(&mut self, x: Tmp) -> Tmp {
+        let approx = self.un(Un::FRcp, x);
+        let negated = self.un(Un::FNeg, x);
+        let one = self.fc(1.0);
+        let error = self.value(Expr::Tri(Tri::FFma, negated, approx, one));
+        let refined = self.value(Expr::Tri(Tri::FFma, approx, error, approx));
+        let magnitude = self.un(Un::FAbs, approx);
+        let zero = self.fc(0.0);
+        let infinity = self.fc(f32::INFINITY);
+        let above = self.cmp(Cmp::FGt, magnitude, zero);
+        let below = self.cmp(Cmp::FLt, magnitude, infinity);
+        let usable = self.both(above, below);
+        self.select(usable, refined, approx)
     }
 
     fn dot(&mut self, p: [Tmp; 3], q: [Tmp; 3]) -> Tmp {
@@ -211,7 +228,7 @@ impl Lifter {
         let denominator = self.dot(s1, e1);
         let i_numerator = self.dot(e3, s1);
         let j_numerator = self.dot(direction, s2);
-        let reciprocal = self.un(Un::FRcp, denominator);
+        let reciprocal = self.reciprocal(denominator);
         let t = self.fop(Bin::FMul, numerator, reciprocal);
         let u = self.fop(Bin::FMul, i_numerator, reciprocal);
         let v = self.fop(Bin::FMul, j_numerator, reciprocal);

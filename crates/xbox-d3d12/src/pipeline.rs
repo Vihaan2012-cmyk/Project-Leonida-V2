@@ -314,9 +314,10 @@ impl Pipeline {
             let code = match stage.user {
                 UserStage::Pixel => shader_translate::PUSH_CODE_PIXEL,
                 UserStage::Geometry => shader_translate::PUSH_CODE_GEOMETRY,
-                UserStage::Compute | UserStage::Vertex | UserStage::Mesh => {
-                    shader_translate::PUSH_CODE
-                }
+                UserStage::Compute
+                | UserStage::Vertex
+                | UserStage::GeometryVertex
+                | UserStage::Mesh => shader_translate::PUSH_CODE,
             } as usize;
             words[code] = stage.code_va as u32;
             words[code + 1] = (stage.code_va >> 32) as u32;

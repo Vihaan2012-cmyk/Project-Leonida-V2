@@ -17,10 +17,14 @@
 use crate::Shim;
 
 #[cfg(windows)]
+mod bcpack;
+#[cfg(windows)]
 mod com;
 #[cfg(windows)]
 mod engine;
 
+#[cfg(windows)]
+pub use bcpack::set_bcpack_format;
 #[cfg(windows)]
 pub use engine::{Decompress, FenceSignal, GpuCopy, GpuDestination, GpuUpload};
 

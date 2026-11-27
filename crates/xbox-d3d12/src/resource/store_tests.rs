@@ -52,7 +52,12 @@ fn committed_buffers_get_distinct_aligned_addresses_the_cpu_can_write() {
         assert_eq!(resources.find(a + 100_000), Some((upload, 100_000)));
         // SAFETY: committed host memory at the buffer's own address.
         unsafe { *word(a + 8) = 99 };
-        kernel.run(gpu, resources.space_mut(), &[(a + 8, b + 4)], (b, PAGE));
+        kernel.run(
+            gpu,
+            &mut resources.space_mut(),
+            &[(a + 8, b + 4)],
+            (b, PAGE),
+        );
         // SAFETY: as above.
         assert_eq!(unsafe { *word(b + 4) }, 100);
         resources.destroy(upload).unwrap();
@@ -77,7 +82,7 @@ fn a_buffer_placed_in_game_memory_is_that_memory() {
         assert!(!resources.space().is_bound(region.address + 3 * PAGE));
         kernel.run(
             gpu,
-            resources.space_mut(),
+            &mut resources.space_mut(),
             &[(region.address, region.address + PAGE)],
             (region.address, 3 * PAGE),
         );
@@ -125,7 +130,7 @@ fn a_placed_tiled_texture_is_read_from_game_memory_and_written_back() {
         assert_eq!(resources.get(id).unwrap().address, region.address);
         resources.upload_texture(id).unwrap();
         let image = resources.get(id).unwrap().image.as_ref().unwrap();
-        let handles = resources.space().handles();
+        let handles = &resources.space().handles().clone();
         let mut index = 0;
         for slice in 0..2u32 {
             for mip in 0..desc.mips() {
@@ -244,7 +249,7 @@ fn a_reserved_buffer_shows_the_tiles_mapped_into_it() {
         assert!(!resources.space().is_bound(reserved));
         kernel.run(
             gpu,
-            resources.space_mut(),
+            &mut resources.space_mut(),
             &[(reserved + 3 * PAGE, reserved + 3 * PAGE + 4)],
             (reserved + 3 * PAGE, PAGE),
         );
@@ -267,7 +272,7 @@ fn descriptor_heap_memory_is_below_four_gib_and_bound() {
         unsafe { *word(heap) = 3 };
         kernel.run(
             gpu,
-            resources.space_mut(),
+            &mut resources.space_mut(),
             &[(heap, heap + 4)],
             (heap, PAGE),
         );

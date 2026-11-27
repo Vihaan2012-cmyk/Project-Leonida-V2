@@ -151,6 +151,7 @@ name = "assets"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "name-hash",
  "png",
  "serde_json",
  "thiserror 2.0.21",
@@ -175,6 +176,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "audio-codec"
 version = "0.1.0"
 dependencies = [
+ "name-hash",
  "thiserror 2.0.21",
 ]
 
@@ -429,6 +431,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
@@ -438,6 +441,7 @@ dependencies = [
  "flate2",
  "game-package",
  "memchr",
+ "name-hash",
  "serde",
  "serde_json",
  "sha2",
@@ -713,6 +717,20 @@ checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "exe-analysis"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+ "memchr",
+ "pe-image",
+ "postcard",
+ "rayon",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1136,6 +1154,7 @@ dependencies = [
  "decompile",
  "embed-manifest",
  "enhancements",
+ "exe-analysis",
  "game-package",
  "gpu",
  "iced-x86",
@@ -1147,11 +1166,13 @@ dependencies = [
  "rpf9",
  "serde_json",
  "sha2",
+ "shader-census",
  "shader-container",
  "shader-ir",
  "shader-store",
  "shader-translate",
  "shims",
+ "source-export",
  "systems",
  "tempfile",
  "upscale",
@@ -1163,12 +1184,14 @@ dependencies = [
 name = "leonida-ui"
 version = "0.1.0"
 dependencies = [
+ "config",
  "game-package",
  "rfd",
  "serde",
  "serde_json",
- "shader-container",
  "tempfile",
+ "toml",
+ "vfs",
  "winsafe",
 ]
 
@@ -1321,6 +1344,10 @@ dependencies = [
  "rustc-hash",
  "thiserror 2.0.21",
 ]
+
+[[package]]
+name = "name-hash"
+version = "0.1.0"
 
 [[package]]
 name = "ndk"
@@ -2102,6 +2129,7 @@ dependencies = [
  "game-package",
  "memchr",
  "memmap2",
+ "name-hash",
  "postcard",
  "rayon",
  "redb",
@@ -2282,6 +2310,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "shader-census"
+version = "0.1.0"
+dependencies = [
+ "game-package",
+ "memmap2",
+ "rdna",
+ "serde",
+ "serde_json",
+ "shader-container",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "shader-container"
 version = "0.1.0"
 dependencies = [
@@ -2304,6 +2345,7 @@ name = "shader-store"
 version = "0.1.0"
 dependencies = [
  "postcard",
+ "rdna",
  "redb",
  "ruzstd",
  "serde",
@@ -2313,12 +2355,14 @@ dependencies = [
  "shader-translate",
  "tempfile",
  "thiserror 2.0.21",
+ "xbox-d3d12",
 ]
 
 [[package]]
 name = "shader-translate"
 version = "0.1.0"
 dependencies = [
+ "bvh-build",
  "gpu",
  "rdna",
  "rspirv",
@@ -2331,6 +2375,7 @@ dependencies = [
 name = "shims"
 version = "0.1.0"
 dependencies = [
+ "assets",
  "audio-codec",
  "bvh-build",
  "config",
@@ -2417,6 +2462,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "source-export"
+version = "0.1.0"
+dependencies = [
+ "decompile",
+ "exe-analysis",
+ "iced-x86",
+ "pe-image",
+ "rayon",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2606,6 +2664,7 @@ dependencies = [
  "indexmap",
  "toml_datetime 1.1.3+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.5",
 ]
 
@@ -2718,6 +2777,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vfs"
 version = "0.1.0"
 dependencies = [
+ "name-hash",
  "offline",
  "serde",
  "serde_json",
@@ -3263,6 +3323,7 @@ name = "xbox-d3d12"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "content-filter",
  "naga",
  "rdna",
  "sha2",
@@ -3270,6 +3331,7 @@ dependencies = [
  "shader-ir",
  "shader-translate",
  "thiserror 2.0.21",
+ "upscale",
  "windows-sys 0.61.2",
  "winit",
 ]
@@ -3302,6 +3364,9 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 [[package]]
 name = "xtask"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "zerocopy"

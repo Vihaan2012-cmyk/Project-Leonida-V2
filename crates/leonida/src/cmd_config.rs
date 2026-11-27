@@ -1,7 +1,9 @@
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use config::{Config, FILES, General, Graphics, Input, Mods, Section};
+use config::{
+    Config, DisplayConfig, FILES, General, Graphics, Input, Mods, Section, Upscaling, Widescreen,
+};
 
 use crate::cli::{ConfigArgs, ConfigCommand};
 
@@ -21,6 +23,9 @@ fn show(dir: &Path) -> Result<()> {
     print_file(Graphics::FILE, &config.graphics.to_text());
     print_file(Input::FILE, &config.input.to_text());
     print_file(Mods::FILE, &config.mods.to_text());
+    print_file(DisplayConfig::FILE, &config.display.to_text());
+    print_file(Widescreen::FILE, &config.widescreen.to_text());
+    print_file(Upscaling::FILE, &config.upscaling.to_text());
     Ok(())
 }
 

@@ -12,6 +12,7 @@ shader-ir.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+bvh-build.workspace = true
 gpu.workspace = true
 rdna.workspace = true
 testkit.workspace = true

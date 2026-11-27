@@ -1,13 +1,17 @@
-//! Leonida's settings: Config/leonida.toml, graphics.toml, input.toml and mods.toml.
+//! Leonida's settings: the TOML files in Config (leonida, graphics, input, mods, display, widescreen, upscaling).
 //!
 //! Every file is TOML. A missing file is written with its documented defaults; a present file is parsed strictly
 //! (unknown names are errors) and checked, and every problem is reported with the file and field it is in.
 
+pub mod display;
 pub mod general;
 pub mod graphics;
 pub mod input;
 pub mod mods;
 mod sampler;
+pub mod save;
+pub mod upscaling;
+pub mod widescreen;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -15,12 +19,15 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+pub use display::DisplayConfig;
 pub use general::{Audio, AudioOutput, Content, General, Nudity};
 pub use graphics::{
     AspectMode, FrameRate, FrameRateMode, Graphics, Upscaler, WindowMode, adjust_sampler,
 };
 pub use input::Input;
 pub use mods::Mods;
+pub use upscaling::Upscaling;
+pub use widescreen::Widescreen;
 
 /// The folder the settings live in when nothing else is said, next to where Leonida is started.
 pub const DEFAULT_DIR: &str = "Config";
@@ -150,6 +157,14 @@ pub trait Section: Serialize + DeserializeOwned + Default + PartialEq {
     fn to_text(&self) -> String {
         toml::to_string_pretty(self).unwrap_or_default()
     }
+
+    /// Writes the settings to `dir/FILE`, changing only the values that differ and keeping the file's comments.
+    fn save(&self, dir: &Path) -> Result<(), ConfigError>
+    where
+        Self: Sized,
+    {
+        save::save(self, dir)
+    }
 }
 
 /// Every settings file, read together.
@@ -159,23 +174,48 @@ pub struct Config {
     pub graphics: Graphics,
     pub input: Input,
     pub mods: Mods,
+    pub display: DisplayConfig,
+    pub widescreen: Widescreen,
+    pub upscaling: Upscaling,
 }
 
-/// The four files, by the name used on the command line.
-pub const FILES: [&str; 4] = [General::FILE, Graphics::FILE, Input::FILE, Mods::FILE];
+/// The files, by the name used on the command line.
+pub const FILES: [&str; 7] = [
+    General::FILE,
+    Graphics::FILE,
+    Input::FILE,
+    Mods::FILE,
+    DisplayConfig::FILE,
+    Widescreen::FILE,
+    Upscaling::FILE,
+];
 
 impl Config {
-    /// Reads all four files from `dir`, writing any that is missing. Stops at the first file that is wrong.
+    /// Reads every file from `dir`, writing any that is missing. Stops at the first file that is wrong.
     pub fn load(dir: &Path) -> Result<Self, ConfigError> {
         Ok(Self {
             general: General::load(dir)?,
             graphics: Graphics::load(dir)?,
             input: Input::load(dir)?,
             mods: Mods::load(dir)?,
+            display: DisplayConfig::load(dir)?,
+            widescreen: Widescreen::load(dir)?,
+            upscaling: Upscaling::load(dir)?,
         })
     }
 
-    /// Replaces the named files (all four when `only` is empty) with the documented defaults.
+    /// Writes every file into `dir`, keeping the comments in the ones that exist.
+    pub fn save(&self, dir: &Path) -> Result<(), ConfigError> {
+        self.general.save(dir)?;
+        self.graphics.save(dir)?;
+        self.input.save(dir)?;
+        self.mods.save(dir)?;
+        self.display.save(dir)?;
+        self.widescreen.save(dir)?;
+        self.upscaling.save(dir)
+    }
+
+    /// Replaces the named files (all of them when `only` is empty) with the documented defaults.
     pub fn reset(dir: &Path, only: &[&str]) -> Result<Vec<&'static str>, ConfigError> {
         let mut written = Vec::new();
         for file in FILES {
@@ -186,7 +226,10 @@ impl Config {
                 General::FILE => General::write_default(dir)?,
                 Graphics::FILE => Graphics::write_default(dir)?,
                 Input::FILE => Input::write_default(dir)?,
-                _ => Mods::write_default(dir)?,
+                Mods::FILE => Mods::write_default(dir)?,
+                DisplayConfig::FILE => DisplayConfig::write_default(dir)?,
+                Widescreen::FILE => Widescreen::write_default(dir)?,
+                _ => Upscaling::write_default(dir)?,
             }
             written.push(file);
         }
@@ -210,6 +253,9 @@ mod tests {
         round_trip::<Graphics>();
         round_trip::<Input>();
         round_trip::<Mods>();
+        round_trip::<DisplayConfig>();
+        round_trip::<Widescreen>();
+        round_trip::<Upscaling>();
     }
 
     #[test]
