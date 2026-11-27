@@ -4,8 +4,9 @@
 //! The game half (`Config::groups`) describes code patches as plain data for `patch.rs`; every group is off by
 //! default and cites the addresses it was derived from in `EVIDENCE`.
 
-
 use std::f32::consts::PI;
+
+use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Size {
@@ -248,6 +249,149 @@ pub fn scaled_half_angle(scale: f32) -> f32 {
 
 pub const FOV_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=1.8;
 
+#[derive(Debug, Error, PartialEq)]
+pub enum WidescreenError {
+    #[error("field of view scale {0} is outside {min}..={max}", min = FOV_SCALE_RANGE.start(), max = FOV_SCALE_RANGE.end())]
+    FovScale(f32),
+    #[error(
+        "patch {group} at {rva:#x}: the image hashes to {found:#018x}, expected {expected:#018x}"
+    )]
+    Mismatch {
+        group: &'static str,
+        rva: u32,
+        expected: u64,
+        found: u64,
+    },
+    #[error("patch {group} at {rva:#x}: {len} bytes cannot be read from the image")]
+    Unreadable {
+        group: &'static str,
+        rva: u32,
+        len: usize,
+    },
+}
+
+// integration: the interface this module needs from `patch.rs`. A patch is data; the mechanism owns reading the
+// loaded image, allocating the constant slot of `RipConstant`, and the reversible write.
+
+/// Read access to the code of an image by RVA (the loaded image, or a synthetic one in tests).
+pub trait CodeImage {
+    fn read(&self, rva: u32, len: usize) -> Option<Vec<u8>>;
+}
+
+/// FNV-1a, 64 bit.
+pub const fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    hash
+}
+
+/// What the image must hold at an address before it is patched: the length and the FNV-1a hash of the original
+/// bytes. The bytes themselves are not kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Expect {
+    pub len: usize,
+    pub fnv1a64: u64,
+}
+
+impl Expect {
+    pub const fn new(len: usize, fnv1a64: u64) -> Self {
+        Self { len, fnv1a64 }
+    }
+
+    pub fn matches(&self, bytes: &[u8]) -> bool {
+        bytes.len() == self.len && fnv1a64(bytes) == self.fnv1a64
+    }
+
+    #[cfg(test)]
+    fn of(bytes: &[u8]) -> Self {
+        Self::new(bytes.len(), fnv1a64(bytes))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatchOp {
+    /// Write `replace` at `rva`, where the image must now hold bytes matching `expect`. `replace` holds only bytes
+    /// we author and is never longer than `expect.len`; the bytes after it keep their original values.
+    Bytes {
+        rva: u32,
+        expect: Expect,
+        replace: Vec<u8>,
+    },
+    /// The instruction of `len` bytes at `rva` ends in a RIP-relative disp32 that reaches `expect_target` now; point
+    /// it at a new read-only f32 slot holding `value`. The slot has to be in reach of a signed 32-bit displacement.
+    RipConstant {
+        rva: u32,
+        len: u8,
+        expect_target: u32,
+        value: f32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    /// The code reads as the patch describes it and every caller was looked at.
+    High,
+    /// The mechanism is clear; effects on parts of the game that were not read are unknown.
+    Medium,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PatchGroup {
+    pub id: &'static str,
+    pub summary: &'static str,
+    pub confidence: Confidence,
+    /// RVAs in `EVIDENCE` the group rests on.
+    pub evidence: &'static [u32],
+    pub ops: Vec<PatchOp>,
+}
+
+impl PatchGroup {
+    /// Check every op against the image: the bytes are what the patch expects.
+    pub fn validate(&self, image: &dyn CodeImage) -> Result<(), WidescreenError> {
+        for op in &self.ops {
+            let (rva, len, expected) = match op {
+                PatchOp::Bytes { rva, expect, .. } => (*rva, expect.len, expect.fnv1a64),
+                PatchOp::RipConstant {
+                    rva,
+                    len,
+                    expect_target,
+                    ..
+                } => (
+                    *rva + u32::from(*len) - 4,
+                    4,
+                    fnv1a64(&rel32(*rva + u32::from(*len), *expect_target)),
+                ),
+            };
+            let unreadable = WidescreenError::Unreadable {
+                group: self.id,
+                rva,
+                len,
+            };
+            let found = image.read(rva, len).ok_or(unreadable)?;
+            let found = fnv1a64(&found);
+            if found != expected {
+                return Err(WidescreenError::Mismatch {
+                    group: self.id,
+                    rva,
+                    expected,
+                    found,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The displacement an instruction ending at `next_rva` needs to reach `target`.
+pub fn rel32(next_rva: u32, target: u32) -> [u8; 4] {
+    target.wrapping_sub(next_rva).to_le_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,4 +570,116 @@ mod tests {
         assert!(near(scaled_half_angle(2.0) / HALF_ANGLE_PER_DEGREE, 2.0));
     }
 
+    struct Synthetic(Vec<(u32, Vec<u8>)>);
+
+    impl CodeImage for Synthetic {
+        fn read(&self, rva: u32, len: usize) -> Option<Vec<u8>> {
+            let end = rva.checked_add(len as u32)?;
+            self.0.iter().find_map(|(base, bytes)| {
+                let start = rva.checked_sub(*base)? as usize;
+                let stop = end.checked_sub(*base)? as usize;
+                bytes.get(start..stop).map(<[u8]>::to_vec)
+            })
+        }
+    }
+
+    const SAMPLE: [u8; 6] = [1, 2, 3, 4, 5, 6];
+
+    fn sample_group() -> PatchGroup {
+        PatchGroup {
+            id: "sample",
+            summary: "",
+            confidence: Confidence::High,
+            evidence: &[],
+            ops: vec![PatchOp::Bytes {
+                rva: 0x100,
+                expect: Expect::of(&SAMPLE),
+                replace: vec![9],
+            }],
+        }
+    }
+
+    #[test]
+    fn fnv1a64_matches_the_published_vectors() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn expect_checks_length_and_hash() {
+        let expect = Expect::of(&SAMPLE);
+        assert_eq!(expect.len, 6);
+        assert!(expect.matches(&SAMPLE));
+        assert!(!expect.matches(&SAMPLE[..5]));
+        assert!(!expect.matches(&[1, 2, 3, 4, 5, 7]));
+    }
+
+    #[test]
+    fn validate_accepts_matching_bytes() {
+        let image = Synthetic(vec![(0x100, SAMPLE.to_vec())]);
+        sample_group().validate(&image).unwrap();
+    }
+
+    #[test]
+    fn validate_reports_the_address_and_both_hashes() {
+        let mut changed = SAMPLE;
+        changed[3] ^= 0x40;
+        let image = Synthetic(vec![(0x100, changed.to_vec())]);
+        let err = sample_group().validate(&image).unwrap_err();
+        assert_eq!(
+            err,
+            WidescreenError::Mismatch {
+                group: "sample",
+                rva: 0x100,
+                expected: fnv1a64(&SAMPLE),
+                found: fnv1a64(&changed),
+            }
+        );
+        let text = err.to_string();
+        assert!(text.contains("0x100") && text.contains(&format!("{:#018x}", fnv1a64(&SAMPLE))));
+    }
+
+    #[test]
+    fn validate_reports_a_short_read() {
+        let image = Synthetic(vec![(0x100, SAMPLE[..4].to_vec())]);
+        assert_eq!(
+            sample_group().validate(&image),
+            Err(WidescreenError::Unreadable {
+                group: "sample",
+                rva: 0x100,
+                len: 6
+            })
+        );
+        assert!(matches!(
+            sample_group().validate(&Synthetic(Vec::new())),
+            Err(WidescreenError::Unreadable { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_checks_the_displacement_of_a_constant_patch() {
+        let group = PatchGroup {
+            id: "constant",
+            summary: "",
+            confidence: Confidence::Medium,
+            evidence: &[],
+            ops: vec![PatchOp::RipConstant {
+                rva: 0x200,
+                len: 8,
+                expect_target: 0x9000,
+                value: 1.0,
+            }],
+        };
+        let mut instruction = vec![0x90; 8];
+        instruction[4..].copy_from_slice(&rel32(0x208, 0x9000));
+        let image = Synthetic(vec![(0x200, instruction.clone())]);
+        group.validate(&image).unwrap();
+        instruction[4] ^= 0x10;
+        let image = Synthetic(vec![(0x200, instruction)]);
+        assert!(matches!(
+            group.validate(&image),
+            Err(WidescreenError::Mismatch { rva: 0x204, .. })
+        ));
+    }
 }
