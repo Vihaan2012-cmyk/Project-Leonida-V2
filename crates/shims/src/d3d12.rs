@@ -22,6 +22,10 @@ fn trace_note(text: String) {
     note(text);
 }
 
+fn forward_motion(dx: i32, dy: i32) {
+    submit_input(RawInput::MouseMove { dx, dy });
+}
+
 fn forward_input(event: InputEvent) {
     let button = |b: xbox_d3d12::assembly::MouseButton| match b {
         xbox_d3d12::assembly::MouseButton::Left => MouseButton::Left,
@@ -75,6 +79,7 @@ pub fn prepare() -> Result<(), xbox_d3d12::assembly::AssemblyError> {
     xbox_d3d12::com::set_trace(trace_note);
     xbox_d3d12::com::set_address_format(image_offset);
     assembly::set_input_sink(forward_input);
+    assembly::set_motion_sink(forward_motion);
     assembly::set_frame_limit(presentation::get().frame_limit);
     #[cfg(windows)]
     assembly::set_heap_allocator(Some(crate::xmem::title_heap_allocator()));

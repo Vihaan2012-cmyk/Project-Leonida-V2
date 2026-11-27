@@ -46,7 +46,7 @@ use crate::memory::AddressSpace;
 use crate::pacing::FrameLimit;
 use crate::present::VulkanContext;
 
-pub use hooks::{InputEvent, MouseButton, set_content_filter, set_input_sink};
+pub use hooks::{InputEvent, MouseButton, set_content_filter, set_input_sink, set_motion_sink};
 pub use resapi::Placement;
 pub use state::{
     Assembly, AssemblyConfig, AssemblyError, Output, WindowOptionsConfig, current, register,
