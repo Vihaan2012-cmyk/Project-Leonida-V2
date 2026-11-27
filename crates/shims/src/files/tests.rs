@@ -2,9 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{
-    ReadFile, WIN32_FIND_DATAW, WriteFile,
-};
+use windows_sys::Win32::Storage::FileSystem::{ReadFile, WIN32_FIND_DATAW, WriteFile};
 
 use super::*;
 use crate::files::configure;
@@ -122,7 +120,11 @@ fn list(pattern: &str) -> Vec<(String, u32)> {
     }
     let mut found = Vec::new();
     loop {
-        let end = data.cFileName.iter().position(|c| *c == 0).expect("terminated");
+        let end = data
+            .cFileName
+            .iter()
+            .position(|c| *c == 0)
+            .expect("terminated");
         let name = String::from_utf16_lossy(&data.cFileName[..end]);
         if name != "." && name != ".." {
             found.push((name, data.nFileSizeLow));
@@ -143,7 +145,12 @@ fn list(pattern: &str) -> Vec<(String, u32)> {
 fn reads_package_files_through_console_paths() {
     let s = setup();
     std::fs::write(s.package.join("data").join("a.txt"), b"package bytes").expect("write");
-    for name in ["GAME:\\data\\a.txt", "g:/data/a.txt", "data\\a.txt", "\\data\\A.TXT"] {
+    for name in [
+        "GAME:\\data\\a.txt",
+        "g:/data/a.txt",
+        "data\\a.txt",
+        "\\data\\A.TXT",
+    ] {
         let handle = open(name, GENERIC_READ, OPEN_EXISTING);
         assert_ne!(handle, INVALID_HANDLE_VALUE, "{name}");
         assert_eq!(read_all(handle), b"package bytes");
@@ -154,7 +161,10 @@ fn reads_package_files_through_console_paths() {
     assert_eq!(last_error(), 2);
     let attributes = w("GAME:\\data\\a.txt");
     // SAFETY: a terminated name.
-    assert_ne!(unsafe { get_file_attributes_w(attributes.as_ptr()) }, u32::MAX);
+    assert_ne!(
+        unsafe { get_file_attributes_w(attributes.as_ptr()) },
+        u32::MAX
+    );
 }
 
 #[test]
@@ -162,7 +172,11 @@ fn a_write_open_of_a_package_file_goes_to_the_overlay() {
     let s = setup();
     let original = s.package.join("data").join("a.txt");
     std::fs::write(&original, b"0123456789").expect("write");
-    let handle = open("GAME:\\data\\a.txt", GENERIC_READ | GENERIC_WRITE, OPEN_EXISTING);
+    let handle = open(
+        "GAME:\\data\\a.txt",
+        GENERIC_READ | GENERIC_WRITE,
+        OPEN_EXISTING,
+    );
     assert_ne!(handle, INVALID_HANDLE_VALUE);
     write_all(handle, b"AB");
     close(handle);
@@ -195,7 +209,14 @@ fn new_files_land_in_output_and_need_a_visible_folder() {
     let scratch = open("T:\\cache\\deep\\x.tmp", GENERIC_WRITE, CREATE_ALWAYS);
     assert_ne!(scratch, INVALID_HANDLE_VALUE);
     close(scratch);
-    assert!(s.output.join("temp").join("cache").join("deep").join("x.tmp").is_file());
+    assert!(
+        s.output
+            .join("temp")
+            .join("cache")
+            .join("deep")
+            .join("x.tmp")
+            .is_file()
+    );
 }
 
 #[test]
@@ -210,7 +231,11 @@ fn listings_merge_the_overlay_and_deletes_hide_package_files() {
     std::fs::write(overlay.join("c.bin"), b"4444").expect("c");
     assert_eq!(
         list("GAME:\\data\\*.bin"),
-        vec![("a.bin".into(), 1), ("b.bin".into(), 3), ("c.bin".into(), 4)]
+        vec![
+            ("a.bin".into(), 1),
+            ("b.bin".into(), 3),
+            ("c.bin".into(), 4)
+        ]
     );
     let a = w("GAME:\\data\\a.bin");
     // SAFETY: a terminated name.
@@ -261,15 +286,28 @@ fn attributes_and_moves_leave_the_package_alone() {
         assert_eq!(move_file_ex_w(name.as_ptr(), to.as_ptr(), 0), 1);
     }
     assert!(original.exists());
-    assert!(s.output.join("overlay").join("data").join("b.txt").is_file());
+    assert!(
+        s.output
+            .join("overlay")
+            .join("data")
+            .join("b.txt")
+            .is_file()
+    );
     assert_eq!(list("GAME:\\data\\*.txt").len(), 1);
 }
 
 #[test]
 fn network_paths_are_refused_and_names_are_traced() {
     let _s = setup();
-    for name in ["\\\\server\\share\\x.bin", "tcpip:1.2.3.4/x", "https://example.com/x"] {
-        assert_eq!(open(name, GENERIC_READ, OPEN_EXISTING), INVALID_HANDLE_VALUE);
+    for name in [
+        "\\\\server\\share\\x.bin",
+        "tcpip:1.2.3.4/x",
+        "https://example.com/x",
+    ] {
+        assert_eq!(
+            open(name, GENERIC_READ, OPEN_EXISTING),
+            INVALID_HANDLE_VALUE
+        );
         assert_eq!(last_error(), 53, "{name}");
     }
     let escape = w("GAME:\\..\\outside.bin");

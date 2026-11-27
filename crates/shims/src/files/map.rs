@@ -302,11 +302,7 @@ mod tests {
 
     #[test]
     fn a_package_on_drive_g_or_t_stays_the_package() {
-        let roots = Roots::new(
-            PathBuf::from("G:\\Pkg"),
-            PathBuf::from("E:\\Out"),
-        )
-        .expect("roots");
+        let roots = Roots::new(PathBuf::from("G:\\Pkg"), PathBuf::from("E:\\Out")).expect("roots");
         assert_eq!(
             roots.map("G:\\Pkg\\a.bin"),
             Ok(layered("G:\\Pkg\\a.bin", "E:\\Out\\overlay\\a.bin"))

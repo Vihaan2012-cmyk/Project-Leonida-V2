@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows_sys::Win32::Foundation::{
-    FALSE, HANDLE, INVALID_HANDLE_VALUE, SetLastError, TRUE,
-};
+use windows_sys::Win32::Foundation::{FALSE, HANDLE, INVALID_HANDLE_VALUE, SetLastError, TRUE};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem as fs_api;
 use windows_sys::Win32::Storage::FileSystem::{CREATEFILE2_EXTENDED_PARAMETERS, WIN32_FIND_DATAW};
@@ -28,7 +26,8 @@ const ERROR_ALREADY_EXISTS: u32 = 183;
 const OPEN_EXISTING: u32 = 3;
 const OPEN_ALWAYS: u32 = 4;
 const CREATE_NEW: u32 = 1;
-const WRITE_ACCESS: u32 = 0x4000_0000 | 0x1000_0000 | 0x2 | 0x4 | 0x100 | 0x1_0000 | 0x4_0000 | 0x8_0000;
+const WRITE_ACCESS: u32 =
+    0x4000_0000 | 0x1000_0000 | 0x2 | 0x4 | 0x100 | 0x1_0000 | 0x4_0000 | 0x8_0000;
 const FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
 const FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const MOVEFILE_REPLACE_EXISTING: u32 = 1;
@@ -73,7 +72,9 @@ fn set_error(code: u32) {
 }
 
 fn io_code(error: &io::Error) -> u32 {
-    error.raw_os_error().map_or(ERROR_ACCESS_DENIED, |c| c as u32)
+    error
+        .raw_os_error()
+        .map_or(ERROR_ACCESS_DENIED, |c| c as u32)
 }
 
 fn wide_ptr_to_string(ptr: *const u16) -> String {
@@ -82,10 +83,14 @@ fn wide_ptr_to_string(ptr: *const u16) -> String {
     }
     // SAFETY: the caller passes a terminated UTF-16 string, as every file API requires; reading stops at the
     // terminator or after 32767 characters.
-    let length = (0..32767).take_while(|i| unsafe { *ptr.add(*i) } != 0).count();
+    let length = (0..32767)
+        .take_while(|i| unsafe { *ptr.add(*i) } != 0)
+        .count();
     // SAFETY: `length` characters were just read.
     let slice = unsafe { std::slice::from_raw_parts(ptr, length) };
-    std::ffi::OsString::from_wide(slice).to_string_lossy().into_owned()
+    std::ffi::OsString::from_wide(slice)
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn narrow_ptr_to_string(ptr: *const u8) -> String {
@@ -93,7 +98,9 @@ fn narrow_ptr_to_string(ptr: *const u8) -> String {
         return String::new();
     }
     // SAFETY: as above, for an 8-bit string.
-    let length = (0..32767).take_while(|i| unsafe { *ptr.add(*i) } != 0).count();
+    let length = (0..32767)
+        .take_while(|i| unsafe { *ptr.add(*i) } != 0)
+        .count();
     // SAFETY: `length` bytes were just read.
     String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, length) }).into_owned()
 }
@@ -103,7 +110,13 @@ fn to_wide(path: &Path) -> Vec<u16> {
     let drive = wide.len() > 2 && wide[1] == u16::from(b':') && wide[0] < 128;
     if wide.len() > 259 && drive {
         let mut long: Vec<u16> = "\\\\?\\".encode_utf16().collect();
-        long.extend(wide.iter().map(|c| if *c == u16::from(b'/') { u16::from(b'\\') } else { *c }));
+        long.extend(wide.iter().map(|c| {
+            if *c == u16::from(b'/') {
+                u16::from(b'\\')
+            } else {
+                *c
+            }
+        }));
         wide = long;
     }
     wide.push(0);
@@ -233,7 +246,15 @@ unsafe extern "win64" fn create_file_w(
     match create_file_common(&text, access, disposition, flags) {
         // SAFETY: a terminated path of our own making; the other arguments are the program's.
         Ok(path) => unsafe {
-            fs_api::CreateFileW(path.as_ptr(), access, share, security, disposition, flags, template)
+            fs_api::CreateFileW(
+                path.as_ptr(),
+                access,
+                share,
+                security,
+                disposition,
+                flags,
+                template,
+            )
         },
         Err(code) => {
             set_error(code);
@@ -258,7 +279,9 @@ unsafe extern "win64" fn create_file2(
     };
     match create_file_common(&text, access, disposition, flags) {
         // SAFETY: as in `create_file_w`.
-        Ok(path) => unsafe { fs_api::CreateFile2(path.as_ptr(), access, share, disposition, params) },
+        Ok(path) => unsafe {
+            fs_api::CreateFile2(path.as_ptr(), access, share, disposition, params)
+        },
         Err(code) => {
             set_error(code);
             INVALID_HANDLE_VALUE
@@ -326,7 +349,11 @@ static LISTINGS: Mutex<Option<HashMap<usize, Listing>>> = Mutex::new(None);
 static NEXT_LISTING: AtomicUsize = AtomicUsize::new(0x4C45_0000_1000);
 
 fn file_name(entry: &WIN32_FIND_DATAW) -> String {
-    let end = entry.cFileName.iter().position(|c| *c == 0).unwrap_or(entry.cFileName.len());
+    let end = entry
+        .cFileName
+        .iter()
+        .position(|c| *c == 0)
+        .unwrap_or(entry.cFileName.len());
     String::from_utf16_lossy(&entry.cFileName[..end]).to_lowercase()
 }
 
@@ -391,7 +418,9 @@ unsafe fn find_first(
         Target::Passthrough => {
             let wide = to_wide(Path::new(&text));
             // SAFETY: a terminated pattern; the other arguments are the program's.
-            return unsafe { fs_api::FindFirstFileExW(wide.as_ptr(), level, data, operation, filter, flags) };
+            return unsafe {
+                fs_api::FindFirstFileExW(wide.as_ptr(), level, data, operation, filter, flags)
+            };
         }
     };
     let base_here = base.as_ref().filter(|b| b.is_dir() && !hidden(b));
@@ -447,19 +476,16 @@ unsafe extern "win64" fn find_first_file_ex_w(
 }
 
 unsafe extern "win64" fn find_next_file_w(handle: HANDLE, data: *mut c_void) -> i32 {
-    let ours = LISTINGS
-        .lock()
-        .ok()
-        .and_then(|mut listings| {
-            let listing = listings.as_mut()?.get_mut(&(handle as usize))?;
-            Some(match listing.entries.get(listing.next) {
-                Some(entry) => {
-                    listing.next += 1;
-                    Some(*entry)
-                }
-                None => None,
-            })
-        });
+    let ours = LISTINGS.lock().ok().and_then(|mut listings| {
+        let listing = listings.as_mut()?.get_mut(&(handle as usize))?;
+        Some(match listing.entries.get(listing.next) {
+            Some(entry) => {
+                listing.next += 1;
+                Some(*entry)
+            }
+            None => None,
+        })
+    });
     match ours {
         Some(Some(entry)) => {
             // SAFETY: `data` is the program's `WIN32_FIND_DATAW`.
@@ -590,7 +616,11 @@ fn move_file(from: &str, to: &str, flags: u32) -> Result<(), u32> {
         if exists(overlay) {
             std::fs::rename(overlay, &dst).map_err(|e| io_code(&e))?;
         } else if base.is_dir() || hidden(base) || !exists(base) {
-            return Err(if exists(base) && !hidden(base) { ERROR_ACCESS_DENIED } else { ERROR_FILE_NOT_FOUND });
+            return Err(if exists(base) && !hidden(base) {
+                ERROR_ACCESS_DENIED
+            } else {
+                ERROR_FILE_NOT_FOUND
+            });
         } else {
             std::fs::copy(base, &dst).map_err(|e| io_code(&e))?;
         }
@@ -667,7 +697,11 @@ fn open_stream(text: &str, mode: &str) -> *mut c_void {
         if !writes {
             return Ok(read_path(&target, text));
         }
-        write_path(&target, text, mode.contains(['a', '+']) && !mode.contains('w'))
+        write_path(
+            &target,
+            text,
+            mode.contains(['a', '+']) && !mode.contains('w'),
+        )
     });
     let Ok(path) = path else {
         return std::ptr::null_mut();
@@ -723,20 +757,41 @@ pub fn shims() -> Vec<Shim> {
     let functions: [(&str, usize); 16] = [
         ("CreateFileW", create_file_w as *const () as usize),
         ("CreateFile2", create_file2 as *const () as usize),
-        ("GetFileAttributesW", get_file_attributes_w as *const () as usize),
-        ("GetFileAttributesA", get_file_attributes_a as *const () as usize),
-        ("GetFileAttributesExW", get_file_attributes_ex_w as *const () as usize),
-        ("GetFileAttributesExA", get_file_attributes_ex_a as *const () as usize),
+        (
+            "GetFileAttributesW",
+            get_file_attributes_w as *const () as usize,
+        ),
+        (
+            "GetFileAttributesA",
+            get_file_attributes_a as *const () as usize,
+        ),
+        (
+            "GetFileAttributesExW",
+            get_file_attributes_ex_w as *const () as usize,
+        ),
+        (
+            "GetFileAttributesExA",
+            get_file_attributes_ex_a as *const () as usize,
+        ),
         ("FindFirstFileW", find_first_file_w as *const () as usize),
-        ("FindFirstFileExW", find_first_file_ex_w as *const () as usize),
+        (
+            "FindFirstFileExW",
+            find_first_file_ex_w as *const () as usize,
+        ),
         ("FindNextFileW", find_next_file_w as *const () as usize),
         ("FindClose", find_close as *const () as usize),
         ("CreateDirectoryW", create_directory_w as *const () as usize),
         ("DeleteFileW", delete_file_w as *const () as usize),
         ("RemoveDirectoryW", remove_directory_w as *const () as usize),
-        ("SetFileAttributesW", set_file_attributes_w as *const () as usize),
+        (
+            "SetFileAttributesW",
+            set_file_attributes_w as *const () as usize,
+        ),
         ("MoveFileExW", move_file_ex_w as *const () as usize),
-        ("GetDiskFreeSpaceExW", get_disk_free_space_ex_w as *const () as usize),
+        (
+            "GetDiskFreeSpaceExW",
+            get_disk_free_space_ex_w as *const () as usize,
+        ),
     ];
     let mut shims = Vec::new();
     for (name, address) in functions.iter() {
@@ -749,10 +804,26 @@ pub fn shims() -> Vec<Shim> {
         }
     }
     for (dll, name, address) in [
-        ("api-ms-win-crt-stdio-l1-1-0.dll", "_wfopen", wfopen as *const () as usize),
-        ("api-ms-win-crt-stdio-l1-1-0.dll", "fopen", fopen as *const () as usize),
-        ("api-ms-win-crt-filesystem-l1-1-0.dll", "_wstat64", wstat64 as *const () as usize),
-        ("api-ms-win-crt-filesystem-l1-1-0.dll", "remove", remove as *const () as usize),
+        (
+            "api-ms-win-crt-stdio-l1-1-0.dll",
+            "_wfopen",
+            wfopen as *const () as usize,
+        ),
+        (
+            "api-ms-win-crt-stdio-l1-1-0.dll",
+            "fopen",
+            fopen as *const () as usize,
+        ),
+        (
+            "api-ms-win-crt-filesystem-l1-1-0.dll",
+            "_wstat64",
+            wstat64 as *const () as usize,
+        ),
+        (
+            "api-ms-win-crt-filesystem-l1-1-0.dll",
+            "remove",
+            remove as *const () as usize,
+        ),
         ("ucrtbase.dll", "_wfopen", wfopen as *const () as usize),
         ("ucrtbase.dll", "fopen", fopen as *const () as usize),
         ("ucrtbase.dll", "_wstat64", wstat64 as *const () as usize),
