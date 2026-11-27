@@ -14,6 +14,8 @@ mod com;
 #[cfg(windows)]
 mod modules;
 #[cfg(windows)]
+mod package;
+#[cfg(windows)]
 mod runtime;
 #[cfg(windows)]
 mod system;
