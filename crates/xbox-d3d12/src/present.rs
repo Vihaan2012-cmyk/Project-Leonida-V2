@@ -9,6 +9,7 @@
 
 pub mod convert;
 pub mod frames;
+pub mod vulkan;
 pub mod window;
 
 #[derive(Debug, thiserror::Error)]
