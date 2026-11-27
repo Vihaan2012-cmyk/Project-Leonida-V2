@@ -3,8 +3,11 @@
 pub mod desc;
 pub mod image;
 pub mod layout;
+pub mod store;
 pub mod tiling;
 pub mod va;
+
+pub use store::{HeapKind, Origin, Resource, ResourceError, ResourceId, Resources};
 
 #[cfg(test)]
 mod tiling_tests;
