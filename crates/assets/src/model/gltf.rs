@@ -205,6 +205,9 @@ struct Joints {
     nodes: Vec<usize>,
     inverse_bind: Vec<Matrix>,
     by_hash: HashMap<u32, usize>,
+    /// Helper joints for palette-less models whose indices run past the skeleton.
+    direct: HashMap<usize, usize>,
+    skeleton_len: usize,
     /// Nodes of joints the skeleton lacks; they hang off the scene root.
     helpers: Vec<usize>,
 }
@@ -220,6 +223,8 @@ fn build_glb(drawables: &[&Drawable], options: &ExportOptions<'_>) -> Result<Vec
         nodes: Vec::new(),
         inverse_bind: Vec::new(),
         by_hash: HashMap::new(),
+        direct: HashMap::new(),
+        skeleton_len: skeleton.map_or(0, |s| s.bones.len()),
         helpers: Vec::new(),
     };
 
@@ -279,7 +284,7 @@ fn build_glb(drawables: &[&Drawable], options: &ExportOptions<'_>) -> Result<Vec
                 && let Some(uri) = m
                     .textures
                     .iter()
-                    .find(|t| t.param_hash == DIFFUSE_PARAMETER)
+                    .find(|t| t.param_hash == Some(DIFFUSE_PARAMETER))
                     .and_then(|t| resolve(t.id64))
             {
                 let image = *image_of.entry(uri.clone()).or_insert_with(|| {
@@ -298,8 +303,7 @@ fn build_glb(drawables: &[&Drawable], options: &ExportOptions<'_>) -> Result<Vec
         for lod in drawable.lods.iter().take(take) {
             for (mi, model) in lod.models.iter().enumerate() {
                 let skinned = model.geometries.iter().any(|g| g.skin.is_some());
-                let palette_map =
-                    skinned.then(|| palette_joints(&model.bone_palette, &mut joints, &mut nodes));
+                let palette_map = skinned.then(|| palette_joints(model, &mut joints, &mut nodes));
                 let mut primitives = Vec::new();
                 for g in &model.geometries {
                     let material = (g.material < drawable.materials.len())
@@ -365,8 +369,26 @@ fn build_glb(drawables: &[&Drawable], options: &ExportOptions<'_>) -> Result<Vec
 }
 
 /// Skin joint index of each palette entry, adding a helper joint for a hash the skeleton lacks.
-fn palette_joints(palette: &[u32], joints: &mut Joints, nodes: &mut Vec<Value>) -> Vec<u16> {
-    palette
+fn palette_joints(model: &Model, joints: &mut Joints, nodes: &mut Vec<Value>) -> Vec<u16> {
+    if model.bone_palette.is_empty() {
+        return (0..model.bone_count as usize)
+            .map(|i| {
+                if i < joints.skeleton_len {
+                    return i as u16;
+                }
+                let joint = *joints.direct.entry(i).or_insert_with(|| {
+                    nodes.push(json!({"name": format!("bone_{i}")}));
+                    joints.nodes.push(nodes.len() - 1);
+                    joints.helpers.push(nodes.len() - 1);
+                    joints.inverse_bind.push(IDENTITY);
+                    joints.nodes.len() - 1
+                });
+                joint as u16
+            })
+            .collect();
+    }
+    model
+        .bone_palette
         .iter()
         .map(|hash| {
             let joint = *joints.by_hash.entry(*hash).or_insert_with(|| {
@@ -401,8 +423,9 @@ fn material_json(m: &Material, index: usize, label: &str) -> Value {
         .iter()
         .map(|t| {
             json!({
-                "parameter": format!("0x{:08x}", t.param_hash),
-                "parameter_name": parameter_name(t.param_hash),
+                "slot": t.slot,
+                "parameter": t.param_hash.map(|h| format!("0x{h:08x}")),
+                "parameter_name": t.param_hash.and_then(parameter_name),
                 "id64": format!("0x{:016x}", t.id64),
             })
         })

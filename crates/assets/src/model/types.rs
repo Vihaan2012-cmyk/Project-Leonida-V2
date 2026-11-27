@@ -82,7 +82,10 @@ impl Geometry {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Model {
+    /// Number of bones the skin indices range over.
+    pub bone_count: u16,
     /// `joaat32` hashes of the bone names the skin indices refer to, sorted ascending in the game.
+    /// Empty when the model has none: its indices are then skeleton bone indices.
     pub bone_palette: Vec<u32>,
     pub geometries: Vec<Geometry>,
 }
@@ -96,11 +99,14 @@ pub struct Lod {
     pub models: Vec<Model>,
 }
 
-/// One texture binding of a material. The slot record layout is inferred (name hash, parameter hash,
-/// then the 64-bit id), so match `id64` against a texture pool rather than trusting `param_hash` alone.
+/// One texture binding of a material. The id is read from the texture reference; `name_hash` is an
+/// inferred field, so match `id64` against a texture pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterialTexture {
-    pub param_hash: u32,
+    /// Position in the shader's texture reference array.
+    pub slot: usize,
+    /// Parameter hash from the parameter table entry for this slot.
+    pub param_hash: Option<u32>,
     pub name_hash: u32,
     pub id64: u64,
 }

@@ -31,6 +31,11 @@ pub(crate) fn decode_set(pages: Pages<'_>, name: Option<&str>) -> Result<ModelSe
             let hashes = pages.optional_pointer(32, "dictionary hashes")?;
             for i in 0..count {
                 let child = pages.pointer(children + 8 * i, 192, "dictionary child")?;
+                if pages.u64(child, "dictionary child")? != 0
+                    || pages.u64(child + 8, "dictionary child")? != 0
+                {
+                    return Err(ModelError::NotAModel);
+                }
                 let hash = match hashes {
                     Some(at) => Some(pages.u32(at + 4 * i, "dictionary hash")?),
                     None => None,
@@ -212,9 +217,11 @@ fn read_models(
         if bones > MAX_PALETTE {
             return Err(ModelError::Invalid(format!("bone palette of {bones}")));
         }
-        let mut bone_palette = Vec::with_capacity(bones as usize);
-        if bones > 0 {
-            let at = p.pointer(model + 0x28, bones as usize * 4, "bone palette")?;
+        let mut bone_palette = Vec::new();
+        if bones > 0
+            && let Some(at) = p.optional_pointer(model + 0x28, "bone palette")?
+        {
+            p.slice(at, bones as usize * 4, "bone palette")?;
             for i in 0..bones as usize {
                 bone_palette.push(p.u32(at + 4 * i, "bone palette")?);
             }
@@ -224,7 +231,7 @@ fn read_models(
         let mut out = Vec::with_capacity(geometries as usize);
         for gi in 0..geometries as usize {
             let geometry = p.pointer(geometry_list + 8 * gi, 160, "geometry")?;
-            let mut g = read_geometry(p, geometry, &bone_palette, warnings)?;
+            let mut g = read_geometry(p, geometry, bones as usize, warnings)?;
             g.material = match mapping {
                 Some(m) => p.u16(m + 2 * gi, "shader mapping")? as usize,
                 None => 0,
@@ -238,6 +245,7 @@ fn read_models(
             out.push(g);
         }
         models.push(Model {
+            bone_count: bones,
             bone_palette,
             geometries: out,
         });
@@ -272,9 +280,10 @@ fn read_shader_group(
 
 /// Shader record: +0 effect hash, +4 `meta` tag, +0x10 texture reference array, +0x20 parameter info
 /// (u8 texture count at +1, u8 parameter count at +4, then eight bytes per parameter), +0x39 render
-/// bucket, +0x3C bucket mask. A texture reference's +0x30 points at 16 bytes: name hash, parameter
-/// hash, 64-bit asset id, behind a 16-byte header whose first word is 6. Which of those words is the
-/// parameter hash is inferred from "parameter hash immediately before the asset key".
+/// bucket, +0x3C bucket mask. The parameter table lists the texture parameters first: entry `t` is
+/// (parameter hash, 4 * t) for texture reference `t`. A texture reference's +0x30 points at 16 bytes
+/// (a pointer-like word, then the 64-bit asset id) behind a 16-byte header: tag 6, then at +8 a hash
+/// that is taken to be the texture name hash.
 fn read_material(
     p: &Pages<'_>,
     shader: usize,
@@ -323,9 +332,20 @@ fn read_material(
             ));
             continue;
         }
+        let param_hash = material
+            .raw_parameters
+            .get(t)
+            .filter(|entry| entry[1] as usize == 4 * t)
+            .map(|entry| entry[0]);
+        if param_hash.is_none() {
+            warnings.push(format!(
+                "material {index} texture {t}: no matching parameter entry"
+            ));
+        }
         material.textures.push(MaterialTexture {
-            name_hash: p.u32(asset, "texture name hash")?,
-            param_hash: p.u32(asset + 4, "texture parameter hash")?,
+            slot: t,
+            name_hash: p.u32(asset - 8, "texture name hash")?,
+            param_hash,
             id64: p.u64(asset + 8, "texture id")?,
         });
     }

@@ -107,6 +107,8 @@ impl GeometrySpec {
 }
 
 pub struct ModelSpec {
+    /// Bone count for a model with no palette; ignored when `palette` is non-empty.
+    pub direct_bones: u16,
     pub geometries: Vec<GeometrySpec>,
     pub palette: Vec<u32>,
 }
@@ -146,6 +148,7 @@ impl DrawableSpec {
             lods: vec![(
                 15.0,
                 vec![ModelSpec {
+                    direct_bones: 0,
                     geometries: vec![geometry],
                     palette: Vec::new(),
                 }],
@@ -291,7 +294,12 @@ fn write_lod(c: &mut Ctx, models: &[ModelSpec]) -> usize {
         c.sys.u16(model + 16, n as u16);
         c.sys.u16(model + 18, n as u16);
         c.sys.u16(model + 54, n as u16);
-        c.sys.u16(model + 20, m.palette.len() as u16);
+        let bones = if m.palette.is_empty() {
+            m.direct_bones
+        } else {
+            m.palette.len() as u16
+        };
+        c.sys.u16(model + 20, bones);
         c.sys.sys_ptr(model + 0x20, mapping);
         if !m.palette.is_empty() {
             let pal = c.sys.alloc(m.palette.len() * 4, 16);
@@ -602,8 +610,12 @@ fn write_shader_group(c: &mut Ctx, materials: &[MaterialSpec]) -> usize {
         let info = c.sys.alloc(8 + params * 8, 16);
         c.sys.u8(info + 1, m.textures.len() as u8);
         c.sys.u8(info + 4, params as u8);
-        c.sys.u32(info + 8, 0x1111_2222);
-        c.sys.u32(info + 12, 0x3333_4444);
+        for (t, tex) in m.textures.iter().enumerate() {
+            c.sys.u32(info + 8 + 8 * t, tex.param);
+            c.sys.u32(info + 12 + 8 * t, 4 * t as u32);
+        }
+        c.sys.u32(info + 8 + 8 * m.textures.len(), 0x1111_2222);
+        c.sys.u32(info + 12 + 8 * m.textures.len(), 0x0040_0003);
         c.sys.sys_ptr(shader + 32, info);
         let tarr = c.sys.alloc(m.textures.len().max(1) * 8, 16);
         c.sys.sys_ptr(shader + 16, tarr);
@@ -611,8 +623,8 @@ fn write_shader_group(c: &mut Ctx, materials: &[MaterialSpec]) -> usize {
             let reference = c.sys.alloc(80, 16);
             let asset_block = c.sys.alloc(32, 16);
             c.sys.u32(asset_block, 6);
-            c.sys.u32(asset_block + 16, tex.name_hash);
-            c.sys.u32(asset_block + 20, tex.param);
+            c.sys.u32(asset_block + 8, tex.name_hash);
+            c.sys.u64(asset_block + 16, 0x5000_1E25);
             c.sys.u64(asset_block + 24, tex.id64);
             c.sys.sys_ptr(reference + 48, asset_block + 16);
             c.sys.sys_ptr(tarr + 8 * t, reference);

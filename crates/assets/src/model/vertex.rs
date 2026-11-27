@@ -99,7 +99,7 @@ fn normal_0x27(w: u32) -> [f32; 3] {
 pub(crate) fn read_geometry(
     p: &Pages<'_>,
     geometry: usize,
-    palette: &[u32],
+    bone_count: usize,
     warnings: &mut Vec<String>,
 ) -> Result<Geometry, ModelError> {
     let vb = p.pointer(geometry + 8, 80, "vertex buffer header")?;
@@ -193,7 +193,7 @@ pub(crate) fn read_geometry(
         }
     }
 
-    out.skin = read_skin(p, fvf, data, n, constant_bone, palette)?;
+    out.skin = read_skin(p, fvf, data, n, constant_bone, bone_count)?;
     orient_winding(&mut out);
     Ok(out)
 }
@@ -376,7 +376,7 @@ fn read_skin(
     data: &[u8],
     n: usize,
     constant_bone: Option<u16>,
-    palette: &[u32],
+    bone_count: usize,
 ) -> Result<Option<SkinData>, ModelError> {
     struct Slot {
         size: u8,
@@ -422,13 +422,12 @@ fn read_skin(
         let Some(bone) = constant_bone else {
             return Ok(None);
         };
-        if palette.is_empty() {
+        if bone_count == 0 {
             return Ok(None);
         }
-        if bone as usize >= palette.len() {
+        if bone as usize >= bone_count {
             return Err(ModelError::Invalid(format!(
-                "constant bone {bone} of a palette of {}",
-                palette.len()
+                "constant bone {bone} of {bone_count} bones"
             )));
         }
         let mut joints = vec![[0u16; 8]; n];
@@ -513,11 +512,10 @@ fn read_skin(
         let mut sj = [0u16; 8];
         let mut sw = [0u8; 8];
         for (dst, &k) in order.iter().enumerate() {
-            if joints[v][k] as usize >= palette.len() {
+            if joints[v][k] as usize >= bone_count {
                 return Err(ModelError::Invalid(format!(
-                    "vertex {v} weights bone {} of a palette of {}",
-                    joints[v][k],
-                    palette.len()
+                    "vertex {v} weights bone {} of {bone_count} bones",
+                    joints[v][k]
                 )));
             }
             sj[dst] = joints[v][k];

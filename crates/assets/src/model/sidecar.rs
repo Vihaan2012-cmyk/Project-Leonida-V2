@@ -35,8 +35,7 @@ pub(crate) fn sidecar_json(
         ResourceKind::Fragment => "fragment",
     };
     let mut notes = vec![
-        "texture links are read from an inferred record layout: match id64 against a texture pool"
-            .to_string(),
+        "texture name hashes are inferred; match id64 against a texture pool".to_string(),
         "raw_parameters are the parameter table words, not decoded".to_string(),
     ];
     notes.extend(set.warnings.iter().cloned());
@@ -77,6 +76,7 @@ fn lod_json(l: &Lod) -> Value {
         "distance": l.distance,
         "models": l.models.iter().enumerate().map(|(i, m)| json!({
             "index": i,
+            "bone_count": m.bone_count,
             "bone_palette": m.bone_palette.iter().map(|h| hex(*h)).collect::<Vec<_>>(),
             "geometries": m.geometries.iter().enumerate().map(|(gi, g)| json!({
                 "index": gi,
@@ -102,8 +102,9 @@ fn material_json(index: usize, m: &Material) -> Value {
         "render_bucket_flag": m.render_bucket >> 7,
         "render_bucket_mask": format!("0x{:08x}", m.render_bucket_mask),
         "textures": m.textures.iter().map(|t| json!({
-            "parameter": hex(t.param_hash),
-            "parameter_name": parameter_name(t.param_hash),
+            "slot": t.slot,
+            "parameter": t.param_hash.map(hex),
+            "parameter_name": t.param_hash.and_then(parameter_name),
             "name_hash": hex(t.name_hash),
             "id64": format!("0x{:016x}", t.id64),
         })).collect::<Vec<_>>(),

@@ -261,6 +261,7 @@ fn materials_lods_and_names_decode() {
     spec.lods.push((
         60.0,
         vec![ModelSpec {
+            direct_bones: 0,
             geometries: vec![GeometrySpec::quad()],
             palette: vec![],
         }],
@@ -305,7 +306,12 @@ fn materials_lods_and_names_decode() {
     assert_eq!(d.materials[1].render_bucket, 0x83);
     assert_eq!(d.materials[1].textures.len(), 2);
     assert_eq!(d.materials[1].textures[0].id64, 0x0123_4567_89AB_CDEF);
-    assert_eq!(d.materials[1].textures[0].param_hash, joaat("diffusetex"));
+    assert_eq!(
+        d.materials[1].textures[0].param_hash,
+        Some(joaat("diffusetex"))
+    );
+    assert_eq!(d.materials[1].textures[1].slot, 1);
+    assert_eq!(d.materials[1].textures[1].name_hash, 8);
     assert_eq!(d.materials[1].raw_parameters.len(), 3);
 }
 
@@ -414,12 +420,12 @@ fn decode_splits_joined_bytes() {
 
 // ---- glTF checks
 
-struct Glb {
-    doc: Value,
-    bin: Vec<u8>,
+pub(super) struct Glb {
+    pub(super) doc: Value,
+    pub(super) bin: Vec<u8>,
 }
 
-fn parse_glb(bytes: &[u8]) -> Glb {
+pub(super) fn parse_glb(bytes: &[u8]) -> Glb {
     assert_eq!(&bytes[0..4], b"glTF");
     assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 2);
     assert_eq!(
@@ -478,7 +484,7 @@ impl Glb {
         (&self.bin[offset..offset + need], a)
     }
 
-    fn floats(&self, i: usize) -> Vec<f32> {
+    pub(super) fn floats(&self, i: usize) -> Vec<f32> {
         let (b, a) = self.accessor_bytes(i);
         assert_eq!(a["componentType"], 5126);
         b.chunks_exact(4)
@@ -502,16 +508,14 @@ impl Glb {
     }
 
     /// Structural validation: no empty arrays, bounds, indices, skins, node tree.
-    fn validate(&self) {
+    pub(super) fn validate(&self) {
         for (key, v) in self.doc.as_object().unwrap() {
             if let Some(a) = v.as_array() {
                 assert!(!a.is_empty(), "{key} is empty");
             }
         }
-        assert_eq!(
-            self.doc["buffers"][0]["byteLength"].as_u64().unwrap() as usize,
-            self.bin.len()
-        );
+        let declared = self.doc["buffers"][0]["byteLength"].as_u64().unwrap() as usize;
+        assert!(declared <= self.bin.len() && self.bin.len() - declared < 4);
         for i in 0..self.doc["accessors"].as_array().unwrap().len() {
             self.accessor_bytes(i);
         }
@@ -635,9 +639,9 @@ impl Glb {
     }
 }
 
-type Mat = [f32; 16];
+pub(super) type Mat = [f32; 16];
 
-fn mul(a: &Mat, b: &Mat) -> Mat {
+pub(super) fn mul(a: &Mat, b: &Mat) -> Mat {
     let mut out = [0.0; 16];
     for c in 0..4 {
         for r in 0..4 {
@@ -691,7 +695,7 @@ fn node_matrix(n: &Value) -> Mat {
     m
 }
 
-fn world_matrices(glb: &Glb) -> Vec<Mat> {
+pub(super) fn world_matrices(glb: &Glb) -> Vec<Mat> {
     let nodes = glb.doc["nodes"].as_array().unwrap();
     let mut world = vec![None; nodes.len()];
     fn go(nodes: &[Value], world: &mut Vec<Option<Mat>>, at: usize, parent: Mat) {
@@ -915,6 +919,7 @@ fn lod_selection_and_dictionary_exports() {
     a.lods.push((
         50.0,
         vec![ModelSpec {
+            direct_bones: 0,
             geometries: vec![GeometrySpec::quad()],
             palette: vec![],
         }],
@@ -1036,4 +1041,47 @@ fn large_meshes_use_wide_indices() {
         .unwrap() as usize;
     assert_eq!(glb.doc["accessors"][idx]["componentType"], 5125);
     assert_eq!(glb.uints(idx).last(), Some(&69_999));
+}
+
+#[test]
+fn palette_less_models_index_the_skeleton_directly() {
+    let mut spec = skinned_spec(
+        SkinForm::Bytes(1),
+        vec![
+            vec![(1, 255)],
+            vec![(0, 255)],
+            vec![(1, 128), (0, 127)],
+            vec![(0, 255)],
+        ],
+        Vec::new(),
+    );
+    spec.lods[0].1[0].direct_bones = 2;
+    spec.skeleton = two_bones();
+    spec.name = Some("car");
+    let set = decode_resource(&drawable_resource(&spec), None).unwrap();
+    let model = &set.drawables[0].lods[0].models[0];
+    assert!(model.bone_palette.is_empty());
+    assert_eq!(model.bone_count, 2);
+    let (_, glb) = export_one(&set);
+    let joints = glb.doc["skins"][0]["joints"].as_array().unwrap();
+    assert_eq!(joints.len(), 2, "indices map straight onto the skeleton");
+    let attrs = &glb.doc["meshes"][0]["primitives"][0]["attributes"];
+    let j0 = glb.uints(attrs["JOINTS_0"].as_u64().unwrap() as usize);
+    assert_eq!(&j0[0..4], &[1, 0, 0, 0]);
+
+    spec.skeleton = Vec::new();
+    let set = decode_resource(&drawable_resource(&spec), None).unwrap();
+    let (_, glb) = export_one(&set);
+    let names: Vec<_> = glb.doc["skins"][0]["joints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| {
+            glb.doc["nodes"][j.as_u64().unwrap() as usize]["name"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(names, vec!["bone_0", "bone_1"]);
 }
