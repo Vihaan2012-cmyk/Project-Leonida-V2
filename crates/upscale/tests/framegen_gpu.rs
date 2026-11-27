@@ -151,10 +151,8 @@ fn scene_colour(scene: &Scene, x: u32, y: u32) -> [f32; 4] {
     if scene.hud && in_hud(x, y) {
         return [0.05, 0.95, 0.05, 1.0];
     }
-    if let Some(left) = scene.square {
-        if in_square(x, y, left) {
-            return [1.0, 0.2, 0.2, 1.0];
-        }
+    if scene.square.is_some_and(|left| in_square(x, y, left)) {
+        return [1.0, 0.2, 0.2, 1.0];
     }
     let n = noise(x as i32 - scene.shift, y as i32);
     [n[0], n[1], n[2], 1.0]
