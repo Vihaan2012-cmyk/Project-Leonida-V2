@@ -596,6 +596,14 @@ impl Emitter {
         Ok(())
     }
 
+    /// Fails the step when `rax` is below `value` (unsigned, a small value).
+    pub fn fail_if_below64(&mut self, value: u32) -> Res {
+        let fail = self.fail_label();
+        self.asm.cmp(rax, value as i32)?;
+        self.asm.jb(fail)?;
+        Ok(())
+    }
+
     /// Fails the step unless the bit is set in `eax`.
     pub fn fail_unless_bit(&mut self, bit: u8) -> Res {
         let fail = self.fail_label();

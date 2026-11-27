@@ -176,3 +176,20 @@ fn input() {
 fn audio() {
     in_child("audio");
 }
+
+#[test]
+fn device() {
+    in_child("device");
+}
+
+#[test]
+#[ignore = "needs the assembled device"]
+fn present() {
+    in_child("present");
+}
+
+#[test]
+#[ignore = "needs the assembled device"]
+fn full_boot() {
+    in_child("boot");
+}
