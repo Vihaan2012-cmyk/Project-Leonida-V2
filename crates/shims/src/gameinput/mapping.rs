@@ -207,3 +207,177 @@ fn gate(axis: [f32; 2]) -> [f32; 2] {
         clamped
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gameinput::config::{MouseButton, vk};
+
+    fn keys(down: &[u8]) -> [bool; 256] {
+        let mut keys = [false; 256];
+        for &k in down {
+            keys[k as usize] = true;
+        }
+        keys
+    }
+
+    fn pad(config: &InputConfig, down: &[u8], mouse: u32) -> GamepadState {
+        virtual_pad(config, &keys(down), mouse, MouseStick::default())
+    }
+
+    #[test]
+    fn face_buttons_go_by_position() {
+        assert_eq!(gilrs_button_bit(Button::South), Some(buttons::A));
+        assert_eq!(gilrs_button_bit(Button::East), Some(buttons::B));
+        assert_eq!(gilrs_button_bit(Button::West), Some(buttons::X));
+        assert_eq!(gilrs_button_bit(Button::North), Some(buttons::Y));
+        assert_eq!(gilrs_button_bit(Button::Select), Some(buttons::VIEW));
+        assert_eq!(gilrs_button_bit(Button::Start), Some(buttons::MENU));
+        assert_eq!(
+            gilrs_button_bit(Button::LeftTrigger),
+            Some(buttons::LEFT_SHOULDER)
+        );
+        assert_eq!(
+            gilrs_button_bit(Button::RightThumb),
+            Some(buttons::RIGHT_THUMBSTICK)
+        );
+        assert_eq!(gilrs_button_bit(Button::LeftTrigger2), None);
+        assert_eq!(gilrs_button_bit(Button::Mode), None);
+    }
+
+    #[test]
+    fn every_gamepad_bit_has_exactly_one_gilrs_button() {
+        let mut all = 0;
+        for button in BIT_BUTTONS {
+            let bit = gilrs_button_bit(button).unwrap();
+            assert_eq!(all & bit, 0);
+            all |= bit;
+        }
+        assert_eq!(all, (1 << buttons::COUNT) - 1);
+        for (i, button) in BIT_BUTTONS.iter().enumerate() {
+            assert_eq!(gilrs_button_bit(*button), Some(1 << i));
+        }
+    }
+
+    #[test]
+    fn controller_axes_put_sticks_at_half_when_centered() {
+        let s = GamepadState {
+            left_trigger: 0.3,
+            right_x: 1.0,
+            left_y: -1.0,
+            ..GamepadState::default()
+        };
+        assert_eq!(controller_axes(&s), [0.5, 0.0, 1.0, 0.5, 0.3, 0.0]);
+    }
+
+    #[test]
+    fn ui_navigation_follows_the_pad() {
+        let none = GamepadState::default();
+        assert_eq!(ui_navigation(&none), 0);
+        let s = GamepadState {
+            buttons: buttons::X
+                | buttons::LEFT_SHOULDER
+                | buttons::MENU
+                | buttons::RIGHT_THUMBSTICK,
+            left_x: 0.6,
+            right_x: -0.6,
+            left_trigger: 0.9,
+            ..none
+        };
+        assert_eq!(
+            ui_navigation(&s),
+            ui::CONTEXT1
+                | ui::PAGE_LEFT
+                | ui::MENU
+                | ui::CONTEXT4
+                | ui::RIGHT
+                | ui::SCROLL_LEFT
+                | ui::PAGE_UP
+        );
+        let at_half = GamepadState {
+            left_y: 0.5,
+            right_trigger: 0.5,
+            ..none
+        };
+        assert_eq!(ui_navigation(&at_half), 0);
+    }
+
+    #[test]
+    fn default_bindings_press_the_documented_buttons() {
+        let config = InputConfig::default();
+        assert_eq!(pad(&config, &[vk::RETURN], 0).buttons, buttons::A);
+        assert_eq!(pad(&config, &[vk::BACK], 0).buttons, buttons::B);
+        assert_eq!(
+            pad(&config, &[vk::Q, vk::E], 0).buttons,
+            buttons::LEFT_SHOULDER | buttons::RIGHT_SHOULDER
+        );
+        assert_eq!(
+            pad(&config, &[vk::ESCAPE, vk::TAB], 0).buttons,
+            buttons::MENU | buttons::VIEW
+        );
+        assert_eq!(
+            pad(&config, &[vk::UP, vk::LEFT], 0).buttons,
+            buttons::DPAD_UP | buttons::DPAD_LEFT
+        );
+        let mouse = pad(
+            &config,
+            &[],
+            MouseButton::Left.bit() | MouseButton::Right.bit(),
+        );
+        assert_eq!((mouse.right_trigger, mouse.left_trigger), (1.0, 1.0));
+    }
+
+    #[test]
+    fn wasd_drives_the_left_stick_with_a_round_gate() {
+        let config = InputConfig::default();
+        let s = pad(&config, &[vk::W], 0);
+        assert_eq!((s.left_x, s.left_y), (0.0, 1.0));
+        let s = pad(&config, &[vk::S, vk::A], 0);
+        let d = std::f32::consts::FRAC_1_SQRT_2;
+        assert_eq!((s.left_x, s.left_y), (-d, -d));
+        let s = pad(&config, &[vk::W, vk::S], 0);
+        assert_eq!((s.left_x, s.left_y), (0.0, 0.0));
+        let s = pad(&config, &[vk::W, vk::S, vk::D], 0);
+        assert_eq!((s.left_x, s.left_y), (1.0, 0.0));
+    }
+
+    #[test]
+    fn rebinding_changes_the_pad() {
+        let config = InputConfig {
+            bindings: vec![Binding {
+                source: Source::Key(vk::SHIFT),
+                control: Control::RightStick(Direction::Left),
+            }],
+            ..InputConfig::default()
+        };
+        let s = pad(&config, &[vk::SHIFT, vk::W], 0);
+        assert_eq!((s.right_x, s.left_y, s.buttons), (-1.0, 0.0, 0));
+    }
+
+    #[test]
+    fn the_mouse_stick_follows_the_documented_dynamics() {
+        let mut stick = MouseStick::default();
+        stick.step(1, 0, 1.0);
+        assert_eq!(stick.x, 1024);
+        stick.step(0, 0, 1.0);
+        assert_eq!(stick.x, 896);
+        stick.step(0, 5, 1.0);
+        assert_eq!(stick.y, -5120);
+        stick.step(1000, 0, 1.0);
+        assert_eq!(stick.x, 32767);
+        let mut slow = MouseStick::default();
+        slow.step(2, 0, 0.5);
+        assert_eq!(slow.x, 1024);
+    }
+
+    #[test]
+    fn mouse_look_can_be_turned_off_and_adds_to_the_stick_keys() {
+        let mut config = InputConfig::default();
+        let stick = MouseStick { x: 16384, y: 0 };
+        let s = virtual_pad(&config, &keys(&[]), 0, stick);
+        assert!((s.right_x - 0.5).abs() < 1e-3);
+        config.mouse_look = false;
+        let s = virtual_pad(&config, &keys(&[]), 0, stick);
+        assert_eq!(s.right_x, 0.0);
+    }
+}
