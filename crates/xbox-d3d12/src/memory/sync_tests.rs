@@ -297,3 +297,51 @@ fn growing_the_window_keeps_what_the_gpu_wrote() {
         assert_eq!(region.read(3), 5);
     });
 }
+
+#[test]
+fn never_read_memory_believes_the_cpu_only_through_mark_dirty() {
+    each_gpu(false, |gpu, space, kernel| {
+        let region = Region::new(PAGE, true);
+        let at = region.address;
+        space.map_host(at, PAGE, SyncPolicy::WriteWatch).unwrap();
+        space.set_host_access(at, PAGE, HostAccess::Never);
+        region.write(0, 1);
+        kernel.run_tracked(gpu, space, &[(at, at + 8)]);
+        space.read_back(at, PAGE).unwrap();
+        assert_eq!(region.read(2), 2);
+        // An unannounced write is not copied; announced, it is.
+        region.write(0, 50);
+        kernel.run_tracked(gpu, space, &[(at, at + 12)]);
+        let mirrored = space.backing() == Backing::Mirrored;
+        space.read_back(at, PAGE).unwrap();
+        assert_eq!(region.read(3), if mirrored { 2 } else { 51 });
+        region.write(0, 60);
+        space.mark_dirty(at, 4);
+        kernel.run_tracked(gpu, space, &[(at, at + 12)]);
+        space.read_back(at, PAGE).unwrap();
+        assert_eq!(region.read(3), 61);
+    });
+}
+
+#[test]
+fn write_watch_follows_host_memory_seen_at_another_address() {
+    each_gpu(false, |gpu, space, kernel| {
+        let region = Region::new(2 * PAGE, true);
+        let alias = 0xC000_0000u64;
+        space
+            .map_host_at(alias, region.address, 2 * PAGE, SyncPolicy::WriteWatch)
+            .unwrap();
+        region.write(0, 20);
+        let (first, _) = kernel.run_tracked(gpu, space, &[(alias, alias + PAGE + 4)]);
+        assert_eq!(region.read(PAGE / 4 + 1), 21);
+        region.write(PAGE / 4 + 8, 30);
+        let (second, _) = kernel.run_tracked(gpu, space, &[(alias + PAGE + 32, alias + 8)]);
+        assert_eq!(region.read(2), 31);
+        if space.backing() == Backing::Mirrored {
+            assert_eq!(first, 2 * PAGE);
+            assert_eq!(second, 4096);
+        }
+        space.unmap(alias, 2 * PAGE).unwrap();
+        space.reclaim();
+    });
+}
