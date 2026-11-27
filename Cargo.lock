@@ -2373,6 +2373,7 @@ dependencies = [
 name = "shims"
 version = "0.1.0"
 dependencies = [
+ "assets",
  "audio-codec",
  "bvh-build",
  "config",

@@ -218,7 +218,7 @@ fn speed_on_synthetic_bc1() {
         let t = Instant::now();
         let out = decode_slice(
             &stream,
-            &super::BcPackCodec::Bc1.lane_widths().unwrap(),
+            super::BcPackCodec::Bc1.lane_widths().unwrap(),
             blocks,
         )
         .unwrap();

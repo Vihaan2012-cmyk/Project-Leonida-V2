@@ -20,7 +20,7 @@ fn pool_file(rel: &str) -> Option<Vec<u8>> {
 }
 
 /// Pixels of a BCn mip as `channels` bytes each, rows tightly packed.
-fn to_pixels(dxgi: u32, w: u32, h: u32, blocks: &[u8]) -> Option<(Vec<u8>, usize)> {
+fn to_pixels(dxgi: u32, w: u32, h: u32, blocks: &[u8]) -> Option<Plane> {
     let (bw, bh) = (w.div_ceil(4) as usize, h.div_ceil(4) as usize);
     let (block_bytes, channels) = match dxgi {
         71 | 72 => (8, 4),
@@ -46,27 +46,35 @@ fn to_pixels(dxgi: u32, w: u32, h: u32, blocks: &[u8]) -> Option<(Vec<u8>, usize
             }
         }
     }
-    Some((px, channels))
+    Some(Plane {
+        px,
+        width: bw * 4,
+        height: bh * 4,
+        channels,
+    })
 }
 
-/// Mean absolute error per channel between the 2x2 box filter of `big` and `small`, with `small` optionally
-/// shifted by `shift` pixels (the control).
-fn box_error(
-    big: &[u8],
-    bw: usize,
-    bh: usize,
-    small: &[u8],
-    sw: usize,
-    sh: usize,
-    ch: usize,
-    shift: usize,
-) -> f64 {
-    let (w, h) = (sw.min(bw / 2), sh.min(bh / 2));
+/// Pixels of one mip: `channels` bytes each, `width` pixels per row (a multiple of four).
+struct Plane {
+    px: Vec<u8>,
+    width: usize,
+    height: usize,
+    channels: usize,
+}
+
+/// Mean absolute error per channel between the 2x2 box filter of `big` and `small`, with `small` read `shift`
+/// pixels to the right (the control uses a non-zero shift).
+fn box_error(big: &Plane, small: &Plane, shift: usize) -> f64 {
+    let ch = big.channels;
+    let (w, h) = (
+        small.width.min(big.width / 2),
+        small.height.min(big.height / 2),
+    );
     let mut sum = 0u64;
     for y in 0..h {
         for x in 0..w {
             for c in 0..ch {
-                let at = |xx: usize, yy: usize| u32::from(big[(yy * bw + xx) * ch + c]);
+                let at = |xx: usize, yy: usize| u32::from(big.px[(yy * big.width + xx) * ch + c]);
                 let avg = (at(2 * x, 2 * y)
                     + at(2 * x + 1, 2 * y)
                     + at(2 * x, 2 * y + 1)
@@ -74,7 +82,8 @@ fn box_error(
                     + 2)
                     / 4;
                 let sx = (x + shift) % w;
-                sum += u64::from(avg.abs_diff(u32::from(small[(y * sw + sx) * ch + c])));
+                sum +=
+                    u64::from(avg.abs_diff(u32::from(small.px[(y * small.width + sx) * ch + c])));
             }
         }
     }
@@ -95,11 +104,10 @@ fn median(v: &mut [f64]) -> f64 {
 }
 
 /// Self-consistency over the 2D BC1/BC3/BC4/BC5 textures of a pool.
-fn survey(file: &[u8], opts: DecodeOptions, per_pool: usize) -> BTreeMap<&'static str, Stats> {
+fn survey(file: &[u8], opts: DecodeOptions, per_codec: usize) -> BTreeMap<&'static str, Stats> {
     let pool = Pool::parse(file).unwrap().with_bcpack_options(opts);
     let mut stats: BTreeMap<&'static str, Stats> = BTreeMap::new();
     let mut cache = ChunkCache::new();
-    let mut taken = 0;
     for index in 0..pool.texture_count() {
         let Some(d) = pool.descriptor(index) else {
             continue;
@@ -127,13 +135,12 @@ fn survey(file: &[u8], opts: DecodeOptions, per_pool: usize) -> BTreeMap<&'stati
         if !set.has_bcpack() {
             continue;
         }
-        if taken >= per_pool {
-            break;
-        }
-        taken += 1;
-        cache.clear();
         let st = stats.entry(name).or_default();
+        if st.seen >= per_codec {
+            continue;
+        }
         st.seen += 1;
+        cache.clear();
         let Ok(result) = pool.decode_texture(index, &mut cache) else {
             st.refused += 1;
             continue;
@@ -148,21 +155,14 @@ fn survey(file: &[u8], opts: DecodeOptions, per_pool: usize) -> BTreeMap<&'stati
         let (w1, h1) = ((w0 / 2).max(1), (h0 / 2).max(1));
         let m0 = mip_bytes(&fi, w0, h0) as usize;
         let m1 = mip_bytes(&fi, w1, h1) as usize;
-        let (Some((p0, ch)), Some((p1, _))) = (
+        let (Some(p0), Some(p1)) = (
             to_pixels(d.format, w0, h0, &t.data[..m0]),
             to_pixels(d.format, w1, h1, &t.data[m0..m0 + m1]),
         ) else {
             continue;
         };
-        let (bw0, bh0) = (w0.div_ceil(4) as usize * 4, h0.div_ceil(4) as usize * 4);
-        let (bw1, bh1) = (w1.div_ceil(4) as usize * 4, h1.div_ceil(4) as usize * 4);
-        let (cw, chh) = (
-            (w1 as usize).min(w0 as usize / 2),
-            (h1 as usize).min(h0 as usize / 2),
-        );
-        let _ = (bh1, chh);
-        let err = box_error(&p0, bw0, bh0, &p1, bw1, bh1, ch, 0);
-        let control = box_error(&p0, bw0, bh0, &p1, bw1, bh1, ch, (cw / 3).max(2));
+        let err = box_error(&p0, &p1, 0);
+        let control = box_error(&p0, &p1, (w1 as usize / 3).max(2));
         st.errors.push(err);
         st.controls.push(control);
     }
@@ -182,37 +182,44 @@ fn report(label: &str, stats: &mut BTreeMap<&'static str, Stats>) {
     }
 }
 
+/// Pools to survey: `LEONIDA_BCPACK_POOLS` (comma separated, relative to `data/ttdb`) or a small default set.
+fn survey_pools() -> Vec<String> {
+    match std::env::var("LEONIDA_BCPACK_POOLS") {
+        Ok(v) => v.split(',').map(str::to_string).collect(),
+        Err(_) => [
+            "graphics/ttdb_graphics.ttpf",
+            "peds/peds_loose.ttpf",
+            "lighting/lighting.ttpf",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+    }
+}
+
 #[test]
 fn mip_zero_downsamples_to_mip_one_on_real_pools() {
-    let mut any = false;
-    for (rel, per_pool) in [
-        ("graphics/ttdb_graphics.ttpf", 400),
-        ("lighting/lighting.ttpf", 300),
-        ("peds/peds_loose.ttpf", 300),
-    ] {
-        let Some(file) = pool_file(rel) else { continue };
-        any = true;
+    for rel in survey_pools() {
+        let Some(file) = pool_file(&rel) else {
+            continue;
+        };
         for (label, allow) in [("strict", false), ("provisional", true)] {
-            let mut stats = survey(
-                &file,
-                DecodeOptions {
-                    allow_provisional: allow,
-                },
-                per_pool,
-            );
+            let opts = DecodeOptions {
+                allow_provisional: allow,
+            };
+            let mut stats = survey(&file, opts, 400);
             report(&format!("{rel} [{label}]"), &mut stats);
-            if !allow {
-                if let Some(bc1) = stats.get_mut("BC1") {
-                    if bc1.errors.len() >= 10 {
-                        let (e, c) = (median(&mut bc1.errors), median(&mut bc1.controls));
-                        assert!(e < 12.0, "BC1 median error {e}");
-                        assert!(c > e * 1.2, "control {c} not worse than {e}");
-                    }
+            for (codec, st) in stats.iter_mut() {
+                if st.errors.len() >= 10 {
+                    let (e, c) = (median(&mut st.errors), median(&mut st.controls));
+                    assert!(e < 12.0, "{rel} {codec} median error {e}");
+                    assert!(
+                        c > e * 1.2,
+                        "{rel} {codec}: control {c} is not worse than {e}"
+                    );
                 }
             }
         }
     }
-    let _ = (any, BcPackCodec::Bc1);
 }
 
 /// Throughput of the whole chunk decode over every BC1/BC3/BC5 chunk of a pool, in decoded MB/s.
@@ -227,16 +234,11 @@ fn decode_speed_on_real_chunks() {
             allow_provisional: true,
         };
         let mut per: BTreeMap<u8, (usize, usize, f64)> = BTreeMap::new();
-        let mut lane_secs = 0.0;
         for c in pool.chunks().iter().filter(|c| (1..=5).contains(&c.codec)) {
             let codec = BcPackCodec::from_chunk_codec(c.codec).unwrap();
             let raw = &file[c.src as usize..(c.src + c.packed) as usize];
             let t = Instant::now();
             let ok = decode_with(codec, raw, c.size as usize, &opts).is_ok();
-            let l = Instant::now();
-            let _ =
-                super::lanes::decode_slice(raw, codec.lane_widths().unwrap(), c.size as usize / 8);
-            lane_secs += l.elapsed().as_secs_f64();
             let e = per.entry(c.codec).or_default();
             if ok {
                 e.0 += 1;
@@ -244,7 +246,6 @@ fn decode_speed_on_real_chunks() {
                 e.2 += t.elapsed().as_secs_f64();
             }
         }
-        eprintln!("lane stage alone: {lane_secs:.2} s");
         for (codec, (n, bytes, secs)) in per {
             eprintln!(
                 "{rel} codec {codec}: {n} chunks, {:.1} MB decoded in {secs:.2} s = {:.1} MB/s",

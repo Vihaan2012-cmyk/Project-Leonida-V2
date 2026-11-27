@@ -61,6 +61,9 @@ pub struct Chunk {
     pub pad: u64,
 }
 
+/// A chunk index with the result of decoding it.
+type Decoded = (usize, Result<Vec<u8>, ReadError>);
+
 /// Decoded chunks kept while one texture is read, so mips sharing a chunk inflate it once.
 #[derive(Default)]
 pub struct ChunkCache(HashMap<usize, Vec<u8>>);
@@ -398,7 +401,7 @@ impl<'a> Pool<'a> {
             return Ok(());
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let done: Vec<Vec<(usize, Result<Vec<u8>, ReadError>)>> = std::thread::scope(|scope| {
+        let done: Vec<Vec<Decoded>> = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..threads)
                 .map(|_| {
                     scope.spawn(|| {

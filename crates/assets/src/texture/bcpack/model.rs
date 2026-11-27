@@ -23,14 +23,14 @@ impl Model {
         let freq = &FREQ_TABLE[eab][q];
         let mut fc = [0u32; 256];
         let mut lut = Box::new([0u8; 65536]);
-        for s in 0..1usize << (eab + 1) {
+        for (s, slot) in fc.iter_mut().enumerate().take(1 << (eab + 1)) {
             let seg = (usize::BITS - s.leading_zeros()) as usize;
             let seg_start = if seg == 0 { 0 } else { 1 << (seg - 1) };
             let f = u32::from(freq[seg]);
             let c = (u32::from(base[seg]) + f * (s - seg_start) as u32) & 0xFFFF;
             // Slot 0 is the end marker, so symbol 0 gives up its first slot.
             let (f, c) = if c == 0 { (f - 1, 1) } else { (f, c) };
-            fc[s] = f << 16 | c;
+            *slot = f << 16 | c;
             lut[c as usize..(c + f) as usize].fill(s as u8);
         }
         Model { fc, lut }
