@@ -16,7 +16,7 @@ use xbox_d3d12::present::ScaleMode;
 use crate::gameinput::config::MouseButton;
 use crate::gameinput::{RawInput, submit_input};
 use crate::trace::{image_offset, note};
-use crate::{Shim, presentation};
+use crate::{Shim, fidelityfx, presentation};
 
 fn trace_note(text: String) {
     note(text);
@@ -76,6 +76,8 @@ pub fn prepare() -> Result<(), xbox_d3d12::assembly::AssemblyError> {
     xbox_d3d12::com::set_address_format(image_offset);
     assembly::set_input_sink(forward_input);
     assembly::set_frame_limit(presentation::get().frame_limit);
+    #[cfg(windows)]
+    assembly::set_heap_allocator(Some(crate::xmem::title_heap_allocator()));
     assembly::init(assembly_config()).map(|_| ())
 }
 
@@ -93,7 +95,95 @@ unsafe extern "win64" fn create_device(
         return 0x887A_0004;
     }
     // SAFETY: as the caller promises.
-    unsafe { assembly::create_assembled_device(params, riid, out) }
+    let result = unsafe { assembly::create_assembled_device(params, riid, out) };
+    if result == 0 {
+        connect_services();
+    }
+    result
+}
+
+/// DXGI formats the upscaler's host images have a pixel format for.
+fn pixel_format(dxgi: u32) -> Option<upscale::PixelFormat> {
+    use upscale::PixelFormat as P;
+    Some(match dxgi {
+        2 => P::Rgba32Float,
+        10 => P::Rgba16Float,
+        16 => P::Rg32Float,
+        24 => P::Rgb10A2Unorm,
+        26 => P::R11G11B10Float,
+        28 => P::Rgba8Unorm,
+        34 => P::Rg16Float,
+        37 => P::Rg16Snorm,
+        40 | 41 => P::R32Float,
+        54 => P::R16Float,
+        56 => P::R16Unorm,
+        61 => P::R8Unorm,
+        _ => return None,
+    })
+}
+
+/// The game's textures for the upscaler, read and written through the assembled device.
+struct Textures;
+
+impl fidelityfx::integration::TextureAccess for Textures {
+    fn read(
+        &self,
+        resource: &fidelityfx::integration::UpscaleResource,
+    ) -> Result<upscale::Image, fidelityfx::integration::UpscaleFailure> {
+        let fail = |text: String| fidelityfx::integration::UpscaleFailure(text);
+        let data = assembly::access::read_texture(resource.resource).map_err(fail)?;
+        let format = pixel_format(data.format).ok_or_else(|| {
+            fail(format!(
+                "DXGI format {} has no upscaler pixel format",
+                data.format
+            ))
+        })?;
+        Ok(upscale::Image {
+            width: data.width,
+            height: data.height,
+            format,
+            data: data.bytes,
+        })
+    }
+
+    fn write(
+        &self,
+        resource: &fidelityfx::integration::UpscaleResource,
+        image: &upscale::Image,
+    ) -> Result<(), fidelityfx::integration::UpscaleFailure> {
+        assembly::access::write_texture(resource.resource, image.width, image.height, &image.data)
+            .map_err(fidelityfx::integration::UpscaleFailure)
+    }
+}
+
+/// DirectStorage requests bound for a buffer are written into it; other GPU destinations are not supported yet.
+#[cfg(windows)]
+fn gpu_copy(upload: &crate::dstorage::GpuUpload<'_>) -> i32 {
+    use crate::dstorage::GpuDestination;
+    match upload.destination {
+        GpuDestination::Buffer { resource, offset } => {
+            match assembly::access::write_buffer(*resource, *offset, upload.data) {
+                Ok(()) => 0,
+                Err(e) => {
+                    note(format!("a DirectStorage copy into a buffer failed: {e}"));
+                    0x8000_4005_u32 as i32
+                }
+            }
+        }
+        other => {
+            note(format!(
+                "a DirectStorage request for {other:?} was not copied: only buffer destinations are supported"
+            ));
+            0x8000_4001_u32 as i32
+        }
+    }
+}
+
+/// What other layers need once the device exists: the upscaler's texture access and DirectStorage's GPU copy.
+fn connect_services() {
+    fidelityfx::integration::set_texture_access(Some(std::sync::Arc::new(Textures)));
+    #[cfg(windows)]
+    crate::dstorage::set_gpu_copy(Some(gpu_copy));
 }
 
 /// `D3D12SerializeVersionedRootSignature(desc, blob, error)`.

@@ -94,9 +94,7 @@ pub fn write_buffer(resource: usize, offset: u64, data: &[u8]) -> Result<(), Str
             data.len(),
         )
     };
-    resources
-        .space()
-        .mark_dirty(address + offset, end - offset);
+    resources.space().mark_dirty(address + offset, end - offset);
     if let Some(filter) = hooks::content_filter() {
         filter.on_upload(FilterId(u64::from(object.id)), offset, data);
     }
