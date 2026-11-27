@@ -24,6 +24,30 @@ pub enum Command {
     Run(RunArgs),
     /// Look at every file in the game folder for signs of tampering, without running or loading anything.
     Triage(TriageArgs),
+    /// Translate every shader, keep the results in the shader database and build each distinct pipeline once into the pipeline cache.
+    Pipelines(PipelinesArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PipelinesArgs {
+    /// The game folder. Searched for when omitted.
+    #[arg(long)]
+    pub game: Option<PathBuf>,
+    /// How many shaders the driver builds at once. Each large shader can take several gigabytes to build.
+    #[arg(long, default_value_t = 1)]
+    pub jobs: usize,
+    /// Stop after this many shader containers.
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Print each program with its size and how long the driver took.
+    #[arg(long)]
+    pub each: bool,
+    /// Where leonida.db and the pipeline cache are.
+    #[arg(long, default_value = "Output")]
+    pub output: PathBuf,
+    /// A folder of <hash>.spv files that replace generated shaders. May be given more than once; the first match wins.
+    #[arg(long = "overrides")]
+    pub overrides: Vec<PathBuf>,
 }
 
 #[derive(Debug, Args)]

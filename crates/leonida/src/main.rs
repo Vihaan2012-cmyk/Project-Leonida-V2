@@ -2,6 +2,7 @@ mod cli;
 mod cmd_check;
 mod cmd_exe;
 mod cmd_package;
+mod cmd_pipelines;
 mod cmd_run;
 mod cmd_shaders;
 mod cmd_verify;
@@ -31,6 +32,7 @@ fn main() -> ExitCode {
         Some(Command::Check(args)) => cmd_check::check_command(args),
         Some(Command::Run(args)) => cmd_run::run_command(args),
         Some(Command::Triage(args)) => cmd_package::triage_command(args),
+        Some(Command::Pipelines(args)) => cmd_pipelines::pipelines_command(args),
     };
     result.unwrap_or_else(|error| {
         eprintln!("error: {error:#}");
