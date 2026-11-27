@@ -7,8 +7,8 @@ fn allocations_are_aligned_and_do_not_overlap() {
     let b = va.alloc(0x10000, 0x10000).unwrap();
     let c = va.alloc(0x100, 0x100000).unwrap();
     assert_eq!(a, 0x1_0000_0000);
-    assert!(b >= a + 0x1234 && b % 0x10000 == 0);
-    assert!(c % 0x100000 == 0 && c >= b + 0x10000);
+    assert!(b >= a + 0x1234 && b.is_multiple_of(0x10000));
+    assert!(c.is_multiple_of(0x100000) && c >= b + 0x10000);
 }
 
 #[test]

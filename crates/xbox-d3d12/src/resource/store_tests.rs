@@ -47,7 +47,7 @@ fn committed_buffers_get_distinct_aligned_addresses_the_cpu_can_write() {
             resources.get(upload).unwrap().address,
             resources.get(default).unwrap().address,
         );
-        assert!(a % PAGE == 0 && b % PAGE == 0 && a != b);
+        assert!(a.is_multiple_of(PAGE) && b.is_multiple_of(PAGE) && a != b);
         assert_eq!(resources.get(upload).unwrap().size, 131072);
         assert_eq!(resources.find(a + 100_000), Some((upload, 100_000)));
         // SAFETY: committed host memory at the buffer's own address.
@@ -193,7 +193,7 @@ fn committed_textures_are_keyed_by_an_address_nothing_is_mapped_at() {
             resources.get(a).unwrap().address,
             resources.get(b).unwrap().address,
         );
-        assert!(ka >= 1 << 44 && kb >= ka + 65536 && ka % 256 == 0);
+        assert!(ka >= 1 << 44 && kb >= ka + 65536 && ka.is_multiple_of(256));
         assert!(!resources.space().is_bound(ka));
         assert_eq!(resources.find(ka + 5), Some((a, 5)));
         assert!(matches!(
@@ -261,7 +261,7 @@ fn descriptor_heap_memory_is_below_four_gib_and_bound() {
         let heap = resources
             .alloc_low(100_000, crate::memory::SyncPolicy::Always)
             .unwrap();
-        assert!(heap < 1 << 32 && heap % PAGE == 0);
+        assert!(heap < 1 << 32 && heap.is_multiple_of(PAGE));
         assert!(resources.space().is_bound(heap));
         // SAFETY: committed host memory at `heap`, at least 100,000 bytes.
         unsafe { *word(heap) = 3 };
