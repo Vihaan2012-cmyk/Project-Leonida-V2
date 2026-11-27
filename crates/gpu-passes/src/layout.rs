@@ -5,7 +5,7 @@
 //! (docs/textures.md, docs/textures_arrays.md).
 
 use crate::LayoutError;
-use crate::swizzle::{Job, Swizzle};
+use crate::swizzle::{Equation, Job, Swizzle};
 
 /// The element of a format: a pixel (`block` 1) or a 4x4 block of a BCn format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,3 +107,96 @@ pub struct Layout {
     pub linear_size: u64,
     pub subresources: Vec<Subresource>,
 }
+
+struct Mip {
+    blocks: [u32; 2],
+    padded: [u32; 2],
+    offset: u64,
+    origin: [u32; 2],
+    in_tail: bool,
+}
+
+struct Chain {
+    size: u64,
+    first_tail: u32,
+    mips: Vec<Mip>,
+}
+
+fn tail_entry_origin(entry: u32, slot: [u32; 2]) -> [u32; 2] {
+    let offset = if entry > 6 {
+        16u32 << entry
+    } else {
+        entry << 8
+    };
+    let (mut tx, mut ty) = (0, 0);
+    for bit in 0..6 {
+        tx |= ((offset >> (9 + 2 * bit)) & 1) << bit;
+        ty |= ((offset >> (8 + 2 * bit)) & 1) << bit;
+    }
+    [tx * slot[0], ty * slot[1]]
+}
+
+fn compact_chain(desc: &SurfaceDesc, eq: &Equation) -> Result<Chain, LayoutError> {
+    let Format { elem_bytes, block } = desc.format;
+    if !matches!(block, 1 | 4) {
+        return Err(LayoutError::Block(block));
+    }
+    if desc.width == 0 || desc.height == 0 {
+        return Err(LayoutError::Empty);
+    }
+    let levels = 32 - desc.width.max(desc.height).leading_zeros();
+    if desc.mips < 1 || desc.mips > levels {
+        return Err(LayoutError::MipCount(desc.mips));
+    }
+    let tile = desc.swizzle.tile_bytes() as u64;
+    let max_tail = if tile == 4096 { 8 } else { 12 };
+    let [bw, bh, _] = eq.tile_extent();
+    let slot = match elem_bytes {
+        1 => [16, 16],
+        2 => [16, 8],
+        4 => [8, 8],
+        8 => [8, 4],
+        _ => [4, 4],
+    };
+    let ew = desc.width.div_ceil(block);
+    let eh = desc.height.div_ceil(block);
+    let size_of = |m: &Mip| m.padded[0] as u64 * m.padded[1] as u64 * elem_bytes as u64;
+
+    let mut mips = Vec::new();
+    let mut first_tail = desc.mips;
+    for i in 0..desc.mips {
+        let blocks = [ew.div_ceil(1 << i).max(1), eh.div_ceil(1 << i).max(1)];
+        if desc.mips > 1 && blocks[0] <= bw / 2 && blocks[1] <= bh && desc.mips - i <= max_tail {
+            first_tail = i;
+            break;
+        }
+        mips.push(Mip {
+            blocks,
+            padded: [blocks[0].div_ceil(bw) * bw, blocks[1].div_ceil(bh) * bh],
+            offset: 0,
+            origin: [0, 0],
+            in_tail: false,
+        });
+    }
+    let mut offset = if first_tail < desc.mips { tile } else { 0 };
+    for m in mips.iter_mut().rev() {
+        m.offset = offset;
+        offset += size_of(m);
+    }
+    for i in first_tail..desc.mips {
+        let entry = max_tail - 1 - (i - first_tail);
+        mips.push(Mip {
+            blocks: [ew.div_ceil(1 << i).max(1), eh.div_ceil(1 << i).max(1)],
+            padded: [bw, bh],
+            offset: 0,
+            origin: tail_entry_origin(entry, slot),
+            in_tail: true,
+        });
+    }
+    Ok(Chain {
+        size: offset,
+        first_tail,
+        mips,
+    })
+}
+
