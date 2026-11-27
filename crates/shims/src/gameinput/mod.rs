@@ -22,6 +22,7 @@ pub mod curve;
 mod device;
 pub mod hub;
 pub mod mapping;
+pub mod settings;
 #[cfg(test)]
 mod tests;
 
