@@ -2,6 +2,9 @@
 //! graphics pages and exported as binary glTF with a JSON sidecar.
 
 mod pages;
+mod types;
+
+pub use types::*;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
