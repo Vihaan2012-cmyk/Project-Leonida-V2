@@ -256,6 +256,27 @@ pub enum ExeCommand {
         #[arg(long, default_value_t = 0)]
         depth: usize,
     },
+    /// Write every function as source-like files with an index (never commit the output).
+    ExportSource {
+        /// Where to write the tree.
+        #[arg(long, default_value = "Output/decomp/src")]
+        out: PathBuf,
+        /// Functions decompiled at once.
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+        /// Leave files that an earlier run finished as they are.
+        #[arg(long)]
+        resume: bool,
+        /// Only the files holding these: an address (0x...), a function or class name, or part of a file path.
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        /// Functions larger than this many bytes are left as stubs.
+        #[arg(long, default_value_t = 0x2_0000)]
+        max_size: u32,
+        /// Functions per file for code with no known source file or class.
+        #[arg(long, default_value_t = 200)]
+        per_file: usize,
+    },
     /// Code that calls, jumps to or references an address, an import or a string.
     Xrefs {
         /// A hex RVA or virtual address.

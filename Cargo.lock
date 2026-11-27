@@ -1150,6 +1150,7 @@ dependencies = [
  "shader-store",
  "shader-translate",
  "shims",
+ "source-export",
  "systems",
  "tempfile",
  "vfs",
