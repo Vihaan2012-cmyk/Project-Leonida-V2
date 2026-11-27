@@ -453,3 +453,43 @@ fn packed_float_math_and_intrinsics_read_as_such() {
     assert!(text.contains("_mm256_hadd_ps("), "{text}");
     assert!(text.contains(" * "), "{text}");
 }
+
+#[test]
+fn division_by_a_magic_multiplier_is_a_division() {
+    let text = run(|a| {
+        a.mov(eax, ecx)?;
+        a.mov(edx, 0xAAAA_AAABu32)?;
+        a.imul_2(rax, rdx)?;
+        a.shr(rax, 33)?;
+        a.ret()
+    });
+    assert!(text.contains("return a1 / 3;"), "{text}");
+}
+
+#[test]
+fn string_literals_and_flag_folding() {
+    let mut image = Image::new(assemble(|a| {
+        a.sub(rsp, 0x28)?;
+        ip_load(a, Code::Lea_r64_m, Register::RCX, DATA)?;
+        a.mov(rbx, rdx)?;
+        a.call(START + 0x80)?;
+        a.cmp(ebx, 5)?;
+        a.setl(al)?;
+        a.mov(edx, 9)?;
+        a.cmp(ebx, 100)?;
+        a.cmovg(ebx, edx)?;
+        a.movzx(eax, al)?;
+        a.add(eax, ebx)?;
+        a.add(rsp, 0x28)?;
+        a.ret()
+    }));
+    image.function_len = 0x80;
+    image.code.resize(0x90, 0xCC);
+    image.data = b"hello\0".to_vec();
+    image.texts.insert(DATA, "hello".into());
+    let text = decompile(&image, START).expect("decompiles");
+    assert!(text.contains("sub_00001080(\"hello\")"), "{text}");
+    assert!(text.contains("(int32_t)"), "{text}");
+    assert!(text.contains("< 5"), "{text}");
+    assert!(text.contains("> 0x64 ? 9 :"), "{text}");
+}

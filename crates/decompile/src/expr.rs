@@ -402,7 +402,44 @@ pub fn simplify(e: Expr) -> Expr {
             (a, b) => Expr::Binary(op, Box::new(a), Box::new(b)),
         },
         Expr::Unary("!", a) => negate(*a),
+        Expr::Binary(">>", product, shift) => match (*product, *shift) {
+            (Expr::Binary("*", x, m), Expr::Const(s, _))
+                if is_u32(&x) && matches!(*m, Expr::Const(..)) && (32..64).contains(&s) =>
+            {
+                let Expr::Const(m, _) = *m else { unreachable!() };
+                match magic_divisor(m, s as u32) {
+                    Some(n) => bin("/", *x, Expr::Const(n, 4)),
+                    None => bin(">>", bin("*", *x, Expr::Const(m, 8)), Expr::Const(s, 1)),
+                }
+            }
+            (a, b) => bin(">>", a, b),
+        },
         other => other,
+    })
+}
+
+fn is_u32(e: &Expr) -> bool {
+    match e {
+        Expr::Param(_, 4, false) | Expr::Load(_, 4, false) => true,
+        Expr::Var(loc, 4) => !loc.is_vector(),
+        Expr::Cast("uint32_t", _) => true,
+        _ => false,
+    }
+}
+
+/// The `n` for which `x * m >> s` equals `x / n` for every 32-bit `x`.
+fn magic_divisor(m: u64, s: u32) -> Option<u64> {
+    if m == 0 || m >= 1 << 33 {
+        return None;
+    }
+    let power = 1u128 << s;
+    let floor = (power / u128::from(m)) as u64;
+    [floor, floor + 1].into_iter().find(|&n| {
+        n > 1 && {
+            let n128 = u128::from(n);
+            let ceil = power.div_ceil(n128);
+            ceil == u128::from(m) && ceil * n128 - power <= 1u128 << (s - 32)
+        }
     })
 }
 
