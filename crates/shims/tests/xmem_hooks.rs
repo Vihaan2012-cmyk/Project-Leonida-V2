@@ -117,6 +117,71 @@ fn inside(window: (u64, u64), base: *mut c_void, len: u64) -> bool {
     base >= window.0 && base + len <= window.0 + window.1
 }
 
+fn below_4_gib(base: *mut c_void, len: u64) -> bool {
+    let base = base as u64;
+    base >= PAGE && base + len <= 4 * GIB
+}
+
+/// The title's 185 MiB reserve holds its first descriptor heap, which shaders reach with 32-bit pointers.
+#[test]
+fn the_placeholder_the_title_carves_its_descriptor_heap_from_is_placed_below_4_gib() {
+    let window = (64 * GIB, 64 * GIB);
+    let hooks = Installed::new(window);
+    let reserve: VirtualAlloc = shim("XMemVirtualAlloc");
+    // SAFETY: the shapes the executable uses.
+    unsafe {
+        let size = 185 << 20;
+        let heap = reserve(std::ptr::null_mut(), size, 0x4_2000, 0x7, 0x1);
+        assert!(below_4_gib(heap, size as u64), "{heap:p}");
+        assert_eq!(heap as u64 % PAGE, 0);
+
+        let physical = reserve(
+            std::ptr::null_mut(),
+            4 * PAGE as usize,
+            0x2040_2000,
+            0x23,
+            0x2004,
+        );
+        assert!(
+            inside(window, physical, 4 * PAGE),
+            "{physical:p}: a reserve without the placeholder bit"
+        );
+        let committed = reserve(
+            std::ptr::null_mut(),
+            2 * PAGE as usize,
+            0x2040_3000,
+            0x183,
+            0x2004,
+        );
+        assert!(inside(window, committed, 2 * PAGE));
+        let cpu_only = reserve(std::ptr::null_mut(), 2 * PAGE as usize, 0x4_2000, 0x1, 0x1);
+        assert!(
+            !below_4_gib(cpu_only, 2 * PAGE),
+            "not GPU-visible: left to Windows"
+        );
+
+        let large = reserve(
+            std::ptr::null_mut(),
+            (1 << 30) + PAGE as usize,
+            0x4_2000,
+            0x7,
+            0x1,
+        );
+        assert!(
+            inside(window, large, (1 << 30) + PAGE),
+            "{large:p}: too large to share the low gigabytes"
+        );
+        assert_eq!(
+            hooks.take(),
+            vec![Event::Mapped(
+                committed as u64,
+                2 * PAGE,
+                SyncPolicy::WriteWatch
+            )]
+        );
+    }
+}
+
 #[test]
 fn gpu_allocations_are_placed_in_the_window_reported_and_unreported_on_free() {
     let window = (64 * GIB, 64 * GIB);
@@ -152,7 +217,7 @@ fn placement_stays_under_the_end_of_a_window_from_zero() {
     // SAFETY: the shapes the executable uses.
     unsafe {
         let placeholder = reserve(std::ptr::null_mut(), 16 * PAGE as usize, 0x4_2000, 0x7, 0x1);
-        assert!(inside(window, placeholder, 16 * PAGE));
+        assert!(below_4_gib(placeholder, 16 * PAGE));
         let committed = reserve(
             std::ptr::null_mut(),
             3 * PAGE as usize,
@@ -183,7 +248,7 @@ fn a_window_too_small_fails_the_call_with_a_note() {
     unsafe {
         assert!(alloc(0x7_0000, 0x3).is_null());
         assert!(
-            reserve(std::ptr::null_mut(), 0x9_0000, 0x4_2000, 0x7, 0x1).is_null(),
+            reserve(std::ptr::null_mut(), 0x9_0000, 0x2040_2000, 0x23, 0x2004).is_null(),
             "a placeholder too"
         );
         assert!(
@@ -241,7 +306,7 @@ fn physical_pages_are_reported_where_mapped_remapped_unmapped_and_freed() {
     // SAFETY: the shapes the executable uses; every pointer is valid.
     unsafe {
         let base = reserve(std::ptr::null_mut(), 16 * PAGE as usize, 0x4_2000, 0x7, 0x1);
-        assert!(inside(window, base, 16 * PAGE));
+        assert!(below_4_gib(base, 16 * PAGE));
         let start = base as u64;
         let inner = (start + 4 * PAGE) as *mut c_void;
         assert_eq!(

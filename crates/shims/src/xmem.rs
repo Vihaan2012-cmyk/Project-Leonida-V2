@@ -21,14 +21,26 @@
 //! - `XMemTransferMemory(direction, size)`: moves budget between the title's and the system's partitions on
 //!   the console; a PC has one pool, so it succeeds and moves nothing. Each distinct pair is traced.
 //!
+//! `XMemAlloc` and `XMemFree` run the title's allocation hooks (`title_hooks`), and `XMemAllocDefault` and
+//! `XMemFreeDefault`, where the hook chains end, do the allocating.
+//!
 //! With `xbox_d3d12::memory::hooks` installed, memory the GPU reads is placed inside the hooks' window and
-//! reported as it is committed, mapped, unmapped and freed. The title's own `VirtualFree` of such memory goes
-//! to the host and is not seen. Memory counts as GPU-visible when the attribute word has bit 0x2 or the
+//! reported as it is committed, mapped, unmapped and freed. The title frees such memory with `VirtualFree` as
+//! well; `virtual_free` serves that import and reports what it releases. A placeholder reserve that may back a
+//! descriptor heap is placed below 4 GiB instead (`backs_descriptor_heap`). Memory counts as GPU-visible when the attribute word has bit 0x2 or the
 //! protection has a `PAGE_GRAPHICS_*` bit: bit 0x2 is set in every one of the 23 measured calls whose protection
 //! has one (and in the placeholder the physical reserves are carved from) and clear in the two that have none
 //! (0x181 and 0x21). That is a correlation across the measured constants, not a documented meaning.
 
 use crate::Shim;
+
+#[cfg(windows)]
+mod title_hooks;
+#[cfg(windows)]
+mod virtual_free;
+
+#[cfg(windows)]
+pub use title_hooks::{EXPORT_NAME, TitleHeapAllocator, title_heap_allocator};
 
 pub const PAGE: usize = 64 * 1024;
 
@@ -52,10 +64,10 @@ mod imp {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    use xbox_d3d12::memory::SyncPolicy;
     use xbox_d3d12::memory::hooks::{self, GpuMemoryHooks};
+    use xbox_d3d12::memory::{LOW_LIMIT, SyncPolicy};
 
-    use super::PAGE;
+    use super::{PAGE, title_hooks};
     use crate::trace::note;
 
     const TRUE: i32 = 1;
@@ -78,20 +90,20 @@ mod imp {
         attributes & GPU_ATTRIBUTE != 0 || protect & GRAPHICS_PROTECT != 0
     }
 
-    struct State {
+    pub(super) struct State {
         /// Placeholder reservations: start to length.
-        placeholders: BTreeMap<usize, usize>,
+        pub(super) placeholders: BTreeMap<usize, usize>,
         /// Physical pages by number less one; `None` once freed.
         pages: Vec<Option<usize>>,
         /// Mapped addresses and the page there.
         views: BTreeMap<usize, usize>,
         /// Reservations of GPU-visible memory made while hooks were installed: start to length.
-        gpu_reserved: BTreeMap<usize, usize>,
+        pub(super) gpu_reserved: BTreeMap<usize, usize>,
         /// Committed regions reported to the hooks as mapped, to report them unmapped when freed.
-        gpu_mapped: BTreeMap<usize, usize>,
+        pub(super) gpu_mapped: BTreeMap<usize, usize>,
     }
 
-    static STATE: Mutex<State> = Mutex::new(State {
+    pub(super) static STATE: Mutex<State> = Mutex::new(State {
         placeholders: BTreeMap::new(),
         pages: Vec::new(),
         views: BTreeMap::new(),
@@ -99,7 +111,33 @@ mod imp {
         gpu_mapped: BTreeMap::new(),
     });
 
+    /// `XMemAlloc`: the title's allocation hook when the executable has one, else the allocation the hook chain
+    /// ends in. The hook is what a console `XMemAlloc` runs (`title_hooks` has the measurements).
     pub extern "win64" fn alloc(size: usize, attributes: u64) -> *mut c_void {
+        match title_hooks::current().and_then(|hooks| hooks.alloc) {
+            // SAFETY: a hook of the loaded title, called as the console's `XMemAlloc` calls it.
+            Some(hook) => unsafe { hook(size, attributes) },
+            None => alloc_default(size, attributes),
+        }
+    }
+
+    /// `XMemFree`: through the title's free hook when there is one.
+    pub extern "win64" fn free(address: *mut c_void, attributes: u64) {
+        match title_hooks::current().and_then(|hooks| hooks.free) {
+            // SAFETY: as in `alloc`.
+            Some(hook) => unsafe { hook(address, attributes) },
+            None => free_default(address, attributes),
+        }
+    }
+
+    /// `XMemAllocDefault`: the allocation itself, which the last node of every hook chain calls.
+    pub extern "win64" fn alloc_default(size: usize, attributes: u64) -> *mut c_void {
+        let address = allocate(size, attributes);
+        title_hooks::note_default_allocation(address as usize);
+        address
+    }
+
+    fn allocate(size: usize, attributes: u64) -> *mut c_void {
         if attributes & GPU_ATTRIBUTE != 0
             && let Some(hooks) = hooks::current()
         {
@@ -122,7 +160,8 @@ mod imp {
         }
     }
 
-    pub extern "win64" fn free(address: *mut c_void, _attributes: u64) {
+    /// `XMemFreeDefault`.
+    pub extern "win64" fn free_default(address: *mut c_void, _attributes: u64) {
         if address.is_null() {
             return;
         }
@@ -139,7 +178,7 @@ mod imp {
         unsafe { VirtualFree(address, 0, MEM_RELEASE) };
     }
 
-    fn report_mapped(
+    pub(super) fn report_mapped(
         hooks: &dyn GpuMemoryHooks,
         at: usize,
         length: usize,
@@ -156,7 +195,7 @@ mod imp {
         }
     }
 
-    fn report_unmapped(hooks: &dyn GpuMemoryHooks, at: usize, length: usize) {
+    pub(super) fn report_unmapped(hooks: &dyn GpuMemoryHooks, at: usize, length: usize) {
         if let Err(e) = hooks.unmapped(at as u64, length as u64) {
             note(format!(
                 "the GPU cannot unmap {at:#x}+{length:#x} of game memory: {e}"
@@ -196,6 +235,38 @@ mod imp {
             // SAFETY: the allocation just made.
             unsafe { VirtualFree(base, 0, MEM_RELEASE) };
             return std::ptr::null_mut();
+        }
+        base
+    }
+
+    /// The allocation type a title passes to ask for a placeholder it carves itself (`MEM_RESERVE_PLACEHOLDER`).
+    const TITLE_PLACEHOLDER: u32 = MEM_RESERVE_PLACEHOLDER;
+    /// The largest reserve moved below 4 GiB. A judgement, not a measurement: the one measured reserve is 185 MiB
+    /// and the whole low gigabytes are shared with every descriptor heap.
+    const LOW_RESERVE_LIMIT: usize = 1 << 30;
+
+    /// Whether a GPU-visible reserve may back a descriptor heap, which the shaders reach with 32-bit pointers.
+    ///
+    /// Of the 23 `XMemVirtualAlloc` call sites in the 1.0.2.1 executable, exactly one asks for a placeholder
+    /// (allocation type 0x42000, attributes 7, protection 1; `sub_01e86440`). It is the 185 MiB reserve the
+    /// title splits with `VirtualFree` into five ranges and re-reserves with `0x20406000`; the heap of the first
+    /// `CreateDescriptorHeap` is its first three ranges, at the address stored at 0x75df188. Every other site
+    /// reserves for itself, commits, or carves inside a placeholder that already exists. The rule is therefore
+    /// the placeholder bit, with no console bits besides, up to `LOW_RESERVE_LIMIT`; anything else keeps the
+    /// window placement.
+    fn backs_descriptor_heap(allocation_type: u32, size: usize) -> bool {
+        allocation_type & TITLE_PLACEHOLDER != 0
+            && allocation_type & (MEM_COMMIT | MEM_PHYSICAL) == 0
+            && size <= LOW_RESERVE_LIMIT
+    }
+
+    /// Reserves below 4 GiB, from the top, away from where the resource step hands out its own low addresses.
+    fn place_low(size: usize, flags: u32, protect: u32) -> *mut c_void {
+        let base = place((PAGE as u64, LOW_LIMIT - PAGE as u64), size, flags, protect);
+        if base.is_null() {
+            note(format!(
+                "no room below 4 GiB for {size:#x} bytes the title may put a descriptor heap in"
+            ));
         }
         base
     }
@@ -351,12 +422,19 @@ mod imp {
         }
         if reserve_only && size.is_multiple_of(PAGE) && (address as usize).is_multiple_of(PAGE) {
             let base = match hooks.as_deref() {
-                Some(hooks) if gpu && address.is_null() => place_gpu(
-                    hooks,
-                    size,
-                    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                    PAGE_NOACCESS,
-                ),
+                Some(hooks) if gpu && address.is_null() => {
+                    let flags = MEM_RESERVE | MEM_RESERVE_PLACEHOLDER;
+                    let low = if backs_descriptor_heap(allocation_type, size) {
+                        place_low(size, flags, PAGE_NOACCESS)
+                    } else {
+                        std::ptr::null_mut()
+                    };
+                    if low.is_null() {
+                        place_gpu(hooks, size, flags, PAGE_NOACCESS)
+                    } else {
+                        low
+                    }
+                }
                 // SAFETY: a placeholder reservation, at the program's address if it named one.
                 _ => unsafe {
                     VirtualAlloc2(
@@ -478,6 +556,18 @@ mod imp {
         if start + size < base + length && !split(start, size) {
             return false;
         }
+        record_split(&mut state, start, size);
+        true
+    }
+
+    /// Records that `start..start + size` is a placeholder of its own, split out of the one that held it.
+    pub(super) fn record_split(state: &mut State, start: usize, size: usize) {
+        let Some((&base, &length)) = state.placeholders.range(..=start).next_back() else {
+            return;
+        };
+        if start + size > base + length {
+            return;
+        }
         state.placeholders.remove(&base);
         if start > base {
             state.placeholders.insert(base, start - base);
@@ -488,7 +578,6 @@ mod imp {
                 .insert(start + size, base + length - start - size);
         }
         state.placeholders.insert(start, size);
-        true
     }
 
     /// # Safety
@@ -804,9 +893,9 @@ pub fn shims() -> Vec<Shim> {
     {
         let list: [(&str, usize); 12] = [
             ("XMemAlloc", imp::alloc as *const () as usize),
-            ("XMemAllocDefault", imp::alloc as *const () as usize),
+            ("XMemAllocDefault", imp::alloc_default as *const () as usize),
             ("XMemFree", imp::free as *const () as usize),
-            ("XMemFreeDefault", imp::free as *const () as usize),
+            ("XMemFreeDefault", imp::free_default as *const () as usize),
             ("XMemVirtualAlloc", imp::virtual_alloc as *const () as usize),
             (
                 "XMemAllocatePhysicalPages",
@@ -837,13 +926,16 @@ pub fn shims() -> Vec<Shim> {
                 imp::transfer_memory as *const () as usize,
             ),
         ];
-        list.into_iter()
+        let mut shims: Vec<Shim> = list
+            .into_iter()
             .map(|(name, address)| Shim {
                 dll: "xmem.dll",
                 name,
                 address,
             })
-            .collect()
+            .collect();
+        shims.extend(virtual_free::shims());
+        shims
     }
     #[cfg(not(windows))]
     {
