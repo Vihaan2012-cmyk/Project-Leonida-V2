@@ -42,6 +42,7 @@ rdna = { path = "crates/rdna" }
 shader-ir = { path = "crates/shader-ir" }
 shader-translate = { path = "crates/shader-translate" }
 testkit = { path = "crates/testkit" }
+assets = { path = "crates/assets" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
