@@ -10,6 +10,7 @@ mod image;
 mod pipeline;
 mod command;
 mod staging;
+mod bindless;
 
 pub use error::{RenderError, Result};
 pub use format::{Format, level_extent, mip_count};
@@ -25,6 +26,7 @@ pub use image::{Image, ImageDesc, ImageKind, ImageView, ViewDesc};
 pub use pipeline::{ComputePipeline, DescriptorSet, PipelineLayout, SetLayout};
 pub use command::{CommandBuffer, CommandStream, ImageBarrier};
 pub use staging::{StagingRing, StagingSlice};
+pub use bindless::{BindlessSet, BindlessSizes, BindlessView, FlushReport};
 
 /// SPIR-V compiled from the WGSL files in `shaders/` by `naga` at build time.
 pub mod shaders {
