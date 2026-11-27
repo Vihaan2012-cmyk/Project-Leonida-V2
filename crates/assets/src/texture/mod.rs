@@ -10,10 +10,12 @@ pub mod bcpack;
 pub mod dds;
 pub mod format;
 pub mod layout;
+pub mod pool;
 pub mod tiling;
 
 pub use bcpack::BcPackCodec;
 pub use format::{FormatInfo, format_info};
+pub use pool::{ChunkCache, Pool, PoolError, TextureDescriptor};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
