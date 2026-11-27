@@ -131,3 +131,51 @@ fn quantized_block_decodes_octahedral_normals_and_snorm_uvs() {
     }
 }
 
+#[test]
+fn indices_cross_cluster_boundaries_and_short_references() {
+    let n = 300usize;
+    let positions: Vec<[f32; 3]> = (0..n)
+        .map(|i| [i as f32, (i * i % 17) as f32, 0.0])
+        .collect();
+    let triangles: Vec<[u32; 3]> = (0..n as u32 - 2).map(|i| [i, i + 1, i + 2]).collect();
+    for short in [false, true] {
+        let mut g = GeometrySpec::quad();
+        g.positions = positions.clone();
+        g.triangles = triangles.clone();
+        g.short_refs = short;
+        let set = decode_resource(&drawable_resource(&DrawableSpec::simple(g)), None).unwrap();
+        let d = &set.drawables[0].lods[0].models[0].geometries[0];
+        let flat: Vec<u32> = triangles.iter().flatten().copied().collect();
+        assert_eq!(d.indices, flat);
+    }
+}
+
+#[test]
+fn winding_follows_the_stored_normals() {
+    let mut g = GeometrySpec::quad();
+    g.form = PositionForm::Float;
+    g.positions = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ];
+    g.normals = Some(vec![[0.0, 0.0, -1.0]; 4]);
+    let set = decode_resource(&drawable_resource(&DrawableSpec::simple(g)), None).unwrap();
+    let d = &set.drawables[0].lods[0].models[0].geometries[0];
+    assert_eq!(d.indices, vec![0, 2, 1, 0, 3, 2]);
+}
+
+fn skinned_spec(
+    skin: SkinForm,
+    influences: Vec<Vec<(u16, u8)>>,
+    palette: Vec<u32>,
+) -> DrawableSpec {
+    let mut g = GeometrySpec::quad();
+    g.skin = skin;
+    g.influences = influences;
+    let mut d = DrawableSpec::simple(g);
+    d.lods[0].1[0].palette = palette;
+    d
+}
+
