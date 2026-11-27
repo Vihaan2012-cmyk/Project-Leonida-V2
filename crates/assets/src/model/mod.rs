@@ -11,6 +11,8 @@ mod vertex;
 
 #[cfg(test)]
 mod testdata;
+#[cfg(test)]
+mod tests;
 
 pub use gltf::{ExportOptions, ExportedModel, LodSelection, export};
 pub use sidecar::parameter_name;
