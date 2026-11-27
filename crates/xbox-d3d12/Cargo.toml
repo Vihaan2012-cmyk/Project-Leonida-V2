@@ -6,10 +6,18 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ash.workspace = true
+sha2.workspace = true
+shader-container.workspace = true
+shader-ir.workspace = true
+shader-translate.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
+[dev-dependencies]
+rdna.workspace = true
+shader-container = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

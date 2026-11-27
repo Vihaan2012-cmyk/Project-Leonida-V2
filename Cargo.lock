@@ -3231,6 +3231,12 @@ checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 name = "xbox-d3d12"
 version = "0.1.0"
 dependencies = [
+ "ash",
+ "rdna",
+ "sha2",
+ "shader-container",
+ "shader-ir",
+ "shader-translate",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
 ]
