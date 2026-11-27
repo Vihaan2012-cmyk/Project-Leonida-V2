@@ -122,17 +122,15 @@ pub fn pair_regions(markers: &[Marker]) -> Vec<Region> {
     for name in names {
         let mut same = markers.iter().filter(|m| m.name == name).peekable();
         while let Some(m) = same.next() {
-            if m.value == start_hash {
-                if let Some(e) = same.peek() {
-                    if e.value == end_hash && e.offset >= m.offset {
-                        regions.push(Region {
-                            name,
-                            start: m.offset,
-                            end: e.offset,
-                        });
-                        same.next();
-                    }
-                }
+            if m.value != start_hash {
+                continue;
+            }
+            if let Some(e) = same.next_if(|e| e.value == end_hash && e.offset >= m.offset) {
+                regions.push(Region {
+                    name,
+                    start: m.offset,
+                    end: e.offset,
+                });
             }
         }
     }
@@ -175,10 +173,14 @@ impl<'a> Awc<'a> {
         let count = rd_u32(data, 8, "ADAT header")? as usize;
         let header_size = rd_u32(data, 12, "ADAT header")?;
         if header_size as usize > data.len() || header_size < 16 {
-            return Err(Error::Invalid(format!("ADAT header size {header_size} out of range")));
+            return Err(Error::Invalid(format!(
+                "ADAT header size {header_size} out of range"
+            )));
         }
         if count > (header_size as usize - 16) / 4 {
-            return Err(Error::Invalid(format!("ADAT stream count {count} does not fit the header")));
+            return Err(Error::Invalid(format!(
+                "ADAT stream count {count} does not fit the header"
+            )));
         }
         let mut at = 16usize;
         if flags & FLAG_TABLE_4 != 0 {
@@ -217,7 +219,9 @@ impl<'a> Awc<'a> {
             streams.push(AwcStream { id, tags });
         }
         if at > header_size as usize {
-            return Err(Error::Invalid("ADAT tables run past the declared header size".into()));
+            return Err(Error::Invalid(
+                "ADAT tables run past the declared header size".into(),
+            ));
         }
         Ok(Self {
             data,
@@ -243,7 +247,12 @@ impl<'a> Awc<'a> {
         })
     }
 
-    fn require<'s>(&self, stream: &'s AwcStream, kind: u8, name: &'static str) -> Result<&'s AwcTag> {
+    fn require<'s>(
+        &self,
+        stream: &'s AwcStream,
+        kind: u8,
+        name: &'static str,
+    ) -> Result<&'s AwcTag> {
         stream.tag(kind).ok_or(Error::MissingTag(name))
     }
 
@@ -276,7 +285,9 @@ impl<'a> Awc<'a> {
         };
         let d = self.tag_data(tag)?;
         if d.len() % 16 != 0 {
-            return Err(Error::Invalid("marker tag size is not a multiple of 16".into()));
+            return Err(Error::Invalid(
+                "marker tag size is not a multiple of 16".into(),
+            ));
         }
         Ok(d.chunks_exact(16)
             .map(|c| {
@@ -321,7 +332,9 @@ impl<'a> Awc<'a> {
 /// Block index for a sample position from a seek table: entry `i` is the first sample of block `i`, so this is
 /// the last block that starts at or before `sample`.
 pub fn seek_block(table: &[u32], sample: u32) -> usize {
-    table.partition_point(|&start| start <= sample).saturating_sub(1)
+    table
+        .partition_point(|&start| start <= sample)
+        .saturating_sub(1)
 }
 
 #[cfg(test)]
@@ -351,7 +364,10 @@ pub(crate) mod build {
         out.extend_from_slice(&flags.to_le_bytes());
         out.extend_from_slice(&(n as u32).to_le_bytes());
         out.extend_from_slice(&(header_len as u32).to_le_bytes());
-        out.resize(header_len - n * 4 - streams.iter().map(|s| s.tags.len() * 8).sum::<usize>(), 0);
+        out.resize(
+            header_len - n * 4 - streams.iter().map(|s| s.tags.len() * 8).sum::<usize>(),
+            0,
+        );
         for s in streams {
             out.extend_from_slice(&(s.id | ((s.tags.len() as u32) << 29)).to_le_bytes());
         }
@@ -427,7 +443,10 @@ mod tests {
             let f2 = awc.format(awc.stream_by_id(7).unwrap()).unwrap();
             assert_eq!(f2.codec, Codec::Opus);
             assert_eq!(f2.channels, 2);
-            assert!(matches!(awc.data(awc.stream_by_id(7).unwrap()), Err(Error::MissingTag(_))));
+            assert!(matches!(
+                awc.data(awc.stream_by_id(7).unwrap()),
+                Err(Error::MissingTag(_))
+            ));
         }
     }
 
@@ -465,7 +484,10 @@ mod tests {
         );
         bytes.truncate(bytes.len() - 4);
         let awc = Awc::parse(&bytes).unwrap();
-        assert!(matches!(awc.data(&awc.streams[0]), Err(Error::Truncated { .. })));
+        assert!(matches!(
+            awc.data(&awc.streams[0]),
+            Err(Error::Truncated { .. })
+        ));
     }
 
     #[test]
@@ -486,7 +508,10 @@ mod tests {
                 m.extend_from_slice(&v.to_le_bytes());
             }
         }
-        let seek: Vec<u8> = [0u32, 11520, 23040, 34560].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let seek: Vec<u8> = [0u32, 11520, 23040, 34560]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         let bytes = bank(
             0,
             &[StreamSpec {
@@ -503,8 +528,16 @@ mod tests {
         assert_eq!(
             regions,
             vec![
-                Region { name: 0x22, start: 200, end: 900 },
-                Region { name: 0x22, start: 1000, end: 1500 },
+                Region {
+                    name: 0x22,
+                    start: 200,
+                    end: 900
+                },
+                Region {
+                    name: 0x22,
+                    start: 1000,
+                    end: 1500
+                },
             ]
         );
         let table = awc.seek_table(s).unwrap();

@@ -19,8 +19,9 @@ fn crc_table() -> [u32; 256] {
 /// Ogg's CRC-32: polynomial 0x04C11DB7, no reflection, zero start and no final xor.
 pub fn crc32(data: &[u8]) -> u32 {
     let t = crc_table();
-    data.iter()
-        .fold(0u32, |crc, &b| (crc << 8) ^ t[((crc >> 24) as u8 ^ b) as usize])
+    data.iter().fold(0u32, |crc, &b| {
+        (crc << 8) ^ t[((crc >> 24) as u8 ^ b) as usize]
+    })
 }
 
 pub const FLAG_CONTINUED: u8 = 1;

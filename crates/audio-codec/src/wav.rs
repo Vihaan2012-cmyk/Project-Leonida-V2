@@ -27,7 +27,14 @@ fn chunk(out: &mut Vec<u8>, id: &[u8; 4], body: &[u8]) {
     }
 }
 
-fn build(format_tag: u16, bits: u16, rate: u32, channels: u16, data: Vec<u8>, extras: &WavExtras) -> Vec<u8> {
+fn build(
+    format_tag: u16,
+    bits: u16,
+    rate: u32,
+    channels: u16,
+    data: Vec<u8>,
+    extras: &WavExtras,
+) -> Vec<u8> {
     let block_align = channels * bits / 8;
     let mut fmt = Vec::new();
     fmt.extend_from_slice(&format_tag.to_le_bytes());
@@ -111,14 +118,17 @@ impl Wav {
         let mut extras = WavExtras::default();
         while at + 8 <= bytes.len() {
             let id = &bytes[at..at + 4];
-            let size = u32::from_le_bytes([bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]]) as usize;
+            let size =
+                u32::from_le_bytes([bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]])
+                    as usize;
             let body = bytes.get(at + 8..at + 8 + size).ok_or(Error::Truncated {
                 what: "WAV chunk",
                 offset: at,
                 need: size,
                 have: bytes.len().saturating_sub(at + 8),
             })?;
-            let u32_at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+            let u32_at =
+                |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
             match id {
                 b"fmt " if size >= 16 => {
                     fmt = Some((
@@ -205,7 +215,10 @@ mod tests {
             bytes.len() - 8
         );
         let wav = Wav::parse(&bytes).unwrap();
-        assert_eq!((wav.sample_rate, wav.channels, wav.bits, wav.float), (32000, 2, 16, false));
+        assert_eq!(
+            (wav.sample_rate, wav.channels, wav.bits, wav.float),
+            (32000, 2, 16, false)
+        );
         assert_eq!(wav.samples_i16().unwrap(), samples);
         assert_eq!(wav.extras, extras);
     }
@@ -222,7 +235,15 @@ mod tests {
 
     #[test]
     fn odd_sized_chunks_are_padded() {
-        let bytes = pcm16_wav(8000, 1, &[1, 2, 3], &WavExtras { cues: vec![1], loops: vec![] });
+        let bytes = pcm16_wav(
+            8000,
+            1,
+            &[1, 2, 3],
+            &WavExtras {
+                cues: vec![1],
+                loops: vec![],
+            },
+        );
         assert_eq!(bytes.len() % 2, 0);
         assert!(Wav::parse(&bytes).is_ok());
         assert!(Wav::parse(&bytes[..20]).is_err());

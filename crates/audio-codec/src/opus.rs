@@ -27,7 +27,12 @@ pub fn packet_frames(packet: &[u8]) -> Result<u32> {
         0 => 1,
         1 | 2 => 2,
         _ => {
-            let n = u32::from(*packet.get(1).ok_or_else(|| Error::Invalid("Opus packet without a frame count".into()))? & 0x3F);
+            let n = u32::from(
+                *packet
+                    .get(1)
+                    .ok_or_else(|| Error::Invalid("Opus packet without a frame count".into()))?
+                    & 0x3F,
+            );
             if n == 0 {
                 return Err(Error::Invalid("Opus packet with zero frames".into()));
             }
@@ -90,7 +95,10 @@ pub fn ogg_opus(
     if packets.is_empty() {
         return Err(Error::Invalid("no Opus packets".into()));
     }
-    let durations: Vec<u32> = packets.iter().map(|p| packet_frames(p)).collect::<Result<_>>()?;
+    let durations: Vec<u32> = packets
+        .iter()
+        .map(|p| packet_frames(p))
+        .collect::<Result<_>>()?;
     let total: u64 = durations.iter().map(|&d| u64::from(d)).sum();
     let pre_skip = u64::from(pre_skip).min(total);
     let target = pre_skip + frames;
@@ -129,7 +137,10 @@ pub fn ogg_opus(
     while start < used {
         let n = OggWriter::packets_per_page(&lengths[start..]).min(40);
         let end = start + n;
-        running += durations[start..end].iter().map(|&d| u64::from(d)).sum::<u64>();
+        running += durations[start..end]
+            .iter()
+            .map(|&d| u64::from(d))
+            .sum::<u64>();
         let last = end == used;
         let granule = if last { running.min(target) } else { running };
         w.page(
@@ -146,13 +157,22 @@ pub fn ogg_opus(
 pub fn stream_to_ogg(awc: &Awc<'_>, stream: &AwcStream, pre_skip: u16) -> Result<Vec<u8>> {
     let fmt = awc.format(stream)?;
     if fmt.codec != Codec::Opus {
-        return Err(Error::Invalid(format!("stream is {:?}, not Opus", fmt.codec)));
+        return Err(Error::Invalid(format!(
+            "stream is {:?}, not Opus",
+            fmt.codec
+        )));
     }
     let data = awc.data(stream)?;
     let packets = split_blocks(data)?;
     let channels = fmt.channels.max(1);
     let frames = declared_frames(fmt.samples, fmt.opus_frames, channels);
-    ogg_opus(&packets, channels, u32::from(fmt.sample_rate), pre_skip, frames)
+    ogg_opus(
+        &packets,
+        channels,
+        u32::from(fmt.sample_rate),
+        pre_skip,
+        frames,
+    )
 }
 
 /// One channel group of a streamed-music stream: its packets with the per-chunk repeats removed.
@@ -187,7 +207,9 @@ pub fn music_channels(awc: &Awc<'_>, stream: &AwcStream) -> Result<Vec<MusicChan
     let chunk_size = rd32(desc, 4)? as usize;
     let nch = rd32(desc, 8)? as usize;
     if nch == 0 || nch > 64 || chunk_size == 0 {
-        return Err(Error::Invalid("streamed music descriptor has an impossible shape".into()));
+        return Err(Error::Invalid(
+            "streamed music descriptor has an impossible shape".into(),
+        ));
     }
     let mut info = Vec::new();
     for c in 0..nch {
@@ -218,32 +240,41 @@ pub fn music_channels(awc: &Awc<'_>, stream: &AwcStream) -> Result<Vec<MusicChan
         let chunk = data
             .get(start..end)
             .filter(|c| c.len() >= header)
-            .ok_or_else(|| Error::Invalid(format!("streamed music chunk {b} is outside the data")))?;
+            .ok_or_else(|| {
+                Error::Invalid(format!("streamed music chunk {b} is outside the data"))
+            })?;
         let mut at = header;
         let mut this_chunk: Vec<Vec<Vec<u8>>> = Vec::new();
         for c in 0..nch {
             let subblocks = rd32(chunk, c * MUSIC_RECORD_SIZE + 4)? as usize;
             let skip = u64::from(rd32(chunk, c * MUSIC_RECORD_SIZE + 8)?);
-            let run = chunk
-                .get(at..at + subblocks * BLOCK_SIZE)
-                .ok_or_else(|| Error::Invalid(format!("streamed music chunk {b} channel {c} overruns its chunk")))?;
+            let run = chunk.get(at..at + subblocks * BLOCK_SIZE).ok_or_else(|| {
+                Error::Invalid(format!(
+                    "streamed music chunk {b} channel {c} overruns its chunk"
+                ))
+            })?;
             at += subblocks * BLOCK_SIZE;
-            let packets: Vec<Vec<u8>> = split_blocks(run)?.into_iter().map(<[u8]>::to_vec).collect();
+            let packets: Vec<Vec<u8>> =
+                split_blocks(run)?.into_iter().map(<[u8]>::to_vec).collect();
             let mut dropped = 0;
             let mut covered = 0u64;
             while covered < skip {
-                let p = packets
-                    .get(dropped)
-                    .ok_or_else(|| Error::Invalid("repeated prefix longer than the chunk".into()))?;
+                let p = packets.get(dropped).ok_or_else(|| {
+                    Error::Invalid("repeated prefix longer than the chunk".into())
+                })?;
                 covered += u64::from(packet_frames(p)?);
                 dropped += 1;
             }
             if covered != skip {
-                return Err(Error::Invalid("repeated prefix does not end on a packet boundary".into()));
+                return Err(Error::Invalid(
+                    "repeated prefix does not end on a packet boundary".into(),
+                ));
             }
             let prev = &prev_chunk[c];
             if dropped > prev.len() || packets[..dropped] != prev[prev.len() - dropped..] {
-                return Err(Error::Invalid("repeated prefix differs from the previous chunk's tail".into()));
+                return Err(Error::Invalid(
+                    "repeated prefix differs from the previous chunk's tail".into(),
+                ));
             }
             chans[c].extend(packets[dropped..].iter().cloned());
             this_chunk.push(packets);
@@ -269,7 +300,11 @@ pub fn music_channels(awc: &Awc<'_>, stream: &AwcStream) -> Result<Vec<MusicChan
 }
 
 /// Rewrap each channel group of a streamed-music stream as its own Ogg Opus file.
-pub fn music_to_ogg(awc: &Awc<'_>, stream: &AwcStream, pre_skip: u16) -> Result<Vec<(u32, Vec<u8>)>> {
+pub fn music_to_ogg(
+    awc: &Awc<'_>,
+    stream: &AwcStream,
+    pre_skip: u16,
+) -> Result<Vec<(u32, Vec<u8>)>> {
     music_channels(awc, stream)?
         .into_iter()
         .map(|c| {
@@ -337,7 +372,11 @@ mod tests {
 
     #[test]
     fn splits_blocks_and_rejects_overrun() {
-        let ps = vec![packet(19 << 3, 100, 1), packet(19 << 3, 300, 2), packet(19 << 3, 1990, 3)];
+        let ps = vec![
+            packet(19 << 3, 100, 1),
+            packet(19 << 3, 300, 2),
+            packet(19 << 3, 1990, 3),
+        ];
         let data = blocks(&ps);
         assert_eq!(data.len(), 2 * BLOCK_SIZE);
         let got = split_blocks(&data).unwrap();
@@ -364,7 +403,10 @@ mod tests {
         let pages = read_pages(&ogg).unwrap();
         assert_eq!(&pages[0].packets[0][..8], b"OpusHead");
         assert_eq!(pages[0].packets[0][9], 1);
-        assert_eq!(u16::from_le_bytes([pages[0].packets[0][10], pages[0].packets[0][11]]), 312);
+        assert_eq!(
+            u16::from_le_bytes([pages[0].packets[0][10], pages[0].packets[0][11]]),
+            312
+        );
         assert_eq!(&pages[1].packets[0][..8], b"OpusTags");
         let audio: Vec<_> = pages[2..].iter().flat_map(|p| p.packets.clone()).collect();
         // 9312 samples needed: the 10th packet (9600) is the one that reaches it
@@ -407,7 +449,10 @@ mod tests {
         assert_eq!(pages[2..].iter().map(|p| p.packets.len()).sum::<usize>(), 6);
     }
 
-    fn music_bank(chunks: &[(Vec<Vec<Vec<u8>>>, Vec<u32>)], samples: u32) -> Vec<u8> {
+    /// Per chunk: each channel's packets, and each channel's repeated-prefix sample count.
+    type TestChunk = (Vec<Vec<Vec<u8>>>, Vec<u32>);
+
+    fn music_bank(chunks: &[TestChunk], samples: u32) -> Vec<u8> {
         let nch = chunks[0].0.len();
         let header = BLOCK_SIZE;
         let mut payload = Vec::new();
@@ -418,7 +463,8 @@ mod tests {
             let mut chunk = vec![0u8; header];
             for c in 0..nch {
                 let off = c * MUSIC_RECORD_SIZE;
-                chunk[off + 4..off + 8].copy_from_slice(&((runs[c].len() / BLOCK_SIZE) as u32).to_le_bytes());
+                chunk[off + 4..off + 8]
+                    .copy_from_slice(&((runs[c].len() / BLOCK_SIZE) as u32).to_le_bytes());
                 chunk[off + 8..off + 12].copy_from_slice(&skips[c].to_le_bytes());
             }
             for r in &runs {

@@ -263,7 +263,11 @@ impl FrameDecoder {
             return Err(Error::Corrupt("frame ends inside the tile header"));
         }
         // four subframes max: the "maximum length" bit, then a 1-bit shift
-        let shift = if br.read_bit() { 1 + br.read(1) as usize } else { 0 };
+        let shift = if br.read_bit() {
+            1 + br.read(1) as usize
+        } else {
+            0
+        };
         Ok(SAMPLES_PER_FRAME >> shift)
     }
 
@@ -332,7 +336,9 @@ impl FrameDecoder {
         while remaining > 0 && self.groups.len() < self.member_count {
             let mut g = ChannelGroup::default();
             if remaining > 2 {
-                return Err(Error::Unsupported("channel groups of more than 2 channels".into()));
+                return Err(Error::Unsupported(
+                    "channel groups of more than 2 channels".into(),
+                ));
             }
             g.num_channels = remaining;
             let mut n = 0;
@@ -379,8 +385,8 @@ impl FrameDecoder {
             if ch.reuse_sf {
                 let offs = &self.sf_offsets[cur_table][ch.table_idx];
                 let (a, b) = (ch.sf_idx, ch.sf_cur);
-                for band in 0..num_bands {
-                    ch.saved_sf[b][band] = ch.saved_sf[a][offs[band]];
+                for (band, &from) in offs.iter().enumerate().take(num_bands) {
+                    ch.saved_sf[b][band] = ch.saved_sf[a][from];
                 }
             }
             if ch.cur_subframe == 0 || br.read_bit() {
@@ -395,7 +401,10 @@ impl FrameDecoder {
                 } else {
                     let mut i = 0;
                     while i < num_bands {
-                        let idx = t.sf_rl.decode(br).ok_or(Error::Corrupt("scale factor run code"))?;
+                        let idx = t
+                            .sf_rl
+                            .decode(br)
+                            .ok_or(Error::Corrupt("scale factor run code"))?;
                         let (skip, val, sign);
                         if idx == 0 {
                             let code = br.read(14) as i32;
@@ -468,11 +477,18 @@ impl FrameDecoder {
             let idx = t.vec4.decode(br).ok_or(Error::Corrupt("vector code"))?;
             if idx < 0 {
                 for i in (0..4).step_by(2) {
-                    let idx2 = t.vec2.decode(br).ok_or(Error::Corrupt("vector pair code"))?;
+                    let idx2 = t
+                        .vec2
+                        .decode(br)
+                        .ok_or(Error::Corrupt("vector pair code"))?;
                     if idx2 < 0 {
                         let mut pair = [0f32; 2];
                         for p in &mut pair {
-                            let mut v = t.vec1.decode(br).ok_or(Error::Corrupt("vector single code"))? as u32;
+                            let mut v = t
+                                .vec1
+                                .decode(br)
+                                .ok_or(Error::Corrupt("vector single code"))?
+                                as u32;
                             if v as usize == VEC1_TABLE.len() - 1 {
                                 v += Self::read_large_value(br);
                             }
@@ -509,7 +525,9 @@ impl FrameDecoder {
             let mask = subframe_len - 1;
             let mut offset = cur;
             while offset < subframe_len {
-                let code = t.coef[table].decode(br).ok_or(Error::Corrupt("run-level code"))?;
+                let code = t.coef[table]
+                    .decode(br)
+                    .ok_or(Error::Corrupt("run-level code"))?;
                 if code > 1 {
                     let code = code as usize;
                     offset += usize::from(run[code]);
@@ -579,8 +597,8 @@ impl FrameDecoder {
                 start += (winlen - subframe_len) / 2;
                 winlen = subframe_len;
             }
-            let window = &self.windows[SAMPLES_PER_FRAME.trailing_zeros() as usize
-                - winlen.trailing_zeros() as usize];
+            let window = &self.windows
+                [SAMPLES_PER_FRAME.trailing_zeros() as usize - winlen.trailing_zeros() as usize];
             let len = winlen / 2;
             for a in 0..len {
                 let s0 = ch.out[start + a];
@@ -670,7 +688,9 @@ impl FrameDecoder {
                 for mi in 0..self.member_count {
                     let n = (br.read(num_bits) as usize) << 2;
                     if n > subframe_len {
-                        return Err(Error::Corrupt("vector coefficient count above the subframe"));
+                        return Err(Error::Corrupt(
+                            "vector coefficient count above the subframe",
+                        ));
                     }
                     self.channels[self.members[mi]].num_vec_coeffs = n;
                 }
@@ -728,10 +748,10 @@ impl FrameDecoder {
                 let c = self.members[mi];
                 let ch = &self.channels[c];
                 let sf = &ch.saved_sf[ch.sf_cur];
-                for b in 0..self.num_bands {
+                for (b, &sf_b) in sf.iter().enumerate().take(self.num_bands) {
                     let start = self.sfb_offsets[self.table_idx][b];
                     let end = self.sfb_offsets[self.table_idx][b + 1].min(subframe_len);
-                    let exp = ch.quant_step - (ch.max_scale_factor - sf[b]) * ch.scale_factor_step;
+                    let exp = ch.quant_step - (ch.max_scale_factor - sf_b) * ch.scale_factor_step;
                     let quant = 10f64.powf(f64::from(exp) / 20.0) as f32;
                     for y in start..end {
                         self.tmp[y] = ch.out[ch.coefs_at + y] * quant;
@@ -740,7 +760,10 @@ impl FrameDecoder {
                 let at = ch.coefs_at;
                 let imdct = &self.imdct[self.table_idx];
                 let ch = &mut self.channels[c];
-                imdct.process(&self.tmp[..subframe_len], &mut ch.out[at..at + subframe_len]);
+                imdct.process(
+                    &self.tmp[..subframe_len],
+                    &mut ch.out[at..at + subframe_len],
+                );
             }
         }
 

@@ -76,7 +76,7 @@ impl Vlc {
     }
 
     #[cfg(test)]
-    pub fn len(&self) -> usize {
+    pub fn entries(&self) -> usize {
         self.codes.len()
     }
 

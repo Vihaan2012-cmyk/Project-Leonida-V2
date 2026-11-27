@@ -145,16 +145,20 @@ impl StreamDecoder {
         if carry > 0 {
             let n = carry.min(total - pos);
             if self.reservoir_bits > 0 {
-                copy_bits(packet, pos, n, &mut self.reservoir, &mut self.reservoir_bits);
+                copy_bits(
+                    packet,
+                    pos,
+                    n,
+                    &mut self.reservoir,
+                    &mut self.reservoir_bits,
+                );
                 result = self.try_complete_reservoir();
             }
             pos += n;
         }
         // whatever is still pending was not completed by the carry bits
         self.clear_reservoir();
-        if result.is_err() {
-            return result;
-        }
+        result?;
 
         while pos + LENGTH_PREFIX_BITS < total {
             let len = read_bits(packet, pos, LENGTH_PREFIX_BITS);
@@ -163,7 +167,13 @@ impl StreamDecoder {
             }
             let rem = total - pos;
             if len > rem {
-                copy_bits(packet, pos, rem, &mut self.reservoir, &mut self.reservoir_bits);
+                copy_bits(
+                    packet,
+                    pos,
+                    rem,
+                    &mut self.reservoir,
+                    &mut self.reservoir_bits,
+                );
                 break;
             }
             let mut frame = Vec::with_capacity(len.div_ceil(8));
@@ -220,7 +230,10 @@ pub struct Xma2Decoder {
 impl Xma2Decoder {
     pub fn new(config: Xma2Config) -> Result<Self> {
         if config.channels == 0 || config.channels > 16 {
-            return Err(Error::Unsupported(format!("{} XMA2 channels", config.channels)));
+            return Err(Error::Unsupported(format!(
+                "{} XMA2 channels",
+                config.channels
+            )));
         }
         if config.sample_rate == 0 {
             return Err(Error::Invalid("XMA2 stream with a zero sample rate".into()));
@@ -314,10 +327,10 @@ impl Xma2Decoder {
     pub fn push_data(&mut self, data: &[u8]) -> Result<()> {
         let mut first_error = None;
         for packet in data.chunks(PACKET_SIZE) {
-            if packet.len() == PACKET_SIZE {
-                if let Err(e) = self.push_packet(packet) {
-                    first_error.get_or_insert(e);
-                }
+            if packet.len() == PACKET_SIZE
+                && let Err(e) = self.push_packet(packet)
+            {
+                first_error.get_or_insert(e);
             }
         }
         first_error.map_or(Ok(()), Err)

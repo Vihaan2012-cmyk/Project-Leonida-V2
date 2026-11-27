@@ -29,7 +29,13 @@ impl Imdct {
             .collect();
         let bits = m.trailing_zeros();
         let bitrev = (0..m as u32)
-            .map(|i| if bits == 0 { 0 } else { i.reverse_bits() >> (32 - bits) })
+            .map(|i| {
+                if bits == 0 {
+                    0
+                } else {
+                    i.reverse_bits() >> (32 - bits)
+                }
+            })
             .collect();
         Self {
             n,
@@ -39,10 +45,6 @@ impl Imdct {
             fft_tw,
             bitrev,
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.n
     }
 
     fn fft(&self, re: &mut [f32], im: &mut [f32]) {

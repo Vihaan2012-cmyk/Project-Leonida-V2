@@ -92,6 +92,13 @@ pub struct BitWriter {
 }
 
 #[cfg(test)]
+impl Default for BitWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
 impl BitWriter {
     pub fn new() -> Self {
         Self {
@@ -134,7 +141,7 @@ mod tests {
         let data = [0b1010_1100, 0b0101_0011, 0xFF];
         let mut r = BitReader::new(&data);
         assert_eq!(r.read(3), 0b101);
-        assert_eq!(r.read(7), 0b0110_001);
+        assert_eq!(r.read(7), 0b011_0001);
         assert_eq!(r.read(6), 0b01_0011);
         assert_eq!(r.pos(), 16);
         assert_eq!(r.read(8), 0xFF);
