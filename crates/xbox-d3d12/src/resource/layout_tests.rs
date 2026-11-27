@@ -137,3 +137,30 @@ fn row_major_footprints_use_the_d3d12_alignments() {
         (3, 3, 24)
     );
 }
+
+#[test]
+fn array_subresources_do_not_share_bytes_and_round_trip() {
+    let array = array_layout(TileMode::Sw64kD, 64, 64, 3, 7, 4, 1).unwrap();
+    let mut owner = std::collections::HashMap::new();
+    for slice in 0..3 {
+        for m in &array.slice.mips {
+            for y in 0..m.blocks_h {
+                for x in 0..m.blocks_w {
+                    let at = array.block_offset(slice, m.index, x, y).unwrap();
+                    assert!(at + 4 <= array.size);
+                    assert_eq!(owner.insert(at, (slice, m.index)), None);
+                }
+            }
+        }
+    }
+    let mut memory = vec![0u8; array.size as usize];
+    for (slice, mip) in [(0, 0), (2, 0), (1, 3), (2, 6)] {
+        let m = &array.slice.mips[mip as usize];
+        let rows: Vec<u8> = (0..m.blocks_w * m.blocks_h * 4)
+            .map(|i| (i + slice * 7 + mip) as u8)
+            .collect();
+        array.tile(slice, mip, &rows, &mut memory).unwrap();
+        assert_eq!(array.detile(slice, mip, &memory).unwrap(), rows);
+    }
+    assert!(array.block_offset(3, 0, 0, 0).is_none());
+}
