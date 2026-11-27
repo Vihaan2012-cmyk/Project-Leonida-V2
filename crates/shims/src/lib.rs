@@ -24,7 +24,7 @@ pub mod presentation;
 pub mod threads;
 pub mod trace;
 pub mod xg;
-mod xmem;
+pub mod xmem;
 
 /// A function we provide in place of a console one.
 #[derive(Debug, Clone, Copy)]
