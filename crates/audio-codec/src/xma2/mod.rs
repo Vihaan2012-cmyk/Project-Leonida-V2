@@ -11,4 +11,6 @@ pub use stream::{
 };
 
 #[cfg(test)]
+pub(crate) mod testenc;
+#[cfg(test)]
 mod tests;

@@ -6,236 +6,7 @@ use std::f64::consts::PI;
 use super::frame::{FrameDecoder, tables};
 use super::stream::{PACKET_SIZE, PacketHeader, Xma2Config, Xma2Decoder};
 use super::tables::*;
-
-const N: usize = 512;
-const DATA_BITS: usize = PACKET_SIZE * 8 - 32;
-
-type Bits = Vec<bool>;
-
-fn put(b: &mut Bits, n: u32, v: u32) {
-    for i in (0..n).rev() {
-        b.push((v >> i) & 1 == 1);
-    }
-}
-
-fn put_code(b: &mut Bits, (code, len): (u32, u32)) {
-    put(b, len, code);
-}
-
-struct Rng(u32);
-impl Rng {
-    fn next(&mut self) -> u32 {
-        self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223);
-        self.0 >> 8
-    }
-}
-
-/// Four magnitudes (0..=15) and signs, one symbol of the vector coder.
-#[derive(Clone, Copy)]
-struct Tuple {
-    mags: [u8; 4],
-    neg: [bool; 4],
-}
-
-impl Tuple {
-    fn packed(&self) -> i32 {
-        self.mags.iter().fold(0, |v, &m| (v << 4) | i32::from(m))
-    }
-}
-
-/// Tuples the vector table can express, without three zeros in a row (that would switch to run-level coding).
-fn random_tuples(rng: &mut Rng, count: usize) -> Vec<Tuple> {
-    let usable: Vec<u16> = VEC4_SYMS
-        .iter()
-        .copied()
-        .filter(|&s| s > 1)
-        .filter(|&s| {
-            let p = s - 1;
-            let m = [(p >> 12) & 15, (p >> 8) & 15, (p >> 4) & 15, p & 15];
-            let zeros_edge = m.iter().take_while(|&&v| v == 0).count();
-            let zeros_tail = m.iter().rev().take_while(|&&v| v == 0).count();
-            zeros_edge <= 1 && zeros_tail <= 1 && !m.windows(3).any(|w| w.iter().all(|&v| v == 0))
-        })
-        .collect();
-    (0..count)
-        .map(|_| {
-            let p = usable[(rng.next() as usize) % usable.len()] - 1;
-            let mags = [
-                (p >> 12) as u8 & 15,
-                (p >> 8) as u8 & 15,
-                (p >> 4) as u8 & 15,
-                p as u8 & 15,
-            ];
-            let neg = std::array::from_fn(|i| mags[i] != 0 && rng.next() & 1 == 1);
-            Tuple { mags, neg }
-        })
-        .collect()
-}
-
-fn coefficients(tuples: &[Tuple]) -> Vec<f64> {
-    let mut c = vec![0.0; N];
-    for (j, t) in tuples.iter().enumerate() {
-        for i in 0..4 {
-            let v = f64::from(t.mags[i]);
-            c[4 * j + i] = if t.neg[i] { -v } else { v };
-        }
-    }
-    c
-}
-
-fn vec4_code(packed: i32) -> (u32, u32) {
-    let i = VEC4_SYMS
-        .iter()
-        .position(|&s| i32::from(s) - 1 == packed)
-        .expect("tuple is in the vector table");
-    tables().vec4.code_of(i)
-}
-
-fn encode_channel_coefficients(b: &mut Bits, tuples: &[Tuple]) {
-    put(b, 1, 0);
-    for t in tuples {
-        put_code(b, vec4_code(t.packed()));
-        for i in 0..4 {
-            if t.mags[i] != 0 {
-                put(b, 1, u32::from(t.neg[i]));
-            }
-        }
-    }
-    put_code(b, vec4_code(0));
-    let eob = COEF0_SYMS.iter().position(|&s| s == 1).expect("EOB symbol");
-    put_code(b, tables().coef[0].code_of(eob));
-}
-
-fn encode_scale_factors(b: &mut Bits, bands: usize) {
-    put(b, 2, 0);
-    let zero = SCALE_TABLE
-        .iter()
-        .position(|&(s, _)| s == 60)
-        .expect("delta 0");
-    for _ in 0..bands {
-        put_code(b, tables().sf.code_of(zero));
-    }
-}
-
-/// One frame with a single 512-sample subframe per channel and no length prefix, stop bit or trailer yet.
-fn encode_frame(channels: &[&[Tuple]], step: i32, stereo_transform: bool) -> Bits {
-    let bands = FrameDecoder::new(channels.len(), 32000)
-        .unwrap()
-        .band_count(0);
-    let nb = channels.len();
-    let mut b = Bits::new();
-    put(&mut b, 1, 1);
-    put(&mut b, 1, 0);
-    if nb > 1 {
-        put(&mut b, 1, 0);
-    }
-    put(&mut b, 8, 0);
-    put(&mut b, 1, 0);
-    put(&mut b, 1, 0);
-    put(&mut b, 1, 0);
-    if nb > 1 {
-        put(&mut b, 1, 0);
-        if stereo_transform {
-            put(&mut b, 1, 0);
-            put(&mut b, 1, 1);
-        } else {
-            put(&mut b, 1, 1);
-            put(&mut b, 1, 0);
-        }
-    }
-    for _ in 0..nb {
-        put(&mut b, 1, 1);
-    }
-    put(&mut b, 1, 0);
-    put(&mut b, 6, (step & 63) as u32);
-    if nb > 1 {
-        put(&mut b, 3, 0);
-        for _ in 0..nb {
-            put(&mut b, 1, 0);
-        }
-    }
-    for _ in 0..nb {
-        encode_scale_factors(&mut b, bands);
-    }
-    for tuples in channels {
-        encode_channel_coefficients(&mut b, tuples);
-    }
-    b
-}
-
-/// The finished frame bits: length prefix, body, stop bit, trailer (0 until the packetizer decides).
-fn finish_frame(body: &Bits) -> Bits {
-    let len = body.len() + 15 + 2;
-    let mut f = Bits::new();
-    put(&mut f, 15, len as u32);
-    f.extend_from_slice(body);
-    f.push(true);
-    f.push(false);
-    f
-}
-
-struct Pk {
-    carry: usize,
-    started: usize,
-    data: Bits,
-}
-
-fn packetize(frames: &[Bits]) -> Vec<Vec<u8>> {
-    let mut pks = vec![Pk {
-        carry: 0,
-        started: 0,
-        data: Bits::new(),
-    }];
-    let mut last_trailer: Option<(usize, usize)> = None;
-    for f in frames {
-        let cur = pks.len() - 1;
-        if DATA_BITS - pks[cur].data.len() <= 17 {
-            pks.push(Pk {
-                carry: 0,
-                started: 0,
-                data: Bits::new(),
-            });
-        }
-        let cur = pks.len() - 1;
-        if let Some((pi, bi)) = last_trailer
-            && pi == cur
-        {
-            pks[pi].data[bi] = true;
-        }
-        pks[cur].started += 1;
-        let take = f.len().min(DATA_BITS - pks[cur].data.len());
-        pks[cur].data.extend_from_slice(&f[..take]);
-        let mut rest = &f[take..];
-        if rest.is_empty() {
-            last_trailer = Some((cur, pks[cur].data.len() - 1));
-            continue;
-        }
-        while !rest.is_empty() {
-            let chunk = rest.len().min(DATA_BITS);
-            pks.push(Pk {
-                carry: chunk,
-                started: 0,
-                data: rest[..chunk].to_vec(),
-            });
-            rest = &rest[chunk..];
-        }
-        let cur = pks.len() - 1;
-        last_trailer = Some((cur, pks[cur].data.len() - 1));
-    }
-    pks.iter()
-        .map(|p| {
-            let mut out = vec![0u8; PACKET_SIZE];
-            let word = ((p.started as u32) << 26) | ((p.carry as u32) << 11) | (1 << 8);
-            out[..4].copy_from_slice(&word.to_be_bytes());
-            for (i, &bit) in p.data.iter().enumerate() {
-                if bit {
-                    out[4 + i / 8] |= 0x80 >> (i % 8);
-                }
-            }
-            out
-        })
-        .collect()
-}
+use super::testenc::*;
 
 /// Reference synthesis of identical-layout frames: dequantise, direct IMDCT, sine-window overlap-add.
 fn reference(coefs_per_frame: &[Vec<f64>], quant_step: i32) -> Vec<f64> {
@@ -499,4 +270,98 @@ fn band_layout_for_32khz() {
     assert_eq!(super::band_rate_class(22050), 24000);
     assert_eq!(super::band_rate_class(44100), 44100);
     assert_eq!(super::band_rate_class(48000), 48000);
+}
+
+#[test]
+fn every_table_entry_decodes_to_its_own_symbol() {
+    use crate::bits::{BitReader, BitWriter};
+    let t = tables();
+    let all = [
+        (&t.sf, SCALE_TABLE.len()),
+        (&t.sf_rl, SCALE_RL_TABLE.len()),
+        (&t.coef[0], COEF0_LENS.len()),
+        (&t.coef[1], COEF1_TABLE.len()),
+        (&t.vec4, VEC4_LENS.len()),
+        (&t.vec2, VEC2_TABLE.len()),
+        (&t.vec1, VEC1_TABLE.len()),
+    ];
+    for (vlc, n) in all {
+        assert_eq!(vlc.entries(), n);
+        let mut w = BitWriter::new();
+        for i in 0..n {
+            let (code, len) = vlc.code_of(i);
+            w.put(len, code);
+        }
+        let mut r = BitReader::with_bit_len(&w.bytes, w.bits);
+        for i in 0..n {
+            assert_eq!(
+                vlc.decode(&mut r),
+                Some(vlc.symbol_of(i)),
+                "entry {i} of a table of {n}"
+            );
+        }
+        assert_eq!(r.bits_left(), 0);
+    }
+}
+
+#[test]
+fn run_and_level_tables_line_up_with_the_code_tables() {
+    assert_eq!(COEF0_RUN.len(), COEF0_SYMS.len());
+    assert_eq!(COEF0_LEVEL.len(), COEF0_SYMS.len());
+    assert_eq!(COEF1_RUN.len(), COEF1_TABLE.len());
+    assert_eq!(COEF1_LEVEL.len(), COEF1_TABLE.len());
+    assert_eq!(SCALE_RL_RUN.len(), SCALE_RL_TABLE.len());
+    assert_eq!(SCALE_RL_LEVEL.len(), SCALE_RL_TABLE.len());
+    // symbols 0 (escape) and 1 (end of block) exist in both coefficient code tables
+    for s in [0u16, 1] {
+        assert!(COEF0_SYMS.contains(&s));
+        assert!(COEF1_TABLE.iter().any(|&(sym, _)| u16::from(sym) == s));
+    }
+    // symbols are within the run/level tables
+    assert!(COEF0_SYMS.iter().all(|&s| usize::from(s) < COEF0_RUN.len()));
+    assert!(
+        COEF1_TABLE
+            .iter()
+            .all(|&(s, _)| usize::from(s) < COEF1_RUN.len())
+    );
+}
+
+#[test]
+fn garbage_and_damaged_packets_never_panic() {
+    let mut rng = Rng(1234);
+    let t = random_tuples(&mut rng, 40);
+    let good = packetize(&[
+        finish_frame(&encode_frame(&[&t], 0, false)),
+        finish_frame(&encode_frame(&[&t, &t], 0, true)),
+    ]);
+    for channels in [1usize, 2] {
+        for round in 0..300 {
+            let mut d = Xma2Decoder::new(Xma2Config::new(32000, channels, None)).unwrap();
+            let mut p = if round % 3 == 0 {
+                (0..PACKET_SIZE)
+                    .map(|_| rng.next() as u8)
+                    .collect::<Vec<u8>>()
+            } else {
+                good[0].clone()
+            };
+            if round % 3 != 0 {
+                for _ in 0..1 + round % 7 {
+                    let at = 4 + (rng.next() as usize) % 300;
+                    p[at] ^= 1 << (rng.next() % 8);
+                }
+            }
+            // a valid-looking header so frames are attempted
+            if round % 3 == 0 {
+                p[0] = 0x04;
+                p[1] = 0;
+                p[2] = 0;
+                p[3] = 0;
+            }
+            let _ = d.push_packet(&p);
+            let _ = d.push_packet(&good[0]);
+            let mut out = vec![0f32; 4096 * channels];
+            d.pull_f32(&mut out);
+            assert!(out.iter().all(|v| v.is_finite()));
+        }
+    }
 }
