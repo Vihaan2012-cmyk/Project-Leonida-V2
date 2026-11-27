@@ -184,10 +184,15 @@ fn module_handles_answer_for_console_dlls_and_the_other_load_variants() {
         assert_eq!(handle_ex(1, wide("d3d12_xs").as_ptr(), &mut again), 1);
         assert_eq!(again, loaded);
         assert_eq!(disable(loaded), 1);
-        assert_eq!(
+        assert_ne!(
             handle(wide("bink2scarlett.dll").as_ptr()),
             0,
-            "package DLLs are not loaded"
+            "the media shim makes Bink a console DLL"
+        );
+        assert_eq!(
+            handle(wide("some_package_library.dll").as_ptr()),
+            0,
+            "DLLs with no shim are not loaded"
         );
         assert_eq!(last_error(), 126);
         assert_ne!(handle(std::ptr::null()), 0, "this process");
