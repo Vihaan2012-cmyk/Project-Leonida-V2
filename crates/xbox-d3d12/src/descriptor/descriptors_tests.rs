@@ -235,3 +235,58 @@ fn a_registered_view_makes_a_real_vulkan_view_of_a_real_image() {
         image.destroy(h);
     }
 }
+
+#[test]
+fn a_descriptor_leads_back_to_its_resource_and_a_view_of_it() {
+    use crate::memory::{AddressSpace, Config};
+    use crate::resource::{HeapKind, Resources};
+    for gpu in &TestGpu::open_all() {
+        let space = AddressSpace::new(
+            gpu.handles.clone(),
+            Config {
+                base: 0,
+                size: Some(1 << 36),
+                chunk: 1 << 30,
+            },
+        )
+        .unwrap();
+        let mut resources = Resources::new(space);
+        let mut d = Descriptors::new();
+        let color = resources
+            .create_committed(
+                &ResourceDesc::texture_2d(dxgi::R8G8B8A8_TYPELESS, 32, 32, 0),
+                HeapKind::Default,
+            )
+            .unwrap();
+        let depth = resources
+            .create_committed(
+                &ResourceDesc::texture_2d(dxgi::R24G8_TYPELESS, 32, 32, 1),
+                HeapKind::Default,
+            )
+            .unwrap();
+        let view = ViewResource::from(resources.get(color).unwrap());
+        let (_, registration) = d
+            .create_srv(Some(&view), &srv_2d(dxgi::R8G8B8A8_UNORM_SRGB))
+            .unwrap();
+        let entry = d.registry.texture(registration.unwrap().index).unwrap();
+        let (resource, info) = resources.view_for(&entry.image).unwrap();
+        assert_eq!(resource.id, color);
+        assert_eq!(info.format, ash::vk::Format::R8G8B8A8_SRGB);
+        let view = ViewResource::from(resources.get(depth).unwrap());
+        let (_, registration) = d
+            .create_srv(Some(&view), &srv_2d(dxgi::R24_UNORM_X8_TYPELESS))
+            .unwrap();
+        let entry = d.registry.texture(registration.unwrap().index).unwrap();
+        let (resource, info) = resources.view_for(&entry.image).unwrap();
+        assert_eq!(resource.id, depth);
+        assert_eq!(info.format, resource.image.as_ref().unwrap().format);
+        let nothing = Image {
+            address: 0xDEAD_0000,
+            format: 56,
+            ..Image::default()
+        };
+        assert!(resources.view_for(&nothing).is_none());
+        resources.destroy(color).unwrap();
+        resources.destroy(depth).unwrap();
+    }
+}
