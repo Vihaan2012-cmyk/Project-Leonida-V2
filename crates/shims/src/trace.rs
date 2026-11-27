@@ -213,6 +213,8 @@ pub struct CrashFacts {
     /// The 48 bytes before the address and the 16 at it, when readable.
     pub code_before: Vec<u8>,
     pub code_at: Vec<u8>,
+    /// For an access violation: whether it wrote (else read or executed) and the address it touched.
+    pub fault: Option<(bool, usize)>,
 }
 
 impl CrashFacts {
@@ -308,6 +310,9 @@ pub(crate) fn push_cxx(what: String, facts: &CrashFacts) {
 
 #[cfg(windows)]
 pub(crate) fn push_exit() {
+    if !stops().is_empty() {
+        return;
+    }
     push_stop(Stop {
         headline: "the process is exiting (exit() or a normal return)".into(),
         lines: Vec::new(),

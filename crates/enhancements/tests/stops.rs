@@ -35,6 +35,14 @@ fn fast_fail() -> Vec<u8> {
     code
 }
 
+/// A write through a null pointer.
+fn null_write() -> Vec<u8> {
+    let mut code = PROLOGUE.to_vec();
+    code.extend_from_slice(&[0x31, 0xC0, 0x89, 0x08]);
+    code.extend_from_slice(&EPILOGUE);
+    code
+}
+
 fn put(file: &mut [u8], at: usize, bytes: &[u8]) {
     file[at..at + bytes.len()].copy_from_slice(bytes);
 }
@@ -109,10 +117,10 @@ fn child(mode: &str, folder: &Path) {
     use windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode;
     // SAFETY: keeps Windows from showing an error dialog for the stop.
     unsafe { SetErrorMode(0x8003) };
-    let code = if mode == "fastfail" {
-        fast_fail()
-    } else {
-        failed_check()
+    let code = match mode {
+        "fastfail" => fast_fail(),
+        "violation" => null_write(),
+        _ => failed_check(),
     };
     let bytes = image(&code);
     let options = LoadOptions {
@@ -180,6 +188,15 @@ fn a_stop_is_explained() {
     assert!(crash.contains("image offset 0x1009"), "{crash}");
     assert!(
         summary.contains("subsystem of the stop: C runtime fast fail"),
+        "{summary}"
+    );
+
+    let (crash, summary) = stop("violation");
+    assert!(crash.contains("exception 0xc0000005"), "{crash}");
+    assert!(crash.contains("it wrote to address 0x0"), "{crash}");
+    assert!(crash.contains("image offset 0x1006"), "{crash}");
+    assert!(
+        summary.starts_with("stopped: exception 0xc0000005"),
         "{summary}"
     );
 }

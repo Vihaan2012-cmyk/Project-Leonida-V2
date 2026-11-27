@@ -134,7 +134,7 @@ fn image() -> (usize, usize) {
         .unwrap_or((0, 0))
 }
 
-fn facts(code: u32, address: usize, context: &CONTEXT) -> CrashFacts {
+fn facts(code: u32, address: usize, context: &CONTEXT, fault: Option<(bool, usize)>) -> CrashFacts {
     let (base, size) = image();
     let inside = |a: usize| size != 0 && (base..base + size).contains(&a);
     let rva = inside(address).then(|| (address - base) as u32);
@@ -161,6 +161,7 @@ fn facts(code: u32, address: usize, context: &CONTEXT) -> CrashFacts {
             .find_map(|n| read_memory(address.wrapping_sub(n), n))
             .unwrap_or_default(),
         code_at: read_memory(address, 16).unwrap_or_default(),
+        fault,
     }
 }
 
@@ -176,6 +177,13 @@ pub fn format_report(facts: &CrashFacts, headline: &str, explanation: &[String])
     );
     if let Some(function) = facts.function_rva {
         let _ = writeln!(text, "inside the function at image offset {function:#x}");
+    }
+    if let Some((write, target)) = facts.fault {
+        let _ = writeln!(
+            text,
+            "it {} address {target:#x}",
+            if write { "wrote to" } else { "read or ran" }
+        );
     }
     for line in explanation {
         let _ = writeln!(text, "{line}");
@@ -205,6 +213,9 @@ pub fn format_report(facts: &CrashFacts, headline: &str, explanation: &[String])
 }
 
 fn record(headline: String, facts: &CrashFacts) {
+    if super::stops().len() >= 64 {
+        return;
+    }
     let explanation = EXPLAINER
         .try_lock()
         .ok()
@@ -257,7 +268,13 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     // SAFETY: as above, the context is valid for the duration of the call.
     let context = unsafe { &*context };
-    let found = facts(code, address, context);
+    let fault = (code == 0xC000_0005 && exception.NumberParameters >= 2).then(|| {
+        (
+            exception.ExceptionInformation[0] == 1,
+            exception.ExceptionInformation[1],
+        )
+    });
+    let found = facts(code, address, context, fault);
     if code == CXX_EXCEPTION {
         let object = (exception.NumberParameters >= 2)
             .then(|| exception.ExceptionInformation[1])
@@ -267,7 +284,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         let headline = if code == BREAKPOINT {
             "breakpoint (int3) inside the program".to_string()
         } else {
-            format!("exception {code:#010x}")
+            format!("exception {code:#010x} (first chance: the program may handle it)")
         };
         record(headline, &found);
     }
@@ -298,7 +315,7 @@ fn capture(headline: &str) {
     let mut context: CONTEXT = unsafe { std::mem::zeroed() };
     // SAFETY: captures this thread's registers.
     unsafe { RtlCaptureContext(&mut context) };
-    let found = facts(0, context.Rip as usize, &context);
+    let found = facts(0, context.Rip as usize, &context, None);
     record(headline.to_string(), &found);
     BUSY.store(false, Ordering::Release);
 }
