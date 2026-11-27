@@ -881,6 +881,15 @@ impl Queue {
         })
     }
 
+    /// Runs `f` on a transient command buffer and waits for it. For setup and tools, not for frames.
+    pub fn immediate(&self, f: impl FnOnce(&mut crate::CommandBuffer) -> Result<()>) -> Result<()> {
+        let mut stream = crate::CommandStream::new(self)?;
+        let mut cb = stream.begin()?;
+        f(&mut cb)?;
+        stream.submit(cb, &[], &[])?.wait()?;
+        stream.reclaim()
+    }
+
     /// Presents on this queue, holding its lock.
     pub(crate) fn present(
         &self,
