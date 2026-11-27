@@ -26,6 +26,8 @@ pub enum Command {
     Run(RunArgs),
     /// Look at every file in the game folder for signs of tampering, without running or loading anything.
     Triage(TriageArgs),
+    /// Gather the boot trace and your settings into Output/report, to send for diagnosis.
+    Report(BootReportArgs),
     /// Convert game behaviour data (binary XML, string tables) to readable text and back.
     Systems(SystemsArgs),
     /// Translate every shader, keep the results in the shader database and build each distinct pipeline once into the pipeline cache.
@@ -167,6 +169,17 @@ pub struct ListArgs {
     /// Most resources to list.
     #[arg(long, default_value_t = 100)]
     pub limit: usize,
+}
+
+#[derive(Debug, Args)]
+pub struct BootReportArgs {
+    /// Where Leonida writes what it makes; the trace is read from <OUTPUT>/boot and the report written to
+    /// <OUTPUT>/report.
+    #[arg(long, default_value = "Output")]
+    pub output: PathBuf,
+    /// The folder the settings files are in.
+    #[arg(long, default_value = "Config")]
+    pub config: PathBuf,
 }
 
 #[derive(Debug, Args)]
