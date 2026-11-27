@@ -167,7 +167,10 @@ fn a_model_page_has_a_system_part_a_spill_and_graphics_pages() {
     let data = archive.read(model).unwrap();
     assert_eq!(data.virtual_data.len(), CHUNK + 2048);
     assert_eq!(data.physical_data[..4], [0x42, 0x40, 0, 0]);
-    assert_eq!(data.at_pointer(0x6000_0000 + CHUNK as u64).unwrap(), &gfx_b[..]);
+    assert_eq!(
+        data.at_pointer(0x6000_0000 + CHUNK as u64).unwrap(),
+        &gfx_b[..]
+    );
     assert_eq!(&data.at_pointer(0x5001_0000).unwrap()[..2048], &spill[..]);
     let small = &found[1];
     assert_eq!(small.offset, next);
@@ -180,10 +183,16 @@ fn a_model_page_has_a_system_part_a_spill_and_graphics_pages() {
 fn a_dictionary_name_selects_the_kind_and_every_name_is_kept() {
     let mut builder = ArchiveBuilder::new();
     builder.start_resource();
-    builder.stream(&system_page(0x800, &["dict_a.#dd", "child_one.#dr", "child_two.#dr"]));
+    builder.stream(&system_page(
+        0x800,
+        &["dict_a.#dd", "child_one.#dr", "child_two.#dr"],
+    ));
     let found = scan(&builder.finish(0));
     assert_eq!(found[0].kind, Kind::DrawableDictionary);
-    assert_eq!(found[0].names, ["dict_a.#dd", "child_one.#dr", "child_two.#dr"]);
+    assert_eq!(
+        found[0].names,
+        ["dict_a.#dd", "child_one.#dr", "child_two.#dr"]
+    );
 }
 
 #[test]
@@ -221,7 +230,7 @@ fn a_gap_wider_than_one_unit_ends_a_resource() {
     builder.start_resource();
     builder.stream(&psin);
     builder.raw(&[0u8; 32]);
-    builder.stream(&vec![0xC4u8; 90]);
+    builder.stream(&[0xC4u8; 90]);
     let found = scan(&builder.finish(0));
     assert_eq!(found.len(), 2);
     assert_eq!(found[1].kind, Kind::Raw);
@@ -232,8 +241,10 @@ fn lone_streams_are_classified_by_their_start() {
     let mut builder = ArchiveBuilder::new();
     builder.start_resource();
     builder.stream(&graphics_page(0x900, 3));
-    builder.stream(&vec![0xC3u8; 40]);
-    builder.stream(b"readable text that goes on for a good while, longer than sixty-four bytes in all.");
+    builder.stream(&[0xC3u8; 40]);
+    builder.stream(
+        b"readable text that goes on for a good while, longer than sixty-four bytes in all.",
+    );
     builder.stream(b"RSC8\x41\x1f\x00\x00\x10\x00\x00\x00\x01\x00\x00\x00");
     let found = scan(&builder.finish(0));
     let kinds: Vec<Kind> = found.iter().map(|resource| resource.kind).collect();
@@ -250,7 +261,7 @@ fn bink_and_audio_banks_are_resources_of_their_own() {
     let bank = awc(3000);
     let mut builder = ArchiveBuilder::new();
     builder.start_resource();
-    builder.stream(&vec![0xC3u8; 40]);
+    builder.stream(&[0xC3u8; 40]);
     let video_at = builder.raw(&video);
     let bank_at = builder.raw(&bank);
     let archive = builder.finish(16);
@@ -259,7 +270,10 @@ fn bink_and_audio_banks_are_resources_of_their_own() {
     assert_eq!(found[1].kind, Kind::Bink2);
     assert_eq!(found[1].offset, video_at);
     assert_eq!(&found[1].magic, b"KB2n");
-    assert_eq!(found[1].content_hash, <[u8; 32]>::from(Sha256::digest(&video)));
+    assert_eq!(
+        found[1].content_hash,
+        <[u8; 32]>::from(Sha256::digest(&video))
+    );
     assert_eq!(found[2].kind, Kind::Awc);
     assert_eq!(found[2].offset, bank_at);
     assert_eq!(archive.read(&found[2]).unwrap().into_bytes(), bank);
@@ -282,14 +296,17 @@ fn content_hash_covers_the_inflated_bytes_virtual_first() {
     assert_eq!(found[0].content_hash, found[1].content_hash);
     let mut whole = system.clone();
     whole.extend_from_slice(&gfx);
-    assert_eq!(found[0].content_hash, <[u8; 32]>::from(Sha256::digest(&whole)));
+    assert_eq!(
+        found[0].content_hash,
+        <[u8; 32]>::from(Sha256::digest(&whole))
+    );
 }
 
 #[test]
 fn the_trailer_and_header_are_not_scanned() {
     let mut builder = ArchiveBuilder::new();
     builder.start_resource();
-    builder.stream(&vec![0xC3u8; 40]);
+    builder.stream(&[0xC3u8; 40]);
     let archive = builder.finish(4096);
     assert_eq!(archive.header().data_start, 0x40);
     assert_eq!(archive.header().trailer, 4096);
@@ -310,7 +327,7 @@ fn headers_that_are_not_archives_are_refused() {
 fn reading_detects_corrupt_and_misplaced_segments() {
     let mut builder = ArchiveBuilder::new();
     builder.start_resource();
-    builder.stream(&vec![0xC3u8; 40]);
+    builder.stream(&[0xC3u8; 40]);
     let archive = builder.finish(0);
     let mut resource = scan(&archive).remove(0);
     resource.layout.segments[0].size += 1;
@@ -397,7 +414,9 @@ fn indexed(builder: ArchiveBuilder, name: &str, index: &Index) -> (u32, Archive)
         found.push(resource);
     });
     index.add(&found).unwrap();
-    index.finish_archive(id, name, archive.len(), &report).unwrap();
+    index
+        .finish_archive(id, name, archive.len(), &report)
+        .unwrap();
     (id, archive)
 }
 
@@ -410,7 +429,7 @@ fn sample_archive(extra: u8) -> ArchiveBuilder {
     builder.stream(&system_page(0x400, &["car_door.#ft"]));
     builder.stream(&graphics_page(0x500, 5));
     builder.start_resource();
-    builder.stream(&vec![extra; 100]);
+    builder.stream(&[extra; 100]);
     builder.start_resource();
     builder.stream(b"<?xml version=\"1.0\"?><doc>hello</doc>");
     builder
@@ -444,7 +463,9 @@ fn the_index_answers_every_lookup() {
     let same = index.by_content_hash(&drawables[0].content_hash).unwrap();
     assert_eq!(same.len(), 2);
     assert_ne!(same[0].archive, same[1].archive);
-    let again = index.get(drawables[1].archive, drawables[1].offset).unwrap();
+    let again = index
+        .get(drawables[1].archive, drawables[1].offset)
+        .unwrap();
     assert_eq!(again.as_ref(), Some(&drawables[1]));
     assert!(index.get(9, 9).unwrap().is_none());
 
@@ -527,8 +548,10 @@ fn a_real_archive_scans_into_whole_readable_resources() {
     let report = archive.scan(|resource| found.push(resource));
     assert!(report.walk.streams > 0, "no streams found");
     assert_eq!(report.resources as usize, found.len());
-    assert!(report.walk.stored_bytes + report.walk.zero_padding + report.walk.unread_bytes
-        <= archive.len());
+    assert!(
+        report.walk.stored_bytes + report.walk.zero_padding + report.walk.unread_bytes
+            <= archive.len()
+    );
     let mut previous_end = 0;
     for resource in &found {
         assert!(resource.offset >= previous_end, "resources overlap");
