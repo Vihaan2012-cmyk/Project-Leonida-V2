@@ -2,12 +2,14 @@
 //! graphics pages and exported as binary glTF with a JSON sidecar.
 
 mod decode;
+mod gltf;
 mod pages;
 mod sidecar;
 mod skeleton;
 mod types;
 mod vertex;
 
+pub use gltf::{ExportOptions, ExportedModel, LodSelection, export};
 pub use sidecar::parameter_name;
 pub use skeleton::joaat;
 pub use types::*;
