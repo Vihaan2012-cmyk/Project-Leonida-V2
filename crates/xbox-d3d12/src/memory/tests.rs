@@ -1,3 +1,4 @@
+use super::dirty::RangeSet;
 use super::testing::*;
 use super::*;
 
