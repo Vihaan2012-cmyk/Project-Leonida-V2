@@ -143,6 +143,35 @@ fn scalar_float_source(name: &str, i: &Instruction) -> Option<u8> {
     }
 }
 
+/// `vmulps` on a ymm register becomes `_mm256_mul_ps`; mnemonics without a known intrinsic keep their name.
+fn intrinsic_name(mnemonic: &str, i: &Instruction) -> String {
+    let lower = mnemonic.to_ascii_lowercase();
+    let bare = lower.strip_prefix('v').unwrap_or(&lower);
+    let wide = (0..i.op_count()).any(|op| {
+        i.op_kind(op) == OpKind::Register
+            && (i.op_register(op).is_ymm() || i.op_register(op).is_zmm())
+    });
+    let prefix = if wide { "_mm256_" } else { "_mm_" };
+    let (stem, suffix) = match bare.len().checked_sub(2).map(|k| bare.split_at(k)) {
+        Some((stem, suffix @ ("ps" | "pd" | "ss" | "sd"))) => (stem, suffix),
+        _ => return lower,
+    };
+    let stem = match stem {
+        "unpckl" => "unpacklo",
+        "unpckh" => "unpackhi",
+        "shuf" => "shuffle",
+        "movmsk" => "movemask",
+        "blendv" => "blendv",
+        "permil" => "permute",
+        "sqrt" | "min" | "max" | "and" | "andn" | "or" | "xor" | "hadd" | "hsub" | "rcp"
+        | "rsqrt" | "dp" | "round" | "blend" | "cmp" | "addsub" | "broadcast" | "insert"
+        | "extract" | "fmadd213" | "fmadd231" | "fmadd132" | "fnmadd213" | "fnmadd231"
+        | "fmsub213" | "fmsub231" | "fnmsub231" | "fnmsub213" | "rcpps" => stem,
+        _ => return lower,
+    };
+    format!("{prefix}{stem}_{suffix}")
+}
+
 fn float_memory(i: &Instruction) -> bool {
     let size = i.memory_size();
     !size.is_packed() && format!("{size:?}").starts_with("Float")
@@ -827,10 +856,48 @@ impl<'p> Lifter<'p> {
                     Expr::Const(63, 1),
                 ),
             )),
-            M::Addss | M::Addsd | M::Vaddss | M::Vaddsd => self.scalar(i, "+", st, out),
-            M::Subss | M::Subsd | M::Vsubss | M::Vsubsd => self.scalar(i, "-", st, out),
-            M::Mulss | M::Mulsd | M::Vmulss | M::Vmulsd => self.scalar(i, "*", st, out),
-            M::Divss | M::Divsd | M::Vdivss | M::Vdivsd => self.scalar(i, "/", st, out),
+            M::Addss
+            | M::Addsd
+            | M::Vaddss
+            | M::Vaddsd
+            | M::Addps
+            | M::Addpd
+            | M::Vaddps
+            | M::Vaddpd => self.scalar(i, "+", st, out),
+            M::Subss
+            | M::Subsd
+            | M::Vsubss
+            | M::Vsubsd
+            | M::Subps
+            | M::Subpd
+            | M::Vsubps
+            | M::Vsubpd => self.scalar(i, "-", st, out),
+            M::Mulss
+            | M::Mulsd
+            | M::Vmulss
+            | M::Vmulsd
+            | M::Mulps
+            | M::Mulpd
+            | M::Vmulps
+            | M::Vmulpd => self.scalar(i, "*", st, out),
+            M::Divss
+            | M::Divsd
+            | M::Vdivss
+            | M::Vdivsd
+            | M::Divps
+            | M::Divpd
+            | M::Vdivps
+            | M::Vdivpd => self.scalar(i, "/", st, out),
+            M::Ptest | M::Vptest | M::Vtestps | M::Vtestpd => {
+                let (a, b) = (self.read(i, 0, st), self.read(i, 1, st));
+                self.flags(FlagKind::Test, a, b, 16, out);
+            }
+            M::Blsr | M::Blsi | M::Blsmsk => {
+                let value = Expr::Intrinsic(name.to_lowercase(), vec![self.read(i, 1, st)]);
+                self.write(i, 0, value, st, out);
+                let result = self.read(i, 0, st);
+                self.flags(FlagKind::Result, result, Expr::Const(0, w), w, out);
+            }
             M::Cvtsi2ss | M::Vcvtsi2ss | M::Cvtsd2ss | M::Vcvtsd2ss => {
                 let value = Expr::Cast("float", Box::new(self.read(i, last, st)));
                 self.write(i, 0, value, st, out);
@@ -923,7 +990,7 @@ impl<'p> Lifter<'p> {
             .filter(|&op| op > 0 || !writes || reads_destination)
             .map(|op| self.read(i, op, st))
             .collect();
-        let value = Expr::Intrinsic(format!("{:?}", i.mnemonic()).to_lowercase(), args);
+        let value = Expr::Intrinsic(intrinsic_name(&format!("{:?}", i.mnemonic()), i), args);
         if writes && matches!(i.op0_kind(), OpKind::Register | OpKind::Memory) {
             self.write(i, 0, value, st, out);
         } else {
