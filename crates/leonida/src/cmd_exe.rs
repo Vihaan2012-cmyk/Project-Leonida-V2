@@ -43,6 +43,7 @@ pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
         ExeCommand::Network => network(&image),
         ExeCommand::Functions { top } => functions(&image, *top),
         ExeCommand::Disasm { address, limit } => disasm(&image, address, *limit)?,
+        ExeCommand::Analyze { out, threads } => analyze(&image, out, *threads)?,
         ExeCommand::Strings { find, min, limit } => strings(&image, find.as_deref(), *min, *limit),
         ExeCommand::Xrefs {
             address,
@@ -58,6 +59,16 @@ pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
         )?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn analyze(image: &Image<'_>, out: &Path, threads: usize) -> Result<()> {
+    let options = exe_analysis::BuildOptions { threads };
+    let db = exe_analysis::ProgramDb::build_with(image, &options);
+    db.save(out)
+        .with_context(|| format!("writing {}", out.display()))?;
+    println!("{}", db.summary());
+    println!("saved to {}", out.display());
+    Ok(())
 }
 
 fn info(image: &Image<'_>) {

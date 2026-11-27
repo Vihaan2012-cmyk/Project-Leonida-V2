@@ -1148,6 +1148,7 @@ dependencies = [
  "content-filter",
  "decompile",
  "embed-manifest",
+ "exe-analysis",
  "game-package",
  "gpu",
  "iced-x86",
