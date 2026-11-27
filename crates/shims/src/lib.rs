@@ -164,7 +164,7 @@ impl Binder {
 
     fn shim(&self, import: &ImportRef<'_>) -> Option<usize> {
         let dll = lower(import.dll);
-        let name = import.name?;
+        let name = function_name(import);
         self.shims
             .iter()
             .find(|s| lower(s.dll) == dll && s.name == name)

@@ -13,6 +13,7 @@ anyhow = "1"
 ash = "0.38"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
+gilrs = "0.11"
 iced-x86 = { version = "1.22", default-features = false, features = ["std", "decoder", "intel", "instr_info"] }
 memchr = "2"
 memmap2 = "0.9"
