@@ -102,12 +102,18 @@ unsafe extern "win64" fn query_interface<V: 'static, T>(
 
 unsafe extern "win64" fn add_ref<V: 'static, T>(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
-    unsafe { obj::<V, T>(this) }.refs.fetch_add(1, Ordering::AcqRel) + 1
+    unsafe { obj::<V, T>(this) }
+        .refs
+        .fetch_add(1, Ordering::AcqRel)
+        + 1
 }
 
 unsafe extern "win64" fn release_owned<V: 'static, T>(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
-    let left = unsafe { obj::<V, T>(this) }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    let left = unsafe { obj::<V, T>(this) }
+        .refs
+        .fetch_sub(1, Ordering::AcqRel)
+        - 1;
     if left == 0 {
         // SAFETY: the last reference is gone, and the object came from `Box::into_raw`.
         drop(unsafe { Box::from_raw(this as *mut Obj<V, T>) });
@@ -121,7 +127,9 @@ unsafe extern "win64" fn release_device(this: This) -> u32 {
     let object = unsafe { obj::<DeviceVt, DeviceData>(this) };
     let _ = object
         .refs
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(1).max(1)));
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            Some(n.saturating_sub(1).max(1))
+        });
     object.refs.load(Ordering::Acquire)
 }
 
@@ -214,8 +222,15 @@ struct GameInputVt {
     get_previous_reading:
         unsafe extern "win64" fn(This, This, u32, This, *mut *mut c_void) -> Hresult,
     get_temporal_reading: unsafe extern "win64" fn(This, u64, This, *mut *mut c_void) -> Hresult,
-    register_reading_callback:
-        unsafe extern "win64" fn(This, This, u32, f32, *mut c_void, Option<ReadingFn>, *mut u64) -> Hresult,
+    register_reading_callback: unsafe extern "win64" fn(
+        This,
+        This,
+        u32,
+        f32,
+        *mut c_void,
+        Option<ReadingFn>,
+        *mut u64,
+    ) -> Hresult,
     register_device_callback: unsafe extern "win64" fn(
         This,
         This,
@@ -234,7 +249,8 @@ struct GameInputVt {
     unregister_callback: unsafe extern "win64" fn(This, u64, u64) -> bool,
     create_dispatcher: unsafe extern "win64" fn(This, *mut *mut c_void) -> Hresult,
     create_aggregate_device: unsafe extern "win64" fn(This, u32, *mut *mut c_void) -> Hresult,
-    find_device_from_id: unsafe extern "win64" fn(This, *const [u8; 32], *mut *mut c_void) -> Hresult,
+    find_device_from_id:
+        unsafe extern "win64" fn(This, *const [u8; 32], *mut *mut c_void) -> Hresult,
     find_device_from_object: unsafe extern "win64" fn(This, This, *mut *mut c_void) -> Hresult,
     find_device_from_platform_handle:
         unsafe extern "win64" fn(This, *mut c_void, *mut *mut c_void) -> Hresult,

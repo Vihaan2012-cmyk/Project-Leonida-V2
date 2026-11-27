@@ -84,7 +84,11 @@ pub enum RawInput {
 
 enum Func {
     Reading(ReadingFn),
-    Device { kinds: u32, filter: u32, func: DeviceFn },
+    Device {
+        kinds: u32,
+        filter: u32,
+        func: DeviceFn,
+    },
     Guide(GuideFn),
     Keyboard,
 }
@@ -168,17 +172,16 @@ impl Hub {
         )
     }
 
-    pub fn with_clock(
-        config: InputConfig,
-        clock: Box<dyn Fn() -> u64 + Send + Sync>,
-    ) -> Arc<Hub> {
+    pub fn with_clock(config: InputConfig, clock: Box<dyn Fn() -> u64 + Send + Sync>) -> Arc<Hub> {
         let mut devices = Vec::new();
         for (class, name, tag) in [
             (Class::Keyboard, "Keyboard", 1u8),
             (Class::Mouse, "Mouse", 2),
             (Class::VirtualPad, "Keyboard and mouse pad (Leonida)", 3),
         ] {
-            let uuid = [0x4C, 0x45, 0x4F, 0x4E, 0x49, 0x44, 0x41, tag, 0, 0, 0, 0, 0, 0, 0, 0];
+            let uuid = [
+                0x4C, 0x45, 0x4F, 0x4E, 0x49, 0x44, 0x41, tag, 0, 0, 0, 0, 0, 0, 0, 0,
+            ];
             devices.push(new_device(class, name, None, uuid, 0, 0, name));
         }
         let hub = Arc::new_cyclic(|me| Hub {
@@ -239,7 +242,9 @@ impl Hub {
     }
 
     fn arc(&self) -> Arc<Hub> {
-        self.me.upgrade().expect("the hub is alive while it is used")
+        self.me
+            .upgrade()
+            .expect("the hub is alive while it is used")
     }
 
     /// Runs jobs now, or queues them for the dispatcher once the title made one.
@@ -268,7 +273,10 @@ impl Hub {
     }
 
     pub fn device_status(&self, d: usize) -> u32 {
-        self.lock().devices.get(d).map_or(status::NONE, |x| x.status)
+        self.lock()
+            .devices
+            .get(d)
+            .map_or(status::NONE, |x| x.status)
     }
 
     pub fn device_class(&self, d: usize) -> Option<Class> {
@@ -298,7 +306,10 @@ impl Hub {
 
     /// The device a COM pointer stands for.
     pub fn device_of_com(&self, ptr: usize) -> Option<usize> {
-        self.lock().devices.iter().position(|d| d.com == ptr && ptr != 0)
+        self.lock()
+            .devices
+            .iter()
+            .position(|d| d.com == ptr && ptr != 0)
     }
 
     pub fn find_device(&self, id: &[u8; 32]) -> Option<usize> {
@@ -309,7 +320,11 @@ impl Hub {
     }
 
     pub fn battery(&self, d: usize) -> BatteryState {
-        self.lock().devices.get(d).map(|x| x.battery).unwrap_or_default()
+        self.lock()
+            .devices
+            .get(d)
+            .map(|x| x.battery)
+            .unwrap_or_default()
     }
 
     fn set_status(&self, inner: &mut Inner, d: usize, new: u32) -> Vec<Job> {
@@ -330,7 +345,12 @@ impl Hub {
         let timestamp = self.now();
         let supported = inner.devices[d].class.supported_input();
         for cb in &inner.callbacks {
-            let Func::Device { kinds, filter, func } = cb.func else {
+            let Func::Device {
+                kinds,
+                filter,
+                func,
+            } = cb.func
+            else {
                 continue;
             };
             if kinds & supported == 0 || cb.device.is_some_and(|x| x != d) {
@@ -693,7 +713,11 @@ impl Hub {
     }
 
     pub fn rumble(&self, d: usize) -> RumbleParams {
-        self.lock().devices.get(d).map(|x| x.rumble).unwrap_or_default()
+        self.lock()
+            .devices
+            .get(d)
+            .map(|x| x.rumble)
+            .unwrap_or_default()
     }
 
     /// Rumble levels that changed since the last call, by backend source.
@@ -806,12 +830,8 @@ impl Hub {
     }
 
     fn update_virtual_pad(&self, inner: &mut Inner) -> Vec<Job> {
-        let state = mapping::virtual_pad(
-            &inner.config,
-            &inner.keys,
-            inner.mouse_buttons,
-            inner.stick,
-        );
+        let state =
+            mapping::virtual_pad(&inner.config, &inner.keys, inner.mouse_buttons, inner.stick);
         self.push_reading(inner, VIRTUAL_PAD, false, |r| r.pad = state)
     }
 
@@ -856,7 +876,12 @@ impl Hub {
         })
     }
 
-    pub fn register_guide_callback(&self, device: Option<usize>, context: usize, func: GuideFn) -> u64 {
+    pub fn register_guide_callback(
+        &self,
+        device: Option<usize>,
+        context: usize,
+        func: GuideFn,
+    ) -> u64 {
         let mut inner = self.lock();
         self.add_callback(&mut inner, |token| Callback {
             token,
@@ -912,7 +937,13 @@ impl Hub {
                         && dev.status & status_filter != 0
                     {
                         jobs.push(self.device_job(
-                            token, context, func, d, timestamp, dev.status, status::NONE,
+                            token,
+                            context,
+                            func,
+                            d,
+                            timestamp,
+                            dev.status,
+                            status::NONE,
                         ));
                     }
                 }

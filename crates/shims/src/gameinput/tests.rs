@@ -101,9 +101,9 @@ impl Gi {
         let mut token = 0;
         // SAFETY: slot 8.
         let hr = unsafe {
-            slot::<unsafe extern "win64" fn(P, P, u32, f32, P, super::hub::ReadingFn, *mut u64) -> i32>(
-                self.0, 8,
-            )(self.0, device, kinds, 0.0, context, f, &mut token)
+            slot::<
+                unsafe extern "win64" fn(P, P, u32, f32, P, super::hub::ReadingFn, *mut u64) -> i32,
+            >(self.0, 8)(self.0, device, kinds, 0.0, context, f, &mut token)
         };
         assert_eq!(hr, S_OK);
         token
@@ -122,8 +122,26 @@ impl Gi {
         // SAFETY: slot 9.
         let hr = unsafe {
             slot::<
-                unsafe extern "win64" fn(P, P, u32, u32, u32, P, super::hub::DeviceFn, *mut u64) -> i32,
-            >(self.0, 9)(self.0, device, kinds, filter, enumeration, context, f, &mut token)
+                unsafe extern "win64" fn(
+                    P,
+                    P,
+                    u32,
+                    u32,
+                    u32,
+                    P,
+                    super::hub::DeviceFn,
+                    *mut u64,
+                ) -> i32,
+            >(self.0, 9)(
+                self.0,
+                device,
+                kinds,
+                filter,
+                enumeration,
+                context,
+                f,
+                &mut token,
+            )
         };
         assert_eq!(hr, S_OK);
         token
@@ -157,7 +175,9 @@ impl Reading {
         let mut s = GamepadState::default();
         // SAFETY: slot 22.
         let ok = unsafe {
-            slot::<unsafe extern "win64" fn(P, *mut GamepadState) -> bool>(self.0, 22)(self.0, &mut s)
+            slot::<unsafe extern "win64" fn(P, *mut GamepadState) -> bool>(self.0, 22)(
+                self.0, &mut s,
+            )
         };
         ok.then_some(s)
     }
@@ -165,7 +185,9 @@ impl Reading {
     fn ui(&self) -> Option<u32> {
         let mut s = 0;
         // SAFETY: slot 24.
-        let ok = unsafe { slot::<unsafe extern "win64" fn(P, *mut u32) -> bool>(self.0, 24)(self.0, &mut s) };
+        let ok = unsafe {
+            slot::<unsafe extern "win64" fn(P, *mut u32) -> bool>(self.0, 24)(self.0, &mut s)
+        };
         ok.then_some(s)
     }
 
@@ -261,7 +283,9 @@ impl Device {
 
     fn rumble(&self, params: &RumbleParams) {
         // SAFETY: slot 10.
-        unsafe { slot::<unsafe extern "win64" fn(P, *const RumbleParams)>(self.0, 10)(self.0, params) }
+        unsafe {
+            slot::<unsafe extern "win64" fn(P, *const RumbleParams)>(self.0, 10)(self.0, params)
+        }
     }
 
     fn create_ffb(&self) -> i32 {
@@ -368,7 +392,10 @@ fn reading_names_its_device_and_the_device_describes_itself() {
     // SAFETY: the info block's own tables.
     unsafe {
         assert_eq!((*info.gamepad_info).labels[2], label::XBOX_A);
-        assert_eq!((*info.controller_axis_info.add(4)).label, label::XBOX_LEFT_TRIGGER);
+        assert_eq!(
+            (*info.controller_axis_info.add(4)).label,
+            label::XBOX_LEFT_TRIGGER
+        );
         let name = &*info.display_name;
         let bytes = std::slice::from_raw_parts(name.data, name.size_in_bytes as usize);
         assert_eq!(bytes, b"Pad\0");
@@ -401,7 +428,10 @@ fn history_steps_through_a_tap_between_two_frames() {
     assert!(out.0.is_null());
     let (hr, back) = gi.previous(&released, kind::GAMEPAD, none);
     assert_eq!(hr, S_OK);
-    assert_eq!(back.sequence(kind::GAMEPAD), pressed.sequence(kind::GAMEPAD));
+    assert_eq!(
+        back.sequence(kind::GAMEPAD),
+        pressed.sequence(kind::GAMEPAD)
+    );
     assert!(pressed.timestamp() < released.timestamp());
     let (hr, _) = gi.previous(&first, kind::GAMEPAD, none);
     assert_eq!(hr, GAMEINPUT_E_READING_NOT_FOUND);
@@ -557,10 +587,21 @@ unsafe extern "win64" fn on_reading(_token: u64, context: P, reading: P, _overru
     let wrapper = Reading(reading);
     let buttons = wrapper.gamepad().map(|s| s.buttons).unwrap_or(0);
     std::mem::forget(wrapper);
-    Log::of(context).0.lock().unwrap().push(format!("reading {buttons}"));
+    Log::of(context)
+        .0
+        .lock()
+        .unwrap()
+        .push(format!("reading {buttons}"));
 }
 
-unsafe extern "win64" fn on_device(_token: u64, context: P, device: P, _ts: u64, current: u32, previous: u32) {
+unsafe extern "win64" fn on_device(
+    _token: u64,
+    context: P,
+    device: P,
+    _ts: u64,
+    current: u32,
+    previous: u32,
+) {
     let name_ok = !Device(device).info().display_name.is_null();
     Log::of(context)
         .0
@@ -570,7 +611,11 @@ unsafe extern "win64" fn on_device(_token: u64, context: P, device: P, _ts: u64,
 }
 
 unsafe extern "win64" fn on_guide(_token: u64, context: P, _device: P, _ts: u64, pressed: bool) {
-    Log::of(context).0.lock().unwrap().push(format!("guide {pressed}"));
+    Log::of(context)
+        .0
+        .lock()
+        .unwrap()
+        .push(format!("guide {pressed}"));
 }
 
 #[test]
@@ -647,10 +692,20 @@ fn device_callbacks_hear_connect_and_disconnect() {
     let (hub, _) = hub_with(no_virtual());
     let gi = Gi::new(&hub);
     let (log, context) = Log::leak();
-    gi.register_device(std::ptr::null_mut(), kind::GAMEPAD, status::CONNECTED, 0, context, on_device);
+    gi.register_device(
+        std::ptr::null_mut(),
+        kind::GAMEPAD,
+        status::CONNECTED,
+        0,
+        context,
+        on_device,
+    );
     hub.connect_pad(1, &pad("Pad", 1));
     hub.disconnect_pad(1);
-    assert_eq!(log.lines(), vec!["device 0x7 0x0 true", "device 0x0 0x7 true"]);
+    assert_eq!(
+        log.lines(),
+        vec!["device 0x7 0x0 true", "device 0x0 0x7 true"]
+    );
 }
 
 #[test]
@@ -661,15 +716,12 @@ fn guide_button_reaches_guide_callbacks() {
     let (log, context) = Log::leak();
     let mut token = 0u64;
     // SAFETY: slot 10 of IGameInput.
-    let hr = unsafe {
-        slot::<unsafe extern "win64" fn(P, P, P, super::hub::GuideFn, *mut u64) -> i32>(gi.0, 10)(
-            gi.0,
-            std::ptr::null_mut(),
-            context,
-            on_guide,
-            &mut token,
-        )
-    };
+    let hr =
+        unsafe {
+            slot::<unsafe extern "win64" fn(P, P, P, super::hub::GuideFn, *mut u64) -> i32>(
+                gi.0, 10,
+            )(gi.0, std::ptr::null_mut(), context, on_guide, &mut token)
+        };
     assert_eq!(hr, S_OK);
     hub.guide_button(1, true);
     hub.guide_button(1, false);
@@ -686,7 +738,8 @@ fn a_dispatcher_holds_callbacks_until_dispatch() {
     let mut dispatcher: P = std::ptr::null_mut();
     // SAFETY: slot 14 of IGameInput, then slot 3 of IGameInputDispatcher.
     unsafe {
-        let hr = slot::<unsafe extern "win64" fn(P, *mut P) -> i32>(gi.0, 14)(gi.0, &mut dispatcher);
+        let hr =
+            slot::<unsafe extern "win64" fn(P, *mut P) -> i32>(gi.0, 14)(gi.0, &mut dispatcher);
         assert_eq!(hr, S_OK);
         for buttons in [buttons::A, buttons::B, buttons::X] {
             hub.pad_state(1, state(buttons, 0.0));
@@ -746,7 +799,10 @@ fn rumble_requests_are_clamped_scaled_and_switchable() {
     assert_eq!(hub.take_rumble()[0].1, RumbleParams::default());
     // SAFETY: a null parameter stops rumble.
     unsafe {
-        slot::<unsafe extern "win64" fn(P, *const RumbleParams)>(device.0, 10)(device.0, std::ptr::null())
+        slot::<unsafe extern "win64" fn(P, *const RumbleParams)>(device.0, 10)(
+            device.0,
+            std::ptr::null(),
+        )
     };
 }
 
@@ -764,7 +820,10 @@ fn keyboard_readings_list_pressed_keys_in_press_order() {
     let (hr, r) = gi.current(kind::KEYBOARD, std::ptr::null_mut());
     assert_eq!(hr, S_OK);
     let keys = r.keys();
-    assert_eq!(keys.iter().map(|k| k.virtual_key).collect::<Vec<_>>(), vec![b'W', b'A']);
+    assert_eq!(
+        keys.iter().map(|k| k.virtual_key).collect::<Vec<_>>(),
+        vec![b'W', b'A']
+    );
     assert_eq!(keys[0].scan_code, 17);
     assert_eq!(keys[0].code_point, u32::from(b'w'));
     hub.input(RawInput::Key {
@@ -838,7 +897,14 @@ fn the_keyboard_pad_is_present_only_while_no_gamepad_is_in_auto_mode() {
     let (hr, r) = gi.current(kind::GAMEPAD, none);
     assert_eq!(hr, S_OK);
     assert_eq!(r.device().status(), status::ONLINE);
-    gi.register_device(none, kind::GAMEPAD, status::CONNECTED, 0, context, on_device);
+    gi.register_device(
+        none,
+        kind::GAMEPAD,
+        status::CONNECTED,
+        0,
+        context,
+        on_device,
+    );
     hub.connect_pad(1, &pad("Pad", 1));
     assert_eq!(r.device().status(), status::NONE);
     assert_eq!(log.lines().len(), 2);
