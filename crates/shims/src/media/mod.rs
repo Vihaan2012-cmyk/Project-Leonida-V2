@@ -23,6 +23,7 @@ mod header;
 pub mod layout;
 #[doc(hidden)]
 pub mod testing;
+mod worker;
 
 pub use decoder::{
     AudioTrackInfo, DecodeError, DecodedFrame, DecoderFactory, MovieDecoder, Plane, StreamInfo,
