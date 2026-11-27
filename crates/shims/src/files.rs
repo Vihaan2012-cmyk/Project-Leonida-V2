@@ -1,6 +1,6 @@
 //! File system calls the game makes, mapped onto the package, the virtual file system and Output/.
 //!
-//! Path rules are in [`map`]. The package is read-only: a write-open of a package file copies it into the overlay
+//! Path rules are in `map`. The package is read-only: a write-open of a package file copies it into the overlay
 //! first, a delete of one hides it for the rest of the run (nothing is written for that), and everything the game
 //! creates lands under `Output/`. Handle-based calls (`ReadFile`, `WriteFile`, `SetFilePointerEx`, ...) are the
 //! host's, since the shims hand out host handles.
