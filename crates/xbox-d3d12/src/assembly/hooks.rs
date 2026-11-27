@@ -57,6 +57,23 @@ pub fn clear_input_sink() {
     *INPUT.write().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+pub type MotionSink = fn(i32, i32);
+
+static MOTION: RwLock<Option<MotionSink>> = RwLock::new(None);
+
+/// Where raw mouse motion goes while the window holds the cursor captured. Like the input sink it is read when
+/// motion arrives, so it may be set after the window opens.
+pub fn set_motion_sink(sink: MotionSink) {
+    *MOTION.write().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+}
+
+pub(super) fn forward_motion(dx: i32, dy: i32) {
+    let sink = *MOTION.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(sink) = sink {
+        sink(dx, dy);
+    }
+}
+
 pub(super) fn forward(event: InputEvent) {
     let sink = *INPUT.read().unwrap_or_else(|e| e.into_inner());
     if let Some(sink) = sink {
@@ -187,6 +204,20 @@ mod tests {
     use super::*;
     use winit::dpi::PhysicalPosition;
     use winit::event::DeviceId;
+
+    #[test]
+    fn raw_motion_reaches_the_motion_sink() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static SEEN: AtomicI64 = AtomicI64::new(0);
+        fn sink(dx: i32, dy: i32) {
+            SEEN.fetch_add(i64::from(dx) * 1000 + i64::from(dy), Ordering::SeqCst);
+        }
+        forward_motion(1, 1);
+        assert_eq!(SEEN.load(Ordering::SeqCst), 0);
+        set_motion_sink(sink);
+        forward_motion(3, -2);
+        assert_eq!(SEEN.load(Ordering::SeqCst), 2998);
+    }
 
     fn device() -> DeviceId {
         DeviceId::dummy()
