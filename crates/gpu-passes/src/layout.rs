@@ -4,6 +4,8 @@
 //! positions); arrays are mip-major; cube faces are slice-major `SW_4KB_S`; volumes are a single 3D mip
 //! (docs/textures.md, docs/textures_arrays.md).
 
+use ash::vk;
+
 use crate::LayoutError;
 use crate::swizzle::{Equation, Job, Swizzle};
 
@@ -329,5 +331,34 @@ impl SurfaceDesc {
             linear_size: linear,
             subresources: subs,
         })
+    }
+}
+
+impl Layout {
+    /// The buffer-to-image copies that move the linear output into a Vulkan image of the matching BCn or
+    /// uncompressed format. Cube faces and array layers become array layers.
+    pub fn buffer_image_copies(&self, aspect: vk::ImageAspectFlags) -> Vec<vk::BufferImageCopy> {
+        let block = self.desc.format.block;
+        self.subresources
+            .iter()
+            .map(|s| {
+                vk::BufferImageCopy::default()
+                    .buffer_offset(s.job.linear_offset)
+                    .buffer_row_length(s.job.extent[0] * block)
+                    .buffer_image_height(s.job.extent[1] * block)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(aspect)
+                            .mip_level(s.mip)
+                            .base_array_layer(s.slice)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: s.texels[0],
+                        height: s.texels[1],
+                        depth: s.texels[2],
+                    })
+            })
+            .collect()
     }
 }
