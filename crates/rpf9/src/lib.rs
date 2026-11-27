@@ -13,6 +13,9 @@ mod names;
 mod package;
 mod walk;
 
+#[cfg(test)]
+mod tests;
+
 pub use archive::{Archive, Header, ResourceData, ScanReport};
 pub use error::Rpf9Error;
 pub use index::{ArchiveInfo, Index, Query};

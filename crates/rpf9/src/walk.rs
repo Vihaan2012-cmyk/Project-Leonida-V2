@@ -196,13 +196,6 @@ pub(crate) mod testutil {
         encoder.finish().unwrap()
     }
 
-    pub fn deflate(data: &[u8]) -> Vec<u8> {
-        let mut encoder =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(data).unwrap();
-        encoder.finish().unwrap()
-    }
-
     pub fn bink2(frames: u32, total: usize) -> Vec<u8> {
         let mut bytes = vec![0u8; total];
         bytes[..4].copy_from_slice(b"KB2n");
