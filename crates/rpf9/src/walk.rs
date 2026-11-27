@@ -230,8 +230,12 @@ mod tests {
     fn collect(data: &[u8]) -> (Vec<(String, u64, usize)>, WalkStats) {
         let mut found = Vec::new();
         let stats = walk(data, 0, data.len(), &mut |piece| match piece {
-            Piece::Zlib { offset, data, .. } => found.push(("zlib".to_string(), offset, data.len())),
-            Piece::Bink2 { offset, bytes } => found.push(("bink2".to_string(), offset, bytes.len())),
+            Piece::Zlib { offset, data, .. } => {
+                found.push(("zlib".to_string(), offset, data.len()))
+            }
+            Piece::Bink2 { offset, bytes } => {
+                found.push(("bink2".to_string(), offset, bytes.len()))
+            }
             Piece::Awc { offset, bytes } => found.push(("awc".to_string(), offset, bytes.len())),
         });
         (found, stats)

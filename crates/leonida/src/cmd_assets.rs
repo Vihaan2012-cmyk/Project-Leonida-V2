@@ -34,16 +34,22 @@ fn index_command(args: &IndexArgs, db: &Path) -> Result<ExitCode> {
         only: args.only.clone(),
         jobs: args.jobs,
     };
-    let done = rpf9::index_package(&index, &game, manifest, &options, &|progress| match progress {
-        Progress::Started { name, size } => eprintln!("reading {name} ({})", mib(size)),
-        Progress::Finished(info) => eprintln!(
-            "  {}: {} resources from {} streams, {} unread",
-            info.name,
-            info.resources,
-            info.streams,
-            mib(info.unread_bytes)
-        ),
-    })?;
+    let done = rpf9::index_package(
+        &index,
+        &game,
+        manifest,
+        &options,
+        &|progress| match progress {
+            Progress::Started { name, size } => eprintln!("reading {name} ({})", mib(size)),
+            Progress::Finished(info) => eprintln!(
+                "  {}: {} resources from {} streams, {} unread",
+                info.name,
+                info.resources,
+                info.streams,
+                mib(info.unread_bytes)
+            ),
+        },
+    )?;
     if done.is_empty() {
         bail!("no archive matched");
     }
@@ -66,7 +72,10 @@ fn print_counts(index: &Index) -> Result<()> {
 
 fn list_command(args: &ListArgs, db: &Path) -> Result<ExitCode> {
     if !db.is_file() {
-        bail!("no index at {}: run `leonida assets index` first", db.display());
+        bail!(
+            "no index at {}: run `leonida assets index` first",
+            db.display()
+        );
     }
     let index = Index::open(db).with_context(|| format!("opening {}", db.display()))?;
     let kind = match &args.kind {

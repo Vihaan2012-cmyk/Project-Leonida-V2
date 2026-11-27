@@ -55,7 +55,11 @@ impl Inflater {
             let consumed = decoder.total_in() as usize;
             let before = (decoder.total_in(), decoder.total_out());
             let status = decoder
-                .decompress_vec(&input[consumed.min(input.len())..], out, FlushDecompress::None)
+                .decompress_vec(
+                    &input[consumed.min(input.len())..],
+                    out,
+                    FlushDecompress::None,
+                )
                 .map_err(|error| error.to_string())?;
             match status {
                 Status::StreamEnd => {
@@ -91,8 +95,8 @@ pub(crate) fn decode(
         }
         Codec::Zstd => {
             use std::io::Read as _;
-            let mut decoder =
-                ruzstd::decoding::StreamingDecoder::new(stored).map_err(|error| error.to_string())?;
+            let mut decoder = ruzstd::decoding::StreamingDecoder::new(stored)
+                .map_err(|error| error.to_string())?;
             let mut out = Vec::with_capacity(size);
             decoder
                 .by_ref()

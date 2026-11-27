@@ -83,7 +83,10 @@ fn decode(bytes: &[u8]) -> Result<Resource, Rpf9Error> {
 impl Index {
     /// Open the index at `path`, creating it when it does not exist.
     pub fn open(path: &Path) -> Result<Index, Rpf9Error> {
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent).map_err(|error| Rpf9Error::io(parent, error))?;
         }
         let db = Database::create(path)?;
@@ -124,7 +127,14 @@ impl Index {
                 self.remove_rows(info.id)?;
                 info.id
             }
-            None => self.archives()?.iter().map(|info| info.id).max().unwrap_or(0) + 1,
+            None => {
+                self.archives()?
+                    .iter()
+                    .map(|info| info.id)
+                    .max()
+                    .unwrap_or(0)
+                    + 1
+            }
         };
         self.store_archive(&ArchiveInfo {
             id,
@@ -302,7 +312,10 @@ impl Index {
             None => {
                 if let Some(code) = kind_filter {
                     let table = read.open_table(BY_KIND)?;
-                    for row in table.range((code, 0, 0)..=(code, u32::MAX, u64::MAX))?.take(limit) {
+                    for row in table
+                        .range((code, 0, 0)..=(code, u32::MAX, u64::MAX))?
+                        .take(limit)
+                    {
                         let key = row?.0.value();
                         keys.push((key.1, key.2));
                     }
@@ -335,7 +348,8 @@ impl Index {
                 if text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                     let mut hash = [0u8; 32];
                     for (index, byte) in hash.iter_mut().enumerate() {
-                        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).unwrap_or(0);
+                        *byte =
+                            u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).unwrap_or(0);
                     }
                     let table = read.open_table(BY_CONTENT)?;
                     let key = content_key(&hash);

@@ -47,7 +47,10 @@ pub fn find_names(data: &[u8]) -> Vec<String> {
         if suffix.len() != 2 || !suffix.iter().all(u8::is_ascii_lowercase) {
             continue;
         }
-        if data.get(dot + 4).is_some_and(|&next| next.is_ascii_alphanumeric()) {
+        if data
+            .get(dot + 4)
+            .is_some_and(|&next| next.is_ascii_alphanumeric())
+        {
             continue;
         }
         let mut start = dot;

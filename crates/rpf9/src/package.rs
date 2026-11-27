@@ -92,7 +92,12 @@ pub fn index_package(
 ) -> Result<Vec<ArchiveInfo>, Rpf9Error> {
     let archives: Vec<(String, u64)> = package_archives(manifest)
         .into_iter()
-        .filter(|(name, _)| options.only.as_ref().is_none_or(|only| name.contains(only.as_str())))
+        .filter(|(name, _)| {
+            options
+                .only
+                .as_ref()
+                .is_none_or(|only| name.contains(only.as_str()))
+        })
         .collect();
     let mut work: Vec<(String, u64, u32)> = Vec::new();
     for (name, size) in archives {
