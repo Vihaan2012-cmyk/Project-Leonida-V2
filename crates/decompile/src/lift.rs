@@ -220,12 +220,20 @@ impl<'p> Lifter<'p> {
     pub fn code_name(&self, va: u64) -> Expr {
         match self.program.symbol(va) {
             Symbol::Import(name) => Expr::Name(name),
-            _ => Expr::Name(format!("sub_{:08x}", va.wrapping_sub(self.base))),
+            _ => Expr::Name(
+                self.program
+                    .name(va)
+                    .unwrap_or_else(|| format!("sub_{:08x}", va.wrapping_sub(self.base))),
+            ),
         }
     }
 
     fn global(&self, va: u64) -> Expr {
-        Expr::Name(format!("g_{:08x}", va.wrapping_sub(self.base)))
+        Expr::Name(
+            self.program
+                .name(va)
+                .unwrap_or_else(|| format!("g_{:08x}", va.wrapping_sub(self.base))),
+        )
     }
 
     fn read_reg(&self, r: Register, st: &State, i: &Instruction) -> Expr {

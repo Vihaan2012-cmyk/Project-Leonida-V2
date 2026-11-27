@@ -65,7 +65,10 @@ pub fn decompile(program: &dyn Program, entry: u64) -> Result<String, Error> {
     simplify::merge_conditions(&mut function);
     dump(&function, "simplified");
     let (nodes, _) = structure::structure(&function);
-    Ok(Writer::new(&function).function(entry, registers, &nodes))
+    let title = program
+        .name(entry)
+        .unwrap_or_else(|| format!("sub_{:08x}", entry - function.base));
+    Ok(Writer::new(&function).function(&title, registers, &nodes))
 }
 
 fn stack_name(o: i64) -> String {
@@ -112,7 +115,7 @@ impl<'f> Writer<'f> {
         format!("L_{:x}", self.f.blocks[b].start - self.f.base)
     }
 
-    fn function(mut self, entry: u64, registers: u8, nodes: &[Node]) -> String {
+    fn function(mut self, title: &str, registers: u8, nodes: &[Node]) -> String {
         let mut stack_params = 0;
         for block in &self.f.blocks {
             let mut note = |e: &Expr| {
@@ -139,11 +142,7 @@ impl<'f> Writer<'f> {
             Some(4) => "u32",
             Some(_) => "u64",
         };
-        self.line(&format!(
-            "{returns} sub_{:08x}({}) {{",
-            entry - self.f.base,
-            params.join(", ")
-        ));
+        self.line(&format!("{returns} {title}({}) {{", params.join(", ")));
         self.depth = 1;
         self.nodes(nodes);
         self.depth = 0;

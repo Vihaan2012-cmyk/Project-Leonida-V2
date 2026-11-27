@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use iced_x86::code_asm::*;
+use iced_x86::{Code, Instruction, MemoryOperand, Register};
 
 use super::*;
 
@@ -68,6 +69,23 @@ impl Program for Image {
     fn inside(&self, _: u64, target: u64) -> bool {
         (START..START + self.function_len).contains(&target)
     }
+}
+
+/// `code reg, [rip+va]`: the assembler's own operands cannot spell an instruction-relative address.
+pub fn ip_load(a: &mut CodeAssembler, code: Code, reg: Register, va: u64) -> Result<(), IcedError> {
+    let memory = MemoryOperand::with_base_displ(Register::RIP, va as i64);
+    a.add_instruction(Instruction::with2(code, reg, memory)?)
+}
+
+/// `code [rip+va], reg`.
+pub fn ip_store(
+    a: &mut CodeAssembler,
+    code: Code,
+    va: u64,
+    reg: Register,
+) -> Result<(), IcedError> {
+    let memory = MemoryOperand::with_base_displ(Register::RIP, va as i64);
+    a.add_instruction(Instruction::with2(code, memory, reg)?)
 }
 
 pub fn assemble(build: impl FnOnce(&mut CodeAssembler) -> Result<(), IcedError>) -> Vec<u8> {
@@ -145,4 +163,31 @@ fn call_arguments_and_frame() {
     let text = decompile(&image, START).expect("decompiles");
     assert!(text.contains("return sub_00001020(5);"), "{text}");
     assert!(!text.contains("rsp"), "{text}");
+}
+
+#[test]
+fn names_replace_addresses() {
+    let mut image = Image::new(assemble(|a| {
+        a.sub(rsp, 0x28)?;
+        ip_load(a, Code::Mov_r64_rm64, Register::RCX, DATA)?;
+        a.call(START + 0x40)?;
+        ip_store(a, Code::Mov_rm64_r64, DATA + 8, Register::RAX)?;
+        ip_load(a, Code::Lea_r64_m, Register::RCX, DATA + 0x10)?;
+        a.add(rsp, 0x28)?;
+        a.jmp(START + 0x50)
+    }));
+    image.function_len = 0x40;
+    image.code.resize(0x60, 0xCC);
+    image.data = vec![0; 0x20];
+    image.names.insert(START, "Game::Update".into());
+    image.names.insert(START + 0x40, "Game::Tick".into());
+    image.names.insert(START + 0x50, "Game::Finish".into());
+    image.names.insert(DATA, "g_world".into());
+    image.names.insert(DATA + 8, "g_last".into());
+    image.names.insert(DATA + 0x10, "g_table".into());
+    let text = decompile(&image, START).expect("decompiles");
+    assert!(text.contains(" Game::Update("), "{text}");
+    assert!(text.contains("Game::Tick(g_world)"), "{text}");
+    assert!(text.contains("g_last = "), "{text}");
+    assert!(text.contains("Game::Finish(&g_table)"), "{text}");
 }
