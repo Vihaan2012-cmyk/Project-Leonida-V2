@@ -144,6 +144,7 @@ pub struct FrameDecoder {
     windows: [Vec<f32>; NUM_SIZES],
     channels: Vec<Channel>,
     tmp: Vec<f32>,
+    scratch: Vec<f32>,
     groups: Vec<ChannelGroup>,
     // current subframe state
     subframe_len: usize,
@@ -225,6 +226,7 @@ impl FrameDecoder {
             windows,
             channels: vec![Channel::new(); nb_channels],
             tmp: vec![0.0; SAMPLES_PER_FRAME],
+            scratch: vec![0.0; SAMPLES_PER_FRAME],
             groups: Vec::new(),
             subframe_len: 0,
             members: [0; MAX_CHANNELS],
@@ -765,9 +767,10 @@ impl FrameDecoder {
                 let at = ch.coefs_at;
                 let imdct = &self.imdct[self.table_idx];
                 let ch = &mut self.channels[c];
-                imdct.process(
+                imdct.process_with(
                     &self.tmp[..subframe_len],
                     &mut ch.out[at..at + subframe_len],
+                    &mut self.scratch,
                 );
             }
         }

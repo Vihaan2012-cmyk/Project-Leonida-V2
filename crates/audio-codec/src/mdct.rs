@@ -79,11 +79,16 @@ impl Imdct {
 
     /// `coefs` and `out` both hold `n` values.
     pub fn process(&self, coefs: &[f32], out: &mut [f32]) {
+        let mut scratch = vec![0f32; self.n];
+        self.process_with(coefs, out, &mut scratch);
+    }
+
+    /// Same as [`Imdct::process`] with caller-provided scratch of at least `n` values.
+    pub fn process_with(&self, coefs: &[f32], out: &mut [f32], scratch: &mut [f32]) {
         let n = self.n;
         let m = n / 2;
-        debug_assert!(coefs.len() >= n && out.len() >= n);
-        let mut re = vec![0f32; m];
-        let mut im = vec![0f32; m];
+        debug_assert!(coefs.len() >= n && out.len() >= n && scratch.len() >= n);
+        let (re, im) = scratch[..n].split_at_mut(m);
         for i in 0..m {
             let a = coefs[2 * i];
             let b = coefs[n - 1 - 2 * i];
@@ -91,7 +96,7 @@ impl Imdct {
             re[i] = a * wr - b * wi;
             im[i] = a * wi + b * wr;
         }
-        self.fft(&mut re, &mut im);
+        self.fft(re, im);
         for k in 0..m {
             let (wr, wi) = self.post[k];
             let yr = re[k] * wr - im[k] * wi;
