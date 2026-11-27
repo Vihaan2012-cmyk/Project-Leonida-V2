@@ -145,8 +145,9 @@ struct Report {
     compute_entries: usize,
     instructions: usize,
     unsupported: usize,
-    missing: BTreeMap<String, (usize, usize, String)>,
+    missing: BTreeMap<String, (usize, usize, String, String)>,
     lift_errors: BTreeMap<String, usize>,
+    examples: bool,
 }
 
 impl Report {
@@ -166,11 +167,16 @@ impl Report {
         for name in &coverage.unsupported {
             self.missing.entry(name.clone()).or_default().1 += 1;
         }
-        for missing in coverage.unsupported.iter().collect::<BTreeSet<_>>() {
+        let mut seen = BTreeSet::new();
+        for (missing, text) in coverage.unsupported.iter().zip(&coverage.texts) {
+            if !seen.insert(missing) {
+                continue;
+            }
             let entry = self.missing.entry(missing.clone()).or_default();
             entry.0 += 1;
             if entry.2.is_empty() {
                 entry.2 = name.to_string();
+                entry.3 = text.clone();
             }
         }
         if coverage.unsupported.is_empty() && coverage.invalid_words == 0 {
@@ -249,15 +255,21 @@ impl Report {
             "missing instructions ({} kinds), by shaders that need them:",
             missing.len()
         );
-        for (name, (shaders, uses, example)) in missing.into_iter().take(top) {
+        for (name, (shaders, uses, example, text)) in missing.into_iter().take(top) {
             println!("  {name:<32} {shaders:>6} shaders {uses:>9} uses   e.g. {example}");
+            if self.examples {
+                println!("      {text}");
+            }
         }
     }
 }
 
 pub fn report_command(args: &ReportArgs) -> Result<ExitCode> {
     with_archive(args.game.as_ref(), |archive| {
-        let mut report = Report::default();
+        let mut report = Report {
+            examples: args.examples,
+            ..Report::default()
+        };
         carve(archive, |shader| {
             let added = unpack_all(&shader.dxbc).ok().and_then(|blobs| {
                 blobs

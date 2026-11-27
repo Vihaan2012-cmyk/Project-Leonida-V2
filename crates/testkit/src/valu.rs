@@ -49,6 +49,20 @@ fn kind(name: &str) -> Option<Kind> {
         "v_bfrev_b32" => I1(u32::reverse_bits),
         "v_ffbl_b32" => I1(|a| if a == 0 { u32::MAX } else { a.trailing_zeros() }),
         "v_ffbh_u32" => I1(|a| if a == 0 { u32::MAX } else { a.leading_zeros() }),
+        "v_ffbh_i32" => I1(|a| {
+            let differs = a ^ ((a as i32 >> 31) as u32);
+            if differs == 0 {
+                u32::MAX
+            } else {
+                differs.leading_zeros()
+            }
+        }),
+        "v_mul_hi_i32" => I2(|a, b| ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32),
+        "v_mad_i32_i24" => I3(|a, b, c| {
+            let x = (a << 8) as i32 >> 8;
+            let y = (b << 8) as i32 >> 8;
+            x.wrapping_mul(y).wrapping_add(c as i32) as u32
+        }),
         "v_cvt_f32_ubyte0" => IntToFloat(|a| (a & 0xFF) as f32),
         "v_cvt_f32_ubyte1" => IntToFloat(|a| ((a >> 8) & 0xFF) as f32),
         "v_cvt_f32_ubyte2" => IntToFloat(|a| ((a >> 16) & 0xFF) as f32),
@@ -345,6 +359,79 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
             half_op(name, inst, wave)?;
             return Ok(true);
         }
+        "v_cvt_pkrtz_f16_f32" => {
+            if output_modified(inst) {
+                return Err(crate::ExecError::Unsupported {
+                    pc: inst.pc,
+                    text: inst.text(),
+                });
+            }
+            for lane in wave.active_lanes() {
+                let mut halves = [0u32; 2];
+                for (slot, index) in halves.iter_mut().zip([1, 2]) {
+                    let source = arg(inst, index)?;
+                    let mut bits = wave.read_lane(source, lane, inst)?;
+                    if source.abs {
+                        bits &= 0x7FFF_FFFF;
+                    }
+                    if source.neg {
+                        bits ^= 0x8000_0000;
+                    }
+                    *slot = rdna::format::f32_to_f16_round(bits, rdna::format::Round::Zero);
+                }
+                wave.write_lane(arg(inst, 0)?, lane, halves[0] | (halves[1] << 16), inst)?;
+            }
+            return Ok(true);
+        }
+        "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => {
+            for lane in wave.active_lanes() {
+                let x = wave.read_lane_f32(arg(inst, 1)?, lane, inst)?;
+                let y = wave.read_lane_f32(arg(inst, 2)?, lane, inst)?;
+                let z = wave.read_lane_f32(arg(inst, 3)?, lane, inst)?;
+                let (face, sc, tc, major) = if z.abs() >= x.abs() && z.abs() >= y.abs() {
+                    if z < 0.0 {
+                        (5.0, -x, -y, z)
+                    } else {
+                        (4.0, x, -y, z)
+                    }
+                } else if y.abs() >= x.abs() {
+                    if y < 0.0 {
+                        (3.0, x, -z, y)
+                    } else {
+                        (2.0, x, z, y)
+                    }
+                } else if x < 0.0 {
+                    (1.0, z, -y, x)
+                } else {
+                    (0.0, -z, -y, x)
+                };
+                let value = match name {
+                    "v_cubeid_f32" => face,
+                    "v_cubesc_f32" => sc,
+                    "v_cubetc_f32" => tc,
+                    _ => nan_rule(major * 2.0, &[major]),
+                };
+                let value = output_modifiers(wave, inst, value);
+                wave.write_lane(arg(inst, 0)?, lane, value.to_bits(), inst)?;
+            }
+            return Ok(true);
+        }
+        "v_swap_b32" => {
+            let (Operand::Vgpr { reg: a, .. }, Operand::Vgpr { reg: b, .. }) =
+                (arg(inst, 0)?.operand.clone(), arg(inst, 1)?.operand.clone())
+            else {
+                return Err(bad(inst));
+            };
+            for lane in wave.active_lanes() {
+                let (x, y) = (
+                    wave.vgpr[usize::from(a)][lane],
+                    wave.vgpr[usize::from(b)][lane],
+                );
+                wave.vgpr[usize::from(a)][lane] = y;
+                wave.vgpr[usize::from(b)][lane] = x;
+            }
+            return Ok(true);
+        }
         "v_cvt_pk_u8_f32" => {
             for lane in wave.active_lanes() {
                 let x = wave.read_lane_f32(arg(inst, 1)?, lane, inst)?;
@@ -507,16 +594,24 @@ fn compare(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
                     _ => return Err(bad(inst)),
                 }
             }
-            "u32" | "i32" => {
-                let (x, y) = (
-                    wave.read_lane(a, lane, inst)?,
-                    wave.read_lane(b, lane, inst)?,
-                );
-                let signed = ty == "i32";
-                let ordering = if signed {
-                    (x as i32).cmp(&(y as i32))
-                } else {
-                    x.cmp(&y)
+            "u32" | "i32" | "u64" | "i64" => {
+                let wide = ty.ends_with("64");
+                let read = |source: &Arg| -> Result<u64> {
+                    match source.operand {
+                        Operand::Vgpr { reg, .. } if wide => {
+                            let reg = usize::from(reg);
+                            Ok(u64::from(wave.vgpr[reg][lane])
+                                | (u64::from(wave.vgpr[reg + 1][lane]) << 32))
+                        }
+                        _ if wide => wave.read_scalar64(source, inst),
+                        _ => wave.read_lane(source, lane, inst).map(u64::from),
+                    }
+                };
+                let (x, y) = (read(a)?, read(b)?);
+                let ordering = match ty {
+                    "u32" | "u64" => x.cmp(&y),
+                    "i32" => (x as i32).cmp(&(y as i32)),
+                    _ => (x as i64).cmp(&(y as i64)),
                 };
                 match op {
                     "f" => false,
@@ -775,7 +870,7 @@ fn half_op(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
                 if source.neg {
                     bits ^= 0x8000_0000;
                 }
-                (old & 0xFFFF_0000) | rdna::format::f32_to_f16(bits)
+                (old & 0xFFFF_0000) | rdna::format::f32_to_f16_round(bits, wave.f16_round)
             }
             "v_pack_b32_f16" => {
                 let select = selects(inst, "op_sel");
@@ -808,9 +903,14 @@ fn half_op(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
                 match name {
                     "v_fma_mix_f32" => result.to_bits(),
                     "v_fma_mixlo_f16" => {
-                        (old & 0xFFFF_0000) | rdna::format::f32_to_f16(result.to_bits())
+                        (old & 0xFFFF_0000)
+                            | rdna::format::f32_to_f16_round(result.to_bits(), wave.f16_round)
                     }
-                    _ => (old & 0xFFFF) | (rdna::format::f32_to_f16(result.to_bits()) << 16),
+                    _ => {
+                        (old & 0xFFFF)
+                            | (rdna::format::f32_to_f16_round(result.to_bits(), wave.f16_round)
+                                << 16)
+                    }
                 }
             }
         };

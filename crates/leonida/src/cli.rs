@@ -113,6 +113,9 @@ pub struct ReportArgs {
     /// How many missing instructions to list.
     #[arg(long, default_value_t = 40)]
     pub top: usize,
+    /// Also print one example of each missing instruction.
+    #[arg(long)]
+    pub examples: bool,
 }
 
 #[derive(Debug, Args)]

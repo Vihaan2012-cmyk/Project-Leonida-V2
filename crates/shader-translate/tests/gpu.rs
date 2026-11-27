@@ -253,11 +253,11 @@ fn random_suite(wave64: bool) {
         if only.is_some_and(|o| o != seed) {
             continue;
         }
-        let mut generator = Generator {
-            rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
+        let mut generator = Generator::new(
+            Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
             wave64,
-            gpu: true,
-        };
+            true,
+        );
         let source = generator.program();
         let (wave, memory) = prepared(seed, wave64);
         let name = format!("random{}_{seed}", if wave64 { 64 } else { 32 });
@@ -368,11 +368,11 @@ fn compute_suite(wave64: bool) {
     let lanes = if wave64 { 64 } else { 32 };
     let mut completed = 0;
     for seed in 1..=200u64 {
-        let mut generator = Generator {
-            rng: Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1),
+        let mut generator = Generator::new(
+            Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1),
             wave64,
-            gpu: true,
-        };
+            true,
+        );
         let program = generator.program();
         let body = program
             .strip_suffix("s_endpgm")

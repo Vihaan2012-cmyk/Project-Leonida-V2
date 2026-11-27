@@ -17,6 +17,7 @@ pub struct Wave {
     pub exports: Vec<u32>,
     pub messages: Vec<(u32, u32)>,
     pub code_base: u64,
+    pub f16_round: rdna::format::Round,
 }
 
 pub const EXPORT_WORDS: usize = 64 * 4 * 64;
@@ -34,6 +35,7 @@ impl Wave {
             exports: vec![0; EXPORT_WORDS],
             messages: Vec::new(),
             code_base: 0,
+            f16_round: rdna::format::Round::Even,
         };
         wave.set_mask(EXEC, wave.full_mask());
         wave

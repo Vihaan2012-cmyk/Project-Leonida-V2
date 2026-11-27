@@ -7,7 +7,9 @@ use rspirv::spirv::{
     FunctionControl, GlslStd450Op as GLOp, LoopControl, MemoryModel, SelectionControl,
     StorageClass, Word,
 };
-use shader_ir::{Bin, Cmp, Expr, Function, Image, Reg, Stmt, Terminator, Tri, Ty, Un, VerifyError};
+use shader_ir::{
+    Bin, Cmp, Expr, Function, Image, Reg, Round, Stmt, Terminator, Tri, Ty, Un, VerifyError,
+};
 
 use crate::images::{Number, View};
 
@@ -1072,9 +1074,13 @@ impl Emitter {
         ok(self.b.bitwise_or(u32_, None, sign, magnitude))
     }
 
-    fn single_to_half(&mut self, single: Word) -> Result<Word, EmitError> {
+    fn single_to_half(&mut self, single: Word, mode: Round) -> Result<Word, EmitError> {
         let (u32_, bool_) = (self.t.u32_, self.t.bool_);
         let c = |e: &mut Self, v: u32| e.u32c(v);
+        let thirty_one = c(self, 31);
+        let top_bit = ok(self.b.shift_right_logical(u32_, None, single, thirty_one))?;
+        let zero = c(self, 0);
+        let negative = ok(self.b.i_not_equal(bool_, None, top_bit, zero))?;
         let sixteen = c(self, 16);
         let sign = ok(self.b.shift_right_logical(u32_, None, single, sixteen))?;
         let sign_bit = c(self, 0x8000);
@@ -1085,10 +1091,27 @@ impl Emitter {
         let exponent = ok(self.b.bitwise_and(u32_, None, exponent, byte))?;
         let fraction = c(self, 0x7F_FFFF);
         let mantissa = ok(self.b.bitwise_and(u32_, None, single, fraction))?;
-        let zero = c(self, 0);
         let one = c(self, 1);
         let bias = c(self, 112);
         let biased = ok(self.b.i_sub(u32_, None, exponent, bias))?;
+        let away = |e: &mut Self, rest: Word, half: Word, odd: Word| -> Result<Word, EmitError> {
+            let none = e.u32c(0);
+            let inexact = ok(e.b.i_not_equal(bool_, None, rest, none))?;
+            Ok(match mode {
+                Round::Even => {
+                    let above = ok(e.b.u_greater_than(bool_, None, rest, half))?;
+                    let tie = ok(e.b.i_equal(bool_, None, rest, half))?;
+                    let tie = ok(e.b.logical_and(bool_, None, tie, odd))?;
+                    ok(e.b.logical_or(bool_, None, above, tie))?
+                }
+                Round::Up => {
+                    let positive = ok(e.b.logical_not(bool_, None, negative))?;
+                    ok(e.b.logical_and(bool_, None, inexact, positive))?
+                }
+                Round::Down => ok(e.b.logical_and(bool_, None, inexact, negative))?,
+                Round::Zero => e.boolc(false),
+            })
+        };
         let round = |e: &mut Self, value: Word, shift: Word| -> Result<Word, EmitError> {
             let quotient = ok(e.b.shift_right_logical(u32_, None, value, shift))?;
             let one = e.u32c(1);
@@ -1096,44 +1119,51 @@ impl Emitter {
             let low = ok(e.b.i_sub(u32_, None, bit, one))?;
             let rest = ok(e.b.bitwise_and(u32_, None, value, low))?;
             let half = ok(e.b.shift_right_logical(u32_, None, bit, one))?;
-            let above = ok(e.b.u_greater_than(bool_, None, rest, half))?;
-            let tie = ok(e.b.i_equal(bool_, None, rest, half))?;
             let odd = ok(e.b.bitwise_and(u32_, None, quotient, one))?;
             let none = e.u32c(0);
             let odd = ok(e.b.i_not_equal(bool_, None, odd, none))?;
-            let tie = ok(e.b.logical_and(bool_, None, tie, odd))?;
-            let up = ok(e.b.logical_or(bool_, None, above, tie))?;
-            let zero = e.u32c(0);
-            let step = ok(e.b.select(u32_, None, up, one, zero))?;
+            let up = away(e, rest, half, odd)?;
+            let step = ok(e.b.select(u32_, None, up, one, none))?;
             ok(e.b.i_add(u32_, None, quotient, step))
         };
+        let (max_positive, max_negative) =
+            (c(self, mode.overflow(false)), c(self, mode.overflow(true)));
+        let largest = ok(self
+            .b
+            .select(u32_, None, negative, max_negative, max_positive))?;
         let packed = ok(self.b.shift_left_logical(u32_, None, biased, twenty_three))?;
         let packed = ok(self.b.bitwise_or(u32_, None, packed, mantissa))?;
         let thirteen = c(self, 13);
         let normal = round(self, packed, thirteen)?;
+        let normal = self.glsl(u32_, GLOp::UMin, &[normal, largest])?;
         let implicit = c(self, 0x80_0000);
         let full = ok(self.b.bitwise_or(u32_, None, mantissa, implicit))?;
         let fourteen = c(self, 14);
         let shift = ok(self.b.i_sub(u32_, None, fourteen, biased))?;
         let shift = self.masked_shift(shift, 31)?;
         let tiny = round(self, full, shift)?;
+        let magnitude = c(self, 0x7FFF_FFFF);
+        let magnitude = ok(self.b.bitwise_and(u32_, None, single, magnitude))?;
+        let nonzero = ok(self.b.i_not_equal(bool_, None, magnitude, zero))?;
+        let sticky = ok(self.b.select(u32_, None, nonzero, one, zero))?;
+        let never = self.boolc(false);
+        let up = away(self, sticky, one, never)?;
+        let vanished = ok(self.b.select(u32_, None, up, one, zero))?;
         let infinity = c(self, 0x7C00);
         let nan = c(self, 0x7E00);
         let empty = ok(self.b.i_equal(bool_, None, mantissa, zero))?;
         let special = ok(self.b.select(u32_, None, empty, infinity, nan))?;
         let top = ok(self.b.i_equal(bool_, None, exponent, byte))?;
-        let thirty_one = c(self, 31);
         let overflow = ok(self.b.s_greater_than_equal(bool_, None, biased, thirty_one))?;
         let positive = ok(self.b.s_greater_than_equal(bool_, None, biased, one))?;
         let minus_ten = c(self, (-10i32) as u32);
         let underflow = ok(self.b.s_less_than(bool_, None, biased, minus_ten))?;
         let value = ok(self.b.select(u32_, None, positive, normal, tiny))?;
-        let value = ok(self.b.select(u32_, None, underflow, zero, value))?;
-        let value = ok(self.b.select(u32_, None, overflow, infinity, value))?;
+        let value = ok(self.b.select(u32_, None, underflow, vanished, value))?;
+        let value = ok(self.b.select(u32_, None, overflow, largest, value))?;
         let value = ok(self.b.select(u32_, None, top, special, value))?;
         ok(self.b.bitwise_or(u32_, None, sign, value))
     }
-
     fn convert_field(
         &mut self,
         layout: &rdna::format::BufferFormat,
@@ -1723,7 +1753,11 @@ impl Emitter {
                 let half = ok(self.b.bitwise_and(u32_, None, a, mask))?;
                 self.half_to_single(half, true)?
             }
-            Un::F32ToF16 => self.single_to_half(a)?,
+            Un::F32ToF16(round) => self.single_to_half(a, round)?,
+            Un::FCanonical => {
+                let one = self.u32c(1.0f32.to_bits());
+                self.float_binary(Bin::FMul, a, one)?
+            }
             Un::Not64 => ok(self.b.not(u64_, None, a))?,
             Un::Bfrev => ok(self.b.bit_reverse(u32_, None, a))?,
             Un::Ffbl => self.glsl(u32_, GLOp::FindILsb, &[a])?,

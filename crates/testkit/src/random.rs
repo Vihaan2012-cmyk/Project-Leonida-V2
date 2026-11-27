@@ -75,11 +75,21 @@ pub struct Generator {
     pub rng: Rng,
     pub wave64: bool,
     pub gpu: bool,
+    round: u32,
 }
 
 const FLOATS: [&str; 8] = ["0.5", "-0.5", "1.0", "-1.0", "2.0", "-2.0", "4.0", "-4.0"];
 
 impl Generator {
+    pub fn new(rng: Rng, wave64: bool, gpu: bool) -> Generator {
+        Generator {
+            rng,
+            wave64,
+            gpu,
+            round: 0,
+        }
+    }
+
     fn sreg(&mut self) -> String {
         format!("s{}", self.rng.below(16))
     }
@@ -485,7 +495,10 @@ impl Generator {
     fn export(&mut self) -> String {
         match self.rng.below(4) {
             0 => "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)".into(),
-            1 => "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0".into(),
+            1 => format!(
+                "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), {}",
+                self.round
+            ),
             2 => {
                 let target = self.rng.pick(&[
                     "mrt0", "mrt3", "pos0", "pos1", "prim", "param0", "param5", "param31",
@@ -574,6 +587,7 @@ impl Generator {
                     "s_pack_hh_b32_b16",
                     "s_mul_hi_u32",
                     "s_bfe_i32",
+                    "s_bfm_b32",
                 ]);
                 format!(
                     "{op} {}, {}, {}",
@@ -594,6 +608,9 @@ impl Generator {
                     "s_sext_i32_i16",
                     "s_flbit_i32_b32",
                     "s_bitset1_b32",
+                    "s_bitset0_b32",
+                    "s_wqm_b32",
+                    "s_abs_i32",
                 ]);
                 format!("{op} {}, {}", self.sdst(), self.ssrc(true))
             }
@@ -635,7 +652,9 @@ impl Generator {
                 format!("{op} {}, {}, {}", self.pair(), self.pair(), self.pair())
             }
             5 => {
-                let op = self.rng.pick(&["s_mov_b64", "s_not_b64", "s_cmov_b64"]);
+                let op = self
+                    .rng
+                    .pick(&["s_mov_b64", "s_not_b64", "s_cmov_b64", "s_wqm_b64"]);
                 format!("{op} {}, {}", self.pair(), self.pair())
             }
             6 => {
@@ -647,13 +666,112 @@ impl Generator {
                     self.ssrc(false)
                 )
             }
-            7 => format!("s_bcnt1_i32_b64 {}, {}", self.sreg(), self.pair()),
+            7 => match self.rng.below(4) {
+                0 => format!("s_bcnt1_i32_b64 {}, {}", self.sreg(), self.pair()),
+                1 => format!("s_ff1_i32_b64 {}, {}", self.sreg(), self.pair()),
+                2 => format!(
+                    "s_bfm_b64 {}, {}, {}",
+                    self.pair(),
+                    self.ssrc(false),
+                    self.ssrc(false)
+                ),
+                _ => {
+                    let op = self.rng.pick(&["s_cmp_eq_u64", "s_cmp_lg_u64"]);
+                    format!("{op} {}, {}", self.pair(), self.pair())
+                }
+            },
             _ => format!("s_mov_b32 {}, {}", self.sreg(), self.ssrc(true)),
         }
     }
 
+    fn vreg_pair(&mut self) -> String {
+        let first = self.rng.below(8);
+        format!("v[{first}:{}]", first + 1)
+    }
+
+    fn wide_source(&mut self) -> String {
+        match self.rng.below(5) {
+            0 => self.pair(),
+            1 => format!("{}", self.rng.below(65)),
+            2 => format!("-{}", 1 + self.rng.below(16)),
+            _ => self.vreg_pair(),
+        }
+    }
+
+    fn extra(&mut self) -> String {
+        match self.rng.below(8) {
+            0 => {
+                if self.rng.chance(2) {
+                    format!(
+                        "v_cvt_pkrtz_f16_f32_e32 {}, {}, {}",
+                        self.vdst(),
+                        self.fvsrc(true),
+                        self.fvreg()
+                    )
+                } else {
+                    format!(
+                        "v_cvt_pkrtz_f16_f32_e64 {}, {}, {}",
+                        self.vdst(),
+                        self.fsrc(),
+                        self.fsrc()
+                    )
+                }
+            }
+            1 | 2 => {
+                let op = self.rng.pick(&[
+                    "v_cubeid_f32",
+                    "v_cubesc_f32",
+                    "v_cubetc_f32",
+                    "v_cubema_f32",
+                ]);
+                let omod = self.omod();
+                format!(
+                    "{op} {}, {}, {}, {}{omod}",
+                    self.fdst(),
+                    self.fsrc(),
+                    self.fsrc(),
+                    self.fsrc()
+                )
+            }
+            3 => format!(
+                "v_mul_hi_i32 {}, {}, {}",
+                self.vdst(),
+                self.vsrc(false),
+                self.vsrc(false)
+            ),
+            4 => format!(
+                "v_mad_i32_i24 {}, {}, {}, {}",
+                self.vdst(),
+                self.vsrc(false),
+                self.vsrc(false),
+                self.vsrc(false)
+            ),
+            5 => format!("v_ffbh_i32_e32 {}, {}", self.vdst(), self.vsrc(true)),
+            6 => {
+                if self.rng.chance(2) {
+                    format!("v_swap_b32 {}, {}", self.vdst(), self.vdst())
+                } else {
+                    format!("v_swap_b32 {}, {}", self.fdst(), self.fdst())
+                }
+            }
+            _ => {
+                let op = self
+                    .rng
+                    .pick(&["f", "lt", "eq", "le", "gt", "ne", "ge", "t"]);
+                let ty = self.rng.pick(&["u64", "i64"]);
+                let (a, b) = (self.wide_source(), self.wide_source());
+                if self.rng.chance(4) {
+                    format!("v_cmpx_{op}_{ty}_e64 {a}, {b}")
+                } else {
+                    format!("v_cmp_{op}_{ty}_e64 {}, {a}, {b}", self.mask_reg())
+                }
+            }
+        }
+    }
+
     fn vector(&mut self) -> String {
-        match self.rng.below(23) {
+        match self.rng.below(25) {
+            23 | 24 => self.extra(),
             0 | 1 => {
                 let op = self.rng.pick(&[
                     "v_add_nc_u32",
@@ -1187,6 +1305,17 @@ impl Generator {
 
     pub fn program(&mut self) -> String {
         let mut parts = Vec::new();
+        self.round = if self.rng.chance(3) {
+            self.rng.word() % 4
+        } else {
+            0
+        };
+        if self.round != 0 {
+            parts.push(format!(
+                "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), {}",
+                self.round
+            ));
+        }
         let (vcc, exec) = (self.vcc(), self.exec());
         let (save, and_save, andn2, or) = if self.wave64 {
             ("s[30:31]", "s_and_saveexec_b64", "s_andn2_b64", "s_or_b64")

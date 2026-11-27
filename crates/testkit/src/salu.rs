@@ -12,6 +12,19 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<Option<Flow>>
     }
     if let Some(op) = name
         .strip_prefix("s_cmp_")
+        .filter(|op| op.ends_with("_u64"))
+    {
+        let a = wave.read_scalar64(arg(inst, 0)?, inst)?;
+        let b = wave.read_scalar64(arg(inst, 1)?, inst)?;
+        wave.scc = match op {
+            "eq_u64" => a == b,
+            "lg_u64" => a != b,
+            _ => return Err(bad(inst)),
+        };
+        return Ok(Some(Flow::Next));
+    }
+    if let Some(op) = name
+        .strip_prefix("s_cmp_")
         .or_else(|| name.strip_prefix("s_cmpk_"))
     {
         let a = wave.read_scalar(arg(inst, 0)?, inst)?;
@@ -76,7 +89,7 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<Option<Flow>>
     narrow(name, inst, wave).map(|done| done.then_some(Flow::Next))
 }
 
-fn harmless_setreg(inst: &Inst) -> bool {
+fn setreg(inst: &Inst, wave: &mut Wave) -> bool {
     if inst.text().contains("HW_REG_FLAT_SCR") {
         return true;
     }
@@ -87,13 +100,25 @@ fn harmless_setreg(inst: &Inst) -> bool {
         return false;
     };
     let value = match inst.args.get(1).map(|a| &a.operand) {
-        Some(Operand::Int(value)) => *value,
-        Some(Operand::Literal(value)) => i64::from(*value),
+        Some(Operand::Int(value)) => *value as u32,
+        Some(Operand::Literal(value)) => *value,
         _ => return false,
     };
     let offset = (code >> 6) & 31;
     let size = ((code >> 11) & 31) + 1;
-    code & 63 == 1 && offset + size <= 4 && value == 0
+    if code & 63 != 1 || offset + size > 4 {
+        return false;
+    }
+    let mut mode = (wave.f16_round as u32) << 2;
+    for bit in offset..offset + size {
+        let set = (value >> (bit - offset)) & 1;
+        mode = (mode & !(1 << bit)) | (set << bit);
+    }
+    if mode & 3 != 0 {
+        return false;
+    }
+    wave.f16_round = rdna::format::Round::from_field(mode >> 2);
+    true
 }
 
 fn compare(op: &str, a: u32, b: u32) -> Option<bool> {
@@ -120,7 +145,7 @@ fn program_flow(name: &str, inst: &Inst, wave: &mut Wave) -> Result<Option<Flow>
     };
     let taken = match name {
         "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done" => return Ok(Some(Flow::End)),
-        "s_setreg_imm32_b32" | "s_setreg_b32" if harmless_setreg(inst) => {
+        "s_setreg_imm32_b32" | "s_setreg_b32" if setreg(inst, wave) => {
             return Ok(Some(Flow::Next));
         }
         "s_sendmsg" => {
@@ -132,7 +157,7 @@ fn program_flow(name: &str, inst: &Inst, wave: &mut Wave) -> Result<Option<Flow>
             return Ok(Some(Flow::Next));
         }
         "s_nop" | "s_waitcnt" | "s_waitcnt_vscnt" | "s_barrier" | "s_clause"
-        | "s_inst_prefetch" | "s_code_end" => {
+        | "s_inst_prefetch" | "s_code_end" | "s_sleep" | "s_setprio" => {
             return Ok(Some(Flow::Next));
         }
         "s_swappc_b64" if inst.pc == 0 => {
@@ -187,6 +212,18 @@ fn narrow(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
             wave.read_scalar(arg(inst, 0)?, inst)? | (1 << (src(1)? & 31)),
             None,
         ),
+        "s_bitset0_b32" => (
+            wave.read_scalar(arg(inst, 0)?, inst)? & !(1 << (src(1)? & 31)),
+            None,
+        ),
+        "s_wqm_b32" => {
+            let v = whole_quads(u64::from(src(1)?)) as u32;
+            (v, Some(v != 0))
+        }
+        "s_abs_i32" => {
+            let v = (src(1)? as i32).wrapping_abs() as u32;
+            (v, Some(v != 0))
+        }
         "s_ff1_i32_b32" => {
             let v = src(1)?;
             (if v == 0 { u32::MAX } else { v.trailing_zeros() }, None)
@@ -293,6 +330,10 @@ fn binary(name: &str, a: u32, b: u32, scc_in: bool) -> Option<(u32, Option<bool>
             let wide = (u64::from(a) << shift) + u64::from(b);
             (wide as u32, Some(wide >> 32 != 0))
         }
+        "s_bfm_b32" => (
+            ((1u64 << (a & 31)) as u32).wrapping_sub(1) << (b & 31),
+            None,
+        ),
         "s_pack_ll_b32_b16" => ((a & 0xFFFF) | (b << 16), None),
         "s_pack_lh_b32_b16" => ((a & 0xFFFF) | (b & 0xFFFF_0000), None),
         "s_pack_hh_b32_b16" => ((a >> 16) | (b & 0xFFFF_0000), None),
@@ -300,10 +341,32 @@ fn binary(name: &str, a: u32, b: u32, scc_in: bool) -> Option<(u32, Option<bool>
     })
 }
 
+fn whole_quads(mask: u64) -> u64 {
+    (0..16).fold(0, |result, quad| {
+        if (mask >> (4 * quad)) & 0xF != 0 {
+            result | (0xF << (4 * quad))
+        } else {
+            result
+        }
+    })
+}
+
 fn wide(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
     let src = |index: usize| -> Result<u64> { wave.read_scalar64(arg(inst, index)?, inst) };
     let nonzero = |v: u64| (v, Some(v != 0));
     let (value, scc) = match name {
+        "s_wqm_b64" => nonzero(whole_quads(src(1)?)),
+        "s_bfm_b64" => {
+            let width = wave.read_scalar(arg(inst, 1)?, inst)? & 63;
+            let offset = wave.read_scalar(arg(inst, 2)?, inst)? & 63;
+            ((((1u128 << width) - 1) as u64) << offset, None)
+        }
+        "s_ff1_i32_b64" => {
+            let v = src(1)?;
+            let first = if v == 0 { u32::MAX } else { v.trailing_zeros() };
+            wave.write_scalar(arg(inst, 0)?, first, inst)?;
+            return Ok(true);
+        }
         "s_mov_b64" => (src(1)?, None),
         "s_cmov_b64" => {
             if !wave.scc {

@@ -1,5 +1,7 @@
 use std::fmt;
 
+pub use rdna::format::Round;
+
 pub type Tmp = u32;
 pub type BlockId = usize;
 
@@ -46,7 +48,8 @@ pub enum Un {
     FSin,
     FCos,
     F16ToF32,
-    F32ToF16,
+    F32ToF16(Round),
+    FCanonical,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

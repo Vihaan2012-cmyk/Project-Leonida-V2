@@ -186,7 +186,46 @@ pub fn f16_to_f32(half: u32, quiet: bool) -> u32 {
     }
 }
 
+/// The four rounding modes of the MODE register's FP_ROUND fields, in field order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Round {
+    #[default]
+    Even,
+    Up,
+    Down,
+    Zero,
+}
+
+impl Round {
+    pub fn from_field(field: u32) -> Round {
+        [Round::Even, Round::Up, Round::Down, Round::Zero][(field & 3) as usize]
+    }
+
+    /// The half-precision magnitude a value beyond the largest finite one becomes.
+    pub fn overflow(self, negative: bool) -> u32 {
+        match (self, negative) {
+            (Round::Even, _) | (Round::Up, false) | (Round::Down, true) => 0x7C00,
+            _ => 0x7BFF,
+        }
+    }
+
+    /// Whether a magnitude with a nonzero remainder moves away from zero.
+    pub fn away(self, negative: bool, rest: u64, half: u64, odd: bool) -> bool {
+        match self {
+            Round::Even => rest > half || (rest == half && odd),
+            Round::Up => rest != 0 && !negative,
+            Round::Down => rest != 0 && negative,
+            Round::Zero => false,
+        }
+    }
+}
+
 pub fn f32_to_f16(single: u32) -> u32 {
+    f32_to_f16_round(single, Round::Even)
+}
+
+pub fn f32_to_f16_round(single: u32, mode: Round) -> u32 {
+    let negative = single >> 31 != 0;
     let sign = (single >> 16) & 0x8000;
     let exponent = ((single >> 23) & 0xFF) as i32;
     let mantissa = single & 0x7F_FFFF;
@@ -194,26 +233,54 @@ pub fn f32_to_f16(single: u32) -> u32 {
         return sign | if mantissa != 0 { 0x7E00 } else { 0x7C00 };
     }
     let biased = exponent - 112;
+    let largest = mode.overflow(negative);
     if biased >= 31 {
-        return sign | 0x7C00;
+        return sign | largest;
     }
     let round = |value: u32, shift: u32| {
-        let half = 1 << (shift - 1);
-        let rest = value & ((1 << shift) - 1);
+        let half = 1u64 << (shift - 1);
+        let rest = u64::from(value) & ((1u64 << shift) - 1);
         let quotient = value >> shift;
-        if rest > half || (rest == half && quotient & 1 != 0) {
-            quotient + 1
-        } else {
-            quotient
-        }
+        quotient + u32::from(mode.away(negative, rest, half, quotient & 1 != 0))
     };
     if biased <= 0 {
         if biased < -10 {
-            return sign;
+            let nonzero = exponent != 0 || mantissa != 0;
+            return sign | u32::from(mode.away(negative, u64::from(nonzero), 1, false));
         }
         return sign | round(mantissa | 0x80_0000, (14 - biased) as u32);
     }
-    sign | round(((biased as u32) << 23) | mantissa, 13)
+    sign | round(((biased as u32) << 23) | mantissa, 13).min(largest)
+}
+
+/// Rounds a double to half precision, for results that are exact before their one rounding.
+pub fn f64_to_f16_round(double: u64, mode: Round) -> u32 {
+    let negative = double >> 63 != 0;
+    let sign = ((double >> 48) & 0x8000) as u32;
+    let exponent = ((double >> 52) & 0x7FF) as i32;
+    let mantissa = double & 0xF_FFFF_FFFF_FFFF;
+    if exponent == 0x7FF {
+        return sign | if mantissa != 0 { 0x7E00 } else { 0x7C00 };
+    }
+    let largest = mode.overflow(negative);
+    let biased = exponent - 1008;
+    if biased >= 31 {
+        return sign | largest;
+    }
+    let round = |value: u64, shift: u32| {
+        let half = 1u64 << (shift - 1);
+        let rest = value & ((1u64 << shift) - 1);
+        let quotient = (value >> shift) as u32;
+        quotient + u32::from(mode.away(negative, rest, half, quotient & 1 != 0))
+    };
+    if biased <= 0 {
+        if biased < -10 {
+            let nonzero = exponent != 0 || mantissa != 0;
+            return sign | u32::from(mode.away(negative, u64::from(nonzero), 1, false));
+        }
+        return sign | round(mantissa | (1 << 52), (43 - biased) as u32);
+    }
+    sign | round(((biased as u64) << 52) | mantissa, 42).min(largest)
 }
 
 #[cfg(test)]
@@ -222,6 +289,48 @@ mod tests {
 
     fn load(code: u32, bytes: &[u8]) -> [u32; 4] {
         buffer_format(code).unwrap().decode(bytes)
+    }
+
+    #[test]
+    fn halves_round_in_every_mode() {
+        let above_one = 1.0f32.to_bits() + 1;
+        let below_minus_one = (-1.0f32).to_bits() + 1;
+        for (mode, up, down) in [
+            (Round::Even, 0x3C00, 0xBC00),
+            (Round::Up, 0x3C01, 0xBC00),
+            (Round::Down, 0x3C00, 0xBC01),
+            (Round::Zero, 0x3C00, 0xBC00),
+        ] {
+            assert_eq!(f32_to_f16_round(above_one, mode), up, "{mode:?}");
+            assert_eq!(f32_to_f16_round(below_minus_one, mode), down, "{mode:?}");
+            let double_above = 1.0f64.to_bits() + 1;
+            let double_below = (-1.0f64).to_bits() + 1;
+            assert_eq!(f64_to_f16_round(double_above, mode), up, "{mode:?}");
+            assert_eq!(f64_to_f16_round(double_below, mode), down, "{mode:?}");
+        }
+        let big = 70000.0f32.to_bits();
+        assert_eq!(f32_to_f16_round(big, Round::Even), 0x7C00);
+        assert_eq!(f32_to_f16_round(big, Round::Zero), 0x7BFF);
+        assert_eq!(f32_to_f16_round(big | 0x8000_0000, Round::Up), 0xFBFF);
+        assert_eq!(f32_to_f16_round(65519.0f32.to_bits(), Round::Even), 0x7BFF);
+        assert_eq!(f32_to_f16_round(65520.0f32.to_bits(), Round::Even), 0x7C00);
+        assert_eq!(f32_to_f16_round(65535.0f32.to_bits(), Round::Zero), 0x7BFF);
+        let tiny = 1.0e-10f32.to_bits();
+        assert_eq!(f32_to_f16_round(tiny, Round::Even), 0);
+        assert_eq!(f32_to_f16_round(tiny, Round::Up), 1);
+        assert_eq!(f32_to_f16_round(tiny | 0x8000_0000, Round::Down), 0x8001);
+        assert_eq!(f32_to_f16_round(0x8000_0000, Round::Down), 0x8000);
+        assert_eq!(f64_to_f16_round(1.0e-10f64.to_bits(), Round::Up), 1);
+        assert_eq!(f32_to_f16_round(f32::NAN.to_bits(), Round::Zero), 0x7E00);
+        assert_eq!(f32_to_f16_round(f32::INFINITY.to_bits(), Round::Zero), 0x7C00);
+        for half in 0..0x7C00u32 {
+            let single = f16_to_f32(half, true);
+            for mode in [Round::Even, Round::Up, Round::Down, Round::Zero] {
+                assert_eq!(f32_to_f16_round(single, mode), half);
+                let double = f64::from(f32::from_bits(single)).to_bits();
+                assert_eq!(f64_to_f16_round(double, mode), half);
+            }
+        }
     }
 
     #[test]

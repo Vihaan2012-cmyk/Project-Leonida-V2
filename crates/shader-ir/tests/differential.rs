@@ -175,11 +175,11 @@ fn random_programs_match_the_reference() {
     let mut completed = 0;
     for seed in 1..=1500u64 {
         for wave64 in [false, true] {
-            let mut generator = Generator {
-                rng: Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1),
+            let mut generator = Generator::new(
+                Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1),
                 wave64,
-                gpu: false,
-            };
+                false,
+            );
             let source = generator.program();
             let mut wave = start(wave64, seed);
             wave.flush_denormals = seed % 3 == 0;

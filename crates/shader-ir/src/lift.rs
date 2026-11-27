@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use rdna::{Arg, Inst, Operand};
 
 use crate::ir::{
-    Bin, Block, Cmp, Expr, Function, Image, ImageDim, ImageOp, Reg, Stmt, Terminator, Tmp, Tri, Un,
+    Bin, Block, Cmp, Expr, Function, Image, ImageDim, ImageOp, Reg, Round, Stmt, Terminator, Tmp,
+    Tri, Un,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -45,14 +46,7 @@ pub fn lift(code: &[u8], wave64: bool) -> Result<Function, LiftError> {
             .position(|l| *l == pc)
             .ok_or(LiftError::BadBranch { pc: at })
     };
-    let mut lifter = Lifter {
-        wave64,
-        stmts: Vec::new(),
-        next: 0,
-        overrides: Vec::new(),
-        destination: None,
-        write_when: None,
-    };
+    let mut lifter = Lifter::new(wave64);
     let mut blocks = Vec::new();
     for (id, start) in leaders.iter().enumerate() {
         let end = leaders.get(id + 1).copied().unwrap_or(usize::MAX);
@@ -64,6 +58,7 @@ pub fn lift(code: &[u8], wave64: bool) -> Result<Function, LiftError> {
             Some(_) => Terminator::Jump(id + 1),
             None => Terminator::End,
         };
+        lifter.entry = id == 0;
         for inst in body {
             if is_end(inst) {
                 terminator = Terminator::End;
@@ -111,20 +106,15 @@ pub struct Coverage {
     pub instructions: usize,
     pub invalid_words: usize,
     pub unsupported: Vec<String>,
+    pub texts: Vec<String>,
 }
 
 pub fn coverage(code: &[u8], wave64: bool) -> Coverage {
     let decoded = rdna::decode_all(code, !wave64, 0);
     let mut unsupported = Vec::new();
+    let mut texts = Vec::new();
     for inst in &decoded.insts {
-        let mut lifter = Lifter {
-            wave64,
-            stmts: Vec::new(),
-            next: 0,
-            overrides: Vec::new(),
-            destination: None,
-            write_when: None,
-        };
+        let mut lifter = Lifter::new(wave64);
         let supported = if is_end(inst) {
             true
         } else if branch_target(inst).is_some() {
@@ -139,12 +129,14 @@ pub fn coverage(code: &[u8], wave64: bool) -> Coverage {
                 .or_else(|| name.strip_suffix("_e64"))
                 .unwrap_or(name);
             unsupported.push(coverage_name(inst, base));
+            texts.push(inst.text());
         }
     }
     Coverage {
         instructions: decoded.insts.len(),
         invalid_words: decoded.invalid,
         unsupported,
+        texts,
     }
 }
 
@@ -169,6 +161,8 @@ struct Lifter {
     overrides: Vec<(*const Arg, Tmp)>,
     destination: Option<(Select, Select)>,
     write_when: Option<Tmp>,
+    f16_round: Round,
+    entry: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +214,19 @@ fn unsupported(inst: &Inst) -> LiftError {
 }
 
 impl Lifter {
+    fn new(wave64: bool) -> Lifter {
+        Lifter {
+            wave64,
+            stmts: Vec::new(),
+            next: 0,
+            overrides: Vec::new(),
+            destination: None,
+            write_when: None,
+            f16_round: Round::Even,
+            entry: true,
+        }
+    }
+
     fn value(&mut self, expr: Expr) -> Tmp {
         let tmp = self.next;
         self.next += 1;
@@ -814,11 +821,13 @@ impl Lifter {
                 | "s_clause"
                 | "s_inst_prefetch"
                 | "s_code_end"
+                | "s_sleep"
+                | "s_setprio"
         ) {
             return Ok(());
         }
-        if base.starts_with("s_setreg") && harmless_setreg(inst) {
-            return Ok(());
+        if base.starts_with("s_setreg") {
+            return self.setreg(inst);
         }
         if base == "exp" {
             let Operand::Named(target) = &arg(0)?.operand else {
@@ -873,6 +882,21 @@ impl Lifter {
             let zero = self.c64(0);
             let scc = self.cmp(Cmp::Ne64, new, zero);
             self.stmts.push(Stmt::Set(Reg::Scc, scc));
+            return Ok(());
+        }
+        if let Some(op) = base
+            .strip_prefix("s_cmp_")
+            .filter(|op| op.ends_with("_u64"))
+        {
+            let a = self.scalar64(arg(0)?, inst)?;
+            let b = self.scalar64(arg(1)?, inst)?;
+            let cmp = match op {
+                "eq_u64" => Cmp::Eq64,
+                "lg_u64" => Cmp::Ne64,
+                _ => return Err(unsupported(inst)),
+            };
+            let result = self.cmp(cmp, a, b);
+            self.stmts.push(Stmt::Set(Reg::Scc, result));
             return Ok(());
         }
         if let Some(op) = base
@@ -1025,6 +1049,23 @@ impl Lifter {
         Ok(())
     }
 
+    fn setreg(&mut self, inst: &Inst) -> Result<(), LiftError> {
+        if inst.text().contains("HW_REG_FLAT_SCR") {
+            return Ok(());
+        }
+        let (mask, bits) = rounding_write(inst).ok_or_else(|| unsupported(inst))?;
+        if bits & 3 != 0 {
+            return Err(unsupported(inst));
+        }
+        let old = (self.f16_round as u32) << 2;
+        let round = Round::from_field(((old & !mask) | bits) >> 2);
+        if round != self.f16_round && !self.entry {
+            return Err(unsupported(inst));
+        }
+        self.f16_round = round;
+        Ok(())
+    }
+
     fn flag(&mut self, flag: Flag, value: Tmp) {
         let scc = match flag {
             Flag::Keep => return,
@@ -1039,6 +1080,36 @@ impl Lifter {
             Flag::Set(tmp) => tmp,
         };
         self.stmts.push(Stmt::Set(Reg::Scc, scc));
+    }
+
+    fn whole_quads(&mut self, value: Tmp, wide: bool) -> Tmp {
+        let (or, shr, shl, and) = if wide {
+            (Bin::Or64, Bin::ShrU64, Bin::Shl64, Bin::And64)
+        } else {
+            (Bin::Or, Bin::ShrU, Bin::Shl, Bin::And)
+        };
+        let amount = |me: &mut Self, n: u32| {
+            if wide { me.c64(u64::from(n)) } else { me.c(n) }
+        };
+        let one = amount(self, 1);
+        let shifted = self.bin(shr, value, one);
+        let pairs = self.bin(or, value, shifted);
+        let two = amount(self, 2);
+        let shifted = self.bin(shr, pairs, two);
+        let quads = self.bin(or, pairs, shifted);
+        let lowest = if wide {
+            self.c64(0x1111_1111_1111_1111)
+        } else {
+            self.c(0x1111_1111)
+        };
+        let marks = self.bin(and, quads, lowest);
+        let mut result = marks;
+        for n in 1..4 {
+            let n = amount(self, n);
+            let spread = self.bin(shl, marks, n);
+            result = self.bin(or, result, spread);
+        }
+        result
     }
 
     fn sign_bit(&mut self, value: Tmp) -> Tmp {
@@ -1083,6 +1154,39 @@ impl Lifter {
             self.flag(Flag::NonZero, count);
             return Ok(true);
         }
+        if name == "s_ff1_i32_b64" {
+            let a = self.scalar64(arg(1)?, inst)?;
+            let (low, high) = (self.un(Un::Lo, a), self.un(Un::Hi, a));
+            let (first_low, first_high) = (self.un(Un::Ffbl, low), self.un(Un::Ffbl, high));
+            let thirty_two = self.c(32);
+            let first_high = self.bin(Bin::Add, first_high, thirty_two);
+            let zero = self.c(0);
+            let none = self.c(u32::MAX);
+            let high_empty = self.cmp(Cmp::Eq, high, zero);
+            let upper = self.value(Expr::Select(high_empty, none, first_high));
+            let low_empty = self.cmp(Cmp::Eq, low, zero);
+            let value = self.value(Expr::Select(low_empty, upper, first_low));
+            self.set_scalar(arg(0)?, value, inst)?;
+            return Ok(true);
+        }
+        if name == "s_bfm_b64" {
+            let width = self.scalar(arg(1)?, inst)?;
+            let offset = self.scalar(arg(2)?, inst)?;
+            let (width, offset) = (self.un(Un::Zext, width), self.un(Un::Zext, offset));
+            let one = self.c64(1);
+            let bit = self.bin(Bin::Shl64, one, width);
+            let ones = self.bin(Bin::Sub64, bit, one);
+            let value = self.bin(Bin::Shl64, ones, offset);
+            self.set_scalar64(arg(0)?, value, inst)?;
+            return Ok(true);
+        }
+        if name == "s_wqm_b64" {
+            let a = self.scalar64(arg(1)?, inst)?;
+            let value = self.whole_quads(a, true);
+            self.set_scalar64(arg(0)?, value, inst)?;
+            self.flag(Flag::NonZero64, value);
+            return Ok(true);
+        }
         if name.ends_with("_b64") {
             return self.scalar_wide(name, inst);
         }
@@ -1102,6 +1206,9 @@ impl Lifter {
                 | "s_mulk_i32"
                 | "s_flbit_i32_b32"
                 | "s_bitset1_b32"
+                | "s_bitset0_b32"
+                | "s_wqm_b32"
+                | "s_abs_i32"
         );
         if !unary && !binary_scalar(name) {
             return Ok(false);
@@ -1125,6 +1232,23 @@ impl Lifter {
                     let one = self.c(1);
                     let bit = self.bin(Bin::Shl, one, x);
                     (self.bin(Bin::Or, old, bit), Flag::Keep)
+                }
+                "s_bitset0_b32" => {
+                    let old = self.scalar(arg(0)?, inst)?;
+                    let one = self.c(1);
+                    let bit = self.bin(Bin::Shl, one, x);
+                    let keep = self.un(Un::Not, bit);
+                    (self.bin(Bin::And, old, keep), Flag::Keep)
+                }
+                "s_wqm_b32" => (self.whole_quads(x, false), Flag::NonZero),
+                "s_abs_i32" => {
+                    let zero = self.c(0);
+                    let negative = self.cmp(Cmp::LtS, x, zero);
+                    let flipped = self.bin(Bin::Sub, zero, x);
+                    (
+                        self.value(Expr::Select(negative, flipped, x)),
+                        Flag::NonZero,
+                    )
                 }
                 "s_sext_i32_i8" | "s_sext_i32_i16" => {
                     let shift = self.c(if name.ends_with("i8") { 24 } else { 16 });
@@ -1236,6 +1360,12 @@ impl Lifter {
                 (self.bin(Bin::Or, low, high), Flag::Keep)
             }
             "s_mul_i32" => (self.bin(Bin::Mul, x, y), Flag::Keep),
+            "s_bfm_b32" => {
+                let one = self.c(1);
+                let bit = self.bin(Bin::Shl, one, x);
+                let ones = self.bin(Bin::Sub, bit, one);
+                (self.bin(Bin::Shl, ones, y), Flag::Keep)
+            }
             "s_mul_hi_u32" => (self.bin(Bin::MulHiU, x, y), Flag::Keep),
             "s_bfe_i32" => {
                 let field = self.c(31);
@@ -1347,6 +1477,25 @@ impl Lifter {
             .trim_start_matches("v_cmpx_")
             .trim_start_matches("v_cmp_");
         let (op, ty) = body.rsplit_once('_').ok_or_else(|| unsupported(inst))?;
+        if matches!(ty, "u64" | "i64") {
+            let first = usize::from(!exec_form);
+            let a = self.lane64(inst.args.get(first).ok_or_else(|| unsupported(inst))?, inst)?;
+            let b = self.lane64(
+                inst.args.get(first + 1).ok_or_else(|| unsupported(inst))?,
+                inst,
+            )?;
+            let outcome = self
+                .compare64(op, ty == "i64", a, b)
+                .ok_or_else(|| unsupported(inst))?;
+            let mask = self.value(Expr::Ballot(outcome));
+            return if exec_form {
+                self.set_exec(mask);
+                Ok(())
+            } else {
+                let target = inst.args.first().ok_or_else(|| unsupported(inst))?;
+                self.set_mask(target, mask, inst)
+            };
+        }
         let cmp = match ty {
             "f32" => float_compare(op),
             "u32" => int_compare(&format!("{op}_u32")),
@@ -1375,6 +1524,131 @@ impl Lifter {
         } else {
             self.set_mask(arg(0)?, mask, inst)
         }
+    }
+
+    fn lane64(&mut self, arg: &Arg, inst: &Inst) -> Result<Tmp, LiftError> {
+        match arg.operand {
+            Operand::Vgpr { reg, .. } => {
+                let low = self.value(Expr::Get(Reg::V(reg)));
+                let high = self.value(Expr::Get(Reg::V(reg + 1)));
+                Ok(self.bin(Bin::Pack64, low, high))
+            }
+            _ => self.scalar64(arg, inst),
+        }
+    }
+
+    fn either(&mut self, a: Tmp, b: Tmp) -> Tmp {
+        self.value(Expr::Select(a, a, b))
+    }
+
+    fn both(&mut self, a: Tmp, b: Tmp) -> Tmp {
+        self.value(Expr::Select(a, b, a))
+    }
+
+    fn negate(&mut self, a: Tmp) -> Tmp {
+        let zero = self.c(0);
+        let no = self.cmp(Cmp::False, zero, zero);
+        let yes = self.cmp(Cmp::True, zero, zero);
+        self.value(Expr::Select(a, no, yes))
+    }
+
+    fn below64(&mut self, signed: bool, a: Tmp, b: Tmp) -> Tmp {
+        let (a_high, b_high) = (self.un(Un::Hi, a), self.un(Un::Hi, b));
+        let (a_low, b_low) = (self.un(Un::Lo, a), self.un(Un::Lo, b));
+        let high_below = self.cmp(if signed { Cmp::LtS } else { Cmp::LtU }, a_high, b_high);
+        let high_same = self.cmp(Cmp::Eq, a_high, b_high);
+        let low_below = self.cmp(Cmp::LtU, a_low, b_low);
+        let tie_broken = self.both(high_same, low_below);
+        self.either(high_below, tie_broken)
+    }
+
+    fn compare64(&mut self, op: &str, signed: bool, a: Tmp, b: Tmp) -> Option<Tmp> {
+        Some(match op {
+            "eq" => self.cmp(Cmp::Eq64, a, b),
+            "ne" | "lg" => self.cmp(Cmp::Ne64, a, b),
+            "f" | "t" => {
+                let zero = self.c(0);
+                self.cmp(if op == "f" { Cmp::False } else { Cmp::True }, zero, zero)
+            }
+            "lt" => self.below64(signed, a, b),
+            "gt" => self.below64(signed, b, a),
+            "le" => {
+                let above = self.below64(signed, b, a);
+                self.negate(above)
+            }
+            "ge" => {
+                let below = self.below64(signed, a, b);
+                self.negate(below)
+            }
+            _ => return None,
+        })
+    }
+
+    fn cube(&mut self, name: &str, inst: &Inst) -> Result<Tmp, LiftError> {
+        let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
+        let mut v = Vec::new();
+        for index in 1..4 {
+            let raw = self.flane(arg(index)?, inst)?;
+            v.push(self.un(Un::FCanonical, raw));
+        }
+        let [x, y, z] = [v[0], v[1], v[2]];
+        let (ax, ay, az) = (
+            self.un(Un::FAbs, x),
+            self.un(Un::FAbs, y),
+            self.un(Un::FAbs, z),
+        );
+        let z_over_x = self.cmp(Cmp::FGe, az, ax);
+        let z_over_y = self.cmp(Cmp::FGe, az, ay);
+        let z_major = self.both(z_over_x, z_over_y);
+        let y_major = self.cmp(Cmp::FGe, ay, ax);
+        let zero = self.c(0);
+        let below = |me: &mut Self, value: Tmp| me.cmp(Cmp::FLt, value, zero);
+        let pick =
+            |me: &mut Self, when: Tmp, yes: Tmp, no: Tmp| me.value(Expr::Select(when, yes, no));
+        let (x_negative, y_negative, z_negative) = (below(self, x), below(self, y), below(self, z));
+        let (nx, ny, nz) = (
+            self.un(Un::FNeg, x),
+            self.un(Un::FNeg, y),
+            self.un(Un::FNeg, z),
+        );
+        let value = match name {
+            "v_cubeid_f32" => {
+                let face = |me: &mut Self, n: f32| me.c(n.to_bits());
+                let (f0, f1, f2, f3, f4, f5) = (
+                    face(self, 0.0),
+                    face(self, 1.0),
+                    face(self, 2.0),
+                    face(self, 3.0),
+                    face(self, 4.0),
+                    face(self, 5.0),
+                );
+                let on_z = pick(self, z_negative, f5, f4);
+                let on_y = pick(self, y_negative, f3, f2);
+                let on_x = pick(self, x_negative, f1, f0);
+                let rest = pick(self, y_major, on_y, on_x);
+                pick(self, z_major, on_z, rest)
+            }
+            "v_cubesc_f32" => {
+                let on_z = pick(self, z_negative, nx, x);
+                let on_x = pick(self, x_negative, z, nz);
+                let rest = pick(self, y_major, x, on_x);
+                let chosen = pick(self, z_major, on_z, rest);
+                self.un(Un::FCanonical, chosen)
+            }
+            "v_cubetc_f32" => {
+                let on_y = pick(self, y_negative, nz, z);
+                let rest = pick(self, y_major, on_y, ny);
+                let chosen = pick(self, z_major, ny, rest);
+                self.un(Un::FCanonical, chosen)
+            }
+            _ => {
+                let rest = pick(self, y_major, y, x);
+                let chosen = pick(self, z_major, z, rest);
+                let two = self.c(2.0f32.to_bits());
+                self.bin(Bin::FMul, chosen, two)
+            }
+        };
+        Ok(self.output_modifiers(value, inst))
     }
 
     fn vector_op(&mut self, name: &str, inst: &Inst) -> Result<bool, LiftError> {
@@ -1473,13 +1747,64 @@ impl Lifter {
                 let value = self.un(Un::F16ToF32, half);
                 self.output_modifiers(value, inst)
             }
+            "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => {
+                self.cube(name, inst)?
+            }
+            "v_cvt_pkrtz_f16_f32" => {
+                if has_output_modifiers(inst) {
+                    return Err(unsupported(inst));
+                }
+                let low = self.flane(arg(1)?, inst)?;
+                let high = self.flane(arg(2)?, inst)?;
+                let low = self.un(Un::F32ToF16(Round::Zero), low);
+                let high = self.un(Un::F32ToF16(Round::Zero), high);
+                let sixteen = self.c(16);
+                let high = self.bin(Bin::Shl, high, sixteen);
+                self.bin(Bin::Or, low, high)
+            }
+            "v_mul_hi_i32" => {
+                let a = self.lane(arg(1)?, inst)?;
+                let b = self.lane(arg(2)?, inst)?;
+                let high = self.bin(Bin::MulHiU, a, b);
+                let zero = self.c(0);
+                let a_negative = self.cmp(Cmp::LtS, a, zero);
+                let b_negative = self.cmp(Cmp::LtS, b, zero);
+                let fix_a = self.value(Expr::Select(a_negative, b, zero));
+                let fix_b = self.value(Expr::Select(b_negative, a, zero));
+                let high = self.bin(Bin::Sub, high, fix_a);
+                self.bin(Bin::Sub, high, fix_b)
+            }
+            "v_mad_i32_i24" => {
+                let a = self.lane(arg(1)?, inst)?;
+                let b = self.lane(arg(2)?, inst)?;
+                let c = self.lane(arg(3)?, inst)?;
+                let (x, y) = (self.sext(a, 8), self.sext(b, 8));
+                let product = self.bin(Bin::Mul, x, y);
+                self.bin(Bin::Add, product, c)
+            }
+            "v_ffbh_i32" => {
+                let a = self.lane(arg(1)?, inst)?;
+                let thirty_one = self.c(31);
+                let fill = self.bin(Bin::ShrS, a, thirty_one);
+                let differs = self.bin(Bin::Xor, a, fill);
+                self.un(Un::Ffbh, differs)
+            }
+            "v_swap_b32" => {
+                let (first, _) = vgprs(arg(0)?, inst)?;
+                let (second, _) = vgprs(arg(1)?, inst)?;
+                let a = self.value(Expr::Get(Reg::V(first)));
+                let b = self.value(Expr::Get(Reg::V(second)));
+                self.stmts.push(Stmt::SetLane(first, b));
+                self.stmts.push(Stmt::SetLane(second, a));
+                return Ok(true);
+            }
             "v_cvt_f16_f32" => {
                 if has_output_modifiers(inst) {
                     return Err(unsupported(inst));
                 }
                 let (target, _) = vgprs(arg(0)?, inst)?;
                 let single = self.flane(arg(1)?, inst)?;
-                let half = self.un(Un::F32ToF16, single);
+                let half = self.un(Un::F32ToF16(self.f16_round), single);
                 if self.destination.is_some() {
                     half
                 } else {
@@ -1523,7 +1848,7 @@ impl Lifter {
                     value
                 } else {
                     let (target, _) = vgprs(arg(0)?, inst)?;
-                    let half = self.un(Un::F32ToF16, value);
+                    let half = self.un(Un::F32ToF16(self.f16_round), value);
                     self.keep_half(target, half, name == "v_fma_mixhi_f16")
                 }
             }
@@ -2211,25 +2536,24 @@ pub fn export_target(name: &str) -> Option<u8> {
     })
 }
 
-fn harmless_setreg(inst: &Inst) -> bool {
-    let text = inst.text();
-    if text.contains("HW_REG_FLAT_SCR") {
-        return true;
-    }
+/// The bits an immediate MODE write sets among the four rounding bits, as (mask, bits).
+fn rounding_write(inst: &Inst) -> Option<(u32, u32)> {
     let Some(Operand::Named(reg)) = inst.args.first().map(|a| &a.operand) else {
-        return false;
+        return None;
     };
-    let Some(code) = rdna::parse_hwreg(reg) else {
-        return false;
-    };
+    let code = rdna::parse_hwreg(reg)?;
     let value = match inst.args.get(1).map(|a| &a.operand) {
-        Some(Operand::Int(value)) => *value,
-        Some(Operand::Literal(value)) => i64::from(*value),
-        _ => return false,
+        Some(Operand::Int(value)) => *value as u32,
+        Some(Operand::Literal(value)) => *value,
+        _ => return None,
     };
     let offset = (code >> 6) & 31;
     let size = ((code >> 11) & 31) + 1;
-    code & 63 == 1 && offset + size <= 4 && value == 0
+    if code & 63 != 1 || offset + size > 4 {
+        return None;
+    }
+    let mask = ((1 << size) - 1) << offset;
+    Some((mask, (value << offset) & mask))
 }
 
 enum Half {
@@ -2353,6 +2677,7 @@ fn binary_scalar(name: &str) -> bool {
                 | "s_mul_i32"
                 | "s_mul_hi_u32"
                 | "s_bfe_i32"
+                | "s_bfm_b32"
         )
 }
 
