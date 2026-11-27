@@ -13,6 +13,8 @@ use crate::Shim;
 mod com;
 #[cfg(windows)]
 mod modules;
+#[cfg(windows)]
+mod tasks;
 
 pub(crate) const S_OK: i32 = 0;
 pub(crate) const E_NOTIMPL: i32 = 0x8000_4001_u32 as i32;
