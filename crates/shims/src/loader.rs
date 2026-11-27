@@ -14,6 +14,8 @@ mod com;
 #[cfg(windows)]
 mod modules;
 #[cfg(windows)]
+mod system;
+#[cfg(windows)]
 mod tasks;
 
 pub(crate) const S_OK: i32 = 0;
