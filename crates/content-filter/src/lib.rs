@@ -22,6 +22,7 @@
 //! bodies count as nudity. Male chests are not treated as nudity. Which scenes, if any, show nude characters is not in
 //! the documentation, so there are no scene rules.
 
+pub mod blocklist;
 pub mod hash;
 pub mod names;
 pub mod settings;
