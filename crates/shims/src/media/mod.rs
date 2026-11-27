@@ -21,10 +21,11 @@
 mod decoder;
 mod header;
 pub mod layout;
-mod sound;
+pub mod player;
+pub mod sound;
 #[doc(hidden)]
 pub mod testing;
-mod worker;
+pub mod worker;
 
 pub use decoder::{
     AudioTrackInfo, DecodeError, DecodedFrame, DecoderFactory, MovieDecoder, Plane, StreamInfo,

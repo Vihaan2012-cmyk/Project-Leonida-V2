@@ -185,3 +185,121 @@ impl MovieDecoder for FakeDecoder {
             .collect()
     }
 }
+
+/// A clock the test moves by hand.
+#[derive(Default)]
+pub struct ManualClock(Mutex<Duration>);
+
+impl ManualClock {
+    pub fn advance(&self, by: Duration) {
+        if let Ok(mut now) = self.0.lock() {
+            *now += by;
+        }
+    }
+}
+
+impl super::player::Clock for ManualClock {
+    fn now(&self) -> Duration {
+        self.0.lock().map(|t| *t).unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SinkEvent {
+    Push {
+        track: usize,
+        rate: u32,
+        channels: u8,
+        samples: Vec<f32>,
+    },
+    Flush,
+    Gain(usize, f32),
+    Pause(bool),
+}
+
+/// Records what the player sends to the audio engine.
+#[derive(Clone, Default)]
+pub struct RecordingSink(pub Arc<Mutex<Vec<SinkEvent>>>);
+
+impl super::sound::AudioSink for RecordingSink {
+    fn push(&mut self, track: usize, rate: u32, channels: u8, samples: Vec<f32>) {
+        self.0.lock().unwrap().push(SinkEvent::Push {
+            track,
+            rate,
+            channels,
+            samples,
+        });
+    }
+    fn flush(&mut self) {
+        self.0.lock().unwrap().push(SinkEvent::Flush);
+    }
+    fn set_gain(&mut self, track: usize, gain: f32) {
+        self.0.lock().unwrap().push(SinkEvent::Gain(track, gain));
+    }
+    fn pause(&mut self, paused: bool) {
+        self.0.lock().unwrap().push(SinkEvent::Pause(paused));
+    }
+}
+
+/// The game's side of the frame buffers: a description with mapped plane memory at a pitch of 64.
+pub struct FakeGame {
+    desc: Vec<u64>,
+    planes: Vec<Vec<u8>>,
+}
+
+pub const GAME_PITCH: usize = 64;
+
+impl FakeGame {
+    pub fn new(info: &StreamInfo) -> FakeGame {
+        let mut desc = vec![0u64; super::layout::SIZE / 8];
+        // SAFETY: `desc` is `SIZE` bytes.
+        unsafe { super::layout::describe(desc.as_mut_ptr() as *mut u8, info) };
+        let mut game = FakeGame {
+            desc,
+            planes: Vec::new(),
+        };
+        let (cw, ch) = super::layout::chroma_size(info.width, info.height);
+        let _ = cw;
+        for set in 0..super::layout::TOTAL_FRAMES as usize {
+            for plane in 0..5usize {
+                let at = 0x18 + set * 0x50 + plane * 0x10;
+                let bytes = game.bytes();
+                if u32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap()) == 0 {
+                    continue;
+                }
+                let h = if plane == 1 || plane == 2 {
+                    ch
+                } else {
+                    info.height
+                } as usize;
+                game.planes.push(vec![0x55; GAME_PITCH * h]);
+                let ptr = game.planes.last_mut().unwrap().as_mut_ptr() as u64;
+                let bytes = game.bytes();
+                bytes[at..at + 8].copy_from_slice(&ptr.to_le_bytes());
+                bytes[at + 12..at + 16].copy_from_slice(&(GAME_PITCH as u32).to_le_bytes());
+            }
+        }
+        game
+    }
+
+    fn bytes(&mut self) -> &mut [u8] {
+        // SAFETY: `desc` is `SIZE` bytes of u64.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.desc.as_mut_ptr() as *mut u8, super::layout::SIZE)
+        }
+    }
+
+    pub fn ptr(&mut self) -> usize {
+        self.desc.as_mut_ptr() as usize
+    }
+
+    pub fn frame_num(&self) -> u32 {
+        // SAFETY: inside `desc`.
+        unsafe { ((self.desc.as_ptr() as *const u8).add(0x14) as *const u32).read() }
+    }
+
+    /// The memory of `plane` (0 Y, 1 Cr, 2 Cb, 3 A) of `set`, for a movie with `planes_per_set` planes.
+    pub fn plane(&self, set: usize, plane: usize, planes_per_set: usize) -> &[u8] {
+        &self.planes[set * planes_per_set + plane]
+    }
+}
