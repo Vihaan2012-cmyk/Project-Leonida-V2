@@ -135,7 +135,7 @@ impl<'a> UpscaleInputs<'a> {
                 what: "the upscaled output",
             });
         }
-        if !(self.exposure > 0.0) {
+        if self.exposure.is_nan() || self.exposure <= 0.0 {
             return Err(UpscaleError::BadInput {
                 what: "exposure",
                 reason: "must be positive".into(),
