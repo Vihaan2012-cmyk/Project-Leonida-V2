@@ -175,17 +175,6 @@ fn dword(state: &State, operand: &Operand, d: usize) -> Val {
     }
 }
 
-fn bits(mut mask: u128) -> impl Iterator<Item = u32> {
-    std::iter::from_fn(move || {
-        if mask == 0 {
-            return None;
-        }
-        let bit = mask.trailing_zeros();
-        mask &= mask - 1;
-        Some(bit)
-    })
-}
-
 #[derive(Clone, Copy)]
 enum Descriptor {
     Buffer,
@@ -551,11 +540,6 @@ pub fn analyze(code: &[u8], wave32: bool) -> Analysis {
     result
 }
 
-/// The set bits of `mask` below `limit`, as register numbers.
-pub fn registers(mask: u128, limit: u32) -> impl Iterator<Item = u32> {
-    bits(mask).filter(move |&r| r < limit)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +547,21 @@ mod tests {
     fn run(source: &str) -> Analysis {
         let code = rdna::assemble(source, false).expect("assembles");
         analyze(&code, false)
+    }
+
+    fn bits(mut mask: u128) -> impl Iterator<Item = u32> {
+        std::iter::from_fn(move || {
+            if mask == 0 {
+                return None;
+            }
+            let bit = mask.trailing_zeros();
+            mask &= mask - 1;
+            Some(bit)
+        })
+    }
+
+    fn registers(mask: u128, limit: u32) -> impl Iterator<Item = u32> {
+        bits(mask).filter(move |&r| r < limit)
     }
 
     fn set(mask: u128) -> Vec<u32> {

@@ -2282,6 +2282,7 @@ dependencies = [
 name = "shader-census"
 version = "0.1.0"
 dependencies = [
+ "game-package",
  "memmap2",
  "rdna",
  "serde",
