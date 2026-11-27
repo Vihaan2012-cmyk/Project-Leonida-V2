@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use iced_x86::code_asm::*;
-use iced_x86::{Code, Instruction, MemoryOperand, Register};
+use iced_x86::{BlockEncoderOptions, Code, Instruction, MemoryOperand, Register};
 
 use super::*;
 
@@ -492,4 +492,102 @@ fn string_literals_and_flag_folding() {
     assert!(text.contains("(int32_t)"), "{text}");
     assert!(text.contains("< 5"), "{text}");
     assert!(text.contains("> 0x64 ? 9 :"), "{text}");
+}
+
+#[test]
+fn a_jump_table_becomes_a_switch() {
+    let mut a = CodeAssembler::new(64).expect("assembler");
+    let mut default = a.create_label();
+    let mut cases = [a.create_label(), a.create_label(), a.create_label()];
+    a.mov(eax, ecx).unwrap();
+    a.cmp(eax, 2).unwrap();
+    a.ja(default).unwrap();
+    ip_load(&mut a, Code::Lea_r64_m, Register::RDX, BASE).unwrap();
+    a.mov(eax, dword_ptr(rdx + rax * 4 + 0x8000)).unwrap();
+    a.add(rax, rdx).unwrap();
+    a.jmp(rax).unwrap();
+    for (k, label) in cases.iter_mut().enumerate() {
+        a.set_label(label).unwrap();
+        a.mov(eax, 10 * (k as i32 + 1)).unwrap();
+        a.ret().unwrap();
+    }
+    a.set_label(&mut default).unwrap();
+    a.mov(eax, 99).unwrap();
+    a.ret().unwrap();
+    let result = a
+        .assemble_options(START, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS)
+        .expect("encodes");
+    let mut image = Image::new(result.inner.code_buffer.clone());
+    image.data = cases
+        .iter()
+        .flat_map(|l| ((result.label_ip(l).unwrap() - BASE) as u32).to_le_bytes())
+        .collect();
+    let text = decompile(&image, START).expect("decompiles");
+    assert!(text.contains("switch (a1) {"), "{text}");
+    assert!(text.contains("case 0:"), "{text}");
+    assert!(text.contains("return 0x1e;"), "{text}");
+    assert!(text.contains("return 0x63;"), "{text}");
+    assert!(!text.contains("goto"), "{text}");
+}
+
+#[test]
+fn short_circuit_conditions_and_else_if_chains_need_no_goto() {
+    let text = run(|a| {
+        let mut no = a.create_label();
+        let mut second = a.create_label();
+        let mut third = a.create_label();
+        a.test(rcx, rcx)?;
+        a.je(no)?;
+        a.test(rdx, rdx)?;
+        a.je(no)?;
+        a.mov(eax, 1)?;
+        a.ret()?;
+        a.set_label(&mut no)?;
+        a.cmp(r8d, 5)?;
+        a.jne(second)?;
+        a.mov(eax, 2)?;
+        a.ret()?;
+        a.set_label(&mut second)?;
+        a.cmp(r8d, 6)?;
+        a.jne(third)?;
+        a.mov(eax, 3)?;
+        a.ret()?;
+        a.set_label(&mut third)?;
+        a.xor(eax, eax)?;
+        a.ret()
+    });
+    assert!(text.contains("if (a1 == 0 || a2 == 0) {"), "{text}");
+    assert!(!text.contains("goto"), "{text}");
+}
+
+#[test]
+fn break_and_continue_inside_a_loop() {
+    // while (true) { if (a1 == 0) break; a1 = *(a1); if (a1 == a2) continue; sub(a1) }
+    let mut image = Image::new(assemble(|a| {
+        let mut top = a.create_label();
+        let mut out = a.create_label();
+        a.push(rbx)?;
+        a.sub(rsp, 0x20)?;
+        a.mov(rbx, rcx)?;
+        a.mov(rsi, rdx)?;
+        a.set_label(&mut top)?;
+        a.test(rbx, rbx)?;
+        a.je(out)?;
+        a.mov(rbx, qword_ptr(rbx))?;
+        a.cmp(rbx, rsi)?;
+        a.je(top)?;
+        a.mov(rcx, rbx)?;
+        a.call(START + 0x80)?;
+        a.jmp(top)?;
+        a.set_label(&mut out)?;
+        a.add(rsp, 0x20)?;
+        a.pop(rbx)?;
+        a.ret()
+    }));
+    image.function_len = 0x80;
+    image.code.resize(0x90, 0xCC);
+    let text = decompile(&image, START).expect("decompiles");
+    assert!(!text.contains("goto"), "{text}");
+    assert!(text.contains("while (v1 != 0) {"), "{text}");
+    assert!(text.contains("if (v1 != a2) {"), "{text}");
 }
