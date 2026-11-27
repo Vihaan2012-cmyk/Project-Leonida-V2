@@ -27,6 +27,18 @@ pub struct PipelineInfo {
     pub wave_lanes: (u32, u32),
     pub threads: Option<[u32; 3]>,
     pub mesh: Option<MeshInfo>,
+    pub geometry: Option<GeometryInfo>,
+}
+
+/// A geometry shader's primitives: the input primitive (1 point, 2 line, 3 triangle, 6 line and 7 triangle
+/// with adjacency), the output topology (1 points, 3 line strip, 5 triangle strip) and the most vertices one
+/// invocation emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeometryInfo {
+    pub input_primitive: u32,
+    pub output_topology: u32,
+    pub stream_mask: u32,
+    pub max_vertices: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +123,14 @@ pub fn pipeline_info(part: &[u8], dxil_kind: Option<u16>) -> Result<PipelineInfo
             max_vertices: u16_at(info, 12)?,
             max_primitives: u16_at(info, 14)?,
             topology: if size >= 36 { info[27] } else { 0 },
+        });
+    }
+    if kind == Some(2) && size >= 36 {
+        result.geometry = Some(GeometryInfo {
+            input_primitive: u32_at(info, 0)?,
+            output_topology: u32_at(info, 4)?,
+            stream_mask: u32_at(info, 8)?,
+            max_vertices: u16_at(info, 26)?,
         });
     }
     if size >= 48 {

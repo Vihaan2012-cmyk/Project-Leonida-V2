@@ -16,6 +16,7 @@ pub use error::ContainerError;
 pub use fssm::{CodeRange, ENDPGM, Fssm, Interpolant, PixelSetup, WaveSize};
 pub use scan::{ScanResult, ScanSummary, ShaderInfo};
 pub use signature::{
-    Interface, MeshInfo, PipelineInfo, SignatureElement, interface, pipeline_info, signature,
+    GeometryInfo, Interface, MeshInfo, PipelineInfo, SignatureElement, interface, pipeline_info,
+    signature,
 };
 pub use xdat::{MAX_FSSM_BYTES, XBCH_TAG, inflate_xbch, unpack_all, xdat_entries};

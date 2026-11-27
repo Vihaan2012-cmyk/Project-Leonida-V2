@@ -206,6 +206,7 @@ fn run(
         FirstStage::Vertex {
             spirv: &vertex,
             buffer: None,
+            geometry: None,
         },
         &fragment,
         [SIZE, SIZE],

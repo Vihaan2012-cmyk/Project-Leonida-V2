@@ -202,8 +202,21 @@ pub fn coverage(code: &[u8], wave64: bool) -> Coverage {
     }
 }
 
+/// Program end, including a jump to an address held in registers, which leaves this program: the first half
+/// of a merged shader ends that way, jumping into the second.
 fn is_end(inst: &Inst) -> bool {
-    inst.name.starts_with("s_endpgm")
+    inst.name.starts_with("s_endpgm") || inst.name == "s_setpc_b64"
+}
+
+/// A call to the vertex fetch shader: the first instruction, or a call through a pair it overwrites with the
+/// return address.
+pub fn fetch_call(inst: &Inst) -> bool {
+    inst.name == "s_swappc_b64"
+        && (inst.pc == 0
+            || matches!(
+                (inst.args.first().map(|a| &a.operand), inst.args.get(1).map(|a| &a.operand)),
+                (Some(a), Some(b)) if a == b
+            ))
 }
 
 /// The compiler's jump past the reach of a branch: `s_getpc_b64 s[n:n+1]`, a 64-bit add or subtract of a
@@ -1530,9 +1543,9 @@ impl Lifter {
 
     fn scalar_op(&mut self, name: &str, inst: &Inst) -> Result<bool, LiftError> {
         let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
-        if name == "s_swappc_b64" && inst.pc == 0 {
+        if name == "s_swappc_b64" && fetch_call(inst) {
             let base = self.value(Expr::CodeBase);
-            let next = self.c64(4);
+            let next = self.c64(inst.pc as u64 + 4);
             let address = self.bin(Bin::Add64, base, next);
             self.set_scalar64(arg(0)?, address, inst)?;
             self.stmts.push(Stmt::FetchVertexInputs);
@@ -2996,28 +3009,41 @@ impl Lifter {
                 self.set_lane(arg(0)?, value, inst)?;
                 Ok(true)
             }
-            "ds_write2_b32" | "ds_write2st64_b32" | "ds_read2_b32" | "ds_read2st64_b32" => {
+            "ds_write2_b32" | "ds_write2st64_b32" | "ds_read2_b32" | "ds_read2st64_b32"
+            | "ds_write2_b64" | "ds_write2st64_b64" | "ds_read2_b64" | "ds_read2st64_b64" => {
                 let read = name.starts_with("ds_read");
-                let scale = if name.contains("st64") { 256 } else { 4 };
+                let words: u32 = if name.ends_with("b64") { 2 } else { 1 };
+                let scale = 4 * words * if name.contains("st64") { 64 } else { 1 };
                 let first = Self::immediate(inst, "offset0") as u32;
                 let second = Self::immediate(inst, "offset1") as u32;
                 let base = self.lane(arg(usize::from(read))?, inst)?;
                 let mut addresses = Vec::new();
                 for slot in [first, second] {
-                    let immediate = self.c(slot * scale);
-                    addresses.push(self.bin(Bin::Add, base, immediate));
+                    for word in 0..words {
+                        let immediate = self.c(slot * scale + 4 * word);
+                        addresses.push(self.bin(Bin::Add, base, immediate));
+                    }
                 }
                 if read {
                     let (target, _) = vgprs(arg(0)?, inst)?;
-                    let low = self.value(Expr::LdsLoad(addresses[0]));
-                    let high = self.value(Expr::LdsLoad(addresses[1]));
-                    self.stmts.push(Stmt::SetLane(target, low));
-                    self.stmts.push(Stmt::SetLane(target + 1, high));
+                    let values: Vec<Tmp> = addresses
+                        .iter()
+                        .map(|address| self.value(Expr::LdsLoad(*address)))
+                        .collect();
+                    for (offset, value) in values.into_iter().enumerate() {
+                        self.stmts.push(Stmt::SetLane(target + offset as u8, value));
+                    }
                 } else {
-                    let low = self.lane(arg(1)?, inst)?;
-                    let high = self.lane(arg(2)?, inst)?;
-                    self.stmts.push(Stmt::LdsStore(addresses[0], low));
-                    self.stmts.push(Stmt::LdsStore(addresses[1], high));
+                    let mut values = Vec::new();
+                    for index in [1, 2] {
+                        let (data, _) = vgprs(arg(index)?, inst)?;
+                        for word in 0..words as u8 {
+                            values.push(self.value(Expr::Get(Reg::V(data + word))));
+                        }
+                    }
+                    for (address, value) in addresses.into_iter().zip(values) {
+                        self.stmts.push(Stmt::LdsStore(address, value));
+                    }
                 }
                 Ok(true)
             }
@@ -3234,6 +3260,34 @@ impl Lifter {
                 } else {
                     let data = self.lane(arg(1)?, inst)?;
                     self.stmts.push(Stmt::LdsStore(address, data));
+                }
+                Ok(true)
+            }
+            "ds_write_b64" | "ds_write_b96" | "ds_write_b128" | "ds_read_b64" | "ds_read_b96"
+            | "ds_read_b128" => {
+                let read = name.starts_with("ds_read");
+                let base = self.lane(arg(usize::from(read))?, inst)?;
+                let (data, count) = vgprs(arg(if read { 0 } else { 1 })?, inst)?;
+                let mut addresses = Vec::new();
+                for word in 0..u32::from(count) {
+                    let immediate = self.c(offset as u32 + 4 * word);
+                    addresses.push(self.bin(Bin::Add, base, immediate));
+                }
+                if read {
+                    let values: Vec<Tmp> = addresses
+                        .iter()
+                        .map(|address| self.value(Expr::LdsLoad(*address)))
+                        .collect();
+                    for (word, value) in values.into_iter().enumerate() {
+                        self.stmts.push(Stmt::SetLane(data + word as u8, value));
+                    }
+                } else {
+                    let values: Vec<Tmp> = (0..count)
+                        .map(|word| self.value(Expr::Get(Reg::V(data + word))))
+                        .collect();
+                    for (address, value) in addresses.into_iter().zip(values) {
+                        self.stmts.push(Stmt::LdsStore(address, value));
+                    }
                 }
                 Ok(true)
             }

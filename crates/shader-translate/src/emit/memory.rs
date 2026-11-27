@@ -30,6 +30,11 @@ impl Emitter {
         ok(self.b.branch_conditional(condition, then, merge, []))?;
         self.begin(then)?;
         let (ptr, scope) = match space {
+            Space::Lds if self.stage_lds.is_some() => {
+                return Err(EmitError::Unsupported(
+                    "LDS atomics in a merged vertex-and-geometry shader",
+                ));
+            }
             Space::Lds => {
                 let index = self.lds_index(address)?;
                 (self.lds_element(index)?, 2)

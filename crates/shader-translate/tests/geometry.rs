@@ -4,8 +4,8 @@ use common::{gpu, spirv_val};
 use gpu::{FirstStage, Gpu, Target, TextureFormat, VertexAttribute, VertexBuffer, VertexFormat};
 use shader_translate::images::Number;
 use shader_translate::{
-    FloatMode, MeshOptions, PUSH_HEAP, PUSH_WORDS, PixelOptions, PixelOutput, VertexInput,
-    VertexOptions,
+    EsOptions, FloatMode, GsInput, GsOptions, GsOutput, MeshOptions, PUSH_HEAP, PUSH_WORDS,
+    PixelOptions, PixelOutput, VertexInput, VertexOptions,
 };
 
 const SIZE: u32 = 8;
@@ -146,6 +146,7 @@ fn vertex_shaders_place_corners_and_pass_parameters() {
         let first = FirstStage::Vertex {
             spirv: &spirv,
             buffer: None,
+            geometry: None,
         };
         draw(&gpu, first, &pixel, &[f(7.0)], "vertex index");
 
@@ -199,6 +200,7 @@ fn vertex_shaders_place_corners_and_pass_parameters() {
         let first = FirstStage::Vertex {
             spirv: &spirv,
             buffer: Some(&buffer),
+            geometry: None,
         };
         draw(&gpu, first, &pixel, &[], "vertex fetch");
     }
@@ -243,5 +245,141 @@ fn mesh_shaders_export_vertices_and_primitives() {
             groups: [1, 1, 1],
         };
         draw(&gpu, first, &pixel, &[f(7.0)], "mesh");
+    }
+}
+
+fn whole_wave(count: &str, wave64: bool) -> String {
+    if wave64 {
+        format!(
+            "s_bfm_b64 exec, {count}, 0
+             s_cmp_eq_u32 {count}, 64
+             s_cselect_b64 exec, -1, exec"
+        )
+    } else {
+        format!(
+            "s_bfm_b32 exec_lo, {count}, 0
+             s_cmp_eq_u32 {count}, 32
+             s_cselect_b32 exec_lo, -1, exec_lo"
+        )
+    }
+}
+
+fn lane_index(target: &str, wave64: bool) -> String {
+    let high = if wave64 {
+        format!("\nv_mbcnt_hi_u32_b32 {target}, -1, {target}")
+    } else {
+        String::new()
+    };
+    format!("v_mbcnt_lo_u32_b32 {target}, -1, 0{high}")
+}
+
+#[test]
+fn merged_vertex_and_geometry_halves_draw_through_lds() {
+    let Some(gpu) = gpu() else { return };
+    if !gpu.info.pixel_shaders || !gpu.info.descriptor_indexing || !gpu.info.geometry_shaders {
+        eprintln!(
+            "skipping: {} cannot run translated geometry shaders",
+            gpu.info.name
+        );
+        return;
+    }
+    let pixel = fragment(&gpu);
+    for wave64 in [false, true] {
+        let first = format!(
+            "s_bfe_i32 s23, s3, 0x80000
+             {}
+             s_swappc_b64 s[12:13], s[12:13]
+             {}
+             s_bfe_u32 s6, s3, 0x40018
+             s_lshl_b32 s6, s6, 11
+             v_mad_u32_u24 v15, v1, 32, s6
+             v_and_b32_e32 v20, 1, v5
+             v_cvt_f32_u32_e32 v20, v20
+             v_lshrrev_b32_e32 v21, 1, v5
+             v_and_b32_e32 v21, 1, v21
+             v_cvt_f32_u32_e32 v21, v21
+             v_fma_f32 v22, v20, 4.0, -1.0
+             v_fma_f32 v23, v21, 4.0, -1.0
+             v_mov_b32_e32 v24, 0.5
+             v_mov_b32_e32 v25, 1.0
+             v_mul_f32_e32 v20, 0x41800000, v20
+             v_mul_f32_e32 v21, 0x41800000, v21
+             v_mov_b32_e32 v26, s8
+             v_lshlrev_b32_e32 v27, 1, v5
+             v_cvt_f32_u32_e32 v27, v27
+             v_add_f32_e32 v27, 0x40400000, v27
+             ds_write2_b64 v15, v[20:21], v[26:27] offset1:1
+             ds_write_b64 v15, v[22:23] offset:16
+             ds_write_b64 v15, v[24:25] offset:24
+             s_setpc_b64 s[6:7]",
+            whole_wave("s23", wave64),
+            lane_index("v1", wave64)
+        );
+        let mut second = format!(
+            "s_bfe_i32 s0, s3, 0x80008
+             {}
+             {}
+             v_lshlrev_b32_e32 v3, 2, v0
+             v_and_b32_e32 v10, 0x3fffc, v3
+             v_lshrrev_b32_e32 v8, 16, v0
+             v_lshlrev_b32_e32 v8, 2, v8
+             v_lshlrev_b32_e32 v1, 2, v1
+             v_and_b32_e32 v6, 0x3fffc, v1
+             s_bfe_u32 s3, s3, 0x80010
+             s_mov_b32 m0, s3
+             v_mad_u32_u24 v12, 0x60, v2, s2
+",
+            whole_wave("s0", wave64),
+            lane_index("v2", wave64)
+        );
+        for (k, offset) in ["v10", "v8", "v6"].into_iter().enumerate() {
+            second += &format!(
+                "ds_read2_b64 v[20:23], {offset} offset1:1
+                 ds_read2_b64 v[24:27], {offset} offset0:2 offset1:3
+                 ds_write2_b64 v12, v[20:21], v[22:23] offset0:{} offset1:{}
+                 ds_write2_b64 v12, v[24:25], v[26:27] offset0:{} offset1:{}
+                 s_sendmsg sendmsg(MSG_GS|GS_OP_EMIT|0)
+",
+                4 * k,
+                4 * k + 1,
+                4 * k + 2,
+                4 * k + 3
+            );
+        }
+        second += "s_sendmsg sendmsg(MSG_GS|GS_OP_CUT|0)
+             s_sendmsg sendmsg(MSG_GS_DONE|GS_OP_NOP)
+             s_endpgm";
+        let es = shader_translate::es(
+            &lift(&first, wave64),
+            &EsOptions {
+                user_sgprs: 1,
+                inputs: Vec::new(),
+                item_bytes: 32,
+                float: float_mode(&gpu),
+            },
+        )
+        .unwrap();
+        spirv_val(&es, &format!("first_half_{wave64}"));
+        let gs = shader_translate::gs(
+            &lift(&second, wave64),
+            &GsOptions {
+                user_sgprs: 1,
+                input: GsInput::Triangles,
+                item_bytes: 32,
+                output: GsOutput::TriangleStrip,
+                max_vertices: 3,
+                vertex_bytes: 32,
+                position: Some(1),
+                float: float_mode(&gpu),
+            },
+        )
+        .unwrap();
+        spirv_val(&gs, &format!("second_half_{wave64}"));
+        let first = FirstStage::Vertex {
+            spirv: &es,
+            buffer: None,
+            geometry: Some(&gs),
+        };
+        draw(&gpu, first, &pixel, &[f(7.0)], "merged halves");
     }
 }

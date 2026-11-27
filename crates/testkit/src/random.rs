@@ -1642,6 +1642,34 @@ impl Generator {
                 let low = 1 + self.rng.below(if self.gpu { 3 } else { 7 });
                 format!("{op} v[{low}:{}], v9 offset0:{a} offset1:{b}", low + 1)
             }
+            0 if self.rng.chance(3) => {
+                let (op, limit) = if self.rng.chance(3) {
+                    ("ds_write2st64_b64", 8)
+                } else {
+                    ("ds_write2_b64", 32)
+                };
+                let (a, b) = (self.rng.below(limit), self.rng.below(limit));
+                format!(
+                    "{op} v9, {}, {} offset0:{a} offset1:{b}",
+                    self.vreg_pair(),
+                    self.vreg_pair()
+                )
+            }
+            1 if self.rng.chance(3) => {
+                let low = 1 + self.rng.below(if self.gpu { 1 } else { 5 });
+                if self.rng.chance(2) {
+                    let (a, b) = (self.rng.below(32), self.rng.below(32));
+                    format!(
+                        "ds_read2_b64 v[{low}:{}], v9 offset0:{a} offset1:{b}",
+                        low + 3
+                    )
+                } else {
+                    format!("ds_read_b64 v[{low}:{}], v9 offset:{offset}", low + 1)
+                }
+            }
+            0 if self.rng.chance(3) => {
+                format!("ds_write_b64 v9, {} offset:{offset}", self.vreg_pair())
+            }
             0 => format!("ds_write_b32 v9, {} offset:{offset}", self.vreg()),
             1 => format!("ds_read_b32 {}, v9 offset:{offset}", self.vdst()),
             2 => format!(

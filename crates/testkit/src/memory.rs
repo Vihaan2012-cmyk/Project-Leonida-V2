@@ -95,7 +95,8 @@ fn lds_write(wave: &mut Wave, address: u64, value: u32) -> Result<()> {
 
 fn lds_pair(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
     let read = name.starts_with("ds_read");
-    let scale = if name.contains("st64") { 256 } else { 4 };
+    let words = if name.ends_with("b64") { 2 } else { 1 };
+    let scale = 4 * words as u64 * if name.contains("st64") { 64 } else { 1 };
     let first = offset_mod(inst, "offset0") as u64 * scale;
     let second = offset_mod(inst, "offset1") as u64 * scale;
     let address_arg = arg(inst, usize::from(read))?;
@@ -108,20 +109,27 @@ fn lds_pair(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
         let reg = vreg(arg(inst, 0)?, inst)?;
         let mut values = Vec::new();
         for base in &bases {
-            values.push((
-                lds_read(wave, (base + first) & 0xFFFF_FFFF)?,
-                lds_read(wave, (base + second) & 0xFFFF_FFFF)?,
-            ));
+            let mut words_read = Vec::new();
+            for offset in [first, second] {
+                for word in 0..words as u64 {
+                    words_read.push(lds_read(wave, (base + offset + 4 * word) & 0xFFFF_FFFF)?);
+                }
+            }
+            values.push(words_read);
         }
-        for (lane, (low, high)) in lanes.iter().zip(values) {
-            wave.vgpr[reg][*lane] = low;
-            wave.vgpr[reg + 1][*lane] = high;
+        for (lane, words_read) in lanes.iter().zip(values) {
+            for (index, value) in words_read.into_iter().enumerate() {
+                wave.vgpr[reg + index][*lane] = value;
+            }
         }
     } else {
         for (index, offset) in [(1, first), (2, second)] {
-            for (lane, base) in lanes.iter().zip(&bases) {
-                let data = wave.read_lane(arg(inst, index)?, *lane, inst)?;
-                lds_write(wave, (base + offset) & 0xFFFF_FFFF, data)?;
+            let data = vreg(arg(inst, index)?, inst)?;
+            for word in 0..words {
+                for (lane, base) in lanes.iter().zip(&bases) {
+                    let value = wave.vgpr[data + word][*lane];
+                    lds_write(wave, (base + offset + 4 * word as u64) & 0xFFFF_FFFF, value)?;
+                }
             }
         }
     }
@@ -179,6 +187,21 @@ fn lds(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
     if name.starts_with("ds_read2") || name.starts_with("ds_write2") {
         return lds_pair(name, inst, wave);
     }
+    if matches!(name, "ds_write_b64" | "ds_write_b96" | "ds_write_b128") {
+        let offset = offset_mod(inst, "offset") as u64;
+        let Operand::Vgpr { reg, count } = arg(inst, 1)?.operand else {
+            return Err(bad(inst));
+        };
+        let lanes = wave.active_lanes();
+        for word in 0..count {
+            for lane in &lanes {
+                let address = u64::from(wave.read_lane(arg(inst, 0)?, *lane, inst)?) + offset;
+                let value = wave.vgpr[usize::from(reg + word)][*lane];
+                lds_write(wave, address + 4 * u64::from(word), value)?;
+            }
+        }
+        return Ok(());
+    }
     let offset = offset_mod(inst, "offset") as u64;
     let returns = name.contains("_rtn_") || name.starts_with("ds_read");
     let first = usize::from(returns);
@@ -193,6 +216,18 @@ fn lds(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
             "ds_write_b32" => {
                 let data = wave.read_lane(arg(inst, first + 1)?, lane, inst)?;
                 lds_write(wave, address, data)?;
+            }
+            "ds_read_b64" | "ds_read_b96" | "ds_read_b128" => {
+                let Operand::Vgpr { reg, count } = arg(inst, 0)?.operand else {
+                    return Err(bad(inst));
+                };
+                let mut values = Vec::new();
+                for word in 0..count {
+                    values.push(lds_read(wave, address + 4 * u64::from(word))?);
+                }
+                for (word, value) in values.into_iter().enumerate() {
+                    wave.vgpr[usize::from(reg) + word][lane] = value;
+                }
             }
             "ds_write_b16" | "ds_write_b16_d16_hi" => {
                 let data = wave.read_lane(arg(inst, first + 1)?, lane, inst)?;

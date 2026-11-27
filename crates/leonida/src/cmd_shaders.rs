@@ -146,6 +146,8 @@ struct Report {
     pixel_entries: usize,
     vertex_entries: usize,
     mesh_entries: usize,
+    first_halves: usize,
+    geometry_entries: usize,
     instructions: usize,
     unsupported: usize,
     missing: BTreeMap<String, (usize, usize, String, String)>,
@@ -209,6 +211,12 @@ impl Report {
                                 .map_err(|e| e.to_string());
                             self.count(result, |r| &mut r.vertex_entries);
                         }
+                        (Some(Stage::Geometry), _) => {
+                            let result = geometry_options(&fssm, found).and_then(|options| {
+                                shader_translate::gs(&function, &options).map_err(|e| e.to_string())
+                            });
+                            self.count(result, |r| &mut r.geometry_entries);
+                        }
                         (Some(Stage::Mesh), _) => {
                             let result = mesh_options(&fssm, found).and_then(|options| {
                                 shader_translate::mesh(&function, &options)
@@ -254,6 +262,27 @@ impl Report {
         Some(())
     }
 
+    /// The first half of a merged vertex-and-geometry shader, the extra program a vertex shader carries.
+    fn add_first_half(&mut self, blob: &[u8], found: Option<&Interface>) {
+        let Ok(fssm) = Fssm::parse(blob) else {
+            return;
+        };
+        let CodeRange::Header { start, end } = fssm.code_range() else {
+            return;
+        };
+        let wave64 = fssm.wave_size() == WaveSize::Wave64;
+        let Some(code) = blob.get(start..end) else {
+            return;
+        };
+        let result = shader_ir::lift(code, wave64)
+            .map_err(|e| e.to_string())
+            .and_then(|function| {
+                shader_translate::es(&function, &first_half_options(&fssm, found))
+                    .map_err(|e| e.to_string())
+            });
+        self.count(result, |r| &mut r.first_halves);
+    }
+
     fn count<T>(&mut self, result: Result<T, String>, entries: impl Fn(&mut Self) -> &mut usize) {
         match result {
             Ok(_) => *entries(self) += 1,
@@ -277,7 +306,7 @@ impl Report {
         );
         println!("shaders with undecodable words: {}", self.invalid);
         println!(
-            "shaders the translator fully handles: {} ({:.1}%), lifted and checked: {}, turned into test-form SPIR-V: {}, into real compute shaders: {}, pixel shaders: {}, vertex shaders: {}, mesh shaders: {}",
+            "shaders the translator fully handles: {} ({:.1}%), lifted and checked: {}, turned into test-form SPIR-V: {}, into real compute shaders: {}, pixel shaders: {}, vertex shaders: {}, mesh shaders: {}, geometry shaders: {} (with {} vertex halves)",
             self.complete,
             percent(self.complete, self.shaders),
             self.lifted,
@@ -285,7 +314,9 @@ impl Report {
             self.compute_entries,
             self.pixel_entries,
             self.vertex_entries,
-            self.mesh_entries
+            self.mesh_entries,
+            self.geometry_entries,
+            self.first_halves
         );
         for (error, count) in &self.lift_errors {
             println!("  {count} stopped at: {error}");
@@ -355,6 +386,71 @@ fn vertex_options(fssm: &Fssm, found: Option<&Interface>) -> shader_translate::V
     }
 }
 
+fn signature_bytes(elements: &[SignatureElement]) -> u32 {
+    elements
+        .iter()
+        .map(|element| element.register + 1)
+        .max()
+        .unwrap_or(0)
+        * 16
+}
+
+/// The first half's fetched attributes as for a vertex shader, and one LDS item of 16 bytes per output register.
+fn first_half_options(fssm: &Fssm, found: Option<&Interface>) -> shader_translate::EsOptions {
+    let vertex = vertex_options(fssm, found);
+    shader_translate::EsOptions {
+        user_sgprs: vertex.user_sgprs,
+        inputs: vertex.inputs,
+        item_bytes: signature_bytes(found.map(|f| f.outputs.as_slice()).unwrap_or_default()),
+        float: vertex.float,
+    }
+}
+
+/// The geometry entry's primitives from the pipeline-state part and its vertex sizes from the signatures.
+fn geometry_options(
+    fssm: &Fssm,
+    found: Option<&Interface>,
+) -> Result<shader_translate::GsOptions, String> {
+    use shader_translate::{GsInput, GsOutput};
+    let found = found.ok_or("no geometry signatures")?;
+    let info = found
+        .pipeline
+        .as_ref()
+        .and_then(|p| p.geometry)
+        .ok_or("no geometry pipeline state")?;
+    let input = match info.input_primitive {
+        1 => GsInput::Points,
+        2 => GsInput::Lines,
+        3 => GsInput::Triangles,
+        6 => GsInput::LinesAdjacency,
+        7 => GsInput::TrianglesAdjacency,
+        _ => return Err("geometry shader input that is not points, lines or triangles".into()),
+    };
+    let output = match info.output_topology {
+        1 => GsOutput::Points,
+        3 => GsOutput::LineStrip,
+        5 => GsOutput::TriangleStrip,
+        _ => return Err("geometry shader output that is not points, lines or triangles".into()),
+    };
+    if info.stream_mask > 1 {
+        return Err("geometry output to a stream past the first".into());
+    }
+    Ok(shader_translate::GsOptions {
+        user_sgprs: fssm.user_sgprs(),
+        input,
+        item_bytes: signature_bytes(&found.inputs),
+        output,
+        max_vertices: u32::from(info.max_vertices),
+        vertex_bytes: signature_bytes(&found.outputs),
+        position: found
+            .outputs
+            .iter()
+            .find(|element| element.system_value == 1)
+            .map(|element| element.register as u8),
+        float: shader_translate::FloatMode::default(),
+    })
+}
+
 /// The mesh entry's group size, output counts and shared memory from the pipeline-state part.
 fn mesh_options(
     fssm: &Fssm,
@@ -390,6 +486,9 @@ pub fn report_command(args: &ReportArgs) -> Result<ExitCode> {
                 .ok()
                 .and_then(|list| interface(&list, None).ok());
             let added = unpack_all(&shader.dxbc).ok().and_then(|blobs| {
+                if shader.stage == Some(Stage::Vertex) && blobs.len() == 2 {
+                    report.add_first_half(&blobs[0], found.as_ref());
+                }
                 blobs
                     .last()
                     .and_then(|blob| report.add(&shader.name, shader.stage, blob, found.as_ref()))

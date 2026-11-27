@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use rspirv::dr::Operand;
 use rspirv::spirv::{BuiltIn, Capability, Decoration, StorageClass, Word};
 
-use super::{EXEC, EmitError, Emitter, MeshOptions, PUSH_CODE, PUSH_HEAP, VertexOptions, ok};
+use super::{
+    EXEC, EmitError, Emitter, MeshOptions, PUSH_CODE, PUSH_HEAP, VertexInput, VertexOptions, ok,
+};
 use crate::images::Number;
 
 const POSITION: u8 = 12;
@@ -34,7 +36,7 @@ impl GeometryState {
 }
 
 impl Emitter {
-    fn push_bases(&mut self) -> Result<(), EmitError> {
+    pub(super) fn push_bases(&mut self) -> Result<(), EmitError> {
         let low = self.push_word(PUSH_HEAP)?;
         let high = self.push_word(PUSH_HEAP + 1)?;
         self.heap = Some(self.pack(low, high)?);
@@ -44,7 +46,7 @@ impl Emitter {
         Ok(())
     }
 
-    fn preload_vgprs(&mut self, preload: &BTreeMap<u8, Word>) -> Result<(), EmitError> {
+    pub(super) fn preload_vgprs(&mut self, preload: &BTreeMap<u8, Word>) -> Result<(), EmitError> {
         let vectors: Vec<(u8, Word)> = self.vgpr.iter().map(|(r, v)| (*r, *v)).collect();
         for (reg, var) in vectors {
             let value = match preload.get(&reg) {
@@ -59,30 +61,41 @@ impl Emitter {
         self.store(self.messages, zero)
     }
 
-    pub(super) fn vertex_prologue(&mut self, options: VertexOptions) -> Result<(), EmitError> {
-        let (u32_, f32_) = (self.t.u32_, self.t.f32_);
+    /// The vertex index into `index_vgpr` and the instance index past the base instance into `instance_vgpr`;
+    /// returns the built-in inputs read.
+    pub(super) fn vertex_indices(
+        &mut self,
+        preload: &mut BTreeMap<u8, Word>,
+        index_vgpr: u8,
+        instance_vgpr: u8,
+    ) -> Result<Vec<Word>, EmitError> {
+        let u32_ = self.t.u32_;
         self.b.capability(Capability::DrawParameters);
-        let vec4 = self.b.type_vector(f32_, 4);
         let i32_ = self.b.type_int(32, 1);
         let index = self.builtin_input(i32_, BuiltIn::VertexIndex);
         let instance = self.builtin_input(i32_, BuiltIn::InstanceIndex);
         let base_instance = self.builtin_input(i32_, BuiltIn::BaseInstance);
-        let position = self.interface_variable(vec4, StorageClass::Output);
-        self.b.decorate(
-            position,
-            Decoration::BuiltIn,
-            [Operand::BuiltIn(BuiltIn::Position)],
-        );
-        self.push_bases()?;
-        let mut preload = BTreeMap::new();
         let vertex = ok(self.b.load(i32_, None, index, None, []))?;
-        preload.insert(0, ok(self.b.bitcast(u32_, None, vertex))?);
+        preload.insert(index_vgpr, ok(self.b.bitcast(u32_, None, vertex))?);
         let instance_value = ok(self.b.load(i32_, None, instance, None, []))?;
         let base = ok(self.b.load(i32_, None, base_instance, None, []))?;
         let local = ok(self.b.i_sub(i32_, None, instance_value, base))?;
-        preload.insert(3, ok(self.b.bitcast(u32_, None, local))?);
-        let mut inputs = vec![index, instance, base_instance];
-        for input in &options.inputs {
+        preload.insert(instance_vgpr, ok(self.b.bitcast(u32_, None, local))?);
+        Ok(vec![index, instance, base_instance])
+    }
+
+    /// Each fetched attribute r from the vertex input at location r into v[first + 4r] to v[first + 4r + 3];
+    /// returns the inputs.
+    pub(super) fn fetched_inputs(
+        &mut self,
+        inputs: &[VertexInput],
+        first: u8,
+        preload: &mut BTreeMap<u8, Word>,
+    ) -> Result<Vec<Word>, EmitError> {
+        let (u32_, f32_) = (self.t.u32_, self.t.f32_);
+        let i32_ = self.b.type_int(32, 1);
+        let mut variables = Vec::new();
+        for input in inputs {
             let component = match input.number {
                 Number::Float => f32_,
                 Number::Uint => u32_,
@@ -95,7 +108,7 @@ impl Emitter {
                 Decoration::Location,
                 [Operand::LiteralBit32(u32::from(input.register))],
             );
-            inputs.push(var);
+            variables.push(var);
             let value = ok(self.b.load(ty, None, var, None, []))?;
             for c in 0..4u32 {
                 let part = ok(self.b.composite_extract(component, None, value, [c]))?;
@@ -104,9 +117,25 @@ impl Emitter {
                 } else {
                     ok(self.b.bitcast(u32_, None, part))?
                 };
-                preload.insert(4 + 4 * input.register + c as u8, word);
+                preload.insert(first + 4 * input.register + c as u8, word);
             }
         }
+        Ok(variables)
+    }
+
+    pub(super) fn vertex_prologue(&mut self, options: VertexOptions) -> Result<(), EmitError> {
+        let (u32_, f32_) = (self.t.u32_, self.t.f32_);
+        let vec4 = self.b.type_vector(f32_, 4);
+        let position = self.interface_variable(vec4, StorageClass::Output);
+        self.b.decorate(
+            position,
+            Decoration::BuiltIn,
+            [Operand::BuiltIn(BuiltIn::Position)],
+        );
+        self.push_bases()?;
+        let mut preload = BTreeMap::new();
+        let mut inputs = self.vertex_indices(&mut preload, 0, 3)?;
+        inputs.extend(self.fetched_inputs(&options.inputs, 4, &mut preload)?);
         let yes = self.boolc(true);
         let scope = self.u32c(3);
         let uvec4 = self.t.uvec4;

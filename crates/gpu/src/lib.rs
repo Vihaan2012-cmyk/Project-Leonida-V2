@@ -25,6 +25,8 @@ pub enum GpuError {
     NoPixelShaders,
     #[error("this GPU cannot run translated mesh shaders: it lacks VK_EXT_mesh_shader")]
     NoMeshShaders,
+    #[error("this GPU cannot run translated geometry shaders")]
+    NoGeometryShaders,
 }
 
 static VALIDATION_ERRORS: AtomicUsize = AtomicUsize::new(0);
@@ -77,6 +79,7 @@ pub struct DeviceInfo {
     pub mesh_shaders: bool,
     pub quad_operations: bool,
     pub pixel_interlock: bool,
+    pub geometry_shaders: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,11 +222,13 @@ pub struct VertexBuffer {
     pub attributes: Vec<VertexAttribute>,
 }
 
-/// What produces a draw's triangles: a vertex shader over three vertices, or a mesh shader's work groups.
+/// What produces a draw's triangles: a vertex shader over three vertices, optionally followed by a geometry
+/// shader, or a mesh shader's work groups.
 pub enum FirstStage<'a> {
     Vertex {
         spirv: &'a [u32],
         buffer: Option<&'a VertexBuffer>,
+        geometry: Option<&'a [u32]>,
     },
     Mesh {
         spirv: &'a [u32],
@@ -344,6 +349,7 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
         let write_without_format =
             features.features.shader_storage_image_write_without_format == vk::TRUE;
         let fragment_stores = features.features.fragment_stores_and_atomics == vk::TRUE;
+        let geometry_shaders = features.features.geometry_shader == vk::TRUE;
         let min_lod = features.features.shader_resource_min_lod == vk::TRUE;
         let gather_extended = features.features.shader_image_gather_extended == vk::TRUE;
         let image_int64_atomics = has_atomics64 && atomics64.shader_image_int64_atomics == vk::TRUE;
@@ -401,6 +407,7 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
                     .subgroup_supported_operations
                     .contains(vk::SubgroupFeatureFlags::QUAD),
                 pixel_interlock,
+                geometry_shaders,
             },
         })
     }
@@ -493,7 +500,8 @@ impl Gpu {
                 .shader_storage_image_write_without_format(storage)
                 .shader_resource_min_lod(chosen.info.min_lod)
                 .shader_image_gather_extended(chosen.info.gather_extended)
-                .fragment_stores_and_atomics(chosen.info.pixel_shaders);
+                .fragment_stores_and_atomics(chosen.info.pixel_shaders)
+                .geometry_shader(chosen.info.geometry_shaders);
             let mut atomics64 = vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT::default()
                 .shader_image_int64_atomics(true);
             let mut features = vk::PhysicalDeviceFeatures2::default()
@@ -1209,7 +1217,7 @@ impl Gpu {
                 None,
             )?;
             scratch.extra_modules.push(fragment);
-            let stages = [
+            let mut stages = vec![
                 vk::PipelineShaderStageCreateInfo::default()
                     .stage(if mesh {
                         vk::ShaderStageFlags::MESH_EXT
@@ -1223,6 +1231,26 @@ impl Gpu {
                     .module(fragment)
                     .name(c"main"),
             ];
+            if let FirstStage::Vertex {
+                geometry: Some(geometry),
+                ..
+            } = first
+            {
+                if !self.info.geometry_shaders {
+                    return Err(GpuError::NoGeometryShaders);
+                }
+                let module = device.create_shader_module(
+                    &vk::ShaderModuleCreateInfo::default().code(geometry),
+                    None,
+                )?;
+                scratch.extra_modules.push(module);
+                stages.push(
+                    vk::PipelineShaderStageCreateInfo::default()
+                        .stage(vk::ShaderStageFlags::GEOMETRY)
+                        .module(module)
+                        .name(c"main"),
+                );
+            }
             let mut bindings = Vec::new();
             let mut attributes = Vec::new();
             if let FirstStage::Vertex {

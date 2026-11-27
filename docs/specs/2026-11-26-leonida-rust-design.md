@@ -197,6 +197,24 @@ the limits at the start and culls every primitive slot; thread T's `pos0` and `p
 `prim` export (three 9-bit indices at bits 0, 10 and 20, bit 31 for none) fills primitive T. In both stages `pos0` is
 `Position` and `paramN` the raw words at location N; `pos1`-`pos3` and allocation messages are ignored for now.
 
+**Geometry shaders.** Every geometry shader in the game is the second half of a merged shader; the vertex shader it
+pairs with carries the first half as an extra program. The first half runs once per vertex with exec from s3 bits
+0-7, calls the fetch shader, stores its vertex to LDS at its lane's 16-bytes-per-output-register item and jumps into
+the second half. The second half runs once per primitive with exec from s3 bits 8-15, reads its vertices at the
+dword offsets packed two to a register in v0, v1 and v4, writes each vertex it emits to LDS, the vertices of one
+primitive following one another, and sends a GS emit message per vertex and a cut message to end a strip. No program
+that reads the emitted vertices back is in the dump; the console driver supplies it.
+
+The translator splits the halves into a Vulkan vertex shader and a geometry shader with LDS private to each
+invocation. In the vertex shader, attributes arrive from v9 up, the vertex index in v5 and the instance index in v8,
+and the LDS stores become the vertex's outputs, one raw `uvec4` per 16 bytes at locations 0 up. The geometry shader
+loads its vertices' outputs into its private LDS `item_bytes` apart and points v0, v1 and v4 at them; an emit message
+writes the next vertex from its stored words, the position register to `Position` and every other register to the
+location of its number, and a cut ends the primitive. Store addresses count from the lane's own area and wrap at the
+window's size, so the area must start on a multiple of that window (a power of two at least as large as the
+primitive's vertices): the game's shaders place it at a table value times 256 plus s2, which is 0. Both halves
+take user SGPRs from s8.
+
 **Compute groups.** A compute entry declares a flat group of whole waves and rebuilds the thread IDs from the flat
 index, x fastest, as the hardware packs threads into waves. A group that ends partway through a wave starts that wave
 with exec holding only the lanes that carry its threads. Implicit-LOD sampling outside pixel shaders takes its

@@ -16,6 +16,7 @@ use crate::images::{Number, View};
 mod geometry;
 mod image;
 mod memory;
+mod merged;
 mod pixel;
 
 pub const STATE_SCC: u32 = 128;
@@ -92,6 +93,8 @@ enum Entry<'a> {
     Pixel(&'a PixelOptions),
     Vertex(&'a VertexOptions),
     Mesh(&'a MeshOptions),
+    Es(&'a EsOptions),
+    Gs(&'a GsOptions),
 }
 
 /// One fetched vertex attribute: the input-signature register, read as four components of `number`.
@@ -105,6 +108,60 @@ pub struct VertexInput {
 pub struct VertexOptions {
     pub user_sgprs: u32,
     pub inputs: Vec<VertexInput>,
+    pub float: FloatMode,
+}
+
+/// The first half of a merged vertex-and-geometry shader, run as a vertex shader. Its LDS stores become its
+/// vertex's outputs: `item_bytes` (16 per output-signature register) at output locations 0 up, as raw words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EsOptions {
+    /// User SGPRs start at s8, as for the second half.
+    pub user_sgprs: u32,
+    pub inputs: Vec<VertexInput>,
+    pub item_bytes: u32,
+    pub float: FloatMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GsInput {
+    Points,
+    Lines,
+    Triangles,
+    LinesAdjacency,
+    TrianglesAdjacency,
+}
+
+impl GsInput {
+    pub fn vertices(self) -> u32 {
+        match self {
+            GsInput::Points => 1,
+            GsInput::Lines => 2,
+            GsInput::Triangles => 3,
+            GsInput::LinesAdjacency => 4,
+            GsInput::TrianglesAdjacency => 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GsOutput {
+    Points,
+    LineStrip,
+    TriangleStrip,
+}
+
+/// The second half, run as a geometry shader. Each emitted vertex is `vertex_bytes` of LDS, 16 per output
+/// register, and an invocation's vertices follow one another; register `position` becomes the position and
+/// every other register the raw words at the output location of its number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GsOptions {
+    pub user_sgprs: u32,
+    pub input: GsInput,
+    pub item_bytes: u32,
+    pub output: GsOutput,
+    pub max_vertices: u32,
+    pub vertex_bytes: u32,
+    pub position: Option<u8>,
     pub float: FloatMode,
 }
 
@@ -212,6 +269,8 @@ struct Emitter {
     image_cache: Option<(Image, [Word; 4])>,
     pixel: Option<pixel::PixelState>,
     geometry: Option<geometry::GeometryState>,
+    stage_lds: Option<merged::StageLds>,
+    merged: Option<merged::MergedState>,
 }
 
 fn registers(function: &Function) -> (BTreeSet<u8>, BTreeSet<u8>) {
@@ -286,6 +345,17 @@ pub fn mesh(function: &Function, options: &MeshOptions) -> Result<Vec<u32>, Emit
     build(function, Entry::Mesh(options))
 }
 
+/// A vertex shader from the first half of a merged vertex-and-geometry shader; see `EsOptions`.
+pub fn es(function: &Function, options: &EsOptions) -> Result<Vec<u32>, EmitError> {
+    build(function, Entry::Es(options))
+}
+
+/// A geometry shader from the second half; see `GsOptions`. The first half's vertices arrive as its raw
+/// output words and sit `item_bytes` apart in the LDS the halves share.
+pub fn gs(function: &Function, options: &GsOptions) -> Result<Vec<u32>, EmitError> {
+    build(function, Entry::Gs(options))
+}
+
 fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     let pixel_options = match entry {
         Entry::Pixel(options) => Some(options.clone()),
@@ -299,7 +369,18 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         Entry::Mesh(options) => Some(*options),
         _ => None,
     };
-    let pixel_mode = pixel_options.is_some() || vertex_options.is_some();
+    let es_options = match entry {
+        Entry::Es(options) => Some(options.clone()),
+        _ => None,
+    };
+    let gs_options = match entry {
+        Entry::Gs(options) => Some(*options),
+        _ => None,
+    };
+    let pixel_mode = pixel_options.is_some()
+        || vertex_options.is_some()
+        || es_options.is_some()
+        || gs_options.is_some();
     let lanes: u32 = if function.wave64 && !pixel_mode {
         64
     } else {
@@ -324,6 +405,8 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         }
         Entry::Pixel(options) => (options.float, [32, 1, 1], 32),
         Entry::Vertex(options) => (options.float, [32, 1, 1], 32),
+        Entry::Es(options) => (options.float, [32, 1, 1], 32),
+        Entry::Gs(options) => (options.float, [32, 1, 1], 32),
         Entry::Mesh(options) => {
             let words = (options.lds_bytes / 4).max(lanes).next_power_of_two();
             if words > 6 * 1024 {
@@ -510,6 +593,12 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     let iterations = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let messages = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let alive = b.variable(t.ptr_function_bool, None, StorageClass::Function, None);
+    let stage_lds = match (&es_options, &gs_options) {
+        (Some(options), _) => Some(merged::first_half_lds(&mut b, u32_, options)),
+        (_, Some(options)) => Some(merged::second_half_lds(&mut b, u32_, options)),
+        _ => None,
+    };
+    let emitted = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let local = ok(b.load(u32_, None, lane_input, None, []))?;
     let subgroup = if pixel_mode {
         b.constant_bit32(u32_, 0)
@@ -609,6 +698,8 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         image_cache: None,
         pixel: None,
         geometry: None,
+        stage_lds,
+        merged: None,
     };
     if function.ordered && pixel_options.is_none() {
         return Err(EmitError::Unsupported(
@@ -626,6 +717,10 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         e.vertex_prologue(options)?;
     } else if let Some(options) = mesh_options {
         e.mesh_prologue(options)?;
+    } else if let Some(options) = &es_options {
+        e.first_half_prologue(options)?;
+    } else if let Some(options) = &gs_options {
+        e.second_half_prologue(options, emitted)?;
     } else if heap_mode {
         e.compute_prologue()?;
     } else {
@@ -655,6 +750,9 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     if !heap_mode {
         e.epilogue()?;
     }
+    if es_options.is_some() {
+        e.first_half_epilogue()?;
+    }
     if pixel_options.is_some() {
         if function.ordered {
             ok(e.b.end_invocation_interlock_ext())?;
@@ -668,7 +766,33 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     }
     e.lookup_bodies()?;
     e.encode_bodies()?;
-    if let Some(state) = &e.geometry {
+    if let Some(state) = &e.merged {
+        interface.extend(state.interface());
+        match &gs_options {
+            None => {
+                e.b.entry_point(ExecutionModel::Vertex, main, "main", interface)
+            }
+            Some(options) => {
+                e.b.entry_point(ExecutionModel::Geometry, main, "main", interface);
+                e.b.execution_mode(main, ExecutionMode::Invocations, [1]);
+                let input = match options.input {
+                    GsInput::Points => ExecutionMode::InputPoints,
+                    GsInput::Lines => ExecutionMode::InputLines,
+                    GsInput::Triangles => ExecutionMode::Triangles,
+                    GsInput::LinesAdjacency => ExecutionMode::InputLinesAdjacency,
+                    GsInput::TrianglesAdjacency => ExecutionMode::InputTrianglesAdjacency,
+                };
+                e.b.execution_mode(main, input, []);
+                e.b.execution_mode(main, ExecutionMode::OutputVertices, [options.max_vertices]);
+                let output = match options.output {
+                    GsOutput::Points => ExecutionMode::OutputPoints,
+                    GsOutput::LineStrip => ExecutionMode::OutputLineStrip,
+                    GsOutput::TriangleStrip => ExecutionMode::OutputTriangleStrip,
+                };
+                e.b.execution_mode(main, output, []);
+            }
+        }
+    } else if let Some(state) = &e.geometry {
         interface.extend(state.interface());
         match mesh_options {
             Some(options) => {
@@ -1701,6 +1825,25 @@ impl Emitter {
                 self.geometry_export(*target, values)?;
             }
             Stmt::Message(..) | Stmt::FetchVertexInputs if self.geometry.is_some() => {}
+            Stmt::Message(code, _) if self.merged.is_some() => {
+                if self.merged.as_ref().is_some_and(|m| m.second_half()) {
+                    self.second_half_message(*code)?;
+                }
+            }
+            Stmt::FetchVertexInputs if self.merged.is_some() => {}
+            Stmt::Export { .. } if self.merged.is_some() => {
+                return Err(EmitError::Unsupported(
+                    "exports from a merged vertex-and-geometry shader",
+                ));
+            }
+            Stmt::LdsStore(address, value) if self.stage_lds.is_some() => {
+                let active = self.active()?;
+                let (address, value) = (v(self, address), v(self, value));
+                self.if_then(active, |e| {
+                    let ptr = e.merged_lds_element(address, true)?;
+                    e.store(ptr, value)
+                })?;
+            }
             Stmt::LdsStore(..) if self.pixel.is_some() => {
                 return Err(EmitError::Unsupported("LDS in a pixel shader"));
             }
@@ -1966,6 +2109,13 @@ impl Emitter {
             }
             Expr::LdsLoad(_) if self.pixel.is_some() => {
                 return Err(EmitError::Unsupported("LDS in a pixel shader"));
+            }
+            Expr::LdsLoad(address) if self.stage_lds.is_some() => {
+                let ptr = self.merged_lds_element(v(self, address), false)?;
+                let value = self.load(ptr)?;
+                let active = self.active()?;
+                let zero = self.u32c(0);
+                ok(self.b.select(u32_, None, active, value, zero))?
             }
             Expr::LdsLoad(address) => {
                 let index = self.lds_index(v(self, address))?;
