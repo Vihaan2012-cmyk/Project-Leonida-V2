@@ -515,6 +515,10 @@ impl Lifter {
                 let bits = arg.operand.float_bits().unwrap_or(0);
                 return Ok(self.half_modifiers(self_constant_half(bits), arg, modifiers));
             }
+            Operand::Int(value) => {
+                let bits = (*value as u32) & 0xFFFF;
+                return Ok(self.half_modifiers(Half::Bits(bits), arg, modifiers));
+            }
             _ => self.lane(arg, inst)?,
         };
         let raw = if high {
@@ -1747,14 +1751,32 @@ impl Lifter {
         }
         let cmp = match ty {
             "f32" => float_compare(op),
-            "u32" => int_compare(&format!("{op}_u32")),
-            "i32" => int_compare(&format!("{op}_i32")),
+            "f16" if op != "class" => float_compare(op),
+            "u32" | "u16" => int_compare(&format!("{op}_u32")),
+            "i32" | "i16" => int_compare(&format!("{op}_i32")),
             _ => None,
         }
         .ok_or_else(|| unsupported(inst))?;
         let first = usize::from(!exec_form);
         let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
-        let (a, b) = if ty == "f32" {
+        let select = op_sel(inst, "op_sel");
+        let (a, b) = if ty == "f16" {
+            (
+                self.half_value(arg(first)?, select[0], inst)?,
+                self.half_value(arg(first + 1)?, select[1], inst)?,
+            )
+        } else if ty == "u16" || ty == "i16" {
+            let mut pair = Vec::new();
+            for (n, index) in [first, first + 1].into_iter().enumerate() {
+                let half = self.half_source(arg(index)?, select[n], false, inst)?;
+                pair.push(if ty == "i16" {
+                    self.sext(half, 16)
+                } else {
+                    half
+                });
+            }
+            (pair[0], pair[1])
+        } else if ty == "f32" {
             (
                 self.flane(arg(first)?, inst)?,
                 self.flane(arg(first + 1)?, inst)?,
@@ -1900,7 +1922,184 @@ impl Lifter {
         Ok(self.output_modifiers(value, inst))
     }
 
+    fn half_value(&mut self, arg: &Arg, high: bool, inst: &Inst) -> Result<Tmp, LiftError> {
+        let half = self.half_source(arg, high, true, inst)?;
+        Ok(self.un(Un::F16ToF32, half))
+    }
+
+    /// The result of a single-precision computation on halves, rounded back in the current mode.
+    fn rounded_half(&mut self, value: Tmp, inst: &Inst) -> Result<Tmp, LiftError> {
+        let value = self.output_modifiers(value, inst);
+        Ok(self.un(Un::F32ToF16(self.half_round(inst)?), value))
+    }
+
+    /// VOP1/VOP2/VOP3 operations on 16-bit halves. The result goes to the low half, or the high one when
+    /// the destination's op_sel bit is set; the other half keeps its value.
+    fn sixteen_bit(&mut self, name: &str, inst: &Inst) -> Result<bool, LiftError> {
+        let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
+        if name.starts_with("v_pk_") {
+            return self.packed(name, inst);
+        }
+        let Some(op) = sixteen_op(name) else {
+            return Ok(false);
+        };
+        let (target, _) = vgprs(arg(0)?, inst)?;
+        let select = op_sel(inst, "op_sel");
+        let sources = op.sources();
+        let destination_high = select[sources.min(3)];
+        let half = match op {
+            Sixteen::Unary(un) => {
+                let x = self.half_value(arg(1)?, select[0], inst)?;
+                let value = self.un(un, x);
+                self.rounded_half(value, inst)?
+            }
+            Sixteen::Binary(bin, reversed) => {
+                let x = self.half_value(arg(1)?, select[0], inst)?;
+                let y = self.half_value(arg(2)?, select[1], inst)?;
+                let (x, y) = if reversed { (y, x) } else { (x, y) };
+                let value = self.bin(bin, x, y);
+                self.rounded_half(value, inst)?
+            }
+            Sixteen::Fused { accumulate, fused } => {
+                let a = self.half_value(arg(1)?, select[0], inst)?;
+                let b = self.half_value(arg(2)?, select[1], inst)?;
+                let c = if accumulate {
+                    self.half_value(arg(0)?, destination_high, inst)?
+                } else {
+                    self.half_value(arg(3)?, select[2], inst)?
+                };
+                let op = if fused { Tri::FFma } else { Tri::FMad };
+                let value = self.value(Expr::Tri(op, a, b, c));
+                self.rounded_half(value, inst)?
+            }
+            Sixteen::Three(which) => {
+                let a = self.half_value(arg(1)?, select[0], inst)?;
+                let b = self.half_value(arg(2)?, select[1], inst)?;
+                let c = self.half_value(arg(3)?, select[2], inst)?;
+                let value = match which {
+                    Three::Min => self.ternary(Ternary::Min3F, a, b, c),
+                    Three::Max => self.ternary(Ternary::Max3F, a, b, c),
+                    Three::Median => {
+                        let low = self.bin(Bin::FMin, a, b);
+                        let high = self.bin(Bin::FMax, a, b);
+                        let capped = self.bin(Bin::FMin, high, c);
+                        let median = self.bin(Bin::FMax, low, capped);
+                        let smallest = self.bin(Bin::FMin, low, c);
+                        let unordered = self.cmp(Cmp::FU, a, b);
+                        let c_nan = self.cmp(Cmp::FU, c, c);
+                        let any_nan = self.either(unordered, c_nan);
+                        self.value(Expr::Select(any_nan, smallest, median))
+                    }
+                };
+                self.rounded_half(value, inst)?
+            }
+            Sixteen::Integer(int) => {
+                if has_output_modifiers(inst) {
+                    return Err(unsupported(inst));
+                }
+                let x = self.half_source(arg(1)?, select[0], false, inst)?;
+                let y = self.half_source(arg(2)?, select[1], false, inst)?;
+                self.integer16(int, x, y)
+            }
+        };
+        let value = if self.destination.is_some() {
+            half
+        } else {
+            self.keep_half(target, half, destination_high)
+        };
+        self.set_lane(arg(0)?, value, inst)?;
+        Ok(true)
+    }
+
+    fn integer16(&mut self, op: Integer16, x: Tmp, y: Tmp) -> Tmp {
+        let fifteen = self.c(15);
+        let mask = self.c(0xFFFF);
+        let value = match op {
+            Integer16::ShiftRight | Integer16::ShiftLeft | Integer16::ShiftArithmetic => {
+                let amount = self.bin(Bin::And, x, fifteen);
+                match op {
+                    Integer16::ShiftRight => self.bin(Bin::ShrU, y, amount),
+                    Integer16::ShiftLeft => self.bin(Bin::Shl, y, amount),
+                    _ => {
+                        let wide = self.sext(y, 16);
+                        self.bin(Bin::ShrS, wide, amount)
+                    }
+                }
+            }
+            Integer16::Add => self.bin(Bin::Add, x, y),
+            Integer16::Sub => self.bin(Bin::Sub, x, y),
+            Integer16::Mul => self.bin(Bin::Mul, x, y),
+            Integer16::MaxU => self.bin(Bin::MaxU, x, y),
+            Integer16::MinU => self.bin(Bin::MinU, x, y),
+            Integer16::MaxS | Integer16::MinS => {
+                let (a, b) = (self.sext(x, 16), self.sext(y, 16));
+                let bin = if op == Integer16::MaxS {
+                    Bin::MaxS
+                } else {
+                    Bin::MinS
+                };
+                self.bin(bin, a, b)
+            }
+        };
+        self.bin(Bin::And, value, mask)
+    }
+
+    /// VOP3P: each result half reads the source halves op_sel (low result) or op_sel_hi (high result) pick,
+    /// negated by neg_lo or neg_hi.
+    fn packed(&mut self, name: &str, inst: &Inst) -> Result<bool, LiftError> {
+        let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
+        let Some(op) = packed_op(name) else {
+            return Ok(false);
+        };
+        let float = !matches!(op, Packed::Integer(_));
+        if !float && has_output_modifiers(inst) {
+            return Err(unsupported(inst));
+        }
+        let sources = if matches!(op, Packed::Fma) { 3 } else { 2 };
+        let low = op_sel(inst, "op_sel");
+        let high = op_sel_or(inst, "op_sel_hi", true);
+        let neg_low = op_sel(inst, "neg_lo");
+        let neg_high = op_sel(inst, "neg_hi");
+        let mut halves = Vec::new();
+        for result_high in [false, true] {
+            let mut values = Vec::new();
+            for i in 0..sources {
+                let pick = if result_high { high[i] } else { low[i] };
+                let negate = if result_high { neg_high[i] } else { neg_low[i] };
+                let mut half = self.half_source(arg(i + 1)?, pick, false, inst)?;
+                if negate && float {
+                    let sign = self.c(0x8000);
+                    half = self.bin(Bin::Xor, half, sign);
+                }
+                values.push(if float {
+                    self.un(Un::F16ToF32, half)
+                } else {
+                    half
+                });
+            }
+            halves.push(match op {
+                Packed::Float(bin) => {
+                    let value = self.bin(bin, values[0], values[1]);
+                    self.rounded_half(value, inst)?
+                }
+                Packed::Fma => {
+                    let value = self.value(Expr::Tri(Tri::FFma, values[0], values[1], values[2]));
+                    self.rounded_half(value, inst)?
+                }
+                Packed::Integer(int) => self.integer16(int, values[0], values[1]),
+            });
+        }
+        let sixteen = self.c(16);
+        let upper = self.bin(Bin::Shl, halves[1], sixteen);
+        let value = self.bin(Bin::Or, halves[0], upper);
+        self.set_lane(arg(0)?, value, inst)?;
+        Ok(true)
+    }
+
     fn vector_op(&mut self, name: &str, inst: &Inst) -> Result<bool, LiftError> {
+        if self.sixteen_bit(name, inst)? {
+            return Ok(true);
+        }
         let arg = |i: usize| inst.args.get(i).ok_or_else(|| unsupported(inst));
         let value = match name {
             "v_mov_b32" => self.lane(arg(1)?, inst)?,
@@ -2927,7 +3126,11 @@ fn has_output_modifiers(inst: &Inst) -> bool {
 }
 
 fn op_sel(inst: &Inst, key: &str) -> [bool; 4] {
-    let mut bits = [false; 4];
+    op_sel_or(inst, key, false)
+}
+
+fn op_sel_or(inst: &Inst, key: &str, default: bool) -> [bool; 4] {
+    let mut bits = [default; 4];
     let list = inst
         .mods
         .iter()
@@ -3191,6 +3394,146 @@ fn binary_scalar(name: &str) -> bool {
                 | "s_bfe_i32"
                 | "s_bfm_b32"
         )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Integer16 {
+    ShiftRight,
+    ShiftLeft,
+    ShiftArithmetic,
+    Add,
+    Sub,
+    Mul,
+    MaxU,
+    MinU,
+    MaxS,
+    MinS,
+}
+
+#[derive(Clone, Copy)]
+enum Three {
+    Min,
+    Max,
+    Median,
+}
+
+#[derive(Clone, Copy)]
+enum Sixteen {
+    Unary(Un),
+    Binary(Bin, bool),
+    Fused { accumulate: bool, fused: bool },
+    Three(Three),
+    Integer(Integer16),
+}
+
+impl Sixteen {
+    /// Source operands, which is also where the destination's op_sel bit sits.
+    fn sources(self) -> usize {
+        match self {
+            Sixteen::Unary(_) => 1,
+            Sixteen::Binary(..) | Sixteen::Integer(_) => 2,
+            Sixteen::Fused { accumulate, .. } => {
+                if accumulate {
+                    2
+                } else {
+                    3
+                }
+            }
+            Sixteen::Three(_) => 3,
+        }
+    }
+}
+
+fn integer16(name: &str) -> Option<Integer16> {
+    Some(match name {
+        "lshrrev_b16" => Integer16::ShiftRight,
+        "lshlrev_b16" => Integer16::ShiftLeft,
+        "ashrrev_i16" => Integer16::ShiftArithmetic,
+        "add_nc_u16" | "add_u16" => Integer16::Add,
+        "sub_nc_u16" | "sub_u16" => Integer16::Sub,
+        "mul_lo_u16" => Integer16::Mul,
+        "max_u16" => Integer16::MaxU,
+        "min_u16" => Integer16::MinU,
+        "max_i16" => Integer16::MaxS,
+        "min_i16" => Integer16::MinS,
+        _ => return None,
+    })
+}
+
+fn sixteen_op(name: &str) -> Option<Sixteen> {
+    let body = name.strip_prefix("v_")?;
+    if let Some(int) = integer16(body) {
+        return Some(Sixteen::Integer(int));
+    }
+    Some(match body {
+        "rcp_f16" => Sixteen::Unary(Un::FRcp),
+        "rsq_f16" => Sixteen::Unary(Un::FRsq),
+        "sqrt_f16" => Sixteen::Unary(Un::FSqrt),
+        "exp_f16" => Sixteen::Unary(Un::FExp2),
+        "log_f16" => Sixteen::Unary(Un::FLog2),
+        "floor_f16" => Sixteen::Unary(Un::FFloor),
+        "ceil_f16" => Sixteen::Unary(Un::FCeil),
+        "trunc_f16" => Sixteen::Unary(Un::FTrunc),
+        "rndne_f16" => Sixteen::Unary(Un::FRndne),
+        "fract_f16" => Sixteen::Unary(Un::FFract),
+        "sin_f16" => Sixteen::Unary(Un::FSin),
+        "cos_f16" => Sixteen::Unary(Un::FCos),
+        "add_f16" => Sixteen::Binary(Bin::FAdd, false),
+        "sub_f16" => Sixteen::Binary(Bin::FSub, false),
+        "subrev_f16" => Sixteen::Binary(Bin::FSub, true),
+        "mul_f16" => Sixteen::Binary(Bin::FMul, false),
+        "max_f16" => Sixteen::Binary(Bin::FMax, false),
+        "min_f16" => Sixteen::Binary(Bin::FMin, false),
+        "fma_f16" => Sixteen::Fused {
+            accumulate: false,
+            fused: true,
+        },
+        "fmac_f16" => Sixteen::Fused {
+            accumulate: true,
+            fused: true,
+        },
+        "mad_f16" => Sixteen::Fused {
+            accumulate: false,
+            fused: false,
+        },
+        "mac_f16" => Sixteen::Fused {
+            accumulate: true,
+            fused: false,
+        },
+        "min3_f16" => Sixteen::Three(Three::Min),
+        "max3_f16" => Sixteen::Three(Three::Max),
+        "med3_f16" => Sixteen::Three(Three::Median),
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum Packed {
+    Float(Bin),
+    Fma,
+    Integer(Integer16),
+}
+
+fn packed_op(name: &str) -> Option<Packed> {
+    let body = name.strip_prefix("v_pk_")?;
+    Some(match body {
+        "add_f16" => Packed::Float(Bin::FAdd),
+        "mul_f16" => Packed::Float(Bin::FMul),
+        "max_f16" => Packed::Float(Bin::FMax),
+        "min_f16" => Packed::Float(Bin::FMin),
+        "fma_f16" => Packed::Fma,
+        "lshrrev_b16" => Packed::Integer(Integer16::ShiftRight),
+        "lshlrev_b16" => Packed::Integer(Integer16::ShiftLeft),
+        "ashrrev_i16" => Packed::Integer(Integer16::ShiftArithmetic),
+        "add_u16" => Packed::Integer(Integer16::Add),
+        "sub_u16" => Packed::Integer(Integer16::Sub),
+        "mul_lo_u16" => Packed::Integer(Integer16::Mul),
+        "max_u16" => Packed::Integer(Integer16::MaxU),
+        "min_u16" => Packed::Integer(Integer16::MinU),
+        "max_i16" => Packed::Integer(Integer16::MaxS),
+        "min_i16" => Packed::Integer(Integer16::MinS),
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Copy)]

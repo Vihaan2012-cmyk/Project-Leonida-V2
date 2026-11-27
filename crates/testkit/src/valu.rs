@@ -277,6 +277,9 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
         interp(name, inst, wave)?;
         return Ok(true);
     }
+    if sixteen(name, inst, wave)? {
+        return Ok(true);
+    }
     match name {
         "v_nop" => return Ok(true),
         "v_cndmask_b32" => {
@@ -641,6 +644,54 @@ fn compare(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
         let a = arg(inst, first_source)?;
         let b = arg(inst, first_source + 1)?;
         let outcome = match ty {
+            "f16" => {
+                use std::cmp::Ordering::{Equal, Greater, Less};
+                let select = selects(inst, "op_sel");
+                let x = half_float(wave, a, lane, select[0], inst)?;
+                let y = half_float(wave, b, lane, select[1], inst)?;
+                let ord = x.partial_cmp(&y);
+                let (lt, eq, gt) = (ord == Some(Less), ord == Some(Equal), ord == Some(Greater));
+                match op {
+                    "f" => false,
+                    "lt" => lt,
+                    "eq" => eq,
+                    "le" => lt || eq,
+                    "gt" => gt,
+                    "lg" => lt || gt,
+                    "ge" => gt || eq,
+                    "o" => ord.is_some(),
+                    "u" => ord.is_none(),
+                    "nge" => !(gt || eq),
+                    "nlg" => !(lt || gt),
+                    "ngt" => !gt,
+                    "nle" => !(lt || eq),
+                    "neq" => !eq,
+                    "nlt" => !lt,
+                    "t" | "tru" => true,
+                    _ => return Err(bad(inst)),
+                }
+            }
+            "u16" | "i16" => {
+                let select = selects(inst, "op_sel");
+                let x = half_of(wave, a, lane, select[0], false, inst)?;
+                let y = half_of(wave, b, lane, select[1], false, inst)?;
+                let ordering = if ty == "i16" {
+                    (x as u16 as i16).cmp(&(y as u16 as i16))
+                } else {
+                    x.cmp(&y)
+                };
+                match op {
+                    "f" => false,
+                    "lt" => ordering.is_lt(),
+                    "eq" => ordering.is_eq(),
+                    "le" => ordering.is_le(),
+                    "gt" => ordering.is_gt(),
+                    "ne" | "lg" => ordering.is_ne(),
+                    "ge" => ordering.is_ge(),
+                    "t" => true,
+                    _ => return Err(bad(inst)),
+                }
+            }
             "f32" if op == "class" => {
                 let mut bits = wave.read_lane(a, lane, inst)?;
                 if a.abs {
@@ -908,6 +959,7 @@ fn half_of(
 ) -> Result<u32> {
     let mut half = match source.operand {
         Operand::Float(_) => rdna::format::f32_to_f16(source.operand.float_bits().unwrap_or(0)),
+        Operand::Int(value) => (value as u32) & 0xFFFF,
         _ => {
             let raw = wave.read_lane(source, lane, inst)?;
             (if high { raw >> 16 } else { raw }) & 0xFFFF
@@ -1001,6 +1053,213 @@ fn half_op(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
         wave.vgpr[target][lane] = value;
     }
     Ok(())
+}
+
+fn half_float(wave: &Wave, source: &Arg, lane: usize, high: bool, inst: &Inst) -> Result<f32> {
+    let half = half_of(wave, source, lane, high, true, inst)?;
+    Ok(wave.flush(f32::from_bits(rdna::format::f16_to_f32(half, true))))
+}
+
+fn round_half(wave: &Wave, inst: &Inst, value: f32) -> u32 {
+    let value = output_modifiers(wave, inst, value);
+    rdna::format::f32_to_f16_round(value.to_bits(), wave.f16_round)
+}
+
+fn integer16(op: &str, x: u32, y: u32) -> Option<u32> {
+    let (sx, sy) = (x as u16 as i16, y as u16 as i16);
+    Some(
+        match op {
+            "lshrrev_b16" => y >> (x & 15),
+            "lshlrev_b16" => y << (x & 15),
+            "ashrrev_i16" => (i32::from(sy) >> (x & 15)) as u32,
+            "add_nc_u16" | "add_u16" => x.wrapping_add(y),
+            "sub_nc_u16" | "sub_u16" => x.wrapping_sub(y),
+            "mul_lo_u16" => x.wrapping_mul(y),
+            "max_u16" => x.max(y),
+            "min_u16" => x.min(y),
+            "max_i16" => sx.max(sy) as u32,
+            "min_i16" => sx.min(sy) as u32,
+            _ => return None,
+        } & 0xFFFF,
+    )
+}
+
+fn float16_unary(op: &str) -> Option<F1> {
+    Some(match op {
+        "rcp_f16" => |a| 1.0 / a,
+        "rsq_f16" => |a| 1.0 / a.sqrt(),
+        "sqrt_f16" => f32::sqrt,
+        "exp_f16" => f32::exp2,
+        "log_f16" => f32::log2,
+        "floor_f16" => f32::floor,
+        "ceil_f16" => f32::ceil,
+        "trunc_f16" => f32::trunc,
+        "rndne_f16" => f32::round_ties_even,
+        "fract_f16" => |a| a - a.floor(),
+        "sin_f16" => |a| (a * std::f32::consts::TAU).sin(),
+        "cos_f16" => |a| (a * std::f32::consts::TAU).cos(),
+        _ => return None,
+    })
+}
+
+fn float16_binary(op: &str) -> Option<F2> {
+    Some(match op {
+        "add_f16" => |a, b| a + b,
+        "sub_f16" => |a, b| a - b,
+        "subrev_f16" => |a, b| b - a,
+        "mul_f16" => |a, b| a * b,
+        "max_f16" => fmax,
+        "min_f16" => fmin,
+        _ => return None,
+    })
+}
+
+fn float16_three(op: &str) -> Option<F3> {
+    Some(match op {
+        "min3_f16" => |a, b, c| fmin(fmin(a, b), c),
+        "max3_f16" => |a, b, c| fmax(fmax(a, b), c),
+        "med3_f16" => |a, b, c| {
+            if a.is_nan() || b.is_nan() || c.is_nan() {
+                fmin(fmin(a, b), c)
+            } else {
+                fmax(fmin(a, b), fmin(fmax(a, b), c))
+            }
+        },
+        _ => return None,
+    })
+}
+
+/// 16-bit VALU operations on halves: the destination's op_sel bit picks the half written, and the other
+/// half keeps its value.
+fn sixteen(name: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
+    if let Some(op) = name.strip_prefix("v_pk_") {
+        return packed(op, inst, wave);
+    }
+    let Some(op) = name.strip_prefix("v_") else {
+        return Ok(false);
+    };
+    let (unary, binary, three) = (float16_unary(op), float16_binary(op), float16_three(op));
+    let fused = matches!(op, "fma_f16" | "fmac_f16" | "mad_f16" | "mac_f16");
+    let integer = integer16(op, 0, 0).is_some();
+    if unary.is_none() && binary.is_none() && three.is_none() && !fused && !integer {
+        return Ok(false);
+    }
+    if integer && output_modified(inst) {
+        return Err(crate::ExecError::Unsupported {
+            pc: inst.pc,
+            text: inst.text(),
+        });
+    }
+    let Operand::Vgpr { reg, .. } = arg(inst, 0)?.operand else {
+        return Err(bad(inst));
+    };
+    let target = usize::from(reg);
+    let select = selects(inst, "op_sel");
+    let accumulate = matches!(op, "fmac_f16" | "mac_f16");
+    let sources = if unary.is_some() {
+        1
+    } else if three.is_some() || (fused && !accumulate) {
+        3
+    } else {
+        2
+    };
+    let high = select[sources.min(3)];
+    for lane in wave.active_lanes() {
+        let float = |index: usize, which: usize| -> Result<f32> {
+            half_float(wave, arg(inst, index)?, lane, select[which], inst)
+        };
+        let half = if let Some(f) = unary {
+            let x = float(1, 0)?;
+            round_half(wave, inst, nan_rule(f(x), &[x]))
+        } else if let Some(f) = binary {
+            let (x, y) = (float(1, 0)?, float(2, 1)?);
+            let order = if op == "subrev_f16" { [y, x] } else { [x, y] };
+            round_half(wave, inst, nan_rule(f(x, y), &order))
+        } else if let Some(f) = three {
+            let (x, y, z) = (float(1, 0)?, float(2, 1)?, float(3, 2)?);
+            round_half(wave, inst, nan_rule(f(x, y, z), &[x, y, z]))
+        } else if fused {
+            let (a, b) = (float(1, 0)?, float(2, 1)?);
+            let c = if accumulate {
+                half_float(wave, arg(inst, 0)?, lane, high, inst)?
+            } else {
+                float(3, 2)?
+            };
+            let value = if op.starts_with("fma") {
+                nan_rule(a.mul_add(b, c), &[a, b, c])
+            } else {
+                let product = wave.flush(nan_rule(a * b, &[a, b]));
+                nan_rule(product + c, &[product, c])
+            };
+            round_half(wave, inst, value)
+        } else {
+            let x = half_of(wave, arg(inst, 1)?, lane, select[0], false, inst)?;
+            let y = half_of(wave, arg(inst, 2)?, lane, select[1], false, inst)?;
+            integer16(op, x, y).expect("checked above")
+        };
+        let old = wave.vgpr[target][lane];
+        wave.vgpr[target][lane] = if high {
+            (old & 0xFFFF) | (half << 16)
+        } else {
+            (old & 0xFFFF_0000) | half
+        };
+    }
+    Ok(true)
+}
+
+fn packed(op: &str, inst: &Inst, wave: &mut Wave) -> Result<bool> {
+    let binary = match op {
+        "add_f16" | "mul_f16" | "max_f16" | "min_f16" => float16_binary(op),
+        _ => None,
+    };
+    let fma = op == "fma_f16";
+    let integer = integer16(op, 0, 0).is_some() && op != "add_nc_u16" && op != "sub_nc_u16";
+    if binary.is_none() && !fma && !integer {
+        return Ok(false);
+    }
+    if integer && output_modified(inst) {
+        return Err(crate::ExecError::Unsupported {
+            pc: inst.pc,
+            text: inst.text(),
+        });
+    }
+    let sources = if fma { 3 } else { 2 };
+    let low = selects(inst, "op_sel");
+    let high = if inst.mods.iter().any(|m| m.starts_with("op_sel_hi:")) {
+        selects(inst, "op_sel_hi")
+    } else {
+        [true; 4]
+    };
+    let (neg_low, neg_high) = (selects(inst, "neg_lo"), selects(inst, "neg_hi"));
+    for lane in wave.active_lanes() {
+        let mut result = 0;
+        for (half_index, result_high) in [false, true].into_iter().enumerate() {
+            let mut bits = Vec::new();
+            for i in 0..sources {
+                let pick = if result_high { high[i] } else { low[i] };
+                let negate = if result_high { neg_high[i] } else { neg_low[i] };
+                let mut half = half_of(wave, arg(inst, i + 1)?, lane, pick, false, inst)?;
+                if negate && !integer {
+                    half ^= 0x8000;
+                }
+                bits.push(half);
+            }
+            let float = |h: u32| wave.flush(f32::from_bits(rdna::format::f16_to_f32(h, true)));
+            let half = if integer {
+                integer16(op, bits[0], bits[1]).expect("checked above")
+            } else if fma {
+                let (a, b, c) = (float(bits[0]), float(bits[1]), float(bits[2]));
+                round_half(wave, inst, nan_rule(a.mul_add(b, c), &[a, b, c]))
+            } else {
+                let (x, y) = (float(bits[0]), float(bits[1]));
+                let f = binary.expect("checked above");
+                round_half(wave, inst, nan_rule(f(x, y), &[x, y]))
+            };
+            result |= half << (16 * half_index);
+        }
+        wave.write_lane(arg(inst, 0)?, lane, result, inst)?;
+    }
+    Ok(true)
 }
 
 fn dpp_source(inst: &Inst, lane: usize) -> Option<(usize, bool)> {

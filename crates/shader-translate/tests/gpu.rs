@@ -49,7 +49,12 @@ fn without_denormals(wave: &mut Wave, memory: &mut Memory) {
 fn same(a: u32, b: u32) -> bool {
     let nan = |x: u32| x & 0x7F80_0000 == 0x7F80_0000 && x & 0x007F_FFFF != 0;
     let tiny = |x: u32| x & 0x7F80_0000 == 0;
-    a == b || (nan(a) && nan(b)) || (tiny(a) && tiny(b))
+    let half_nan = |x: u32| x & 0x7C00 == 0x7C00 && x & 0x03FF != 0;
+    let halves = [0, 16].iter().all(|shift| {
+        let (x, y) = ((a >> shift) & 0xFFFF, (b >> shift) & 0xFFFF);
+        x == y || (half_nan(x) && half_nan(y))
+    });
+    a == b || (nan(a) && nan(b)) || (tiny(a) && tiny(b)) || halves
 }
 
 fn words(bytes: &[u8]) -> Vec<u32> {

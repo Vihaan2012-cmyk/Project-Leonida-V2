@@ -900,9 +900,203 @@ impl Generator {
         }
     }
 
+    fn bits(&mut self, count: usize) -> String {
+        let bits: Vec<String> = (0..count).map(|_| self.rng.below(2).to_string()).collect();
+        bits.join(",")
+    }
+
+    fn sixteen(&mut self) -> String {
+        let source = |g: &mut Self| g.half_source();
+        let plain = |g: &mut Self| {
+            if g.rng.chance(4) {
+                g.inline()
+            } else {
+                g.vreg()
+            }
+        };
+        let omod = |g: &mut Self| {
+            if g.rng.chance(3) {
+                g.omod().to_string()
+            } else {
+                String::new()
+            }
+        };
+        match self.rng.below(9) {
+            0 => {
+                let ops: &[&str] = if self.gpu {
+                    &["floor", "ceil", "trunc", "rndne", "fract"]
+                } else {
+                    &[
+                        "rcp", "rsq", "sqrt", "exp", "log", "floor", "ceil", "trunc", "rndne",
+                        "fract", "sin", "cos",
+                    ]
+                };
+                let op = self.rng.pick(ops);
+                if self.rng.chance(2) {
+                    format!("v_{op}_f16_e32 {}, {}", self.vdst(), self.vsrc(true))
+                } else {
+                    let select = self.bits(2);
+                    let modifier = omod(self);
+                    format!(
+                        "v_{op}_f16_e64 {}, {} op_sel:[{select}]{modifier}",
+                        self.vdst(),
+                        source(self)
+                    )
+                }
+            }
+            1 | 2 => {
+                let op = self
+                    .rng
+                    .pick(&["add", "sub", "subrev", "mul", "max", "min"]);
+                if self.rng.chance(2) {
+                    format!(
+                        "v_{op}_f16_e32 {}, {}, {}",
+                        self.vdst(),
+                        self.vsrc(true),
+                        self.vreg()
+                    )
+                } else {
+                    let select = self.bits(3);
+                    let modifier = omod(self);
+                    format!(
+                        "v_{op}_f16_e64 {}, {}, {} op_sel:[{select}]{modifier}",
+                        self.vdst(),
+                        source(self),
+                        source(self)
+                    )
+                }
+            }
+            3 => {
+                let op = self.rng.pick(&["fma", "med3", "min3", "max3", "fmac"]);
+                if op == "fmac" {
+                    format!(
+                        "v_fmac_f16_e32 {}, {}, {}",
+                        self.vdst(),
+                        self.vsrc(true),
+                        self.vreg()
+                    )
+                } else {
+                    let select = self.bits(4);
+                    let modifier = omod(self);
+                    format!(
+                        "v_{op}_f16 {}, {}, {}, {} op_sel:[{select}]{modifier}",
+                        self.vdst(),
+                        source(self),
+                        source(self),
+                        source(self)
+                    )
+                }
+            }
+            4 => {
+                let op = self.rng.pick(&[
+                    "lshrrev_b16",
+                    "lshlrev_b16",
+                    "ashrrev_i16",
+                    "add_nc_u16",
+                    "sub_nc_u16",
+                    "mul_lo_u16",
+                    "max_u16",
+                    "min_u16",
+                    "max_i16",
+                    "min_i16",
+                ]);
+                let select = self.bits(3);
+                format!(
+                    "v_{op} {}, {}, {} op_sel:[{select}]",
+                    self.vdst(),
+                    plain(self),
+                    plain(self)
+                )
+            }
+            5 => {
+                let float = self.rng.chance(2);
+                let (op, ty) = if float {
+                    (
+                        self.rng.pick(&[
+                            "f", "lt", "eq", "le", "gt", "lg", "ge", "o", "u", "nge", "nlg", "ngt",
+                            "nle", "neq", "nlt", "tru",
+                        ]),
+                        "f16",
+                    )
+                } else {
+                    (
+                        self.rng.pick(&["lt", "eq", "le", "gt", "ne", "ge"]),
+                        self.rng.pick(&["u16", "i16"]),
+                    )
+                };
+                let select = self.bits(2);
+                let (a, b) = if float {
+                    (source(self), source(self))
+                } else {
+                    (plain(self), plain(self))
+                };
+                if self.rng.chance(4) {
+                    format!("v_cmpx_{op}_{ty}_e64 {a}, {b} op_sel:[{select}]")
+                } else {
+                    format!(
+                        "v_cmp_{op}_{ty}_e64 {}, {a}, {b} op_sel:[{select}]",
+                        self.mask_reg()
+                    )
+                }
+            }
+            6 | 7 => {
+                let op = self.rng.pick(&[
+                    "add_f16",
+                    "mul_f16",
+                    "max_f16",
+                    "min_f16",
+                    "fma_f16",
+                    "lshrrev_b16",
+                    "lshlrev_b16",
+                    "ashrrev_i16",
+                    "add_u16",
+                    "sub_u16",
+                    "mul_lo_u16",
+                    "max_u16",
+                    "min_u16",
+                    "max_i16",
+                    "min_i16",
+                ]);
+                let count = if op == "fma_f16" { 3 } else { 2 };
+                let float = op.ends_with("_f16");
+                let sources: Vec<String> = (0..count).map(|_| plain(self)).collect();
+                let mut text = format!("v_pk_{op} {}, {}", self.vdst(), sources.join(", "));
+                if self.rng.chance(2) {
+                    text += &format!(" op_sel:[{}]", self.bits(count));
+                }
+                if self.rng.chance(2) {
+                    text += &format!(" op_sel_hi:[{}]", self.bits(count));
+                }
+                if float && self.rng.chance(3) {
+                    text += &format!(" neg_lo:[{}]", self.bits(count));
+                }
+                if float && self.rng.chance(3) {
+                    text += &format!(" neg_hi:[{}]", self.bits(count));
+                }
+                if float && self.rng.chance(4) {
+                    text += " clamp";
+                }
+                text
+            }
+            _ => {
+                let op = self.rng.pick(&["add", "sub", "mul", "max", "min"]);
+                const SELECTS: [&str; 3] = ["WORD_0", "WORD_1", "DWORD"];
+                let (s0, s1) = (self.rng.pick(&SELECTS), self.rng.pick(&SELECTS));
+                let d = self.rng.pick(&["WORD_0", "WORD_1", "DWORD"]);
+                let unused = self.rng.pick(&["UNUSED_PAD", "UNUSED_PRESERVE"]);
+                let (a, b) = (self.sdwa_source(true), self.sdwa_source(false));
+                format!(
+                    "v_{op}_f16_sdwa {}, {a}, {b} dst_sel:{d} dst_unused:{unused} src0_sel:{s0} src1_sel:{s1}",
+                    self.vdst()
+                )
+            }
+        }
+    }
+
     fn vector(&mut self) -> String {
-        match self.rng.below(25) {
+        match self.rng.below(27) {
             23 | 24 => self.extra(),
+            25 | 26 => self.sixteen(),
             0 | 1 => {
                 let op = self.rng.pick(&[
                     "v_add_nc_u32",
