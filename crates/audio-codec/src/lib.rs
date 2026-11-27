@@ -6,6 +6,7 @@ pub mod error;
 pub mod huffman;
 pub mod mdct;
 pub mod ogg;
+pub mod opus;
 pub mod wav;
 pub mod xma2;
 
