@@ -151,6 +151,7 @@ name = "assets"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "name-hash",
  "png",
  "serde_json",
  "thiserror 2.0.21",
@@ -175,6 +176,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "audio-codec"
 version = "0.1.0"
 dependencies = [
+ "name-hash",
  "thiserror 2.0.21",
 ]
 
@@ -438,6 +440,7 @@ dependencies = [
  "flate2",
  "game-package",
  "memchr",
+ "name-hash",
  "serde",
  "serde_json",
  "sha2",
@@ -2103,6 +2106,7 @@ dependencies = [
  "game-package",
  "memchr",
  "memmap2",
+ "name-hash",
  "postcard",
  "rayon",
  "redb",
@@ -2703,6 +2707,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vfs"
 version = "0.1.0"
 dependencies = [
+ "name-hash",
  "offline",
  "serde",
  "serde_json",
