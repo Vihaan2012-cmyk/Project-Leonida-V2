@@ -22,6 +22,8 @@ mod runtime;
 #[cfg(windows)]
 mod save;
 #[cfg(windows)]
+mod store;
+#[cfg(windows)]
 mod system;
 #[cfg(windows)]
 mod tasks;
