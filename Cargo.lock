@@ -1009,6 +1009,7 @@ version = "0.1.0"
 dependencies = [
  "offline",
  "pe-loader",
+ "tempfile",
  "windows-sys",
 ]
 
