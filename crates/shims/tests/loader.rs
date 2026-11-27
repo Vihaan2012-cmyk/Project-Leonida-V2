@@ -293,3 +293,93 @@ fn the_runtime_is_found_through_load_library_and_get_proc_address() {
     }
 }
 
+// ---- QueryApiImpl ----
+
+#[test]
+fn every_served_class_answers_query_api_impl() {
+    configure();
+    for class in [
+        "XErrorImpl",
+        "XThreadingImpl",
+        "XSystemImpl",
+        "XSystemAnalyticsImpl",
+        "XPackageImpl",
+        "XGameImpl",
+        "XGameRuntimeFeatureImpl",
+        "XPersistentLocalStorageImpl",
+        "XGameSaveImpl",
+        "XUserImpl",
+        "XStoreImpl",
+        "XLauncherImpl",
+        "XDisplayImpl",
+        "XAccessibilityImpl",
+        "XUserDeviceImpl",
+        "XGameEventImpl",
+        "XGameUiImpl",
+        "XGameStreamingImpl",
+        "XNetworkingImpl",
+    ] {
+        let first = object(class);
+        let second = object(class);
+        assert_eq!(first, second, "{class} is one object");
+    }
+    for class in ["XAppCaptureImpl", "XGameInviteImpl", "XGameProtocolImpl"] {
+        let mut out = 1usize;
+        let hr = shims::loader::query_api(&class_id(class), &class_id(class), &mut out);
+        assert_eq!(hr, NOT_PROVIDED, "{class}");
+        assert_eq!(out, 0);
+    }
+    let mut out = 1usize;
+    assert_eq!(
+        shims::loader::query_api(&[7; 16], &[7; 16], &mut out),
+        NOT_PROVIDED
+    );
+}
+
+#[test]
+fn derived_interfaces_answer_with_the_same_object_and_a_second_family_is_its_own() {
+    let package = object("XPackageImpl");
+    assert_eq!(object_as("XPackageImpl", "IXPackageImpl4"), package);
+    assert_eq!(object_as("XPackageImpl", "IXPackageImpl2"), package);
+    let user = object("XUserImpl");
+    assert_eq!(object_as("XUserImpl", "IXUserImpl6"), user);
+    let gamertag = object_as("XUserImpl", "IXUserGamertagImpl");
+    assert_ne!(gamertag, user);
+    let mut out = 1usize;
+    let hr = shims::loader::query_api(&class_id("XUserImpl"), &[9; 16], &mut out);
+    assert_eq!(
+        hr, 0x8000_4002_u32 as i32,
+        "an interface the class does not have"
+    );
+    assert_eq!(out, 0);
+    // SAFETY: IUnknown's slots of a runtime object.
+    unsafe {
+        let add_ref: unsafe extern "win64" fn(usize) -> u32 = slot(user, 1);
+        let release: unsafe extern "win64" fn(usize) -> u32 = slot(user, 2);
+        let before = add_ref(user);
+        assert_eq!(release(user), before - 1);
+        let query: unsafe extern "win64" fn(usize, *const [u8; 16], *mut usize) -> i32 =
+            slot(user, 0);
+        let mut again = 0usize;
+        assert_eq!(query(user, &interface_id("IXUserImpl3"), &mut again), 0);
+        assert_eq!(again, user);
+        release(user);
+    }
+}
+
+#[test]
+fn an_unimplemented_slot_notes_the_call_and_fails() {
+    let package = object("XPackageImpl");
+    // SAFETY: slot 12 is XPackageFindChunkAvailability, which nothing implements.
+    let hr = unsafe {
+        let call: unsafe extern "win64" fn(usize) -> i32 = slot(package, 12);
+        call(package)
+    };
+    assert_eq!(hr, 0x8000_4001_u32 as i32);
+    assert!(
+        shims::trace::notes()
+            .iter()
+            .any(|n| n.contains("XPackageImpl slot 12 (XPackageFindChunkAvailability)"))
+    );
+}
+
