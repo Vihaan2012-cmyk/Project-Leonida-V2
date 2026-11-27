@@ -34,11 +34,13 @@ pub mod xapu;
 mod xma;
 
 pub use apu::{ApuError, ApuSpace};
-pub use engine::{DEFAULT_RATE, Engine, OutputMode};
+pub use engine::{DEFAULT_RATE, Engine, OutputMode, ReopenGate};
 pub use mixer::{Buffer, BufferId, Completion, Looping, Mixer, VoiceId, VoiceParams};
 pub use output::{Output, OutputError, SharedMixer};
 pub use xapu::{OpusFactory, OpusStream, XApu, XApuResult, set_opus_factory};
-pub use xma::{DecodeError, Decoded, Decoder, XmaRequest, decode as decode_xma, set_decoder};
+pub use xma::{
+    DecodeError, Decoded, Decoder, OwnedXmaRequest, XmaRequest, decode as decode_xma, set_decoder,
+};
 
 static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
 
