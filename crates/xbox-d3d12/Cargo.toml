@@ -13,6 +13,7 @@ shader-ir.workspace = true
 shader-translate.workspace = true
 naga.workspace = true
 thiserror.workspace = true
+upscale.workspace = true
 winit.workspace = true
 
 [target.'cfg(windows)'.dependencies]
