@@ -2,5 +2,6 @@
 
 pub mod bits;
 pub mod error;
+pub mod huffman;
 
 pub use error::{Error, Result};
