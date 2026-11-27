@@ -200,9 +200,16 @@ pub struct RunArgs {
     /// OUTPUT/boot.
     #[arg(long)]
     pub trace: bool,
-    /// Where Leonida writes what it makes while running.
-    #[arg(long, default_value = "Output")]
-    pub output: PathBuf,
+    /// Where Leonida writes what it makes while running. Defaults to `output_folder` in Config/leonida.toml.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    /// The folder with leonida.toml, graphics.toml, input.toml and mods.toml.
+    #[arg(long, default_value = config::DEFAULT_DIR)]
+    pub config: PathBuf,
+    /// Hold the frame rate to console, uncapped, vsync or a number of frames per second, instead of what
+    /// graphics.toml says.
+    #[arg(long)]
+    pub frame_limit: Option<String>,
 }
 
 #[derive(Debug, Args)]

@@ -13,9 +13,21 @@ use shims::{Binder, Binding};
 use crate::cli::RunArgs;
 use crate::cmd_exe::executable;
 use crate::game::resolve_game;
+use crate::runtime::{self, RuntimePlan};
 
 pub fn run_command(args: &RunArgs) -> Result<ExitCode> {
-    let game = resolve_game(args.game.as_ref(), &Manifest::builtin())?;
+    if !args.dry_run && !args.start_the_game {
+        bail!(
+            "this would start the game. Add --start-the-game if you mean to; --dry-run only reads its imports."
+        );
+    }
+    let settings = runtime::load_settings(&args.config, !args.dry_run)?;
+    let given = args
+        .game
+        .clone()
+        .or_else(|| settings.general.game_folder.clone());
+    let game = resolve_game(given.as_ref(), &Manifest::builtin())?;
+    let plan = RuntimePlan::from(args, &settings, &game)?;
     let path = match &args.file {
         Some(name) if name.contains(['/', '\\']) || name.contains("..") => {
             bail!("--file names a file directly inside the game folder")
@@ -24,13 +36,9 @@ pub fn run_command(args: &RunArgs) -> Result<ExitCode> {
         None => executable(&game)?,
     };
     if !args.dry_run {
-        if !args.start_the_game {
-            bail!(
-                "this would start the game. Add --start-the-game if you mean to; --dry-run only reads its imports."
-            );
-        }
-        return run(&path, args);
+        return run(&path, args, &plan);
     }
+    runtime::print_plan(&plan);
     let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     let bytes = map_file(&file).context("mapping the file")?;
     let image = Image::parse(&bytes)?;
@@ -88,7 +96,9 @@ pub fn run_command(args: &RunArgs) -> Result<ExitCode> {
 
 /// Loads the executable with its imports bound and calls its entry point, which normally ends the process.
 #[allow(unsafe_code)]
-fn run(path: &Path, args: &RunArgs) -> Result<ExitCode> {
+fn run(path: &Path, args: &RunArgs, plan: &RuntimePlan) -> Result<ExitCode> {
+    runtime::print_plan(plan);
+    runtime::configure(plan)?;
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let mut binder = Binder::new(&[]);
     if args.trace {
@@ -96,14 +106,15 @@ fn run(path: &Path, args: &RunArgs) -> Result<ExitCode> {
     }
     let options = LoadOptions {
         placement: Placement::Preferred,
-        helpers: Some(args.output.join("runtime")),
+        helpers: Some(plan.output_dir.join("runtime")),
     };
     let module = pe_loader::load(&bytes, &mut binder, &options)
         .with_context(|| format!("loading {}", path.display()))?;
     binder.seal().map_err(|e| anyhow!(e))?;
     shims::trace::set_image(module.base(), module.size());
+    runtime::patch(plan, &bytes, &module);
     let binder: &'static Binder = Box::leak(Box::new(binder));
-    let boot = args.output.join("boot");
+    let boot = plan.output_dir.join("boot");
     if let Some(trace) = binder.trace() {
         shims::trace::watch_crashes(boot.clone(), module.base(), module.size());
         let folder = boot.clone();
