@@ -610,6 +610,17 @@ fn tables() -> [usize; 4] {
     })
 }
 
+static TIMER: std::sync::Once = std::sync::Once::new();
+
+/// The title polls a status entry with `Sleep(1)` between checks (RVA 0x000e8960). With the system's default
+/// 15.6 ms timer tick every poll would cost that long, so each streaming round trip would; the console's wait is
+/// a millisecond. Asking for 1 ms ticks once, when the factory is first requested, restores that.
+fn raise_timer_resolution() {
+    TIMER.call_once(|| {
+        // SAFETY: a plain system call with no pointers; the request lasts for the process.
+        unsafe { windows_sys::Win32::Media::timeBeginPeriod(1) };
+    });
+}
 static FACTORY: OnceLock<usize> = OnceLock::new();
 
 /// `DStorageGetFactory(REFIID, void**)`. The factory is one object for the whole process, and a missing or
@@ -622,6 +633,7 @@ pub unsafe extern "win64" fn get_factory(riid: *const u8, out: *mut *mut c_void)
         return E_NOTIMPL;
     }
     check_requested(Kind::Factory, riid);
+    raise_timer_resolution();
     let factory = *FACTORY.get_or_init(|| {
         new_object(FactoryObject {
             header: header(Kind::Factory),
