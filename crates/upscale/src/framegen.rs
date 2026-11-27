@@ -176,8 +176,12 @@ impl FrameGenerator for InterpolatingFrameGenerator {
     }
 }
 
-/// When to show the frames of one real-frame interval. `now` below is the moment the newest real frame arrived;
-/// the previous real frame is presented at `now` by the previous plan's `real_delay`.
+/// When to show the frames of one real-frame interval, as delays after the moment the newest real frame arrived.
+///
+/// Every frame is shown `hold` after the moment its content happened, so the motion stays even: the generated frame
+/// (content `phase` of the way from the previous real frame to the newest) after `guard`, which covers the GPU time
+/// of the generation, and the newest real frame `(1 - phase) * interval + guard` after its arrival. The previous
+/// real frame is shown by the previous plan, `phase * interval` before the generated one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PresentPlan {
     pub generated_delay: Duration,
@@ -190,6 +194,7 @@ pub struct PresentPlan {
 pub struct Pacer {
     phase: f32,
     smoothing: f64,
+    guard: Duration,
     max_interval: Duration,
     last: Option<Duration>,
     interval: Option<f64>,
@@ -200,10 +205,21 @@ impl Pacer {
         Pacer {
             phase: phase.clamp(0.05, 0.95),
             smoothing: 0.2,
+            guard: Duration::from_millis(2),
             max_interval: Duration::from_millis(125),
             last: None,
             interval: None,
         }
+    }
+
+    /// The time kept between the arrival of a frame and the generated frame it makes; at most a quarter interval.
+    pub fn with_guard(mut self, guard: Duration) -> Self {
+        self.guard = guard;
+        self
+    }
+
+    pub fn interval(&self) -> Option<Duration> {
+        self.interval.map(Duration::from_secs_f64)
     }
 
     /// `None` for the first frame and after a hitch longer than 125 ms: show the real frame alone.
@@ -220,9 +236,10 @@ impl Pacer {
             Some(previous) => previous + (seconds - previous) * self.smoothing,
         };
         self.interval = Some(smoothed);
+        let guard = self.guard.as_secs_f64().min(smoothed * 0.25);
         Some(PresentPlan {
-            generated_delay: Duration::from_secs_f64(smoothed * self.phase as f64),
-            real_delay: Duration::from_secs_f64(smoothed),
+            generated_delay: Duration::from_secs_f64(guard),
+            real_delay: Duration::from_secs_f64(smoothed * (1.0 - self.phase as f64) + guard),
             phase: self.phase,
         })
     }
@@ -243,17 +260,26 @@ mod tests {
 
     #[test]
     fn the_pacer_places_the_generated_frame_inside_the_smoothed_interval() {
-        let mut pacer = Pacer::new(0.5);
+        let mut pacer = Pacer::new(0.5).with_guard(ms(2));
         assert_eq!(pacer.on_real_frame(ms(0)), None);
-        let plan = pacer.on_real_frame(ms(33)).unwrap();
-        assert_eq!(plan.real_delay, ms(33));
-        assert_eq!(plan.generated_delay.as_micros(), 16_500);
-        let plan = pacer.on_real_frame(ms(83)).unwrap();
-        assert!(plan.real_delay > ms(33) && plan.real_delay < ms(50));
+        let plan = pacer.on_real_frame(ms(32)).unwrap();
+        assert_eq!(plan.generated_delay, ms(2));
+        assert_eq!(plan.real_delay, ms(18));
+        let plan = pacer.on_real_frame(ms(82)).unwrap();
+        let interval = pacer.interval().unwrap();
+        assert!(interval > ms(32) && interval < ms(50));
         assert_eq!(
-            plan.generated_delay.as_secs_f64() * 2.0,
-            plan.real_delay.as_secs_f64()
+            (plan.real_delay - plan.generated_delay).as_secs_f64() * 2.0,
+            interval.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn the_guard_never_exceeds_a_quarter_interval() {
+        let mut pacer = Pacer::new(0.5).with_guard(ms(20));
+        pacer.on_real_frame(ms(0));
+        let plan = pacer.on_real_frame(ms(16)).unwrap();
+        assert_eq!(plan.generated_delay, ms(4));
     }
 
     #[test]
@@ -262,7 +288,9 @@ mod tests {
         pacer.on_real_frame(ms(0));
         pacer.on_real_frame(ms(16)).unwrap();
         assert_eq!(pacer.on_real_frame(ms(400)), None);
-        assert_eq!(pacer.on_real_frame(ms(416)).unwrap().real_delay, ms(16));
+        assert_eq!(pacer.interval(), None);
+        pacer.on_real_frame(ms(416)).unwrap();
+        assert_eq!(pacer.interval(), Some(ms(16)));
         pacer.reset();
         assert_eq!(pacer.on_real_frame(ms(432)), None);
     }
