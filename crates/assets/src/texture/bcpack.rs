@@ -8,8 +8,13 @@
 
 use thiserror::Error;
 
+#[cfg(test)]
+mod lane_tests;
+mod lanes;
 mod model;
 mod tables;
+#[cfg(test)]
+mod testenc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BcPackCodec {
