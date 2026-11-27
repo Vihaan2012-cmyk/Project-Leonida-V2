@@ -117,7 +117,7 @@ mod tests {
             std::fs::read_dir(dir.path().join("Config"))
                 .unwrap()
                 .count(),
-            4
+            7
         );
     }
 
