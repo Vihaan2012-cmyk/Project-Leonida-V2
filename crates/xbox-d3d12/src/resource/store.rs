@@ -15,6 +15,8 @@ use super::image::{GpuImage, ImageError};
 use super::layout;
 use super::va::{VaAllocator, commit_host, release_host};
 use crate::descriptor::format::Kind;
+use crate::descriptor::gfx10;
+use crate::descriptor::vulkan::{ViewInfo, view_info};
 use crate::memory::{AddressSpace, LOW_LIMIT, MemoryError, PAGE, SyncPolicy};
 
 pub type ResourceId = u32;
@@ -423,6 +425,19 @@ impl Resources {
         let (&start, &id) = self.by_address.range(..=address).next_back()?;
         let r = &self.items[&id];
         (address < start + r.size).then_some((id, address - start))
+    }
+
+    /// The texture a registered image descriptor names, and the Vulkan view to make of it.
+    pub fn view_for(&self, image: &gfx10::Image) -> Option<(&Resource, ViewInfo)> {
+        let (id, _) = self.find(image.address)?;
+        let r = self.items.get(&id)?;
+        let gpu = r.image.as_ref()?;
+        let format = r.desc.format_info().ok()?;
+        let mut info = view_info(image, format)?;
+        if format.kind != Kind::Color {
+            info.format = gpu.format;
+        }
+        Some((r, info))
     }
 
     fn texture(&self, id: ResourceId) -> Result<&Resource, ResourceError> {
