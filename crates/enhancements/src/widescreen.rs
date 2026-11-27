@@ -316,7 +316,8 @@ impl Expect {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PatchOp {
     /// Write `replace` at `rva`, where the image must now hold bytes matching `expect`. `replace` holds only bytes
-    /// we author and is never longer than `expect.len`; the bytes after it keep their original values.
+    /// we author: a change inside a longer checked instruction is just the changed bytes, and the rest stays as
+    /// the image has it.
     Bytes {
         rva: u32,
         expect: Expect,
@@ -392,6 +393,45 @@ pub fn rel32(next_rva: u32, target: u32) -> [u8; 4] {
     target.wrapping_sub(next_rva).to_le_bytes()
 }
 
+/// What the aspect and field-of-view patches do. All off by default.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Config {
+    /// The game's aspect ratio is the real width over height instead of 16:9 or 4:3.
+    pub live_aspect: bool,
+    /// No black bars for shapes other than 16:9 in the scene viewport.
+    pub no_pillarbox: bool,
+    /// Factor on the vertical field of view; 1.0 leaves it alone.
+    pub fov_scale: Option<f32>,
+}
+
+impl Config {
+    /// Native ultrawide: the aspect follows the window and the game stops barring other shapes.
+    pub fn ultrawide() -> Self {
+        Self {
+            live_aspect: true,
+            no_pillarbox: true,
+            fov_scale: None,
+        }
+    }
+
+    pub fn groups(&self) -> Result<Vec<PatchGroup>, WidescreenError> {
+        let mut groups = Vec::new();
+        if self.live_aspect {
+            groups.push(live_aspect());
+        }
+        if self.no_pillarbox {
+            groups.push(no_pillarbox());
+        }
+        if let Some(scale) = self.fov_scale
+            && scale != 1.0
+        {
+            groups.push(fov_scale(scale)?);
+        }
+        Ok(groups)
+    }
+}
+
+/// An address in the image and what was found there.
 #[derive(Debug, Clone, Copy)]
 pub struct Evidence {
     pub rva: u32,
@@ -481,6 +521,95 @@ pub const EVIDENCE: &[Evidence] = &[
         what: "settings object accessor (global 0xaad3ce0, +0x450): output size at +0x204/+0x208, upscaled render size at +0x1ec/+0x1f0 when +0x1e8 is set",
     },
 ];
+
+fn jump(from: u32, to: u32) -> Vec<u8> {
+    let mut code = vec![0xe9];
+    code.extend_from_slice(&rel32(from + 5, to));
+    code
+}
+
+/// The body of the aspect quantizer, rewritten to return float(width) / float(height) and 16/9 while the height is 0.
+/// It is a leaf of exactly 36 bytes, the size of the code it replaces.
+pub fn live_aspect_code(at: u32) -> Vec<u8> {
+    let mut code = Vec::with_capacity(36);
+    code.extend_from_slice(&[0x8b, 0x05]);
+    code.extend_from_slice(&rel32(at + 6, DISPLAY_HEIGHT));
+    code.extend_from_slice(&[0x85, 0xc0, 0x74, 0x11]);
+    code.extend_from_slice(&[0xc5, 0xfa, 0x2a, 0x05]);
+    code.extend_from_slice(&rel32(at + 18, DISPLAY_WIDTH));
+    code.extend_from_slice(&[0xc5, 0xf2, 0x2a, 0xc8]);
+    code.extend_from_slice(&[0xc5, 0xfa, 0x5e, 0xc1]);
+    code.push(0xc3);
+    code.extend_from_slice(&[0xc5, 0xfa, 0x10, 0x05]);
+    code.extend_from_slice(&rel32(at + 35, ASPECT_16_9));
+    code.push(0xc3);
+    code
+}
+
+fn live_aspect() -> PatchGroup {
+    PatchGroup {
+        id: "live_aspect",
+        summary: "The aspect ratio the camera, HUD and effects read is the real display width over height",
+        confidence: Confidence::High,
+        evidence: &[0x73c790, 0x73c0d0, 0x737b90, 0x2258ec0, 0x1de4030],
+        ops: vec![
+            PatchOp::Bytes {
+                rva: ASPECT_QUANTIZER,
+                expect: Expect::new(13, 0xb012_1d3a_faab_7db0),
+                replace: live_aspect_code(ASPECT_QUANTIZER),
+            },
+            PatchOp::Bytes {
+                rva: ASPECT_GETTER,
+                expect: Expect::new(9, 0x8561_d669_b4d1_c6e8),
+                replace: {
+                    let mut code = jump(ASPECT_GETTER, ASPECT_QUANTIZER);
+                    code.extend_from_slice(&[0xcc; 4]);
+                    code
+                },
+            },
+        ],
+    }
+}
+
+fn no_pillarbox() -> PatchGroup {
+    PatchGroup {
+        id: "no_pillarbox",
+        summary: "The scene viewport takes the whole window for shapes other than 16:9",
+        confidence: Confidence::Medium,
+        evidence: &[0x28c0520],
+        ops: vec![PatchOp::Bytes {
+            rva: BARS_TEST,
+            expect: Expect::new(6, 0x46a7_9fe9_4998_01e4),
+            replace: vec![0xeb],
+        }],
+    }
+}
+
+/// The sites that turn a field of view into a half-angle right before `tanf` and combine it with the aspect.
+pub const FOV_SITES: [u32; 8] = [
+    0x737d1e, 0x1295e5b, 0x2e20748, 0x36aa723, 0x417ab24, 0x4a24426, 0x3108de5, 0x3b6c5fd,
+];
+
+fn fov_scale(scale: f32) -> Result<PatchGroup, WidescreenError> {
+    if !FOV_SCALE_RANGE.contains(&scale) || !scale.is_finite() {
+        return Err(WidescreenError::FovScale(scale));
+    }
+    Ok(PatchGroup {
+        id: "fov_scale",
+        summary: "Scales the vertical field of view of the camera projection, culling and shader parameters together",
+        confidence: Confidence::Medium,
+        evidence: &[0x737b90, 0x1295d80, 0x3108cc0, 0x615be20],
+        ops: FOV_SITES
+            .iter()
+            .map(|&rva| PatchOp::RipConstant {
+                rva,
+                len: 8,
+                expect_target: HALF_ANGLE_CONSTANT,
+                value: scaled_half_angle(scale),
+            })
+            .collect(),
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -771,5 +900,232 @@ mod tests {
             group.validate(&image),
             Err(WidescreenError::Mismatch { rva: 0x204, .. })
         ));
+    }
+
+    fn disp_at(code: &[u8], at: usize) -> i32 {
+        i32::from_le_bytes(code[at..at + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn live_aspect_code_reaches_the_globals() {
+        let at = ASPECT_QUANTIZER;
+        let code = live_aspect_code(at);
+        assert_eq!(code.len(), 36);
+        assert_eq!(&code[..2], &[0x8b, 0x05]);
+        let height = (at as i64 + 6 + i64::from(disp_at(&code, 2))) as u32;
+        assert_eq!(height, DISPLAY_HEIGHT);
+        let width = (at as i64 + 18 + i64::from(disp_at(&code, 14))) as u32;
+        assert_eq!(width, DISPLAY_WIDTH);
+        let fallback = (at as i64 + 35 + i64::from(disp_at(&code, 31))) as u32;
+        assert_eq!(fallback, ASPECT_16_9);
+        let jz_target = 10 + usize::from(code[9]);
+        assert_eq!(&code[jz_target..jz_target + 4], &[0xc5, 0xfa, 0x10, 0x05]);
+        assert_eq!(code[26], 0xc3);
+        assert_eq!(code[35], 0xc3);
+    }
+
+    #[test]
+    fn getter_jump_lands_on_the_quantizer() {
+        let group = live_aspect();
+        let PatchOp::Bytes { rva, replace, .. } = &group.ops[1] else {
+            panic!("expected a byte patch");
+        };
+        assert_eq!(*rva, ASPECT_GETTER);
+        assert_eq!(replace.len(), 9);
+        assert_eq!(replace[0], 0xe9);
+        let target = (*rva as i64 + 5 + i64::from(disp_at(replace, 1))) as u32;
+        assert_eq!(target, ASPECT_QUANTIZER);
+    }
+
+    /// The groups with every byte check replaced by one over synthetic originals made here, and an image holding
+    /// them, so the checks run without the executable's bytes.
+    fn synthetic_image_for(groups: &[PatchGroup]) -> (Vec<PatchGroup>, Synthetic) {
+        let mut segments = Vec::new();
+        let mut checked = groups.to_vec();
+        for group in &mut checked {
+            for op in &mut group.ops {
+                match op {
+                    PatchOp::Bytes { rva, expect, .. } => {
+                        let bytes: Vec<u8> = (0..expect.len)
+                            .map(|i| (i as u8).wrapping_mul(7).wrapping_add(*rva as u8))
+                            .collect();
+                        *expect = Expect::of(&bytes);
+                        segments.push((*rva, bytes));
+                    }
+                    PatchOp::RipConstant {
+                        rva,
+                        len,
+                        expect_target,
+                        ..
+                    } => {
+                        let mut bytes = vec![0x90; usize::from(*len)];
+                        let at = usize::from(*len) - 4;
+                        bytes[at..].copy_from_slice(&rel32(*rva + u32::from(*len), *expect_target));
+                        segments.push((*rva, bytes));
+                    }
+                }
+            }
+        }
+        (checked, Synthetic(segments))
+    }
+
+    fn all_groups() -> Vec<PatchGroup> {
+        Config {
+            live_aspect: true,
+            no_pillarbox: true,
+            fov_scale: Some(1.2),
+        }
+        .groups()
+        .unwrap()
+    }
+
+    #[test]
+    fn every_group_validates_against_an_image_that_matches() {
+        let groups = all_groups();
+        assert_eq!(groups.len(), 3);
+        let (groups, image) = synthetic_image_for(&groups);
+        for group in &groups {
+            group.validate(&image).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_changed_byte_is_reported_with_its_address_and_hashes() {
+        let groups = Config::ultrawide().groups().unwrap();
+        let (groups, mut image) = synthetic_image_for(&groups);
+        let (base, bytes) = image
+            .0
+            .iter_mut()
+            .find(|(rva, _)| *rva == BARS_TEST)
+            .unwrap();
+        let expected = fnv1a64(bytes);
+        bytes[0] ^= 0x01;
+        let found = fnv1a64(bytes);
+        let rva = *base;
+        let err = groups[1].validate(&image).unwrap_err();
+        assert_eq!(
+            err,
+            WidescreenError::Mismatch {
+                group: "no_pillarbox",
+                rva,
+                expected,
+                found,
+            }
+        );
+    }
+
+    #[test]
+    fn the_games_own_bytes_are_not_matched_by_zeros() {
+        let groups = Config::ultrawide().groups().unwrap();
+        let zeros = Synthetic(vec![
+            (ASPECT_QUANTIZER, vec![0; 13]),
+            (ASPECT_GETTER, vec![0; 9]),
+            (BARS_TEST, vec![0; 6]),
+        ]);
+        assert!(matches!(
+            groups[0].validate(&zeros),
+            Err(WidescreenError::Mismatch {
+                rva: ASPECT_QUANTIZER,
+                ..
+            })
+        ));
+        assert!(matches!(
+            groups[1].validate(&zeros),
+            Err(WidescreenError::Mismatch { rva: BARS_TEST, .. })
+        ));
+    }
+
+    #[test]
+    fn a_moved_constant_target_is_caught() {
+        let groups = Config {
+            fov_scale: Some(1.3),
+            ..Config::default()
+        }
+        .groups()
+        .unwrap();
+        let (groups, mut image) = synthetic_image_for(&groups);
+        image.0[0].1[4] ^= 0x10;
+        assert!(matches!(
+            groups[0].validate(&image),
+            Err(WidescreenError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn missing_code_is_unreadable_not_a_match() {
+        let groups = Config::ultrawide().groups().unwrap();
+        let empty = Synthetic(Vec::new());
+        assert!(matches!(
+            groups[0].validate(&empty),
+            Err(WidescreenError::Unreadable { .. })
+        ));
+    }
+
+    #[test]
+    fn replacements_hold_only_bytes_we_wrote() {
+        let groups = Config::ultrawide().groups().unwrap();
+        let ops = |group: usize| -> Vec<(u32, Expect, Vec<u8>)> {
+            groups[group]
+                .ops
+                .iter()
+                .map(|op| match op {
+                    PatchOp::Bytes {
+                        rva,
+                        expect,
+                        replace,
+                    } => (*rva, *expect, replace.clone()),
+                    other => panic!("unexpected {other:?}"),
+                })
+                .collect()
+        };
+        let aspect = ops(0);
+        assert_eq!(aspect[0].2, live_aspect_code(ASPECT_QUANTIZER));
+        let mut expected_jump = jump(ASPECT_GETTER, ASPECT_QUANTIZER);
+        expected_jump.extend_from_slice(&[0xcc; 4]);
+        assert_eq!(aspect[1].2, expected_jump);
+        let bars = ops(1);
+        assert_eq!(bars[0].0, BARS_TEST);
+        assert_eq!(bars[0].2, [0xeb]);
+        assert_eq!(bars[0].1.len, 6);
+        assert!(bars[0].2.len() < bars[0].1.len);
+        assert_eq!(aspect[1].2.len(), aspect[1].1.len);
+    }
+
+    #[test]
+    fn fov_patch_carries_the_scaled_half_angle() {
+        let groups = Config {
+            fov_scale: Some(1.25),
+            ..Config::default()
+        }
+        .groups()
+        .unwrap();
+        assert_eq!(groups[0].ops.len(), FOV_SITES.len());
+        for op in &groups[0].ops {
+            let PatchOp::RipConstant { value, len, .. } = op else {
+                panic!("expected a constant patch");
+            };
+            assert_eq!(*len, 8);
+            assert!(near(*value / HALF_ANGLE_PER_DEGREE, 1.25));
+        }
+    }
+
+    #[test]
+    fn evidence_covers_what_the_groups_cite() {
+        let all = Config {
+            live_aspect: true,
+            no_pillarbox: true,
+            fov_scale: Some(1.1),
+        }
+        .groups()
+        .unwrap();
+        for group in &all {
+            for rva in group.evidence {
+                assert!(
+                    EVIDENCE.iter().any(|e| e.rva == *rva),
+                    "{} cites {rva:#x} with no evidence entry",
+                    group.id
+                );
+            }
+        }
     }
 }
