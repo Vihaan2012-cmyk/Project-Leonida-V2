@@ -37,7 +37,7 @@ pub fn scan_command(args: &ContentScanArgs) -> Result<ExitCode> {
     };
     let mut scanner = Scanner::new();
     let options = WalkOptions {
-        start: None,
+        start: args.start,
         limit: args.limit,
     };
     for archive in &archives {

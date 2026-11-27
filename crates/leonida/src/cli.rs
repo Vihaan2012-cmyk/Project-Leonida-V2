@@ -49,6 +49,9 @@ pub struct ContentScanArgs {
     /// pack/core_restofworld/core_restofworld.rpf (levels.rpf adds the mannequins and takes much longer).
     #[arg(long = "archive")]
     pub archives: Vec<String>,
+    /// Start reading at this byte offset instead of the start of the data area, for a quick sample.
+    #[arg(long)]
+    pub start: Option<u64>,
     /// Only read this many bytes of each archive, for a quick sample.
     #[arg(long)]
     pub limit: Option<u64>,
