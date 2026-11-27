@@ -160,6 +160,27 @@ fn padded<const N: usize>(text: &str) -> [u8; N] {
     out
 }
 
+/// The executable (RVA 0x2478440) compares the hosting OS version with 10.0.26100.9628 and, from there on, enables
+/// device feature 0x11f and skips a startup probe: the console OS it ships for is at least that.
+const CONSOLE_OS: [u16; 4] = [10, 0, 26100, 9628];
+
+/// `major.minor.build.revision` from `LEONIDA_HOSTING_OS`, else the console's.
+fn parse_os_version(text: &str) -> Option<[u16; 4]> {
+    let mut parts = text.trim().split('.');
+    let mut out = [0u16; 4];
+    for slot in &mut out {
+        *slot = parts.next()?.parse().ok()?;
+    }
+    parts.next().is_none().then_some(out)
+}
+
+fn os_version() -> [u16; 4] {
+    std::env::var("LEONIDA_HOSTING_OS")
+        .ok()
+        .and_then(|text| parse_os_version(&text))
+        .unwrap_or(CONSOLE_OS)
+}
+
 /// A member function that returns a struct takes the address for it after `this` and hands it back.
 unsafe extern "win64" fn analytics_info(
     _: This,
@@ -167,8 +188,8 @@ unsafe extern "win64" fn analytics_info(
 ) -> *mut SystemAnalyticsInfo {
     if !result.is_null() {
         let info = SystemAnalyticsInfo {
-            os_version: [10, 0, 22000, 0],
-            hosting_os_version: [10, 0, 22000, 0],
+            os_version: os_version(),
+            hosting_os_version: os_version(),
             family: padded("Xbox"),
             form: padded(&super::setting("LEONIDA_ANALYTICS_FORM", "Xbox Series X")),
         };
@@ -552,4 +573,30 @@ pub(super) fn impls() -> Vec<ClassImpl> {
             failure: E_NOTIMPL,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packed(version: [u16; 4]) -> u64 {
+        u64::from(version[0]) << 48
+            | u64::from(version[1]) << 32
+            | u64::from(version[2]) << 16
+            | u64::from(version[3])
+    }
+
+    #[test]
+    fn default_os_version_passes_the_executables_gate() {
+        assert!(packed(CONSOLE_OS) >= 0x000a_0000_65f4_259c);
+        assert!(packed([10, 0, 22000, 0]) < 0x000a_0000_65f4_259c);
+    }
+
+    #[test]
+    fn os_version_text_needs_four_numbers() {
+        assert_eq!(parse_os_version("10.0.26100.1"), Some([10, 0, 26100, 1]));
+        assert_eq!(parse_os_version("10.0.26100"), None);
+        assert_eq!(parse_os_version("10.0.26100.1.2"), None);
+        assert_eq!(parse_os_version("10.0.x.1"), None);
+    }
 }
