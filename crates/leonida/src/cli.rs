@@ -22,6 +22,18 @@ pub enum Command {
     Check(CheckArgs),
     /// Run the game executable, or with --dry-run only show how its imports would be provided.
     Run(RunArgs),
+    /// Look at every file in the game folder for signs of tampering, without running or loading anything.
+    Triage(TriageArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TriageArgs {
+    /// The game folder. Searched for when omitted.
+    #[arg(long)]
+    pub game: Option<PathBuf>,
+    /// Write the report here instead of printing it.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
