@@ -586,6 +586,15 @@ impl Glb {
             );
         }
         for skin in self.doc["skins"].as_array().into_iter().flatten() {
+            let mut common = None;
+            for j in skin["joints"].as_array().unwrap() {
+                let mut at = j.as_u64().unwrap() as usize;
+                while let Some(p) = parent[at] {
+                    at = p;
+                }
+                assert_eq!(*common.get_or_insert(at), at, "joints have no common root");
+            }
+            assert_eq!(skin["skeleton"].as_u64().map(|s| s as usize), common);
             let joints = skin["joints"].as_array().unwrap().len();
             let ibm =
                 &self.doc["accessors"][skin["inverseBindMatrices"].as_u64().unwrap() as usize];
