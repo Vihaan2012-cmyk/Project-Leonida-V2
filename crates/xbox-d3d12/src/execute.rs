@@ -3,6 +3,7 @@
 pub mod barrier;
 mod command;
 mod context;
+pub mod parallel;
 mod replay;
 pub mod state;
 

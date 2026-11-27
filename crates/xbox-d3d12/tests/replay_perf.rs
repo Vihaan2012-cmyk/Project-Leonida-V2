@@ -1603,3 +1603,149 @@ fn a_game_frame_replays_with_far_fewer_calls_than_draws() {
     assert!(report.stats.push_calls < 400, "{:?}", report.stats);
     assert_eq!(report.stats.rendering_scopes, 4);
 }
+
+fn submit_in_order(world: &World, recorded: &[xbox_d3d12::execute::parallel::Recorded]) {
+    let buffers: Vec<vk::CommandBuffer> = recorded.iter().map(|r| r.buffer).collect();
+    let d = &world.ctx.device;
+    // SAFETY: the buffers are ended; the fence wait finishes the work before anything is freed.
+    unsafe {
+        let fence = d
+            .create_fence(&vk::FenceCreateInfo::default(), None)
+            .unwrap();
+        d.queue_submit(
+            world.ctx.queue,
+            &[vk::SubmitInfo::default().command_buffers(&buffers)],
+            fence,
+        )
+        .unwrap();
+        d.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+        d.destroy_fence(fence, None);
+    }
+}
+
+/// A list that writes `value` to `OUT_A` and to its own word, fenced by UAV barriers on both sides.
+fn writer_list(world: &World, index: u32, value: u32) -> Vec<Command> {
+    vec![
+        Command::Barriers(vec![Barrier::Uav]),
+        Command::SetRootSignature {
+            bind: BindPoint::Compute,
+            root: world.compute_root.clone(),
+        },
+        Command::SetPipeline(world.compute[0].clone()),
+        Command::SetRootConstants {
+            bind: BindPoint::Compute,
+            param: 0,
+            first: 0,
+            values: vec![value, 0],
+        },
+        Command::SetRootView {
+            bind: BindPoint::Compute,
+            param: 1,
+            va: OUT_A,
+        },
+        Command::Dispatch([1, 1, 1]),
+        Command::Barriers(vec![Barrier::Uav]),
+        Command::SetRootView {
+            bind: BindPoint::Compute,
+            param: 1,
+            va: OUT_B + 4 * u64::from(index),
+        },
+        Command::Dispatch([1, 1, 1]),
+        Command::Barriers(vec![Barrier::Uav]),
+    ]
+}
+
+#[test]
+fn lists_recorded_on_several_threads_run_in_submission_order() {
+    let Some(world) = World::new(2) else { return };
+    let lists: Vec<Vec<Command>> = (0..8).map(|i| writer_list(&world, i, 100 + i)).collect();
+    let refs: Vec<&[Command]> = lists.iter().map(|l| l.as_slice()).collect();
+    let mut pools = xbox_d3d12::execute::parallel::RecordPools::new(&world.ctx, 4).unwrap();
+    for _ in 0..2 {
+        let recorded =
+            xbox_d3d12::execute::parallel::record_lists(&world.ctx, &mut pools, &refs, &|_| {
+                world.env()
+            })
+            .unwrap();
+        assert_eq!(recorded.len(), 8);
+        assert!(recorded.iter().all(|r| r.report.dispatches == 2));
+        submit_in_order(&world, &recorded);
+        assert_eq!(world.arena.words(OUT_A, 1), [107]);
+        assert_eq!(
+            world.arena.words(OUT_B, 8),
+            [100, 101, 102, 103, 104, 105, 106, 107]
+        );
+        // SAFETY: the submission above finished.
+        unsafe { pools.reset().unwrap() };
+        // SAFETY: the arena is host-coherent and idle.
+        unsafe { std::ptr::write_bytes((world.arena.ptr + OUT_A as usize) as *mut u8, 0, 0x2000) };
+    }
+}
+
+#[test]
+fn a_list_that_fails_to_record_fails_the_batch_and_a_single_worker_records_in_order() {
+    let Some(world) = World::new(2) else { return };
+    let good = writer_list(&world, 0, 5);
+    let bad = vec![Command::Dispatch([1, 1, 1])];
+    let refs: Vec<&[Command]> = vec![&good, &bad, &good];
+    let mut pools = xbox_d3d12::execute::parallel::RecordPools::new(&world.ctx, 3).unwrap();
+    let error = xbox_d3d12::execute::parallel::record_lists(&world.ctx, &mut pools, &refs, &|_| {
+        world.env()
+    })
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        xbox_d3d12::execute::ReplayError::NoPipeline(_)
+    ));
+    // SAFETY: nothing was submitted.
+    unsafe { pools.reset().unwrap() };
+    let mut single = xbox_d3d12::execute::parallel::RecordPools::new(&world.ctx, 1).unwrap();
+    let refs: Vec<&[Command]> = vec![&good, &good];
+    let recorded =
+        xbox_d3d12::execute::parallel::record_lists(&world.ctx, &mut single, &refs, &|_| {
+            world.env()
+        })
+        .unwrap();
+    assert_eq!(recorded.len(), 2);
+    assert_ne!(recorded[0].buffer, recorded[1].buffer);
+}
+
+#[test]
+#[ignore = "benchmark: run with --release --ignored --nocapture"]
+fn recording_eight_lists_in_parallel_beats_recording_them_in_turn() {
+    let Some(world) = World::new(8) else { return };
+    let lists: Vec<Vec<Command>> = (0..8)
+        .map(|_| {
+            game_frame(
+                &world,
+                Shape {
+                    passes: 5,
+                    draws_per_pass: 250,
+                },
+            )
+        })
+        .collect();
+    let refs: Vec<&[Command]> = lists.iter().map(|l| l.as_slice()).collect();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    for workers in [1, 2, 4, 8] {
+        let mut pools =
+            xbox_d3d12::execute::parallel::RecordPools::new(&world.ctx, workers).unwrap();
+        let mut times = Vec::new();
+        for _ in 0..30 {
+            // SAFETY: nothing is submitted, so no buffer is pending.
+            unsafe { pools.reset().unwrap() };
+            let start = Instant::now();
+            xbox_d3d12::execute::parallel::record_lists(&world.ctx, &mut pools, &refs, &|_| {
+                world.env()
+            })
+            .unwrap();
+            times.push(start.elapsed());
+        }
+        let med = median(&mut times);
+        println!(
+            "8 lists, {workers} worker(s) on {threads} hardware threads: median {:.2} ms for {} draws",
+            med.as_secs_f64() * 1e3,
+            8 * 5 * 250
+        );
+    }
+}
