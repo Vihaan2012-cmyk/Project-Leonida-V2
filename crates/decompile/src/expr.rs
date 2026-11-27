@@ -50,7 +50,8 @@ pub enum FlagKind {
 #[derive(Clone, PartialEq, Debug)]
 pub enum Expr {
     Var(Loc, u8),
-    Param(u8),
+    /// The incoming value of a 1-based argument, read as this many bytes; true for an xmm argument.
+    Param(u8, u8, bool),
     Const(u64, u8),
     Name(String),
     Text(String),
@@ -183,21 +184,30 @@ impl Expr {
 
 pub fn signed_type(width: u8) -> &'static str {
     match width {
-        1 => "i8",
-        2 => "i16",
-        4 => "i32",
-        _ => "i64",
+        1 => "int8_t",
+        2 => "int16_t",
+        4 => "int32_t",
+        _ => "int64_t",
+    }
+}
+
+pub fn unsigned_type(width: u8) -> &'static str {
+    match width {
+        1 => "uint8_t",
+        2 => "uint16_t",
+        4 => "uint32_t",
+        _ => "uint64_t",
     }
 }
 
 pub fn type_name(width: u8, float: bool) -> String {
     match (width, float) {
-        (4, true) => "f32".into(),
-        (8, true) => "f64".into(),
-        (16, _) => "m128".into(),
-        (32, _) => "m256".into(),
-        (64, _) => "m512".into(),
-        (w, _) => format!("u{}", u32::from(w) * 8),
+        (4, true) => "float".into(),
+        (8, true) => "double".into(),
+        (16, _) => "__m128".into(),
+        (32, _) => "__m256".into(),
+        (64, _) => "__m512".into(),
+        (w, _) => unsigned_type(w).into(),
     }
 }
 
@@ -427,6 +437,8 @@ pub struct Printer<'a> {
     pub stack_name: &'a dyn Fn(i64) -> String,
     pub var_width: &'a dyn Fn(u32) -> u8,
     pub var_name: &'a dyn Fn(u32) -> String,
+    pub param_name: &'a dyn Fn(u8) -> String,
+    pub param_width: &'a dyn Fn(u8) -> u8,
 }
 
 impl Printer<'_> {
@@ -451,16 +463,20 @@ impl Printer<'_> {
             Expr::Var(Loc::Var(n), w) => {
                 let width = (self.var_width)(*n);
                 if *w < width && width <= 8 {
-                    out.push_str(&format!(
-                        "({}){}",
-                        type_name(*w, false),
-                        (self.var_name)(*n)
-                    ));
+                    out.push_str(&format!("({}){}", unsigned_type(*w), (self.var_name)(*n)));
                 } else {
                     out.push_str(&(self.var_name)(*n));
                 }
             }
-            Expr::Param(n) => out.push_str(&format!("a{n}")),
+            Expr::Param(n, w, vector) => {
+                let name = (self.param_name)(*n);
+                let width = (self.param_width)(*n);
+                if *w < width && !*vector {
+                    out.push_str(&format!("({}){name}", unsigned_type(*w)));
+                } else {
+                    out.push_str(&name);
+                }
+            }
             Expr::Const(v, w) => out.push_str(&constant(*v, *w)),
             Expr::Name(name) => out.push_str(name),
             Expr::Text(text) => out.push_str(&format!("{text:?}")),
@@ -511,7 +527,7 @@ impl Printer<'_> {
             }
             Expr::Call(target, args) => {
                 match &**target {
-                    Expr::Name(_) | Expr::Var(..) | Expr::Param(_) => self.write(target, out, 0),
+                    Expr::Name(_) | Expr::Var(..) | Expr::Param(..) => self.write(target, out, 0),
                     other => {
                         out.push('(');
                         self.write(other, out, 14);

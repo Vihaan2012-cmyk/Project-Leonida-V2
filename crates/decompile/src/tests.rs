@@ -115,7 +115,10 @@ fn early_return() {
         a.xor(eax, eax)?;
         a.ret()
     });
-    assert!(text.contains("u32 sub_00001000(u64 a1)"), "{text}");
+    assert!(
+        text.contains("uint32_t sub_00001000(uint64_t a1)"),
+        "{text}"
+    );
     assert!(
         text.contains(
             "if (a1 == 0) {
@@ -124,7 +127,7 @@ fn early_return() {
         ),
         "{text}"
     );
-    assert!(text.contains("return (u32)(a1 + 1);"), "{text}");
+    assert!(text.contains("return (uint32_t)(a1 + 1);"), "{text}");
     assert!(!text.contains("goto"), "{text}");
 }
 
@@ -212,7 +215,7 @@ fn windows_arguments_and_stack_locals() {
     image.code.resize(0x90, 0xCC);
     let text = decompile(&image, START).expect("decompiles");
     assert!(
-        text.contains("(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5)"),
+        text.contains("(uint64_t a1, uint32_t a2, uint64_t a3, uint64_t a4, uint32_t a5)"),
         "{text}"
     );
     assert!(text.contains("v_28 = a3 + a4;"), "{text}");
@@ -229,7 +232,7 @@ fn float_result_comes_from_xmm0() {
         a.ret()
     });
     assert!(
-        text.contains("f32 sub_00001000(u64 a1, u64 a2, u64 a3)"),
+        text.contains("float sub_00001000(float a1, float a2, float a3)"),
         "{text}"
     );
     assert!(text.contains("return a1 * a2 + a3;"), "{text}");
@@ -246,8 +249,8 @@ fn one_register_holding_two_values_gives_two_variables() {
         a.mov(qword_ptr(rcx + 0x30), rax)?;
         a.ret()
     });
-    assert!(text.contains("v1 = *(u64 *)a1;"), "{text}");
-    assert!(text.contains("v2 = *(u64 *)(a1 + 0x20);"), "{text}");
+    assert!(text.contains("v1 = *(uint64_t *)a1;"), "{text}");
+    assert!(text.contains("v2 = *(uint64_t *)(a1 + 0x20);"), "{text}");
     assert!(!text.contains("rax"), "{text}");
 }
 
@@ -270,4 +273,55 @@ fn a_value_merged_at_a_join_is_one_variable() {
     assert!(text.contains("v1 = 1;"), "{text}");
     assert!(text.contains("v1 = a2;"), "{text}");
     assert!(text.contains("return v1 * v1;"), "{text}");
+}
+
+#[test]
+fn types_follow_width_float_and_dereference() {
+    let text = run(|a| {
+        a.mulsd(xmm1, xmm1)?;
+        a.movsd_2(qword_ptr(rcx + 8), xmm1)?;
+        a.movzx(eax, byte_ptr(rcx + 3))?;
+        a.ret()
+    });
+    assert!(
+        text.contains("uint32_t sub_00001000(void *a1, double a2)"),
+        "{text}"
+    );
+    assert!(text.contains("*(double *)(a1 + 8) = a2 * a2;"), "{text}");
+    assert!(text.contains("return *(uint8_t *)(a1 + 3);"), "{text}");
+}
+
+#[test]
+fn vectors_and_integer_locals_are_declared() {
+    let text = run(|a| {
+        let mut skip = a.create_label();
+        a.movaps(xmm0, xmmword_ptr(rcx))?;
+        a.test(edx, edx)?;
+        a.je(skip)?;
+        a.movaps(xmm0, xmmword_ptr(rcx + 0x10))?;
+        a.set_label(&mut skip)?;
+        a.movaps(xmmword_ptr(rcx + 0x20), xmm0)?;
+        a.movaps(xmmword_ptr(rcx + 0x30), xmm0)?;
+        a.ret()
+    });
+    assert!(text.contains("(void *a1, uint32_t a2)"), "{text}");
+    assert!(text.contains("__m128 v1;"), "{text}");
+}
+
+#[test]
+fn pointer_locals_are_declared_with_a_star_each() {
+    let text = run(|a| {
+        let mut other = a.create_label();
+        a.mov(rax, qword_ptr(rcx + 8))?;
+        a.mov(rdx, qword_ptr(rcx + 0x10))?;
+        a.cmp(dword_ptr(rax), 0)?;
+        a.je(other)?;
+        a.mov(eax, dword_ptr(rdx + 4))?;
+        a.ret()?;
+        a.set_label(&mut other)?;
+        a.mov(eax, dword_ptr(rax + 4))?;
+        a.add(eax, dword_ptr(rdx + 8))?;
+        a.ret()
+    });
+    assert!(text.contains("void *v1, *v2;"), "{text}");
 }

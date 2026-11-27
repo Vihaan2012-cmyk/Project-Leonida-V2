@@ -6,6 +6,7 @@ mod expr;
 mod lift;
 mod simplify;
 mod structure;
+mod types;
 mod vars;
 
 use expr::{Expr, Loc, Printer, register_name, type_name};
@@ -70,7 +71,35 @@ pub fn decompile(program: &dyn Program, entry: u64) -> Result<String, Error> {
     let title = program
         .name(entry)
         .unwrap_or_else(|| format!("sub_{:08x}", entry - function.base));
-    Ok(Writer::new(&function, &vars).function(&title, registers, &nodes))
+    let count = parameter_count(&function, &vars, registers);
+    let facts = types::infer(&function, &vars, count);
+    Ok(Writer::new(&function, &vars, &facts).function(&title, &nodes))
+}
+
+/// Register arguments that were read plus the stack arguments the code touches.
+fn parameter_count(f: &Function, vars: &[vars::VarInfo], registers: u8) -> u8 {
+    let mut count = registers;
+    for v in vars {
+        count = count.max(v.param);
+    }
+    for block in &f.blocks {
+        let mut note = |e: &Expr| {
+            e.visit(&mut |x| match x {
+                Expr::Var(Loc::Stack(o), _) => {
+                    if let Some(n) = types::stack_param(*o) {
+                        count = count.max(n);
+                    }
+                }
+                Expr::Param(n, ..) => count = count.max(*n),
+                _ => {}
+            })
+        };
+        block.stmts.iter().flat_map(Stmt::exprs).for_each(&mut note);
+        if let Some(e) = block.exit.expr() {
+            note(e);
+        }
+    }
+    count
 }
 
 fn stack_name(o: i64) -> String {
@@ -86,15 +115,17 @@ fn stack_name(o: i64) -> String {
 struct Writer<'f> {
     f: &'f Function,
     vars: &'f [vars::VarInfo],
+    facts: &'f types::Facts,
     text: String,
     depth: usize,
 }
 
 impl<'f> Writer<'f> {
-    fn new(f: &'f Function, vars: &'f [vars::VarInfo]) -> Self {
+    fn new(f: &'f Function, vars: &'f [vars::VarInfo], facts: &'f types::Facts) -> Self {
         Self {
             f,
             vars,
+            facts,
             text: String::new(),
             depth: 0,
         }
@@ -110,8 +141,15 @@ impl<'f> Writer<'f> {
     fn expr(&self, e: &Expr) -> String {
         Printer {
             stack_name: &stack_name,
-            var_width: &|n| self.vars.get(n as usize).map_or(8, |v| v.width),
+            var_width: &|n| self.facts.vars.get(n as usize).map_or(8, |v| v.width),
             var_name: &|n| self.var_name(n),
+            param_name: &|n| format!("a{n}"),
+            param_width: &|n| {
+                self.facts
+                    .params
+                    .get(usize::from(n).wrapping_sub(1))
+                    .map_or(8, |p| p.width)
+            },
         }
         .expr(e)
     }
@@ -128,42 +166,60 @@ impl<'f> Writer<'f> {
         format!("L_{:x}", self.f.blocks[b].start - self.f.base)
     }
 
-    fn function(mut self, title: &str, registers: u8, nodes: &[Node]) -> String {
-        let mut stack_params = 0;
-        for block in &self.f.blocks {
-            let mut note = |e: &Expr| {
-                e.visit(&mut |x| {
-                    if let Expr::Var(Loc::Stack(o), _) = x
-                        && *o >= 0x28
-                        && o % 8 == 0
-                    {
-                        stack_params = stack_params.max(5 + (o - 0x28) / 8);
-                    }
-                })
-            };
-            block.stmts.iter().flat_map(Stmt::exprs).for_each(&mut note);
-            if let Some(e) = block.exit.expr() {
-                note(e);
-            }
-        }
-        let named = self
-            .vars
+    fn function(mut self, title: &str, nodes: &[Node]) -> String {
+        let params: Vec<String> = self
+            .facts
+            .params
             .iter()
-            .map(|v| i64::from(v.param))
-            .max()
-            .unwrap_or(0);
-        let count = i64::from(registers).max(stack_params).max(named);
-        let params: Vec<String> = (1..=count).map(|n| format!("u64 a{n}")).collect();
+            .enumerate()
+            .map(|(k, p)| {
+                let space = if p.decl.ends_with('*') { "" } else { " " };
+                format!("{}{space}a{}", p.decl, k + 1)
+            })
+            .collect();
         let returns = match self.f.returns {
             None => "void".to_string(),
             Some((loc, w)) => type_name(w, loc.is_vector() && matches!(w, 4 | 8)),
         };
         self.line(&format!("{returns} {title}({}) {{", params.join(", ")));
         self.depth = 1;
+        self.declarations();
         self.nodes(nodes);
         self.depth = 0;
         self.line("}");
         self.text
+    }
+
+    fn declarations(&mut self) {
+        let mut any = false;
+        for (offset, decl) in &self.facts.locals {
+            let name = stack_name(*offset);
+            self.line(&format!("{};", decl.replace("{}", &name)));
+            any = true;
+        }
+        let mut groups: Vec<(&str, Vec<String>)> = Vec::new();
+        for (n, ty) in self.facts.vars.iter().enumerate() {
+            if self.vars[n].param != 0 {
+                continue;
+            }
+            let name = self.var_name(n as u32);
+            match groups.iter_mut().find(|(d, _)| *d == ty.decl) {
+                Some((_, names)) => names.push(name),
+                None => groups.push((&ty.decl, vec![name])),
+            }
+        }
+        for (decl, names) in groups {
+            let (base, stars) = match decl.strip_suffix('*') {
+                Some(base) => (base.trim_end(), "*"),
+                None => (decl, ""),
+            };
+            let names: Vec<String> = names.iter().map(|n| format!("{stars}{n}")).collect();
+            self.line(&format!("{base} {};", names.join(", ")));
+            any = true;
+        }
+        if any {
+            self.text.push('\n');
+        }
     }
 
     fn stmt(&self, stmt: &Stmt) -> Option<String> {

@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::expr::{Expr, Loc, R8, R9, RCX, RDX, VECTOR};
+use crate::expr::{Expr, Loc, R8, R9, RCX, RDX, TEMP, VECTOR, unsigned_type};
 use crate::lift::{Function, Stmt};
 use crate::simplify::partial;
 
@@ -16,6 +16,10 @@ pub struct VarInfo {
     pub width: u8,
     /// The 1-based argument whose incoming value it carries, or 0.
     pub param: u8,
+    /// Whether it lived in a vector register.
+    pub vector: bool,
+    /// Whether every definition was a scalar float, 4 or 8 bytes wide.
+    pub scalar_only: bool,
 }
 
 struct Union {
@@ -310,16 +314,17 @@ pub fn rename(f: &mut Function, max_blocks: usize) -> Option<Vec<VarInfo>> {
             }
         }
     }
-    let mut aliases: HashMap<u32, u8> = HashMap::new();
+    let mut aliases: HashMap<u32, (u8, u8, bool)> = HashMap::new();
     for (root, (count, site)) in &defs_of {
         let Some((b, k)) = site else { continue };
         if *count == 1
             && !walk.union.undefined[*root as usize]
             && walk.union.param[*root as usize] == 0
-            && let Stmt::Def(_, 8, Expr::Param(n)) = &f.blocks[*b].stmts[*k]
+            && let Stmt::Def(_, w, Expr::Param(n, pw, vector)) = &f.blocks[*b].stmts[*k]
+            && w == pw
             && !mutated[usize::from(*n)]
         {
-            aliases.insert(*root, *n);
+            aliases.insert(*root, (*n, *w, *vector));
         }
     }
 
@@ -328,27 +333,30 @@ pub fn rename(f: &mut Function, max_blocks: usize) -> Option<Vec<VarInfo>> {
     let mut vars: Vec<VarInfo> = Vec::new();
     for (b, block) in f.blocks.iter().enumerate() {
         for (stmt, site) in block.stmts.iter().zip(&sites[b]) {
-            let (Some(def), Stmt::Def(Loc::Reg(_), w, _)) = (site.def, stmt) else {
+            let (Some(def), Stmt::Def(Loc::Reg(r), w, _)) = (site.def, stmt) else {
                 continue;
             };
             let root = walk.union.find(def);
             if walk.union.undefined[root as usize] {
                 continue;
             }
-            if let Some(n) = aliases.get(&root) {
-                names.insert(root, Target::Param(*n));
+            if let Some(alias) = aliases.get(&root) {
+                names.insert(root, Target::Param(alias.0, alias.1, alias.2));
                 continue;
             }
             let target = *names.entry(root).or_insert_with(|| {
                 vars.push(VarInfo {
                     width: 0,
                     param: walk.union.param[root as usize],
+                    vector: (VECTOR..TEMP).contains(r),
+                    scalar_only: true,
                 });
                 Target::Var(vars.len() as u32 - 1)
             });
             if let Target::Var(index) = target {
                 let info = &mut vars[index as usize];
                 info.width = info.width.max(*w);
+                info.scalar_only &= matches!(*w, 4 | 8);
             }
         }
     }
@@ -372,7 +380,7 @@ pub fn rename(f: &mut Function, max_blocks: usize) -> Option<Vec<VarInfo>> {
                 let root = walk.union.find(def);
                 match names.get(&root) {
                     Some(Target::Var(v)) => *loc = Loc::Var(*v),
-                    Some(Target::Param(_)) => *stmt = Stmt::Clobber(Vec::new()),
+                    Some(Target::Param(..)) => *stmt = Stmt::Clobber(Vec::new()),
                     None => {}
                 }
             }
@@ -395,7 +403,7 @@ pub fn rename(f: &mut Function, max_blocks: usize) -> Option<Vec<VarInfo>> {
 enum Target {
     Var(u32),
     /// The incoming value of this 1-based argument.
-    Param(u8),
+    Param(u8, u8, bool),
 }
 
 fn rewrite(e: Expr, mapping: &[(Loc, Target)]) -> Expr {
@@ -405,14 +413,12 @@ fn rewrite(e: Expr, mapping: &[(Loc, Target)]) -> Expr {
     e.map(&mut |x| match x {
         Expr::Var(loc, w) => match mapping.iter().find(|(l, _)| *l == loc) {
             Some((_, Target::Var(v))) => Expr::Var(Loc::Var(*v), w),
-            Some((_, Target::Param(n))) if w >= 8 => Expr::Param(*n),
-            Some((_, Target::Param(n))) => Expr::Cast(
-                match w {
-                    1 => "u8",
-                    2 => "u16",
-                    _ => "u32",
-                },
-                Box::new(Expr::Param(*n)),
+            Some((_, Target::Param(n, pw, vector))) if w >= *pw || *vector => {
+                Expr::Param(*n, *pw, *vector)
+            }
+            Some((_, Target::Param(n, pw, vector))) => Expr::Cast(
+                unsigned_type(w.min(4)),
+                Box::new(Expr::Param(*n, *pw, *vector)),
             ),
             None => Expr::Var(loc, w),
         },
