@@ -7,4 +7,5 @@
 //! `ResumeX`). The window is the layer's own: the game's Win32 calls go to the host's user32, and `PresentX` carries no
 //! window handle, so frames are shown in a `winit` window (or any `HWND` passed in) through a Vulkan swap chain.
 
+pub mod convert;
 pub mod frames;
