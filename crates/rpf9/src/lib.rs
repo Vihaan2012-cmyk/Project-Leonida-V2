@@ -3,6 +3,7 @@
 //! The table of contents of an archive is encrypted and never read. Resources are found by walking the data
 //! area, validating every stream by inflating it, and joining streams by the rules of the measured formats.
 
+mod archive;
 mod error;
 mod group;
 mod inflate;
@@ -10,6 +11,7 @@ mod model;
 mod names;
 mod walk;
 
+pub use archive::{Archive, Header, ResourceData, ScanReport};
 pub use error::Rpf9Error;
 pub use model::{Codec, Kind, Layout, Resource, Segment, Space, hex};
 pub use names::{find_names, joaat, name_hash, stem};
