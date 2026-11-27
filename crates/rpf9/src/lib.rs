@@ -7,7 +7,9 @@ mod error;
 mod inflate;
 mod model;
 mod names;
+mod walk;
 
 pub use error::Rpf9Error;
 pub use model::{Codec, Kind, Layout, Resource, Segment, Space, hex};
 pub use names::{find_names, joaat, name_hash, stem};
+pub use walk::WalkStats;
