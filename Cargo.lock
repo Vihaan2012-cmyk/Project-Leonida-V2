@@ -561,6 +561,7 @@ dependencies = [
  "pe-image",
  "pe-loader",
  "rdna",
+ "rpf9",
  "sha2",
  "shader-container",
  "shader-ir",
