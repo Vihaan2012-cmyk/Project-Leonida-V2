@@ -45,6 +45,8 @@ ID3D12Device 41 CreateCommandSignature pc sites=5
 ID3D12Device 42 GetResourceTiling pc
 ID3D12Device 43 GetAdapterLuid pc
 ID3D12Device 48 CreateCommandQueueX measured
+ID3D12Device 49 SetFeature49X measured (called as (0x11f, 1) once after creation; result unused; ignored)
+ID3D12Device 50 RegisterGpuCrashCallbackX measured (called as (callback, 0, callback) in the crash-handler set-up; accepted)
 ID3D12Device 55 CreatePipelineStateFromCacheX inferred
 ID3D12Device 57 CreateGraphicsPipelineStateFromCacheX inferred
 ID3D12Device 62 CreateComputePipelineStateX measured
