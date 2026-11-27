@@ -1311,6 +1311,7 @@ name = "xbox-d3d12"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+ "windows-sys",
 ]
 
 [[package]]
