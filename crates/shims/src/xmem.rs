@@ -13,6 +13,9 @@
 //!   `XMemFreePhysicalPages(count, pages)`: Windows' AWE functions without the process handle. Each physical
 //!   page is a 64 KiB section of the page file, since AWE needs a privilege ordinary users lack; its number is
 //!   an index into our own table.
+//!   `write_physical_page` is how DirectStorage reads land in those pages. The page-table entry of such a
+//!   request is taken as a page number from `XMemAllocatePhysicalPages`, or as the address of a mapped view of
+//!   a page; whether the title stores one or the other (or a console physical address) is not measured.
 //! - `XMemIsToolsMemAvailable()`: there is no development kit memory, so false.
 //! - `XMemGetWorkingSetStatistics(kind, stats)`: `BOOL`. The executable passes 0x2000000a or 0x20000001 and
 //!   the upscaler 0x20000001, with a buffer of at least 0x80 bytes; the callers read a 64-bit size at +8.
