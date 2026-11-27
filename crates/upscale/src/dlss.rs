@@ -1,36 +1,46 @@
-//! Optional NVIDIA DLSS through NVIDIA's NGX runtime on the player's own machine. Nothing of NVIDIA's is linked,
-//! bundled or shipped.
+//! Optional NVIDIA DLSS super resolution through NGX, the runtime that comes with NVIDIA's driver. Nothing of
+//! NVIDIA's is linked, bundled or shipped.
 //!
-//! The player supplies NVIDIA's files: the driver installs `nvngx.dll` (the NGX loader) in the system folder, and the
-//! player points the configuration at a DLSS library (`nvngx_dlss.dll`) they obtained from NVIDIA. DLSS only works on
-//! NVIDIA GPUs with tensor cores (GeForce RTX); on anything else, or without those files, it reports unavailable and
-//! the caller falls back to [`crate::fsr1`] or [`crate::temporal`].
+//! The player supplies NVIDIA's files: the driver installs the NGX loader (`nvngx.dll`), and the player points the
+//! configuration at a DLSS library (`nvngx_dlss.dll`) they obtained from NVIDIA. DLSS only works on NVIDIA GPUs with
+//! tensor cores (GeForce RTX); anywhere else, or when NGX fails, [`create_with_fallback`] hands back FSR 1 or the
+//! temporal upscaler together with a message saying why.
 //!
-//! What is done: [`probe`] loads the driver's NGX loader (from the system folder only, unless the configuration names
-//! another path), resolves the public `NVSDK_NGX_VULKAN_*` entry points by name and checks the configured DLSS file
-//! is a Windows library. The DLSS library itself is never loaded by us: NGX loads it from the path the application
-//! hands it.
+//! What runs:
+//! - [`required_extensions`]: the instance and device extensions NGX names; the renderer's device must enable them.
+//! - [`DlssUpscaler`]: NGX initialisation, the DLSS availability query, the optimal-settings query
+//!   ([`DlssUpscaler::optimal_settings`], so the game's render size can follow the quality mode), feature creation,
+//!   evaluation and release, behind the crate's [`Upscaler`] trait (CPU images in and out) and through
+//!   [`DlssUpscaler::evaluate_vk`] for images the renderer keeps on the GPU.
+//! - [`DlssMode`]: the game's quality modes mapped to DLSS modes and DLAA.
 //!
-//! What is not done: evaluating DLSS. That needs the renderer's `VkInstance`/`VkDevice` (not visible through
-//! [`crate::Compute`]) and NGX's `NVSDK_NGX_Parameter`, which NVIDIA's header declares as a C++ abstract class with
-//! overloaded virtual `Set`/`Get` methods; its virtual-table order is not stated by NVIDIA's public documentation, so
-//! calling it would be a guess. [`DlssUpscaler::new`] therefore returns [`UpscaleError::Unimplemented`] when the
-//! runtime is present, and [`UpscaleError::Unavailable`] when it is not. DLSS frame generation goes through
-//! Streamline's swap-chain proxy and is likewise not offered.
+//! NGX's parameter map is a C++ interface (`NVSDK_NGX_Parameter`); the driver exports no C wrappers for it, so the
+//! `Set` and `Get` overloads are called through the virtual table in the order NVIDIA's public header declares them
+//! (see [`ffi::slots`]). The declarations in [`ffi`] are our own, written from NVIDIA's public SDK headers
+//! (<https://github.com/NVIDIA/DLSS>, NVIDIA RTX SDK licence): no NVIDIA file is copied or distributed.
+
+pub mod fallback;
+pub mod ffi;
+pub mod modes;
+pub mod ngx;
+mod upscaler;
+pub mod vk;
+
+#[cfg(test)]
+mod tests;
 
 use std::path::{Path, PathBuf};
 
-use crate::{Image, UpscaleError, UpscaleInputs, Upscaler, UpscalerKind};
+pub use fallback::{Selection, create_with_fallback, select_upscaler};
+pub use modes::{DlssMode, DlssOptions};
+pub use ngx::{Availability, OptimalSettings};
+pub use upscaler::DlssUpscaler;
 
 /// The NGX entry points whose presence [`probe`] checks (names from NVIDIA's public `nvsdk_ngx_vk.h`).
-pub const ENTRY_POINTS: &[&str] = &[
-    "NVSDK_NGX_VULKAN_Init",
-    "NVSDK_NGX_VULKAN_Shutdown",
-    "NVSDK_NGX_VULKAN_GetCapabilityParameters",
-    "NVSDK_NGX_VULKAN_CreateFeature",
-    "NVSDK_NGX_VULKAN_EvaluateFeature",
-    "NVSDK_NGX_VULKAN_ReleaseFeature",
-];
+pub use ngx::REQUIRED_EXPORTS as ENTRY_POINTS;
+
+/// The file name NGX looks for in the folders it is given.
+pub const DLSS_LIBRARY_NAME: &str = "nvngx_dlss.dll";
 
 #[derive(Debug, Clone, Default)]
 pub struct DlssConfig {
@@ -58,9 +68,9 @@ pub fn probe(config: &DlssConfig) -> DlssStatus {
     if let Err(reason) = check_dlss_file(dlss) {
         return DlssStatus::Unavailable(reason);
     }
-    match loader::open(config.ngx_runtime.as_deref()) {
-        Ok(ngx) => DlssStatus::Present {
-            ngx: ngx.path.clone(),
+    match ngx::Api::open(config.ngx_runtime.as_deref()) {
+        Ok(api) => DlssStatus::Present {
+            ngx: api.library.path.clone(),
             dlss: dlss.clone(),
         },
         Err(reason) => DlssStatus::Unavailable(reason),
@@ -76,146 +86,94 @@ fn check_dlss_file(path: &Path) -> Result<(), String> {
     match read {
         Err(error) => Err(format!("{}: {error}", path.display())),
         Ok(()) if &head != b"MZ" => Err(format!("{} is not a Windows library", path.display())),
-        Ok(()) => Ok(()),
-    }
-}
-
-/// DLSS super resolution. It cannot be created yet, see the module documentation.
-pub struct DlssUpscaler {
-    _private: (),
-}
-
-impl DlssUpscaler {
-    pub fn new(config: &DlssConfig) -> Result<DlssUpscaler, UpscaleError> {
-        match probe(config) {
-            DlssStatus::Unavailable(reason) => Err(UpscaleError::Unavailable {
-                name: "DLSS",
-                reason,
-            }),
-            DlssStatus::Present { .. } => Err(UpscaleError::Unimplemented {
-                name: "DLSS",
-                reason: "NGX evaluation needs the renderer's Vulkan device and NVIDIA's \
-                         NVSDK_NGX_Parameter C++ interface, whose layout public documentation does not give"
-                    .into(),
-            }),
+        Ok(()) => {
+            let named = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(DLSS_LIBRARY_NAME));
+            if named {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} must be named {DLSS_LIBRARY_NAME}: NGX finds the DLSS library by that name",
+                    path.display()
+                ))
+            }
         }
     }
 }
 
-impl Upscaler for DlssUpscaler {
-    fn kind(&self) -> UpscalerKind {
-        UpscalerKind::Dlss
-    }
+/// The Vulkan extensions NGX needs enabled.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequiredExtensions {
+    pub instance: Vec<String>,
+    pub device: Vec<String>,
+}
 
-    fn name(&self) -> &'static str {
-        "NVIDIA DLSS"
-    }
+/// Asks the NGX loader which Vulkan extensions it needs, using the loader in the system folder. Empty when NGX is not
+/// present (no NVIDIA driver): the device then needs nothing for DLSS, which will not be offered anyway.
+pub fn required_extensions() -> RequiredExtensions {
+    required_extensions_with(&DlssConfig::default()).unwrap_or_default()
+}
 
-    fn uses_jitter(&self) -> bool {
-        true
-    }
+/// As [`required_extensions`], for a configured loader location, and with the reason when NGX cannot be asked.
+pub fn required_extensions_with(config: &DlssConfig) -> Result<RequiredExtensions, String> {
+    let api = ngx::Api::open(config.ngx_runtime.as_deref())?;
+    let lists = api.required_extensions().map_err(|e| e.to_string())?;
+    Ok(RequiredExtensions {
+        instance: lists.instance,
+        device: lists.device,
+    })
+}
 
-    fn upscale(&mut self, _inputs: &UpscaleInputs<'_>) -> Result<Image, UpscaleError> {
-        Err(UpscaleError::Unimplemented {
-            name: "DLSS",
-            reason: "see DlssUpscaler::new".into(),
+/// One DLSS mode and what NGX says about it for an output size; `settings` is `None` when NGX could not be asked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModeSupport {
+    pub mode: DlssMode,
+    pub settings: Option<OptimalSettings>,
+}
+
+impl ModeSupport {
+    /// Whether NGX offers the mode (it reports a zero render size for modes it does not).
+    pub fn offered(&self) -> bool {
+        self.settings
+            .is_some_and(|s| s.render_size[0] > 0 && s.render_size[1] > 0)
+    }
+}
+
+/// What NGX says about DLSS on this machine, without the game's renderer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DlssCapabilities {
+    pub device_name: String,
+    pub availability: Availability,
+    pub modes: Vec<ModeSupport>,
+}
+
+/// Creates an NVIDIA Vulkan device with NGX's extensions, initialises NGX on it and asks whether DLSS is available and
+/// which render size each mode gives for `output`. Needs no DLSS library path: NGX also looks in its own locations.
+pub fn query_capabilities(
+    config: &DlssConfig,
+    output: [u32; 2],
+) -> Result<DlssCapabilities, String> {
+    let options = DlssOptions::default();
+    let opened = upscaler::open_own_device(config.ngx_runtime.as_deref())?;
+    let mut ngx = upscaler::init_ngx(
+        opened.api,
+        &opened.ctx,
+        &options,
+        config.dlss_dll.as_deref(),
+    )?;
+    let availability = ngx.availability();
+    let modes = DlssMode::ALL
+        .iter()
+        .map(|&mode| ModeSupport {
+            mode,
+            settings: ngx.optimal_settings(output, mode).ok(),
         })
-    }
-
-    fn reset(&mut self) {}
-}
-
-#[cfg(windows)]
-mod loader {
-    use std::ffi::{CString, c_void};
-    use std::os::windows::ffi::OsStrExt;
-    use std::path::{Path, PathBuf};
-
-    use windows_sys::Win32::Foundation::FreeLibrary;
-    use windows_sys::Win32::System::LibraryLoader::{
-        GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW,
-    };
-
-    pub struct Ngx {
-        module: *mut c_void,
-        pub path: PathBuf,
-    }
-
-    impl Drop for Ngx {
-        fn drop(&mut self) {
-            // SAFETY: `module` came from a successful LoadLibraryExW and is released once.
-            unsafe { FreeLibrary(self.module) };
-        }
-    }
-
-    pub fn open(explicit: Option<&Path>) -> Result<Ngx, String> {
-        let (name, flags, path) = match explicit {
-            Some(path) => (
-                path.to_path_buf(),
-                LOAD_WITH_ALTERED_SEARCH_PATH,
-                path.to_path_buf(),
-            ),
-            None => (
-                PathBuf::from("nvngx.dll"),
-                LOAD_LIBRARY_SEARCH_SYSTEM32,
-                PathBuf::from("nvngx.dll (system folder)"),
-            ),
-        };
-        let wide: Vec<u16> = name.as_os_str().encode_wide().chain([0]).collect();
-        // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call; no file handle is passed.
-        let module = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), flags) };
-        if module.is_null() {
-            return Err(format!(
-                "NVIDIA's NGX runtime was not found at {} (needs an NVIDIA driver)",
-                path.display()
-            ));
-        }
-        let ngx = Ngx { module, path };
-        let missing: Vec<&str> = super::ENTRY_POINTS
-            .iter()
-            .copied()
-            .filter(|name| {
-                let name = CString::new(*name).expect("entry point names have no NUL");
-                // SAFETY: `module` is a loaded library and `name` is NUL-terminated.
-                unsafe { GetProcAddress(ngx.module, name.as_ptr().cast()) }.is_none()
-            })
-            .collect();
-        if missing.is_empty() {
-            Ok(ngx)
-        } else {
-            Err(format!(
-                "{} lacks the NGX entry points {}",
-                ngx.path.display(),
-                missing.join(", ")
-            ))
-        }
-    }
-}
-
-#[cfg(not(windows))]
-mod loader {
-    use std::path::{Path, PathBuf};
-
-    pub struct Ngx {
-        pub path: PathBuf,
-    }
-
-    pub fn open(_explicit: Option<&Path>) -> Result<Ngx, String> {
-        Err("DLSS needs Windows and an NVIDIA driver".into())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn without_a_configured_library_dlss_is_unavailable() {
-        let status = probe(&DlssConfig::default());
-        assert!(matches!(status, DlssStatus::Unavailable(r) if r.contains("no DLSS library")));
-        assert!(matches!(
-            DlssUpscaler::new(&DlssConfig::default()),
-            Err(UpscaleError::Unavailable { name: "DLSS", .. })
-        ));
-    }
+        .collect();
+    Ok(DlssCapabilities {
+        device_name: opened.ctx.device_name.clone(),
+        availability,
+        modes,
+    })
 }
