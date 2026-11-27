@@ -8,6 +8,7 @@
 pub mod bcn;
 pub mod bcpack;
 pub mod dds;
+pub mod dict;
 mod extract;
 pub mod format;
 pub mod layout;
