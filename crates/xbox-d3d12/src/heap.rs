@@ -16,6 +16,10 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
+pub mod console;
+
+pub use console::{ConsolePlacement, HeapAllocator, Hooked, LowBlock, LowMemory, PlacementNote};
+
 use crate::com::{self, E_INVALIDARG, E_OUTOFMEMORY, E_POINTER, Kind, add_ref, release};
 use crate::device::DeviceCore;
 
