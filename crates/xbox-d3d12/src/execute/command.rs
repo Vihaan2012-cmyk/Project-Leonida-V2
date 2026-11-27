@@ -295,4 +295,28 @@ impl Command {
                 | Command::ExecuteIndirect { .. }
         )
     }
+
+    /// Whether the command only sets state the replay applies at the next draw, so it records nothing and may
+    /// sit between barriers that are gathered into one call.
+    pub fn is_lazy(&self) -> bool {
+        matches!(
+            self,
+            Command::SetRootSignature { .. }
+                | Command::SetPipeline(_)
+                | Command::SetRootConstants { .. }
+                | Command::SetRootView { .. }
+                | Command::SetRootTable { .. }
+                | Command::SetDescriptorHeaps(_)
+                | Command::SetViewports(_)
+                | Command::SetScissors(_)
+                | Command::SetBlendFactor(_)
+                | Command::SetStencilRef(_)
+                | Command::SetTopology(_)
+                | Command::SetVertexBuffers { .. }
+                | Command::SetIndexBuffer(_)
+                | Command::SetRenderTargets { .. }
+                | Command::Barriers(_)
+                | Command::Marker(_)
+        )
+    }
 }
