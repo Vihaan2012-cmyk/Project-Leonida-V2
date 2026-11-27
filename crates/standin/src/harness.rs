@@ -71,6 +71,9 @@ impl Environment {
 pub struct RunOptions {
     pub timeout: Duration,
     pub placement: Placement,
+    /// Unload the image afterwards. Off by default, as in `leonida run`: shims start threads that run Rust code
+    /// while the image's thread-local storage is in place, and they outlive the entry point.
+    pub unload: bool,
 }
 
 impl Default for RunOptions {
@@ -78,6 +81,7 @@ impl Default for RunOptions {
         RunOptions {
             timeout: Duration::from_secs(60),
             placement: Placement::Anywhere,
+            unload: false,
         }
     }
 }
@@ -248,7 +252,12 @@ pub fn run(
         });
     }
     debug_assert!(report.failed.is_none() || report.exit == FAILED | failed);
-    drop(module);
-    drop(binder);
+    if options.unload {
+        drop(module);
+        drop(binder);
+    } else {
+        std::mem::forget(module);
+        std::mem::forget(binder);
+    }
     Ok(report)
 }
