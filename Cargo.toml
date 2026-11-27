@@ -16,9 +16,12 @@ flate2 = "1"
 iced-x86 = { version = "1.22", default-features = false, features = ["std", "decoder", "intel", "instr_info"] }
 memchr = "2"
 memmap2 = "0.9"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+redb = "5"
 naga = { version = "30", features = ["wgsl-in", "spv-out"] }
 rayon = "1"
 rspirv = "0.13"
+ruzstd = { version = "0.8", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -26,6 +29,7 @@ tempfile = "3"
 thiserror = "2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Kernel", "Win32_Security"] }
 game-package = { path = "crates/game-package" }
+rpf9 = { path = "crates/rpf9" }
 shader-container = { path = "crates/shader-container" }
 leonida-ui = { path = "crates/leonida-ui" }
 pe-image = { path = "crates/pe-image" }
