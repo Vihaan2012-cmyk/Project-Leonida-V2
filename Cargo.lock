@@ -2335,6 +2335,7 @@ dependencies = [
  "pe-loader",
  "tempfile",
  "thiserror 2.0.21",
+ "upscale",
  "windows-sys 0.61.2",
  "xbox-d3d12",
 ]
