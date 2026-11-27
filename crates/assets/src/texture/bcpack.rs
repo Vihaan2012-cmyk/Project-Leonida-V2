@@ -8,6 +8,8 @@
 
 use thiserror::Error;
 
+#[cfg(test)]
+mod block_tests;
 mod blocks;
 mod codebooks;
 #[cfg(test)]
