@@ -745,3 +745,72 @@ fn static_model_exports_valid_gltf_in_y_up() {
     );
 }
 
+fn skinned_character() -> ModelSet {
+    let influences = vec![
+        vec![(0, 255)],
+        vec![(1, 128), (0, 127)],
+        vec![(2, 255)],
+        vec![
+            (0, 10),
+            (1, 20),
+            (2, 30),
+            (0, 40),
+            (1, 50),
+            (2, 60),
+            (0, 20),
+            (1, 25),
+        ],
+    ];
+    let mut spec = skinned_spec(
+        SkinForm::Bytes(2),
+        influences,
+        vec![joaat("SKEL_ROOT"), joaat("SKEL_Pelvis"), 0xCAFE_F00D],
+    );
+    spec.skeleton = two_bones();
+    spec.name = Some("ped");
+    decode_resource(&drawable_resource(&spec), None).unwrap()
+}
+
+#[test]
+fn skinned_model_has_consistent_skin_and_rest_pose() {
+    let set = skinned_character();
+    let (_, glb) = export_one(&set);
+    let skin = &glb.doc["skins"][0];
+    let joints = skin["joints"].as_array().unwrap();
+    assert_eq!(
+        joints.len(),
+        3,
+        "two bones and one helper for the unknown hash"
+    );
+    let names: Vec<_> = joints
+        .iter()
+        .map(|j| {
+            glb.doc["nodes"][j.as_u64().unwrap() as usize]["name"]
+                .as_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(names, vec!["SKEL_ROOT", "SKEL_Pelvis", "bone_0xcafef00d"]);
+
+    let ibm = glb.floats(skin["inverseBindMatrices"].as_u64().unwrap() as usize);
+    let world = world_matrices(&glb);
+    for (j, node) in joints.iter().enumerate() {
+        let w = world[node.as_u64().unwrap() as usize];
+        let m: Mat = ibm[16 * j..16 * j + 16].try_into().unwrap();
+        let rest = mul(&w, &m);
+        for (i, v) in rest.iter().enumerate() {
+            let want = if i % 5 == 0 { 1.0 } else { 0.0 };
+            assert!(close(*v, want, 1e-5), "joint {j}: {rest:?}");
+        }
+    }
+
+    let prim = &glb.doc["meshes"][0]["primitives"][0];
+    let attrs = &prim["attributes"];
+    assert!(attrs.get("JOINTS_1").is_some() && attrs.get("WEIGHTS_1").is_some());
+    let j0 = glb.uints(attrs["JOINTS_0"].as_u64().unwrap() as usize);
+    let w0 = glb.floats(attrs["WEIGHTS_0"].as_u64().unwrap() as usize);
+    assert_eq!(&j0[4..6], &[1, 0]);
+    assert!(close(w0[4], 128.0 / 255.0, 1e-5) && close(w0[5], 127.0 / 255.0, 1e-5));
+    assert_eq!(j0[8], 2);
+}
+
