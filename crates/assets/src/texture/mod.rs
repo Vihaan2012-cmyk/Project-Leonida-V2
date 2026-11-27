@@ -6,6 +6,7 @@
 //! [`Unsupported`] reason; nothing is guessed.
 
 pub mod format;
+pub mod layout;
 pub mod tiling;
 
 pub use format::{FormatInfo, format_info};
