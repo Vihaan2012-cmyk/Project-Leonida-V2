@@ -2279,6 +2279,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "shader-census"
+version = "0.1.0"
+dependencies = [
+ "memmap2",
+ "rdna",
+ "serde",
+ "serde_json",
+ "shader-container",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "shader-container"
 version = "0.1.0"
 dependencies = [
