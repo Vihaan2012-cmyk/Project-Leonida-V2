@@ -6,14 +6,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    pub game: Option<PathBuf>,
+    /// Record a boot trace when playing.
+    pub trace: bool,
     pub find_on_start: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            game: None,
+            trace: false,
             find_on_start: true,
         }
     }
@@ -70,7 +71,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("settings.json");
         let settings = Settings {
-            game: Some(PathBuf::from("E:/Games/GTA")),
+            trace: true,
             find_on_start: false,
         };
         settings.save_to(&path).unwrap();

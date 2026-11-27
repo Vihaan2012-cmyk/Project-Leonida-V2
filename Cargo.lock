@@ -1184,12 +1184,14 @@ dependencies = [
 name = "leonida-ui"
 version = "0.1.0"
 dependencies = [
+ "config",
  "game-package",
  "rfd",
  "serde",
  "serde_json",
- "shader-container",
  "tempfile",
+ "toml",
+ "vfs",
  "winsafe",
 ]
 

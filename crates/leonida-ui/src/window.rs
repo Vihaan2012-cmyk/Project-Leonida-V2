@@ -1,25 +1,39 @@
+//! The Leonida window: one tab per group of settings, a Play button and the commands it starts.
+//!
+//! What each field holds and checks lives in `form` and `model`; this file only draws the fields and passes their
+//! text through.
+
 use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
+use config::Config;
 use game_package::Manifest;
-use shader_container::{ScanResult, ScanSummary};
 use winsafe::{self as w, co, guard::DeleteObjectGuard, gui, prelude::*};
 
 use crate::Error;
-use crate::build_steps::{self, STEPS, StepReport, StepState};
+use crate::cache;
+use crate::checks::{self, World};
+use crate::child;
+use crate::form::{self, Choice, Env, Field, Kind};
 use crate::game::{self, GameState};
 use crate::jobs::{Jobs, Outcome, Wake};
+use crate::model::{FieldError, Form, Severity, save_changed};
+use crate::modlist::{self, ModList};
+use crate::play::{self, Paths, PlayOptions};
 use crate::settings::Settings;
 
-const WIDTH: i32 = 640;
-const HEIGHT: i32 = 890;
+const WIDTH: i32 = 1100;
+const HEIGHT: i32 = 740;
 const TIMER: usize = 1;
-const ORANGE: (u8, u8, u8) = (196, 110, 0);
-const GREEN: (u8, u8, u8) = (16, 124, 16);
+const ROW: i32 = 26;
+const GRAY: (u8, u8, u8) = (110, 110, 110);
 const RED: (u8, u8, u8) = (196, 43, 28);
+const AMBER: (u8, u8, u8) = (166, 100, 0);
+const GREEN: (u8, u8, u8) = (16, 124, 16);
 
 pub fn run() -> Result<(), Error> {
     let _ = w::FreeConsole();
@@ -27,17 +41,65 @@ pub fn run() -> Result<(), Error> {
     Ok(())
 }
 
+enum Ctl {
+    Check(gui::CheckBox),
+    Combo(gui::ComboBox, Vec<Choice>, bool),
+    Edit(gui::Edit),
+}
+
+struct FieldUi {
+    field: Field,
+    ctl: Ctl,
+    hint: gui::Label,
+    browse: Option<gui::Button>,
+}
+
+struct Layout {
+    label: i32,
+    control: i32,
+    hint: i32,
+}
+
+fn layout_for(columns: usize) -> (i32, Layout) {
+    match columns {
+        0 | 1 => (
+            700,
+            Layout {
+                label: 150,
+                control: 230,
+                hint: 300,
+            },
+        ),
+        2 => (
+            520,
+            Layout {
+                label: 150,
+                control: 170,
+                hint: 190,
+            },
+        ),
+        _ => (
+            350,
+            Layout {
+                label: 110,
+                control: 130,
+                hint: 100,
+            },
+        ),
+    }
+}
+
 struct State {
+    root: PathBuf,
     manifests: Vec<Manifest>,
-    settings: Settings,
-    game: GameState,
-    found: Vec<PathBuf>,
+    monitors: usize,
+    form: Form,
     jobs: Jobs,
-    steps: Vec<StepReport>,
-    scan: Option<ScanResult>,
     log: Vec<String>,
     started: Instant,
-    shown_status: String,
+    prefs: Settings,
+    mods: ModList,
+    shown_job: String,
 }
 
 #[derive(Clone)]
@@ -45,121 +107,215 @@ struct Window {
     wnd: gui::WindowMain,
     title: gui::Label,
     status: gui::Label,
-    detail: gui::Label,
-    primary: gui::Button,
-    headings: [gui::Label; 4],
-    choose: gui::Button,
-    games: gui::ListView<()>,
-    use_selected: gui::Button,
-    find_again: gui::Button,
-    verify: gui::Button,
-    open_folder: gui::Button,
-    cancel: gui::Button,
-    steps: gui::ListView<()>,
-    progress: gui::ProgressBar,
     play: gui::Button,
-    shader_report: gui::Button,
-    mods: gui::Button,
-    viewer: gui::Button,
-    find_on_start: gui::CheckBox,
-    unavailable_options: [gui::CheckBox; 3],
-    output_change: gui::Button,
-    save_log: gui::Button,
-    clear_log: gui::Button,
+    save: gui::Button,
+    revert: gui::Button,
+    open_config: gui::Button,
+    job: gui::Label,
+    progress: gui::ProgressBar,
+    cancel: gui::Button,
     log: gui::Edit,
+    fields: Rc<Vec<FieldUi>>,
+    headings: Rc<Vec<gui::Label>>,
+    pages: Rc<Vec<gui::TabPage>>,
+    game_status: gui::Label,
+    find_game: gui::Button,
+    shader_line: gui::Label,
+    pipeline_line: gui::Label,
+    prepare: gui::Button,
+    blocklist_line: gui::Label,
+    scan: gui::Button,
+    trace: gui::CheckBox,
+    boot_line: gui::Label,
+    open_boot: gui::Button,
+    mods_list: gui::ListView<()>,
+    mod_up: gui::Button,
+    mod_down: gui::Button,
+    mod_on: gui::Button,
+    mod_off: gui::Button,
+    mod_refresh: gui::Button,
+    conflicts: gui::Edit,
     state: Rc<RefCell<State>>,
+    colors: Rc<RefCell<(HashSet<usize>, HashSet<usize>)>>,
     status_color: Rc<Cell<(u8, u8, u8)>>,
+    updating: Rc<Cell<bool>>,
     fonts: Rc<RefCell<Vec<DeleteObjectGuard<w::HFONT>>>>,
 }
 
-fn label(
-    wnd: &gui::WindowMain,
+fn label<P: GuiParent + 'static>(
+    parent: &P,
     text: &str,
     pos: (i32, i32),
     size: (i32, i32),
-    horz: gui::Horz,
 ) -> gui::Label {
     gui::Label::new(
-        wnd,
+        parent,
         gui::LabelOpts {
             text,
             position: gui::dpi(pos.0, pos.1),
             size: gui::dpi(size.0, size.1),
-            resize_behavior: (horz, gui::Vert::None),
             ..Default::default()
         },
     )
 }
 
-fn button(
-    wnd: &gui::WindowMain,
+fn button<P: GuiParent + 'static>(
+    parent: &P,
     text: &str,
     pos: (i32, i32),
     size: (i32, i32),
-    horz: gui::Horz,
 ) -> gui::Button {
     let (width, height) = gui::dpi(size.0, size.1);
     gui::Button::new(
-        wnd,
+        parent,
         gui::ButtonOpts {
             text,
             position: gui::dpi(pos.0, pos.1),
             width,
             height,
-            resize_behavior: (horz, gui::Vert::None),
             ..Default::default()
         },
     )
 }
 
-fn check(wnd: &gui::WindowMain, text: &str, y: i32, checked: bool) -> gui::CheckBox {
-    gui::CheckBox::new(
-        wnd,
-        gui::CheckBoxOpts {
-            text,
-            position: gui::dpi(16, y),
-            size: gui::dpi(WIDTH - 32, 22),
-            check_state: if checked {
-                co::BST::CHECKED
-            } else {
-                co::BST::UNCHECKED
-            },
-            resize_behavior: (gui::Horz::Resize, gui::Vert::None),
+fn edit<P: GuiParent + 'static>(
+    parent: &P,
+    pos: (i32, i32),
+    width: i32,
+    height: i32,
+    multiline: bool,
+) -> gui::Edit {
+    let (control_style, window_style) = if multiline {
+        (
+            co::ES::MULTILINE | co::ES::READONLY | co::ES::AUTOVSCROLL,
+            co::WS::CHILD | co::WS::VISIBLE | co::WS::VSCROLL | co::WS::TABSTOP,
+        )
+    } else {
+        (
+            co::ES::AUTOHSCROLL,
+            co::WS::CHILD | co::WS::VISIBLE | co::WS::TABSTOP | co::WS::GROUP,
+        )
+    };
+    gui::Edit::new(
+        parent,
+        gui::EditOpts {
+            position: gui::dpi(pos.0, pos.1),
+            width: gui::dpi_x(width),
+            height: gui::dpi(0, height).1,
+            control_style,
+            window_style,
             ..Default::default()
         },
     )
 }
 
-fn list(wnd: &gui::WindowMain, y: i32, height: i32, columns: &[(&str, i32)]) -> gui::ListView<()> {
+fn list<P: GuiParent + 'static>(
+    parent: &P,
+    pos: (i32, i32),
+    size: (i32, i32),
+    columns: &[(&str, i32)],
+) -> gui::ListView<()> {
     let columns: Vec<(&str, i32)> = columns
         .iter()
         .map(|&(title, width)| (title, gui::dpi_x(width)))
         .collect();
     gui::ListView::<()>::new(
-        wnd,
+        parent,
         gui::ListViewOpts {
-            position: gui::dpi(16, y),
-            size: gui::dpi(WIDTH - 32, height),
+            position: gui::dpi(pos.0, pos.1),
+            size: gui::dpi(size.0, size.1),
             columns: &columns,
             control_ex_style: co::LVS_EX::FULLROWSELECT | co::LVS_EX::DOUBLEBUFFER,
-            resize_behavior: (gui::Horz::Resize, gui::Vert::None),
             ..Default::default()
         },
     )
 }
 
-fn col(index: i32) -> i32 {
-    16 + 154 * index
+fn build_field(page: &gui::TabPage, field: &Field, x: i32, y: i32, l: &Layout) -> FieldUi {
+    label(page, &field.label, (x, y + 3), (l.label - 6, 20));
+    let cx = x + l.label;
+    let mut browse = None;
+    let mut control_width = l.control;
+    let mut hint_x = cx + l.control + 8;
+    if matches!(field.kind, Kind::Folder | Kind::File { .. }) {
+        control_width -= 30;
+        browse = Some(button(page, "...", (cx + control_width + 4, y), (26, 22)));
+    }
+    let ctl = match &field.kind {
+        Kind::Switch { .. } => Ctl::Check(gui::CheckBox::new(
+            page,
+            gui::CheckBoxOpts {
+                text: "",
+                position: gui::dpi(cx, y + 2),
+                size: gui::dpi(24, 20),
+                ..Default::default()
+            },
+        )),
+        Kind::Choice(choices) | Kind::Combo(choices) => {
+            let editable = matches!(field.kind, Kind::Combo(_));
+            let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
+            Ctl::Combo(
+                gui::ComboBox::new(
+                    page,
+                    gui::ComboBoxOpts {
+                        position: gui::dpi(cx, y),
+                        width: gui::dpi_x(l.control),
+                        control_style: if editable {
+                            co::CBS::DROPDOWN
+                        } else {
+                            co::CBS::DROPDOWNLIST
+                        },
+                        items: &labels,
+                        ..Default::default()
+                    },
+                ),
+                choices.clone(),
+                editable,
+            )
+        }
+        _ => Ctl::Edit(edit(page, (cx, y), control_width, 22, false)),
+    };
+    if matches!(ctl, Ctl::Check(_)) {
+        hint_x = cx + 30;
+    }
+    let hint = label(page, &field.help, (hint_x, y + 2), (l.hint + 20, ROW - 2));
+    FieldUi {
+        field: field.clone(),
+        ctl,
+        hint,
+        browse,
+    }
 }
 
-fn local_data_dir() -> String {
-    std::env::var_os("LOCALAPPDATA")
-        .map(|dir| PathBuf::from(dir).join("Leonida").display().to_string())
-        .unwrap_or_else(|| "Leonida".to_string())
+fn monitors() -> Vec<String> {
+    let mut found = Vec::new();
+    let _ = w::HDC::NULL.EnumDisplayMonitors(None, |monitor, _, _| {
+        if let Ok(info) = monitor.GetMonitorInfo() {
+            found.push(info.szDevice().trim_start_matches("\\\\.\\").to_string());
+        }
+        true
+    });
+    found
 }
 
 impl Window {
     fn new() -> Window {
+        let screens = monitors();
+        let env = Env {
+            monitors: screens.clone(),
+        };
+        let pages_data = form::pages(&env);
+        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let config_dir = root.join(config::DEFAULT_DIR);
+        let mut start_log = Vec::new();
+        let config = match Config::load(&config_dir) {
+            Ok(config) => config,
+            Err(error) => {
+                start_log.push(format!("Could not read the settings: {error}"));
+                Config::default()
+            }
+        };
+
         let wnd = gui::WindowMain::new(gui::WindowMainOpts {
             title: "Leonida",
             size: gui::dpi(WIDTH, HEIGHT),
@@ -168,177 +324,196 @@ impl Window {
                 | co::WS::CLIPCHILDREN
                 | co::WS::BORDER
                 | co::WS::VISIBLE
-                | co::WS::SIZEBOX
-                | co::WS::MINIMIZEBOX
-                | co::WS::MAXIMIZEBOX,
+                | co::WS::MINIMIZEBOX,
             class_bg_brush: gui::Brush::Color(co::COLOR::WINDOW),
             ..Default::default()
         });
-        let none = gui::Horz::None;
-        let stretch = gui::Horz::Resize;
-        let right = gui::Horz::Repos;
-
-        let title = label(&wnd, "Leonida", (16, 8), (300, 40), none);
+        let title = label(&wnd, "Leonida", (16, 8), (300, 40));
         let version = format!("Version {}", env!("CARGO_PKG_VERSION"));
-        let version_label = gui::Label::new(
+        let _ = gui::Label::new(
             &wnd,
             gui::LabelOpts {
                 text: &version,
                 position: gui::dpi(WIDTH - 200, 22),
                 size: gui::dpi(184, 20),
                 control_style: co::SS::RIGHT,
-                resize_behavior: (right, gui::Vert::None),
                 ..Default::default()
             },
         );
-        let _ = version_label;
+
+        let mut tab_pages = Vec::new();
+        let mut fields = Vec::new();
+        let mut headings = Vec::new();
+        for page in &pages_data {
+            let tab_page = gui::TabPage::new(&wnd, gui::TabPageOpts::default());
+            let (width, layout) = layout_for(page.columns.len());
+            for (column, items) in page.columns.iter().enumerate() {
+                let x = 12 + column as i32 * width;
+                for (row, field) in items.iter().enumerate() {
+                    let y = 10 + row as i32 * ROW;
+                    if field.kind == Kind::Heading {
+                        headings.push(label(&tab_page, &field.label, (x, y), (width - 20, 22)));
+                    } else {
+                        fields.push(build_field(&tab_page, field, x, y, &layout));
+                    }
+                }
+            }
+            tab_pages.push((page.title, tab_page));
+        }
+        let page_of = |id: &str| {
+            let at = pages_data
+                .iter()
+                .position(|page| page.id == id)
+                .unwrap_or(0);
+            tab_pages[at].1.clone()
+        };
+
+        let game_page = page_of(form::GAME);
+        let game_status = label(&game_page, "", (12, 130), (1000, 22));
+        let find_game = button(&game_page, "Look for the game", (12, 158), (170, 28));
+        let shader_line = label(&game_page, "", (12, 206), (700, 20));
+        let pipeline_line = label(&game_page, "", (12, 228), (700, 20));
+        let prepare = button(&game_page, "Prepare shaders", (12, 258), (170, 28));
         label(
-            &wnd,
-            "Plays GTA VI on your PC, using the Xbox Series game files you own.",
-            (16, 50),
-            (WIDTH - 32, 20),
-            stretch,
+            &game_page,
+            "Translates every shader and builds the pipelines (leonida pipelines). It takes a long time.",
+            (196, 263),
+            (800, 20),
         );
-        let status = label(&wnd, "", (16, 82), (440, 28), stretch);
-        let primary = button(&wnd, "Build game", (WIDTH - 160, 80), (144, 34), right);
-        let detail = label(&wnd, "", (16, 114), (WIDTH - 32, 20), stretch);
 
-        let game_heading = label(&wnd, "Game files", (16, 150), (300, 22), none);
-        let choose = button(
-            &wnd,
-            "Choose folder...",
-            (WIDTH - 160, 144),
-            (144, 28),
-            right,
+        let content_page = page_of(form::CONTENT);
+        let blocklist_line = label(&content_page, "", (12, 52), (700, 20));
+        let scan = button(&content_page, "Scan", (12, 80), (170, 28));
+        label(
+            &content_page,
+            "Finds what to hide and writes the blocklist (leonida content scan). Only nudity is filtered.",
+            (196, 85),
+            (800, 20),
         );
-        let games = list(
-            &wnd,
-            176,
-            84,
-            &[("Where", 330), ("Version", 170), ("Status", 100)],
-        );
-        let use_selected = button(&wnd, "Use selected", (col(0), 268), (146, 28), none);
-        let find_again = button(&wnd, "Look again", (col(1), 268), (146, 28), none);
-        let verify = button(&wnd, "Verify files", (col(2), 268), (146, 28), none);
-        let open_folder = button(&wnd, "Open folder", (col(3), 268), (146, 28), none);
 
-        let build_heading = label(&wnd, "Build", (16, 314), (300, 22), none);
-        let cancel = button(&wnd, "Cancel", (WIDTH - 160, 308), (144, 28), right);
-        let steps = list(&wnd, 340, 176, &[("Step", 290), ("Status", 290)]);
+        let trace_page = page_of(form::TRACE);
+        let trace = gui::CheckBox::new(
+            &trace_page,
+            gui::CheckBoxOpts {
+                text: "Record a boot trace when playing (--trace)",
+                position: gui::dpi(12, 14),
+                size: gui::dpi(500, 22),
+                ..Default::default()
+            },
+        );
+        let boot_line = label(&trace_page, "", (12, 48), (1000, 20));
+        let open_boot = button(&trace_page, "Open the boot folder", (12, 76), (190, 28));
+
+        let mods_page = page_of(form::MODS);
+        let mods_list = list(
+            &mods_page,
+            (12, 44),
+            (1030, 230),
+            &[
+                ("Priority", 70),
+                ("On", 50),
+                ("Package", 220),
+                ("Name", 240),
+                ("Version", 80),
+                ("Type", 80),
+                ("Problem", 270),
+            ],
+        );
+        let mod_up = button(&mods_page, "Lower priority", (12, 282), (130, 28));
+        let mod_down = button(&mods_page, "Higher priority", (150, 282), (130, 28));
+        let mod_on = button(&mods_page, "Turn on", (288, 282), (110, 28));
+        let mod_off = button(&mods_page, "Turn off", (406, 282), (110, 28));
+        let mod_refresh = button(&mods_page, "Look again", (524, 282), (110, 28));
+        label(
+            &mods_page,
+            "Files more than one package provides (the later in the order wins):",
+            (12, 322),
+            (800, 20),
+        );
+        let conflicts = edit(&mods_page, (12, 346), 1030, 90, true);
+
+        let pages_only: Vec<(&str, gui::TabPage)> = tab_pages
+            .iter()
+            .map(|(title, page)| (*title, page.clone()))
+            .collect();
+        let _ = gui::Tab::new(
+            &wnd,
+            gui::TabOpts {
+                position: gui::dpi(16, 52),
+                size: gui::dpi(WIDTH - 32, 490),
+                pages: &pages_only,
+                ..Default::default()
+            },
+        );
+
+        let play = button(&wnd, "Play", (16, 552), (150, 36));
+        let save = button(&wnd, "Save settings", (176, 552), (130, 36));
+        let revert = button(&wnd, "Revert", (314, 552), (100, 36));
+        let open_config = button(&wnd, "Open settings folder", (422, 552), (160, 36));
+        let status = label(&wnd, "", (596, 560), (WIDTH - 612, 22));
+        let job = label(&wnd, "", (16, 598), (600, 20));
         let progress = gui::ProgressBar::new(
             &wnd,
             gui::ProgressBarOpts {
-                position: gui::dpi(16, 524),
-                size: gui::dpi(WIDTH - 32, 12),
+                position: gui::dpi(630, 600),
+                size: gui::dpi(340, 14),
                 range: (0, 1000),
-                resize_behavior: (stretch, gui::Vert::None),
                 ..Default::default()
             },
         );
-        let play = button(&wnd, "Play game", (col(0), 544), (146, 28), none);
-        let shader_report = button(&wnd, "Shader report...", (col(1), 544), (146, 28), none);
-        let mods = button(&wnd, "Mods...", (col(2), 544), (146, 28), none);
-        let viewer = button(&wnd, "Model viewer...", (col(3), 544), (146, 28), none);
+        let cancel = button(&wnd, "Cancel", (984, 592), (100, 28));
+        let log = edit(&wnd, (16, 628), WIDTH - 32, 100, true);
 
-        let options_heading = label(&wnd, "Options", (16, 588), (300, 22), none);
-        let find_on_start = check(
-            &wnd,
-            "Look for the game files when Leonida opens",
-            614,
-            true,
-        );
-        let unavailable_options = [
-            check(
-                &wnd,
-                "Keep built files on disk, so the game starts faster next time",
-                638,
-                true,
-            ),
-            check(
-                &wnd,
-                "Upscale with AMD FSR 1 for higher frame rates",
-                662,
-                false,
-            ),
-            check(&wnd, "Unlock the frame rate", 686, false),
-        ];
-        label(&wnd, "Built files", (16, 720), (90, 20), none);
-        let _ = gui::Edit::new(
-            &wnd,
-            gui::EditOpts {
-                text: &local_data_dir(),
-                position: gui::dpi(110, 716),
-                width: gui::dpi_x(WIDTH - 236),
-                height: gui::dpi(0, 24).1,
-                control_style: co::ES::AUTOHSCROLL | co::ES::READONLY,
-                resize_behavior: (stretch, gui::Vert::None),
-                ..Default::default()
-            },
-        );
-        let output_change = button(&wnd, "Change...", (WIDTH - 116, 714), (100, 28), right);
-
-        let activity_heading = label(&wnd, "Activity", (16, 758), (300, 22), none);
-        let save_log = button(&wnd, "Save log...", (WIDTH - 264, 752), (120, 28), right);
-        let clear_log = button(&wnd, "Clear", (WIDTH - 136, 752), (120, 28), right);
-        let log = gui::Edit::new(
-            &wnd,
-            gui::EditOpts {
-                position: gui::dpi(16, 786),
-                width: gui::dpi_x(WIDTH - 32),
-                height: gui::dpi(0, HEIGHT - 798).1,
-                control_style: co::ES::MULTILINE | co::ES::READONLY | co::ES::AUTOVSCROLL,
-                window_style: co::WS::CHILD | co::WS::VISIBLE | co::WS::VSCROLL | co::WS::TABSTOP,
-                resize_behavior: (stretch, gui::Vert::Resize),
-                ..Default::default()
-            },
-        );
-
-        let settings = Settings::load();
-        find_on_start.set_check(settings.find_on_start);
+        let manifests = Manifest::builtin();
+        let form = Form::new(&config, &pages_data);
+        let mods = ModList::default();
         let window = Window {
             wnd,
             title,
             status,
-            detail,
-            primary,
-            headings: [
-                game_heading,
-                build_heading,
-                options_heading,
-                activity_heading,
-            ],
-            choose,
-            games,
-            use_selected,
-            find_again,
-            verify,
-            open_folder,
-            cancel,
-            steps,
-            progress,
             play,
-            shader_report,
-            mods,
-            viewer,
-            find_on_start,
-            unavailable_options,
-            output_change,
-            save_log,
-            clear_log,
+            save,
+            revert,
+            open_config,
+            job,
+            progress,
+            cancel,
             log,
+            fields: Rc::new(fields),
+            headings: Rc::new(headings),
+            pages: Rc::new(tab_pages.into_iter().map(|(_, page)| page).collect()),
+            game_status,
+            find_game,
+            shader_line,
+            pipeline_line,
+            prepare,
+            blocklist_line,
+            scan,
+            trace,
+            boot_line,
+            open_boot,
+            mods_list,
+            mod_up,
+            mod_down,
+            mod_on,
+            mod_off,
+            mod_refresh,
+            conflicts,
             state: Rc::new(RefCell::new(State {
-                manifests: Manifest::builtin(),
-                settings,
-                game: GameState::default(),
-                found: Vec::new(),
+                root,
+                manifests,
+                monitors: screens.len(),
+                form,
                 jobs: Jobs::default(),
-                steps: build_steps::initial_reports(),
-                scan: None,
-                log: Vec::new(),
+                log: start_log,
                 started: Instant::now(),
-                shown_status: String::new(),
+                prefs: Settings::load(),
+                mods,
+                shown_job: String::new(),
             })),
+            colors: Rc::new(RefCell::new((HashSet::new(), HashSet::new()))),
             status_color: Rc::new(Cell::new(GREEN)),
+            updating: Rc::new(Cell::new(false)),
             fonts: Rc::new(RefCell::new(Vec::new())),
         };
         window.events();
@@ -354,53 +529,69 @@ impl Window {
         let me = self.clone();
         self.wnd.on().wm_timer(TIMER, move || me.tick());
         let me = self.clone();
-        self.wnd.on().wm_ctl_color_static(move |p| {
-            p.hdc.SetBkMode(co::BKMODE::TRANSPARENT)?;
-            if p.hwnd.ptr() == me.status.hwnd().ptr() {
-                let (r, g, b) = me.status_color.get();
-                p.hdc.SetTextColor(w::COLORREF::from_rgb(r, g, b))?;
+        self.wnd
+            .on()
+            .wm_ctl_color_static(move |p| me.paint(&p.hdc, &p.hwnd));
+        for page in self.pages.iter() {
+            let me = self.clone();
+            page.on()
+                .wm_ctl_color_static(move |p| me.paint(&p.hdc, &p.hwnd));
+        }
+
+        for index in 0..self.fields.len() {
+            let me = self.clone();
+            match &self.fields[index].ctl {
+                Ctl::Check(check) => check.on().bn_clicked(move || {
+                    me.changed(index);
+                    Ok(())
+                }),
+                Ctl::Combo(combo, _, editable) => {
+                    let again = self.clone();
+                    combo.on().cbn_sel_change(move || {
+                        me.changed(index);
+                        Ok(())
+                    });
+                    if *editable {
+                        combo.on().cbn_edit_change(move || {
+                            again.changed(index);
+                            Ok(())
+                        });
+                    }
+                }
+                Ctl::Edit(edit) => edit.on().en_change(move || {
+                    me.changed(index);
+                    Ok(())
+                }),
             }
-            Ok(w::HBRUSH::GetSysColorBrush(co::COLOR::WINDOW)?)
-        });
+            if let Some(browse) = &self.fields[index].browse {
+                let me = self.clone();
+                browse.on().bn_clicked(move || {
+                    me.browse(index);
+                    Ok(())
+                });
+            }
+        }
 
         let me = self.clone();
-        self.primary.on().bn_clicked(move || {
-            me.start_build();
+        self.play.on().bn_clicked(move || {
+            me.start_playing();
             Ok(())
         });
         let me = self.clone();
-        self.choose.on().bn_clicked(move || {
-            if let Some(path) = rfd::FileDialog::new()
-                .set_title("Choose the folder that contains MicrosoftGame.Config")
-                .pick_folder()
-            {
-                me.set_game(path);
-            }
+        self.save.on().bn_clicked(move || {
+            me.save_settings();
             Ok(())
         });
         let me = self.clone();
-        self.use_selected.on().bn_clicked(move || {
-            let index = me
-                .games
-                .items()
-                .last_selected()
-                .map(|item| item.index() as usize);
-            let path = index.and_then(|index| me.state.borrow().found.get(index).cloned());
-            if let Some(path) = path {
-                me.set_game(path);
-            }
+        self.revert.on().bn_clicked(move || {
+            me.revert_settings();
             Ok(())
         });
         let me = self.clone();
-        self.find_again.on().bn_clicked(move || {
-            me.start_find();
-            Ok(())
-        });
-        let me = self.clone();
-        self.open_folder.on().bn_clicked(move || {
-            if let Some(path) = me.state.borrow().game.path.clone() {
-                let _ = std::process::Command::new("explorer").arg(path).spawn();
-            }
+        self.open_config.on().bn_clicked(move || {
+            let dir = me.paths().config_dir;
+            let _ = std::fs::create_dir_all(&dir);
+            open_folder(&dir);
             Ok(())
         });
         let me = self.clone();
@@ -410,94 +601,129 @@ impl Window {
             Ok(())
         });
         let me = self.clone();
-        self.shader_report.on().bn_clicked(move || {
-            let report = me
-                .state
-                .borrow()
-                .scan
-                .as_ref()
-                .map(|scan| ScanSummary::of(scan).report());
-            let target = rfd::FileDialog::new()
-                .set_title("Save shader report")
-                .set_file_name("shader-report.txt")
-                .save_file();
-            if let (Some(report), Some(target)) = (report, target) {
-                match std::fs::write(&target, report) {
-                    Ok(()) => me.log(&format!("Shader report saved to {}", target.display())),
-                    Err(error) => me.log(&format!("Could not save the shader report: {error}")),
-                }
-            }
+        self.find_game.on().bn_clicked(move || {
+            me.start_find();
             Ok(())
         });
         let me = self.clone();
-        self.find_on_start.on().bn_clicked(move || {
-            let settings = {
+        self.prepare.on().bn_clicked(move || {
+            me.start_prepare();
+            Ok(())
+        });
+        let me = self.clone();
+        self.scan.on().bn_clicked(move || {
+            me.start_scan();
+            Ok(())
+        });
+        let me = self.clone();
+        self.trace.on().bn_clicked(move || {
+            let prefs = {
                 let mut state = me.state.borrow_mut();
-                state.settings.find_on_start = me.find_on_start.is_checked();
-                state.settings.clone()
+                state.prefs.trace = me.trace.is_checked();
+                state.prefs.clone()
             };
-            me.save_settings(&settings);
-            Ok(())
-        });
-        let me = self.clone();
-        self.save_log.on().bn_clicked(move || {
-            let text = me.state.borrow().log.join("\r\n");
-            let target = rfd::FileDialog::new()
-                .set_title("Save log")
-                .set_file_name("leonida-log.txt")
-                .save_file();
-            if let Some(target) = target
-                && let Err(error) = std::fs::write(&target, text)
-            {
-                me.log(&format!("Could not save the log: {error}"));
+            if let Err(error) = prefs.save() {
+                me.log(&format!("Could not save the trace choice: {error}"));
             }
             Ok(())
         });
         let me = self.clone();
-        self.clear_log.on().bn_clicked(move || {
-            me.state.borrow_mut().log.clear();
-            me.log.set_text("")?;
+        self.open_boot.on().bn_clicked(move || {
+            let dir = me.paths().boot_dir();
+            open_folder(if dir.is_dir() {
+                &dir
+            } else {
+                dir.parent().unwrap_or(&dir)
+            });
             Ok(())
         });
+        for (button, action) in [
+            (&self.mod_up, ModAction::Lower),
+            (&self.mod_down, ModAction::Higher),
+            (&self.mod_on, ModAction::On),
+            (&self.mod_off, ModAction::Off),
+        ] {
+            let me = self.clone();
+            button.on().bn_clicked(move || {
+                me.mod_action(action);
+                Ok(())
+            });
+        }
+        let me = self.clone();
+        self.mod_refresh.on().bn_clicked(move || {
+            me.scan_mods();
+            Ok(())
+        });
+    }
+
+    fn paint(&self, hdc: &w::HDC, hwnd: &w::HWND) -> w::AnyResult<w::HBRUSH> {
+        hdc.SetBkMode(co::BKMODE::TRANSPARENT)?;
+        let key = hwnd.ptr() as usize;
+        let (errors, notes) = &*self.colors.borrow();
+        let (r, g, b) = if hwnd.ptr() == self.status.hwnd().ptr() {
+            self.status_color.get()
+        } else if errors.contains(&key) {
+            RED
+        } else if notes.contains(&key) {
+            AMBER
+        } else if self
+            .fields
+            .iter()
+            .any(|ui| ui.hint.hwnd().ptr() == hwnd.ptr())
+        {
+            GRAY
+        } else {
+            (0, 0, 0)
+        };
+        hdc.SetTextColor(w::COLORREF::from_rgb(r, g, b))?;
+        Ok(w::HBRUSH::GetSysColorBrush(co::COLOR::WINDOW)?)
     }
 
     fn on_create(&self) -> Result<(), Error> {
         let mut fonts = self.fonts.borrow_mut();
         let title = font(30, co::FW::SEMIBOLD)?;
-        let status = font(18, co::FW::SEMIBOLD)?;
+        let status = font(16, co::FW::SEMIBOLD)?;
         let heading = font(16, co::FW::SEMIBOLD)?;
+        let small = font(13, co::FW::NORMAL)?;
         set_font(self.title.hwnd(), &title);
         set_font(self.status.hwnd(), &status);
-        for label in &self.headings {
+        for label in self.headings.iter() {
             set_font(label.hwnd(), &heading);
         }
-        fonts.extend([title, status, heading]);
+        for ui in self.fields.iter() {
+            set_font(ui.hint.hwnd(), &small);
+        }
+        fonts.extend([title, status, heading, small]);
         drop(fonts);
-
-        for hwnd in [
-            self.verify.hwnd(),
-            self.play.hwnd(),
-            self.mods.hwnd(),
-            self.viewer.hwnd(),
-            self.output_change.hwnd(),
-        ] {
-            let _ = hwnd.EnableWindow(false);
-        }
-        for option in &self.unavailable_options {
-            let _ = option.hwnd().EnableWindow(false);
-        }
         self.wnd.hwnd().SetTimer(TIMER, 100, None)?;
 
-        let (saved, find) = {
-            let state = self.state.borrow();
-            (state.settings.game.clone(), state.settings.find_on_start)
-        };
-        match saved {
-            Some(path) => self.set_game(path),
-            None if find => self.start_find(),
-            None => self.refresh(),
+        let pending = std::mem::take(&mut self.state.borrow_mut().log);
+        for line in pending {
+            self.log(&line);
+        }
+        self.trace.set_check(self.state.borrow().prefs.trace);
+        self.show_all();
+        self.scan_mods();
+        let has_game = !self
+            .state
+            .borrow()
+            .form
+            .value("general.game_folder")
+            .is_empty();
+        if !has_game {
+            self.start_find();
         }
         Ok(())
+    }
+
+    fn paths(&self) -> Paths {
+        let state = self.state.borrow();
+        let general = state
+            .form
+            .build()
+            .map(|config| config.general)
+            .unwrap_or_else(|_| state.form.config().general.clone());
+        Paths::of(&state.root, config::DEFAULT_DIR, &general)
     }
 
     fn log(&self, line: &str) {
@@ -512,71 +738,375 @@ impl Window {
         self.log.replace_selection(&format!("{stamped}\r\n"));
     }
 
-    fn save_settings(&self, settings: &Settings) {
-        if let Err(error) = settings.save() {
-            self.log(&format!("Could not save settings: {error}"));
+    fn read(&self, index: usize) -> String {
+        let ui = &self.fields[index];
+        match &ui.ctl {
+            Ctl::Check(check) => {
+                let Kind::Switch { on, off } = &ui.field.kind else {
+                    return String::new();
+                };
+                if check.is_checked() { on } else { off }.clone()
+            }
+            Ctl::Combo(combo, choices, editable) => {
+                if *editable {
+                    combo.hwnd().GetWindowText().unwrap_or_default()
+                } else {
+                    combo
+                        .items()
+                        .selected_index()
+                        .and_then(|at| choices.get(at as usize))
+                        .map(|choice| choice.value.clone())
+                        .unwrap_or_default()
+                }
+            }
+            Ctl::Edit(edit) => edit.text().unwrap_or_default(),
         }
     }
 
-    fn set_game(&self, path: PathBuf) {
-        let (message, settings) = {
-            let mut state = self.state.borrow_mut();
-            state.game = GameState::recognise(path.clone(), &state.manifests);
-            if !state.found.contains(&path) {
-                state.found.insert(0, path.clone());
+    fn write(&self, index: usize, text: &str) {
+        let ui = &self.fields[index];
+        self.updating.set(true);
+        match &ui.ctl {
+            Ctl::Check(check) => {
+                let Kind::Switch { on, .. } = &ui.field.kind else {
+                    return;
+                };
+                check.set_check(text == on);
             }
-            state.steps = build_steps::initial_reports();
-            state.scan = None;
-            state.settings.game = Some(path.clone());
-            let message = match &state.game.version {
-                Some(version) => format!("Using {version} in {}", path.display()),
-                None => format!("{} is not a supported version of the game", path.display()),
-            };
-            (message, state.settings.clone())
-        };
-        self.save_settings(&settings);
-        self.log(&message);
+            Ctl::Combo(combo, choices, editable) => {
+                if *editable {
+                    let _ = combo.hwnd().SetWindowText(text);
+                } else {
+                    let at = choices.iter().position(|c| c.value == text);
+                    combo.items().select(at.map(|at| at as u32));
+                }
+            }
+            Ctl::Edit(edit) => {
+                if edit.text().unwrap_or_default() != text {
+                    let _ = edit.set_text(text);
+                }
+            }
+        }
+        self.updating.set(false);
+    }
+
+    fn index_of(&self, id: &str) -> Option<usize> {
+        self.fields.iter().position(|ui| ui.field.id == id)
+    }
+
+    fn show_all(&self) {
+        for index in 0..self.fields.len() {
+            let text = self
+                .state
+                .borrow()
+                .form
+                .value(&self.fields[index].field.id)
+                .to_string();
+            self.write(index, &text);
+        }
         self.refresh();
     }
 
-    fn wake() -> Wake {
-        Arc::new(|| {})
+    fn changed(&self, index: usize) {
+        if self.updating.get() {
+            return;
+        }
+        let text = self.read(index);
+        let id = self.fields[index].field.id.clone();
+        let others = self.state.borrow_mut().form.set(&id, &text);
+        for other in others {
+            if let Some(at) = self.index_of(&other) {
+                let text = self.state.borrow().form.value(&other).to_string();
+                self.write(at, &text);
+            }
+        }
+        if id == "mods.load_order" {
+            self.rebuild_mods(None);
+        }
+        self.refresh();
+    }
+
+    fn browse(&self, index: usize) {
+        let ui = &self.fields[index];
+        let picked = match &ui.field.kind {
+            Kind::Folder => rfd::FileDialog::new()
+                .set_title(format!("Choose {}", ui.field.label.to_lowercase()))
+                .pick_folder(),
+            Kind::File { extension } => rfd::FileDialog::new()
+                .set_title(format!("Choose {}", ui.field.label))
+                .add_filter(*extension, &[*extension])
+                .pick_file(),
+            _ => None,
+        };
+        if let Some(path) = picked {
+            let text = path.display().to_string();
+            self.write(index, &text);
+            self.changed(index);
+        }
+    }
+
+    /// Checks everything and redraws what depends on it: the hints, the enabled fields, the status line.
+    fn refresh(&self) {
+        let (errors, dirty, game_line, manifests_ok) = {
+            let state = self.state.borrow();
+            let mut errors: Vec<FieldError> = Vec::new();
+            match state.form.build() {
+                Ok(config) => {
+                    let paths = Paths::of(&state.root, config::DEFAULT_DIR, &config.general);
+                    errors.extend(checks::check(
+                        &config,
+                        &World {
+                            manifests: &state.manifests,
+                            paths: &paths,
+                            monitors: state.monitors,
+                        },
+                    ));
+                }
+                Err(found) => errors.extend(found),
+            }
+            (errors, state.form.is_dirty(), (), ())
+        };
+        let _ = (game_line, manifests_ok);
+        let mut by_field = BTreeMap::new();
+        let mut general = Vec::new();
+        for error in errors {
+            match error.id.clone() {
+                Some(id) if self.index_of(&id).is_some() => {
+                    by_field.entry(id).or_insert(error);
+                }
+                _ => general.push(error),
+            }
+        }
+        {
+            let mut colors = self.colors.borrow_mut();
+            colors.0.clear();
+            colors.1.clear();
+        }
+        for ui in self.fields.iter() {
+            let enabled = self.state.borrow().form.is_enabled(&ui.field);
+            let (text, severity) = match by_field.get(&ui.field.id) {
+                Some(error) => (error.message.clone(), Some(error.severity)),
+                None => (ui.field.help.clone(), None),
+            };
+            let key = ui.hint.hwnd().ptr() as usize;
+            match severity {
+                Some(Severity::Error) => self.colors.borrow_mut().0.insert(key),
+                Some(Severity::Note) => self.colors.borrow_mut().1.insert(key),
+                None => false,
+            };
+            let _ = ui.hint.hwnd().SetWindowText(&text);
+            ui.hint.hwnd().InvalidateRect(None, true).ok();
+            match &ui.ctl {
+                Ctl::Check(c) => c.hwnd().EnableWindow(enabled),
+                Ctl::Combo(c, _, _) => c.hwnd().EnableWindow(enabled),
+                Ctl::Edit(c) => c.hwnd().EnableWindow(enabled),
+            };
+            if let Some(browse) = &ui.browse {
+                browse.hwnd().EnableWindow(enabled);
+            }
+        }
+        let blocking = by_field
+            .values()
+            .chain(general.iter())
+            .filter(|e| e.severity == Severity::Error)
+            .count();
+        let busy = self.state.borrow().jobs.is_busy();
+        let (color, text) = if blocking > 0 {
+            let first = by_field
+                .values()
+                .chain(general.iter())
+                .find(|e| e.severity == Severity::Error)
+                .map(|e| match &e.id {
+                    Some(id) => format!("{id}: {}", e.message),
+                    None => e.message.clone(),
+                })
+                .unwrap_or_default();
+            (RED, format!("{blocking} problem(s). {first}"))
+        } else if dirty {
+            (AMBER, "Unsaved changes".to_string())
+        } else {
+            (GREEN, "Settings saved".to_string())
+        };
+        self.status_color.set(color);
+        let _ = self.status.hwnd().SetWindowText(&text);
+        self.save.hwnd().EnableWindow(dirty && blocking == 0);
+        self.revert.hwnd().EnableWindow(dirty);
+        self.play.hwnd().EnableWindow(blocking == 0 && !busy);
+        self.prepare.hwnd().EnableWindow(blocking == 0 && !busy);
+        self.scan.hwnd().EnableWindow(blocking == 0 && !busy);
+        self.find_game.hwnd().EnableWindow(!busy);
+        self.cancel.hwnd().EnableWindow(busy);
+        self.refresh_info();
+        self.wnd.hwnd().InvalidateRect(None, true).ok();
+    }
+
+    fn refresh_info(&self) {
+        let paths = self.paths();
+        let now = SystemTime::now();
+        let made = cache::inspect(&paths.output_dir);
+        let game = match &paths.game_dir {
+            None => {
+                "No game folder chosen. Look for the game, or choose the folder above.".to_string()
+            }
+            Some(dir) => {
+                let state = self.state.borrow();
+                match checks::game_state(dir, &state.manifests) {
+                    Ok(GameState {
+                        version,
+                        exe_present,
+                        ..
+                    }) => format!(
+                        "{} in {}{}",
+                        version.unwrap_or_default(),
+                        dir.display(),
+                        if exe_present {
+                            ""
+                        } else {
+                            " (the game's executable is not there)"
+                        }
+                    ),
+                    Err(message) => message,
+                }
+            }
+        };
+        let _ = self.game_status.hwnd().SetWindowText(&game);
+        let _ = self.shader_line.hwnd().SetWindowText(&format!(
+            "{}   ({})",
+            made.shader_line(now),
+            paths.output_dir.display()
+        ));
+        let _ = self
+            .pipeline_line
+            .hwnd()
+            .SetWindowText(&made.pipeline_line(now));
+        let _ = self.blocklist_line.hwnd().SetWindowText(&format!(
+            "{}   ({})",
+            made.blocklist_line(now),
+            cache::BLOCKLIST
+        ));
+        let _ = self.boot_line.hwnd().SetWindowText(&format!(
+            "Traces are written to {}",
+            paths.boot_dir().display()
+        ));
+    }
+
+    fn save_settings(&self) -> bool {
+        let built = self.state.borrow().form.build();
+        let config = match built {
+            Ok(config) => config,
+            Err(errors) => {
+                for error in errors {
+                    self.log(&format!(
+                        "{}: {}",
+                        error.id.unwrap_or_default(),
+                        error.message
+                    ));
+                }
+                return false;
+            }
+        };
+        let dir = self.paths().config_dir;
+        let old = self.state.borrow().form.config().clone();
+        match save_changed(&dir, &old, &config) {
+            Ok(files) => {
+                self.state.borrow_mut().form.reload(&config);
+                if !files.is_empty() {
+                    self.log(&format!("Saved {} in {}", files.join(", "), dir.display()));
+                }
+                self.refresh();
+                true
+            }
+            Err(error) => {
+                self.log(&format!("Could not save the settings: {error}"));
+                false
+            }
+        }
+    }
+
+    fn revert_settings(&self) {
+        let dir = self.paths().config_dir;
+        match Config::load(&dir) {
+            Ok(config) => {
+                self.state.borrow_mut().form.reload(&config);
+                self.show_all();
+                self.rebuild_mods(None);
+                self.log("Settings read again from disk");
+            }
+            Err(error) => self.log(&format!("Could not read the settings: {error}")),
+        }
+    }
+
+    fn start_playing(&self) {
+        if self.state.borrow().form.is_dirty() && !self.save_settings() {
+            return;
+        }
+        let paths = self.paths();
+        let options = {
+            let state = self.state.borrow();
+            PlayOptions {
+                trace: state.prefs.trace,
+                frame_limit: Some(state.form.value(form::FRAME_LIMIT).to_string()),
+            }
+        };
+        let Ok(program) = std::env::current_exe() else {
+            self.log("Could not find the Leonida program to start");
+            return;
+        };
+        let launch = play::play(&program, &paths, &options);
+        self.log(&format!("Starting: {}", launch.describe()));
+        if let Err(error) = launch.command().spawn() {
+            self.log(&format!("Could not start the game: {error}"));
+        }
+    }
+
+    fn start_command(
+        &self,
+        name: &'static str,
+        build: fn(&std::path::Path, &Paths) -> play::Launch,
+    ) {
+        if self.state.borrow().form.is_dirty() && !self.save_settings() {
+            return;
+        }
+        let Ok(program) = std::env::current_exe() else {
+            self.log("Could not find the Leonida program to start");
+            return;
+        };
+        let launch = build(&program, &self.paths());
+        let started = self
+            .state
+            .borrow_mut()
+            .jobs
+            .start(name, wake(), move |reporter| {
+                Outcome::Command(child::run(&launch, name, reporter))
+            });
+        if started {
+            self.log(&format!("{name} started"));
+        }
+        self.refresh();
+    }
+
+    fn start_prepare(&self) {
+        self.start_command("Preparing shaders", play::prepare_shaders);
+    }
+
+    fn start_scan(&self) {
+        self.start_command("Scanning content", play::scan_content);
     }
 
     fn start_find(&self) {
-        let started = {
-            let mut state = self.state.borrow_mut();
-            let manifests = state.manifests.clone();
-            state.jobs.start(
-                "Looking for the game files",
-                Self::wake(),
-                move |reporter| {
-                    reporter.progress(
-                        0.1,
-                        "Checking Downloads, Desktop, Documents, Games and the top of each drive",
-                    );
-                    Outcome::GamesFound(game::find_games(&manifests))
-                },
-            )
-        };
+        let manifests = self.state.borrow().manifests.clone();
+        let started = self.state.borrow_mut().jobs.start(
+            "Looking for the game files",
+            wake(),
+            move |reporter| {
+                reporter.busy(
+                    "Checking Downloads, Desktop, Documents, Games and the top of each drive",
+                );
+                Outcome::GamesFound(game::find_games(&manifests))
+            },
+        );
         if started {
             self.log("Looking for the game files...");
-        }
-        self.refresh();
-    }
-
-    fn start_build(&self) {
-        let started = {
-            let mut state = self.state.borrow_mut();
-            let game = state.game.path.clone();
-            let manifests = state.manifests.clone();
-            state.steps = build_steps::initial_reports();
-            state.jobs.start("Building", Self::wake(), move |reporter| {
-                build_steps::run_build(game, manifests, reporter)
-            })
-        };
-        if started {
-            self.log("Build started");
         }
         self.refresh();
     }
@@ -595,10 +1125,24 @@ impl Window {
             self.log(line);
         }
         if let Some((title, fraction, message)) = running {
-            self.progress.set_position((fraction * 1000.0) as u32);
-            self.show_status(ORANGE, &format!("{title}..."), &message)?;
+            match fraction {
+                Some(fraction) => {
+                    self.progress.set_marquee(false);
+                    self.progress.set_position((fraction * 1000.0) as u32);
+                }
+                None => self.progress.set_marquee(true),
+            }
+            let text = format!("{title}... {message}");
+            if self.state.borrow().shown_job != text {
+                self.state.borrow_mut().shown_job = text.clone();
+                self.job.hwnd().SetWindowText(&text)?;
+            }
         }
         if let Some(outcome) = polled.finished {
+            self.progress.set_marquee(false);
+            self.progress.set_position(0);
+            self.state.borrow_mut().shown_job.clear();
+            self.job.hwnd().SetWindowText("")?;
             self.finish(outcome);
             self.refresh();
         }
@@ -607,144 +1151,192 @@ impl Window {
 
     fn finish(&self, outcome: Outcome) {
         match outcome {
-            Outcome::GamesFound(found) => {
-                let count = found.len();
-                {
-                    let mut state = self.state.borrow_mut();
-                    for path in found.iter().rev() {
-                        if !state.found.contains(path) {
-                            state.found.insert(0, path.clone());
+            Outcome::GamesFound(found) => match found.as_slice() {
+                [] => self.log("No game files found. Choose the folder on the Game tab."),
+                [first, rest @ ..] => {
+                    if !rest.is_empty() {
+                        self.log(&format!(
+                            "Found {} copies of the game files; using the first. Others:",
+                            found.len()
+                        ));
+                        for other in rest {
+                            self.log(&format!("  {}", other.display()));
                         }
                     }
-                }
-                match count {
-                    0 => self
-                        .log("No game files found. Use Choose folder... to point Leonida at them."),
-                    1 => self.set_game(found[0].clone()),
-                    n => self.log(&format!(
-                        "Found {n} copies of the game files. Pick one and press Use selected."
-                    )),
-                }
-            }
-            Outcome::Build { steps, scan } => {
-                {
-                    let mut state = self.state.borrow_mut();
-                    state.steps = steps;
-                    if scan.is_some() {
-                        state.scan = scan;
+                    if let Some(at) = self.index_of("general.game_folder") {
+                        let text = first.display().to_string();
+                        self.write(at, &text);
+                        self.changed(at);
+                        self.log(&format!("Using {text}"));
                     }
                 }
-                self.log("Build finished");
+            },
+            Outcome::Command(result) => {
+                if result.success {
+                    self.log(&format!("{} finished", result.name));
+                } else {
+                    self.log(&format!("{} failed: {}", result.name, result.detail));
+                }
             }
         }
     }
 
-    fn show_status(&self, color: (u8, u8, u8), status: &str, detail: &str) -> Result<(), Error> {
-        let key = format!("{status}|{detail}");
-        if self.state.borrow().shown_status == key {
-            return Ok(());
+    fn scan_mods(&self) {
+        let (root, version) = {
+            let state = self.state.borrow();
+            (state.root.clone(), game_version(&state.manifests))
+        };
+        match modlist::inspect(&root, &version, None) {
+            Ok(overview) => {
+                for note in &overview.notes {
+                    self.log(&format!("mods: {note}"));
+                }
+                let order = load_order(self.state.borrow().form.value("mods.load_order"));
+                self.state.borrow_mut().mods = ModList::new(&overview.installed, &order);
+                self.draw_mods(None);
+                self.update_conflicts();
+            }
+            Err(error) => self.log(&format!("Could not read the mods: {error}")),
         }
-        self.state.borrow_mut().shown_status = key;
-        self.status_color.set(color);
-        self.status
-            .hwnd()
-            .SetWindowText(&format!("\u{25CF}  {status}"))?;
-        self.detail.hwnd().SetWindowText(detail)?;
-        Ok(())
     }
 
-    fn refresh(&self) {
-        let _ = self.try_refresh();
-    }
-
-    fn try_refresh(&self) -> Result<(), Error> {
-        let state = self.state.borrow();
-        let busy = state.jobs.is_busy();
-        let supported = state.game.is_supported();
-        let built = STEPS
+    /// Rebuilds the list from the load order text, after it was typed.
+    fn rebuild_mods(&self, _selected: Option<usize>) {
+        let order = load_order(self.state.borrow().form.value("mods.load_order"));
+        let installed: Vec<modlist::Installed> = self
+            .state
+            .borrow()
+            .mods
+            .items()
             .iter()
-            .zip(&state.steps)
-            .filter(|(step, _)| step.available)
-            .all(|(_, report)| report.state == StepState::Done);
+            .filter(|item| item.problem.as_deref() != Some("not found in Mods"))
+            .map(|item| modlist::Installed {
+                id: item.id.clone(),
+                title: item.title.clone(),
+                version: item.version.clone(),
+                kind: item.kind.clone(),
+                author: String::new(),
+                problem: item.problem.clone(),
+            })
+            .collect();
+        self.state.borrow_mut().mods = ModList::new(&installed, &order);
+        self.draw_mods(None);
+        self.update_conflicts();
+    }
 
-        self.games.items().delete_all()?;
-        for path in &state.found {
-            let recognised = GameState::recognise(path.clone(), &state.manifests);
-            let version = recognised
-                .version
-                .unwrap_or_else(|| "Not supported".to_string());
-            let status = if state.game.path.as_ref() == Some(path) {
-                "In use"
+    fn draw_mods(&self, select: Option<usize>) {
+        let _ = self.mods_list.items().delete_all();
+        let items = self.state.borrow().mods.items().to_vec();
+        let mut priority = 0;
+        for item in &items {
+            let place = if item.enabled {
+                priority += 1;
+                priority.to_string()
             } else {
-                ""
+                String::new()
             };
-            self.games.items().add(
-                &[path.display().to_string(), version, status.to_string()],
+            let _ = self.mods_list.items().add(
+                &[
+                    place,
+                    if item.enabled { "yes" } else { "" }.to_string(),
+                    item.id.clone(),
+                    item.title.clone(),
+                    item.version.clone(),
+                    item.kind.clone(),
+                    item.problem.clone().unwrap_or_default(),
+                ],
                 None,
                 (),
-            )?;
+            );
         }
-
-        self.steps.items().delete_all()?;
-        for report in &state.steps {
-            let status = match report.state {
-                StepState::Done => format!("Done: {}", report.detail),
-                StepState::Failed => format!("Failed: {}", report.detail),
-                StepState::Waiting if report.detail.is_empty() => "Waiting".to_string(),
-                StepState::Waiting => report.detail.clone(),
-                StepState::NotBuiltYet => "Not available yet".to_string(),
-            };
-            self.steps
-                .items()
-                .add(&[report.name.to_string(), status], None, ())?;
+        if let Some(at) = select
+            && let Some(item) = self.mods_list.items().iter().nth(at)
+        {
+            let _ = item.select(true);
         }
-
-        self.primary.hwnd().EnableWindow(supported && !busy);
-        self.choose.hwnd().EnableWindow(!busy);
-        self.find_again.hwnd().EnableWindow(!busy);
-        self.use_selected
-            .hwnd()
-            .EnableWindow(!busy && !state.found.is_empty());
-        self.open_folder
-            .hwnd()
-            .EnableWindow(state.game.path.is_some());
-        let cancelling = state.jobs.running().is_some_and(|job| job.cancelling());
-        self.cancel.hwnd().EnableWindow(busy && !cancelling);
-        self.shader_report
-            .hwnd()
-            .EnableWindow(!busy && state.scan.is_some());
-
-        if busy {
-            return Ok(());
-        }
-        self.progress.set_position(if built { 1000 } else { 0 });
-        let (color, status, detail) = match (&state.game.path, &state.game.version) {
-            (None, _) => (
-                RED,
-                "Game files not found".to_string(),
-                "Choose the folder that contains MicrosoftGame.Config, or press Look again."
-                    .to_string(),
-            ),
-            (Some(path), None) => (
-                RED,
-                "These game files aren't supported".to_string(),
-                format!("{} isn't the Xbox Series version 1.0.2.1.", path.display()),
-            ),
-            (Some(_), Some(_)) if built => (
-                GREEN,
-                "Built".to_string(),
-                "Everything that can be prepared is ready. Playing isn't available yet."
-                    .to_string(),
-            ),
-            (Some(path), Some(version)) => (
-                GREEN,
-                "Ready to build".to_string(),
-                format!("{version} in {}", path.display()),
-            ),
-        };
-        drop(state);
-        self.show_status(color, &status, &detail)
     }
+
+    fn mod_action(&self, action: ModAction) {
+        let Some(index) = self
+            .mods_list
+            .items()
+            .last_selected()
+            .map(|item| item.index() as usize)
+        else {
+            return;
+        };
+        let (moved, order) = {
+            let mut state = self.state.borrow_mut();
+            let moved = match action {
+                ModAction::Lower => state.mods.move_up(index),
+                ModAction::Higher => state.mods.move_down(index),
+                ModAction::On => state.mods.set_enabled(index, true),
+                ModAction::Off => state.mods.set_enabled(index, false),
+            };
+            (moved, state.mods.load_order())
+        };
+        self.draw_mods(moved);
+        if let Some(at) = self.index_of("mods.load_order") {
+            let text = order.join(", ");
+            self.write(at, &text);
+            self.state.borrow_mut().form.set("mods.load_order", &text);
+        }
+        self.update_conflicts();
+        self.refresh();
+    }
+
+    fn update_conflicts(&self) {
+        let (root, version, order) = {
+            let state = self.state.borrow();
+            (
+                state.root.clone(),
+                game_version(&state.manifests),
+                state.mods.load_order(),
+            )
+        };
+        let text = match modlist::inspect(&root, &version, Some(&order)) {
+            Ok(overview) if overview.conflicts.is_empty() => "No contested files.".to_string(),
+            Ok(overview) => overview
+                .conflicts
+                .iter()
+                .map(modlist::conflict_line)
+                .collect::<Vec<_>>()
+                .join("\r\n"),
+            Err(error) => error,
+        };
+        let _ = self.conflicts.set_text(&text);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ModAction {
+    Lower,
+    Higher,
+    On,
+    Off,
+}
+
+fn load_order(text: &str) -> Vec<String> {
+    text.split([',', ';'])
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn game_version(manifests: &[Manifest]) -> String {
+    manifests
+        .last()
+        .map(|manifest| manifest.version.clone())
+        .unwrap_or_default()
+}
+
+fn wake() -> Wake {
+    Arc::new(|| {})
+}
+
+fn open_folder(path: &std::path::Path) {
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
 }
 
 fn font(height: i32, weight: co::FW) -> Result<DeleteObjectGuard<w::HFONT>, Error> {
