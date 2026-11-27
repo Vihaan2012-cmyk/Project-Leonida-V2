@@ -46,6 +46,7 @@ systems = { path = "crates/systems" }
 decompile = { path = "crates/decompile" }
 offline = { path = "crates/offline" }
 gpu = { path = "crates/gpu" }
+gpu-passes = { path = "crates/gpu-passes" }
 rdna = { path = "crates/rdna" }
 shader-ir = { path = "crates/shader-ir" }
 shader-translate = { path = "crates/shader-translate" }
