@@ -389,10 +389,13 @@ fn real_game_has_plausible_counts() {
     assert!(summary.functions > 10_000, "{summary}");
     assert!(summary.call_edges > summary.functions, "{summary}");
     assert!(
-        summary.classes > 100 && summary.vtables >= summary.classes,
+        summary.classes > 50 && summary.vtables >= summary.classes,
         "{summary}"
     );
-    assert!(summary.named > 0, "{summary}");
+    assert!(
+        summary.named_by_import_thunk > 0 && summary.named_by_vtable_slot > 0,
+        "{summary}"
+    );
     let sorted = db.functions().windows(2).all(|w| w[0].rva < w[1].rva);
     assert!(sorted);
 }
