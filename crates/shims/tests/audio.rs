@@ -66,7 +66,7 @@ fn all_nineteen_imports_are_provided() {
 fn the_boot_call_sequence_succeeds_the_way_the_title_checks() {
     let _guard = serial();
     type Create = unsafe extern "win64" fn(*mut usize, u64) -> i32;
-    type Contexts = unsafe extern "win64" fn(*mut usize, u64, u64, u64) -> i32;
+    type Contexts = unsafe extern "win64" fn(*mut u64) -> i32;
     type Release = unsafe extern "win64" fn(usize) -> i32;
     type Heap = unsafe extern "win64" fn(u64, u64) -> i32;
     type Alloc = unsafe extern "win64" fn(*mut usize, *mut u32, u32, u32, u64) -> i32;
@@ -84,14 +84,24 @@ fn the_boot_call_sequence_succeeds_the_way_the_title_checks() {
     let map_virtual: MapVirtual = shim("AcpHal.dll", "ApuMapVirtualAddress");
     let map_apu: MapApu = shim("AcpHal.dll", "ApuMapApuAddress");
 
-    let (mut acp, mut shape) = (0usize, 0usize);
+    let mut acp = 0usize;
+    let mut info = [0u64; 8];
+    info[2] = 350;
     let (mut block, mut apu) = (0usize, 0u32);
     // SAFETY: the shapes the executable uses; every pointer is valid.
     unsafe {
         assert!(create(&mut acp, 0) >= 0);
         assert_ne!(acp, 0);
-        assert!(contexts(&mut shape, 0, 0, 0) >= 0);
-        assert_ne!(shape, 0);
+        assert!(contexts(info.as_mut_ptr()) >= 0);
+        let shape = info[7] as *const u8;
+        assert!(!shape.is_null(), "the contexts' address goes to +0x38");
+        assert!(
+            std::slice::from_raw_parts(shape, 350 * 64)
+                .iter()
+                .all(|b| *b == 0)
+        );
+        info[2] = 0;
+        assert!(contexts(info.as_mut_ptr()) < 0);
         assert!(heap(0, 0x226e00) >= 0);
         assert!(alloc(&mut block, std::ptr::null_mut(), 0x2000, 0x800, 0) >= 0);
         assert_ne!(block, 0);
@@ -113,37 +123,95 @@ fn the_boot_call_sequence_succeeds_the_way_the_title_checks() {
 }
 
 #[test]
-fn commands_complete_at_once_and_results_drain() {
+fn the_hal_object_answers_through_its_vtable_the_way_the_title_calls_it() {
     let _guard = serial();
-    type Connect = unsafe extern "win64" fn() -> u64;
+    type Create = unsafe extern "win64" fn(*mut usize, u64) -> i32;
+    type Init = unsafe extern "win64" fn(usize, u64, u64) -> i32;
+    type Submit = unsafe extern "win64" fn(usize, u32, u32, i32, *const u32, u64) -> i32;
+    type Stop = unsafe extern "win64" fn(usize);
+    let create: Create = shim("AcpHal.dll", "AcpHalCreate");
+    let mut object = 0usize;
+    // SAFETY: the shapes the executable uses; the object's first word is its vtable.
+    unsafe {
+        assert!(create(&mut object, 0) >= 0);
+        let vtable = (object as *const *const usize).read();
+        assert!(!vtable.is_null(), "the title calls through the first word");
+        let init: Init = std::mem::transmute(vtable.read());
+        let stop: Stop = std::mem::transmute(vtable.add(1).read());
+        let submit: Submit = std::mem::transmute(vtable.add(2).read());
+        let release: Stop = std::mem::transmute(vtable.add(5).read());
+        assert!(init(object, 0x1000, 0x1000) >= 0);
+        assert!(with_engine(|e| e.hal_mut().started()));
+        assert!(submit(object, 2, 0xf0f0_f0f0, -1, [0xc0u32].as_ptr(), 0) >= 0);
+        assert!(submit(object, 5, 0xf6f6_f6f6, -1, [3u32].as_ptr(), 0) >= 0);
+        assert!(with_engine(|e| e.hal_mut().is_enabled(3)));
+        assert!(submit(object, 0x12, 0xf1f1_f1f1, -1, [3u32, 4].as_ptr(), 0) >= 0);
+        assert_eq!(with_engine(|e| e.hal_mut().take_reads()), vec![(3, 4)]);
+        assert!(submit(object, 7, 4, -1, [3u32].as_ptr(), 0) >= 0);
+        assert!(!with_engine(|e| e.hal_mut().is_enabled(3)));
+        stop(object);
+        assert!(!with_engine(|e| e.hal_mut().started()));
+        release(object);
+    }
+}
+
+#[test]
+fn opus_commands_open_decode_and_close_with_results_the_title_state_machine_expects() {
+    let _guard = serial();
+    type Connect = unsafe extern "win64" fn(*mut u64, *mut usize, *mut u64) -> i32;
     type Disconnect = unsafe extern "win64" fn(u64, u64) -> i32;
     type Enqueue = unsafe extern "win64" fn(u64, *const u8, u64) -> i32;
-    type Dequeue = unsafe extern "win64" fn(u64, *mut u32) -> i32;
+    type Dequeue = unsafe extern "win64" fn(u64, *mut u8) -> i32;
     type Count = unsafe extern "win64" fn() -> u32;
     let connect: Connect = shim("xapu.dll", "XApuConnect");
     let disconnect: Disconnect = shim("xapu.dll", "XApuDisconnect");
     let enqueue: Enqueue = shim("xapu.dll", "XApuEnqueueCommand");
     let dequeue: Dequeue = shim("xapu.dll", "XApuDequeueResult");
     let count: Count = shim("xapu.dll", "XApuGetResultCount");
+    let (mut info, mut region, mut handle) = ([0u64; 2], 0usize, 0u64);
     // SAFETY: the shapes the executable uses; every pointer is valid.
     unsafe {
-        let handle = connect();
+        assert!(connect(info.as_mut_ptr(), &mut region, &mut handle) >= 0);
         assert!(handle != 0 && (handle as i64) > 0);
+        assert_ne!(region, 0);
         assert_eq!(count(), 0);
-        let command = [3u8; 64];
-        for _ in 0..4 {
-            assert_eq!(enqueue(handle, command.as_ptr(), 0), 0);
-        }
+        let mut open = [0u8; 0x40];
+        open[0] = 1;
+        open[4] = 5;
+        open[0x18] = 2;
+        assert_eq!(enqueue(handle, open.as_ptr(), 0), 0);
+        let mut decode = [0u8; 0x40];
+        decode[0] = 3;
+        decode[4] = 5;
+        decode[0x24..0x28].copy_from_slice(&960u32.to_le_bytes());
+        decode[0x28..0x2c].copy_from_slice(&40u32.to_le_bytes());
+        decode[0x2c..0x34].copy_from_slice(&(region as u64).to_le_bytes());
+        decode[0x34..0x38].copy_from_slice(&0x1e00u32.to_le_bytes());
+        decode[0x38..0x40].copy_from_slice(&((region + 0x14000) as u64).to_le_bytes());
+        assert_eq!(enqueue(handle, decode.as_ptr(), 0), 0);
+        let mut close = [0u8; 0x40];
+        close[0] = 2;
+        close[4] = 5;
+        assert_eq!(enqueue(handle, close.as_ptr(), 0), 0);
         assert!(enqueue(handle, std::ptr::null(), 0) < 0);
-        assert_eq!(count(), 4);
-        for left in (0..4).rev() {
-            let mut result = 0xFFFF_FFFFu32;
-            assert_eq!(dequeue(handle, &mut result), 0);
-            assert_eq!(result, 0);
-            assert_eq!(count(), left);
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while count() < 3 {
+            assert!(std::time::Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
         }
-        let mut result = 0u32;
-        assert!(dequeue(handle, &mut result) < 0, "empty is a failure code");
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let mut result = [0xFFu8; 0x40];
+            assert_eq!(dequeue(handle, result.as_mut_ptr()), 0);
+            let word = |at: usize| u32::from_le_bytes(result[at..at + 4].try_into().unwrap());
+            seen.push((word(0), word(4), word(0x34)));
+        }
+        assert_eq!(seen, [(1, 5, 0), (3, 5, 0x1e00), (2, 5, 0)]);
+        let mut result = [0u8; 0x40];
+        assert!(
+            dequeue(handle, result.as_mut_ptr()) < 0,
+            "empty is a failure code"
+        );
         assert_eq!(disconnect(handle, 0x20), 0);
     }
 }
