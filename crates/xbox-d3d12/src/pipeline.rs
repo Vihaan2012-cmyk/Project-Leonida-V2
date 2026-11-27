@@ -975,3 +975,94 @@ fn sample_flags(count: u32) -> vk::SampleCountFlags {
         _ => vk::SampleCountFlags::TYPE_1,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_root() -> Arc<RootSignature> {
+        Arc::new(RootSignature {
+            version: crate::root::RootVersion::V1_1,
+            parameters: Vec::new(),
+            static_samplers: Vec::new(),
+            flags: 0,
+        })
+    }
+
+    #[test]
+    fn slot_67_parts_become_one_fspx_payload() {
+        let parts = Slot67Parts {
+            dispatch_state: vec![1; 28],
+            kind1: vec![2; 20],
+            program: vec![3; 64],
+            records: vec![4; 8],
+        };
+        let desc = ComputePsoDesc::from_slot67(None, &parts).unwrap();
+        let bytes = desc.cs.0;
+        assert_eq!(&bytes[..4], b"FSPX");
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        assert_eq!(word(8), 4);
+        assert_eq!(word(12), bytes.len());
+        for (i, (kind, size)) in [(0, 28), (1, 20), (6, 64), (7, 8)].into_iter().enumerate() {
+            assert_eq!((word(16 + 16 * i), word(24 + 16 * i)), (kind, size));
+            let at = word(20 + 16 * i);
+            assert_eq!(bytes[at], [1, 2, 3, 4][i]);
+        }
+    }
+
+    #[test]
+    fn slot_67_needs_a_program_and_its_state() {
+        let parts = Slot67Parts::default();
+        assert!(matches!(
+            ComputePsoDesc::from_slot67(None, &parts),
+            Err(PipelineError::Invalid(_))
+        ));
+        let parts = Slot67Parts {
+            program: vec![0; 40],
+            ..Default::default()
+        };
+        assert!(matches!(
+            ComputePsoDesc::from_slot67(None, &parts),
+            Err(PipelineError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn descriptions_with_the_same_content_share_a_key() {
+        let root = empty_root();
+        let mut a = GraphicsPsoDesc::new(root.clone());
+        a.vs = Bytecode(vec![1, 2, 3]);
+        let mut b = GraphicsPsoDesc::new(root);
+        b.vs = Bytecode(vec![1, 2, 3]);
+        assert_eq!(a.key(), b.key());
+        b.raster.cull = 1;
+        assert_ne!(a.key(), b.key());
+        b.raster.cull = 3;
+        b.vs = Bytecode(vec![1, 2, 4]);
+        assert_ne!(a.key(), b.key());
+    }
+
+    #[test]
+    fn bindless_bindings_follow_the_translator_contract() {
+        let bindings = bindless_bindings(8);
+        let find = |n: u32| bindings.iter().find(|b| b.binding == n).unwrap();
+        assert_eq!(
+            find(images::TEXTURE_TABLE).descriptor_type,
+            vk::DescriptorType::STORAGE_BUFFER
+        );
+        assert_eq!(find(images::SAMPLERS).descriptor_count, 8);
+        assert_eq!(
+            find(images::COMPARE_SAMPLERS).descriptor_type,
+            vk::DescriptorType::SAMPLER
+        );
+        let wide = images::atomic_binding(images::View::D3, true);
+        assert_eq!(
+            find(wide).descriptor_type,
+            vk::DescriptorType::STORAGE_IMAGE
+        );
+        let mut numbers: Vec<u32> = bindings.iter().map(|b| b.binding).collect();
+        numbers.sort();
+        numbers.dedup();
+        assert_eq!(numbers.len(), bindings.len());
+    }
+}
