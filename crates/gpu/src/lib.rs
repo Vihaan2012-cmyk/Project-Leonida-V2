@@ -23,6 +23,8 @@ pub enum GpuError {
         "this GPU cannot run translated pixel shaders: it lacks dynamic rendering, fragment barycentrics or fragment stores"
     )]
     NoPixelShaders,
+    #[error("this GPU cannot run translated mesh shaders: it lacks VK_EXT_mesh_shader")]
+    NoMeshShaders,
 }
 
 static VALIDATION_ERRORS: AtomicUsize = AtomicUsize::new(0);
@@ -72,6 +74,7 @@ pub struct DeviceInfo {
     pub gather_extended: bool,
     pub image_int64_atomics: bool,
     pub pixel_shaders: bool,
+    pub mesh_shaders: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +181,62 @@ pub struct Target {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VertexFormat {
+    Float32x4,
+    Float32x3,
+    Float32x2,
+    Uint32x4,
+    Unorm8x4,
+}
+
+impl VertexFormat {
+    fn vk(self) -> vk::Format {
+        match self {
+            VertexFormat::Float32x4 => vk::Format::R32G32B32A32_SFLOAT,
+            VertexFormat::Float32x3 => vk::Format::R32G32B32_SFLOAT,
+            VertexFormat::Float32x2 => vk::Format::R32G32_SFLOAT,
+            VertexFormat::Uint32x4 => vk::Format::R32G32B32A32_UINT,
+            VertexFormat::Unorm8x4 => vk::Format::R8G8B8A8_UNORM,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VertexAttribute {
+    pub location: u32,
+    pub format: VertexFormat,
+    pub offset: u32,
+}
+
+/// One vertex buffer for the draw's three vertices.
+#[derive(Debug, Clone)]
+pub struct VertexBuffer {
+    pub data: Vec<u8>,
+    pub stride: u32,
+    pub attributes: Vec<VertexAttribute>,
+}
+
+/// What produces a draw's triangles: a vertex shader over three vertices, or a mesh shader's work groups.
+pub enum FirstStage<'a> {
+    Vertex {
+        spirv: &'a [u32],
+        buffer: Option<&'a VertexBuffer>,
+    },
+    Mesh {
+        spirv: &'a [u32],
+        groups: [u32; 3],
+    },
+}
+
+impl FirstStage<'_> {
+    fn spirv(&self) -> &[u32] {
+        match self {
+            FirstStage::Vertex { spirv, .. } | FirstStage::Mesh { spirv, .. } => spirv,
+        }
+    }
+}
+
 enum Work<'a> {
     Compute {
         spirv: &'a [u32],
@@ -185,7 +244,7 @@ enum Work<'a> {
         subgroup_size: Option<u32>,
     },
     Draw {
-        vertex: &'a [u32],
+        first: FirstStage<'a>,
         fragment: &'a [u32],
         extent: [u32; 2],
         targets: &'a mut [Target],
@@ -244,8 +303,10 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
         instance.get_physical_device_properties2(physical, &mut properties);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut atomics64 = vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT::default();
         let mut barycentric = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();
+        let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
         let extensions = instance
             .enumerate_device_extension_properties(physical)
             .unwrap_or_default();
@@ -256,14 +317,19 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
         };
         let has_atomics64 = has(ash::ext::shader_image_atomic_int64::NAME);
         let has_barycentric = has(ash::khr::fragment_shader_barycentric::NAME);
+        let has_mesh = has(ash::ext::mesh_shader::NAME);
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut f13)
-            .push_next(&mut f12);
+            .push_next(&mut f12)
+            .push_next(&mut f11);
         if has_atomics64 {
             features = features.push_next(&mut atomics64);
         }
         if has_barycentric {
             features = features.push_next(&mut barycentric);
+        }
+        if has_mesh {
+            features = features.push_next(&mut mesh);
         }
         instance.get_physical_device_features2(physical, &mut features);
         let int64 = features.features.shader_int64 == vk::TRUE;
@@ -276,7 +342,9 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
         let image_int64_atomics = has_atomics64 && atomics64.shader_image_int64_atomics == vk::TRUE;
         let pixel_shaders = has_barycentric
             && barycentric.fragment_shader_barycentric == vk::TRUE
-            && fragment_stores;
+            && fragment_stores
+            && f11.shader_draw_parameters == vk::TRUE;
+        let mesh_shaders = has_mesh && mesh.mesh_shader == vk::TRUE;
         let descriptor_indexing = f12.runtime_descriptor_array == vk::TRUE
             && f12.shader_sampled_image_array_non_uniform_indexing == vk::TRUE;
         let storage_images = descriptor_indexing
@@ -319,6 +387,7 @@ fn describe(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<Ca
                 gather_extended,
                 image_int64_atomics,
                 pixel_shaders: pixel_shaders && f13.dynamic_rendering == vk::TRUE,
+                mesh_shaders,
             },
         })
     }
@@ -403,6 +472,8 @@ impl Gpu {
                 .runtime_descriptor_array(indexing)
                 .shader_sampled_image_array_non_uniform_indexing(indexing)
                 .shader_storage_image_array_non_uniform_indexing(storage);
+            let mut f11 = vk::PhysicalDeviceVulkan11Features::default()
+                .shader_draw_parameters(chosen.info.pixel_shaders);
             let base = vk::PhysicalDeviceFeatures::default()
                 .shader_int64(chosen.info.int64)
                 .shader_float64(chosen.info.float64)
@@ -415,7 +486,8 @@ impl Gpu {
             let mut features = vk::PhysicalDeviceFeatures2::default()
                 .features(base)
                 .push_next(&mut f13)
-                .push_next(&mut f12);
+                .push_next(&mut f12)
+                .push_next(&mut f11);
             let mut barycentric = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default()
                 .fragment_shader_barycentric(true);
             let mut extensions = Vec::new();
@@ -426,6 +498,11 @@ impl Gpu {
             if chosen.info.pixel_shaders {
                 features = features.push_next(&mut barycentric);
                 extensions.push(ash::khr::fragment_shader_barycentric::NAME.as_ptr());
+            }
+            let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default().mesh_shader(true);
+            if chosen.info.mesh_shaders {
+                features = features.push_next(&mut mesh);
+                extensions.push(ash::ext::mesh_shader::NAME.as_ptr());
             }
             let create = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queues)
@@ -555,7 +632,7 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
-        vertex: &[u32],
+        first: FirstStage<'_>,
         fragment: &[u32],
         extent: [u32; 2],
         targets: &mut [Target],
@@ -565,7 +642,7 @@ impl Gpu {
         resources: &mut [(u32, Resource)],
     ) -> Result<(), GpuError> {
         let work = Work::Draw {
-            vertex,
+            first,
             fragment,
             extent,
             targets,
@@ -584,8 +661,8 @@ impl Gpu {
         let empty = match &work {
             Work::Compute { spirv, .. } => spirv.is_empty(),
             Work::Draw {
-                vertex, fragment, ..
-            } => vertex.is_empty() || fragment.is_empty(),
+                first, fragment, ..
+            } => first.spirv().is_empty() || fragment.is_empty(),
         };
         if empty {
             return Err(GpuError::BadSpirv);
@@ -716,20 +793,13 @@ impl Gpu {
                         .map_err(|(_, error)| error)?[0];
                 }
                 Work::Draw {
-                    vertex,
+                    first,
                     fragment,
                     extent,
                     targets,
                     depth,
                 } => {
-                    self.graphics_pipeline(
-                        &mut scratch,
-                        vertex,
-                        fragment,
-                        *extent,
-                        targets,
-                        depth,
-                    )?;
+                    self.graphics_pipeline(&mut scratch, first, fragment, *extent, targets, depth)?;
                 }
             }
             counts[0] += buffers.len() as u32;
@@ -886,12 +956,36 @@ impl Gpu {
                     device.cmd_dispatch(command, groups[0], groups[1], groups[2]);
                 }
                 Work::Draw {
+                    first,
                     extent,
                     targets,
                     depth,
                     ..
                 } => {
-                    device.cmd_draw(command, 3, 1, 0, 0);
+                    match first {
+                        FirstStage::Vertex { buffer, .. } => {
+                            if let Some(buffer) = buffer {
+                                let words: Vec<u32> = buffer
+                                    .data
+                                    .chunks(4)
+                                    .map(|c| {
+                                        let mut w = [0u8; 4];
+                                        w[..c.len()].copy_from_slice(c);
+                                        u32::from_le_bytes(w)
+                                    })
+                                    .collect();
+                                let vertices =
+                                    self.host_buffer(&words, vk::BufferUsageFlags::VERTEX_BUFFER)?;
+                                device.cmd_bind_vertex_buffers(command, 0, &[vertices.0], &[0]);
+                                scratch.staging.push(vertices);
+                            }
+                            device.cmd_draw(command, 3, 1, 0, 0);
+                        }
+                        FirstStage::Mesh { groups, .. } => {
+                            let mesh = ash::ext::mesh_shader::Device::new(&self.instance, device);
+                            mesh.cmd_draw_mesh_tasks(command, groups[0], groups[1], groups[2]);
+                        }
+                    }
                     device.cmd_end_rendering(command);
                     target_readbacks =
                         self.read_targets(device, command, &scratch, *extent, targets, depth)?;
@@ -1062,7 +1156,7 @@ impl Gpu {
     unsafe fn graphics_pipeline(
         &self,
         scratch: &mut Scratch<'_>,
-        vertex: &[u32],
+        first: &FirstStage<'_>,
         fragment: &[u32],
         extent: [u32; 2],
         targets: &[Target],
@@ -1070,6 +1164,10 @@ impl Gpu {
     ) -> Result<(), GpuError> {
         if !self.info.pixel_shaders {
             return Err(GpuError::NoPixelShaders);
+        }
+        let mesh = matches!(first, FirstStage::Mesh { .. });
+        if mesh && !self.info.mesh_shaders {
+            return Err(GpuError::NoMeshShaders);
         }
         for target in targets {
             // SAFETY: as this function's.
@@ -1082,8 +1180,10 @@ impl Gpu {
         let device = &self.device;
         // SAFETY: valid create infos; every handle goes into `scratch`.
         unsafe {
-            let vertex = device
-                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(vertex), None)?;
+            let vertex = device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(first.spirv()),
+                None,
+            )?;
             scratch.extra_modules.push(vertex);
             let fragment = device.create_shader_module(
                 &vk::ShaderModuleCreateInfo::default().code(fragment),
@@ -1092,7 +1192,11 @@ impl Gpu {
             scratch.extra_modules.push(fragment);
             let stages = [
                 vk::PipelineShaderStageCreateInfo::default()
-                    .stage(vk::ShaderStageFlags::VERTEX)
+                    .stage(if mesh {
+                        vk::ShaderStageFlags::MESH_EXT
+                    } else {
+                        vk::ShaderStageFlags::VERTEX
+                    })
                     .module(vertex)
                     .name(c"main"),
                 vk::PipelineShaderStageCreateInfo::default()
@@ -1100,7 +1204,32 @@ impl Gpu {
                     .module(fragment)
                     .name(c"main"),
             ];
-            let input = vk::PipelineVertexInputStateCreateInfo::default();
+            let mut bindings = Vec::new();
+            let mut attributes = Vec::new();
+            if let FirstStage::Vertex {
+                buffer: Some(buffer),
+                ..
+            } = first
+            {
+                bindings.push(
+                    vk::VertexInputBindingDescription::default()
+                        .binding(0)
+                        .stride(buffer.stride)
+                        .input_rate(vk::VertexInputRate::VERTEX),
+                );
+                for attribute in &buffer.attributes {
+                    attributes.push(
+                        vk::VertexInputAttributeDescription::default()
+                            .location(attribute.location)
+                            .binding(0)
+                            .format(attribute.format.vk())
+                            .offset(attribute.offset),
+                    );
+                }
+            }
+            let input = vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&bindings)
+                .vertex_attribute_descriptions(&attributes);
             let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
                 .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
             let viewports = [vk::Viewport {
@@ -1147,10 +1276,8 @@ impl Gpu {
                         .as_ref()
                         .map_or(vk::Format::UNDEFINED, |d| d.format.vk()),
                 );
-            let create = vk::GraphicsPipelineCreateInfo::default()
+            let mut create = vk::GraphicsPipelineCreateInfo::default()
                 .stages(&stages)
-                .vertex_input_state(&input)
-                .input_assembly_state(&assembly)
                 .viewport_state(&viewport)
                 .rasterization_state(&raster)
                 .multisample_state(&multisample)
@@ -1158,6 +1285,11 @@ impl Gpu {
                 .color_blend_state(&blend)
                 .layout(scratch.pipeline_layout)
                 .push_next(&mut rendering);
+            if !mesh {
+                create = create
+                    .vertex_input_state(&input)
+                    .input_assembly_state(&assembly);
+            }
             scratch.pipeline = device
                 .create_graphics_pipelines(vk::PipelineCache::null(), &[create], None)
                 .map_err(|(_, error)| error)?[0];

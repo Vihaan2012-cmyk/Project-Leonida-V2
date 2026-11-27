@@ -36,7 +36,7 @@ impl PixelState {
 
 impl Emitter {
     /// A module-scope input or output, even while a function is being built.
-    fn interface_variable(&mut self, pointee: Word, storage: StorageClass) -> Word {
+    pub(super) fn interface_variable(&mut self, pointee: Word, storage: StorageClass) -> Word {
         let ptr = self.b.type_pointer(None, storage, pointee);
         let id = self.b.id();
         let inst = rspirv::dr::Instruction::new(
@@ -49,7 +49,7 @@ impl Emitter {
         id
     }
 
-    fn builtin_input(&mut self, pointee: Word, builtin: BuiltIn) -> Word {
+    pub(super) fn builtin_input(&mut self, pointee: Word, builtin: BuiltIn) -> Word {
         let var = self.interface_variable(pointee, StorageClass::Input);
         self.b
             .decorate(var, Decoration::BuiltIn, [Operand::BuiltIn(builtin)]);

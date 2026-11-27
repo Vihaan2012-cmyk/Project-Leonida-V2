@@ -1,7 +1,7 @@
 mod common;
 
 use common::{gpu, spirv_val};
-use gpu::{Gpu, Resource, Sampler, Target, Texture, TextureFormat, TextureView};
+use gpu::{FirstStage, Gpu, Resource, Sampler, Target, Texture, TextureFormat, TextureView};
 use rspirv::binary::Assemble;
 use rspirv::dr::{Builder, Operand};
 use rspirv::spirv::{
@@ -203,7 +203,10 @@ fn run(
     let mut heap = vec![0u32; 256];
     let user = user.to_vec();
     gpu.draw(
-        &vertex,
+        FirstStage::Vertex {
+            spirv: &vertex,
+            buffer: None,
+        },
         &fragment,
         [SIZE, SIZE],
         &mut targets,

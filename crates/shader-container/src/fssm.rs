@@ -109,6 +109,11 @@ impl<'a> Fssm<'a> {
         code_range(self.bytes)
     }
 
+    /// The user SGPR count, bits 16-21 of 0xD4.
+    pub fn user_sgprs(&self) -> u32 {
+        (u32_at(self.bytes, WAVE_FLAGS) >> 16) & 0x3F
+    }
+
     /// A pixel shader's setup: input enables at 0x248, depth control and target mask after them, the user
     /// SGPR count in bits 16-21 of 0xD4, and two words per interpolant from 0x138 (index, mask and signature
     /// register; then the mode, 1 flat or 2 interpolated, with 8 for half precision).
@@ -139,7 +144,7 @@ impl<'a> Fssm<'a> {
             inputs: word(PIXEL_INPUTS)?,
             depth_control: word(PIXEL_INPUTS + 4)?,
             target_mask: word(PIXEL_INPUTS + 8)?,
-            user_sgprs: (word(WAVE_FLAGS)? >> 16) & 0x3F,
+            user_sgprs: self.user_sgprs(),
             interpolants,
         })
     }

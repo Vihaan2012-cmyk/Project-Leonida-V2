@@ -13,6 +13,7 @@ use shader_ir::{
 
 use crate::images::{Number, View};
 
+mod geometry;
 mod image;
 mod memory;
 mod pixel;
@@ -89,6 +90,33 @@ enum Entry<'a> {
     Harness(&'a HarnessOptions),
     Compute(&'a ComputeOptions),
     Pixel(&'a PixelOptions),
+    Vertex(&'a VertexOptions),
+    Mesh(&'a MeshOptions),
+}
+
+/// One fetched vertex attribute: the input-signature register, read as four components of `number`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VertexInput {
+    pub register: u8,
+    pub number: Number,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexOptions {
+    pub user_sgprs: u32,
+    pub inputs: Vec<VertexInput>,
+    pub float: FloatMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshOptions {
+    /// User SGPRs start at s8; s0-s7 hold the hardware's values.
+    pub user_sgprs: u32,
+    pub group_size: u32,
+    pub max_vertices: u32,
+    pub max_primitives: u32,
+    pub lds_bytes: u32,
+    pub float: FloatMode,
 }
 
 /// Which way a pixel shader's depth output may move, when it writes one.
@@ -129,6 +157,7 @@ struct Types {
     u32_: Word,
     u64_: Word,
     f32_: Word,
+    uvec3: Word,
     uvec4: Word,
     wide: Word,
     ptr_function_u32: Word,
@@ -182,6 +211,7 @@ struct Emitter {
     encode: [Option<Word>; 2],
     image_cache: Option<(Image, [Word; 4])>,
     pixel: Option<pixel::PixelState>,
+    geometry: Option<geometry::GeometryState>,
 }
 
 fn registers(function: &Function) -> (BTreeSet<u8>, BTreeSet<u8>) {
@@ -241,12 +271,34 @@ pub fn pixel(function: &Function, options: &PixelOptions) -> Result<Vec<u32>, Em
     build(function, Entry::Pixel(options))
 }
 
+/// A vertex shader: user SGPRs from s0 as for compute; v0 holds the vertex index and v3 the instance index;
+/// fetched attribute r fills v[4 + 4r] to v[7 + 4r] from the vertex input at location r; `pos0` writes the
+/// position and parameter N the raw words at output location N.
+pub fn vertex(function: &Function, options: &VertexOptions) -> Result<Vec<u32>, EmitError> {
+    build(function, Entry::Vertex(options))
+}
+
+/// A mesh shader from a primitive-shader program: user SGPRs from s8, the wave's index in s3 bits 24-27 and
+/// the dispatch-wide thread index in v5. Each thread's position, parameter and primitive exports fill the
+/// vertex and primitive slots of its index in the group; slots no primitive export reaches are culled.
+pub fn mesh(function: &Function, options: &MeshOptions) -> Result<Vec<u32>, EmitError> {
+    build(function, Entry::Mesh(options))
+}
+
 fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     let pixel_options = match entry {
         Entry::Pixel(options) => Some(options.clone()),
         _ => None,
     };
-    let pixel_mode = pixel_options.is_some();
+    let vertex_options = match entry {
+        Entry::Vertex(options) => Some(options.clone()),
+        _ => None,
+    };
+    let mesh_options = match entry {
+        Entry::Mesh(options) => Some(*options),
+        _ => None,
+    };
+    let pixel_mode = pixel_options.is_some() || vertex_options.is_some();
     let lanes: u32 = if function.wave64 && !pixel_mode {
         64
     } else {
@@ -270,6 +322,16 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
             (options.float, options.group_size, words)
         }
         Entry::Pixel(options) => (options.float, [32, 1, 1], 32),
+        Entry::Vertex(options) => (options.float, [32, 1, 1], 32),
+        Entry::Mesh(options) => {
+            let words = (options.lds_bytes / 4).max(lanes).next_power_of_two();
+            if words > 6 * 1024 {
+                return Err(EmitError::Unsupported(
+                    "mesh shared memory larger than 24 KiB",
+                ));
+            }
+            (options.float, [options.group_size, 1, 1], words)
+        }
     };
     let threads: u32 = group_size.iter().product();
     if threads == 0 || !threads.is_multiple_of(lanes) {
@@ -278,13 +340,17 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         ));
     }
     let waves = threads / lanes;
-    let heap_mode = matches!(entry, Entry::Compute(_) | Entry::Pixel(_));
+    let heap_mode = !matches!(entry, Entry::Harness(_));
     if !lds_words.is_power_of_two() {
         return Err(EmitError::LdsSize);
     }
     let types = function.verify()?;
     let mut b = Builder::new();
-    b.set_version(1, 3);
+    if mesh_options.is_some() {
+        b.set_version(1, 4);
+    } else {
+        b.set_version(1, 3);
+    }
     for capability in [
         Capability::Shader,
         Capability::Int64,
@@ -370,7 +436,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         var
     };
     let lane_input = input(&mut b, ptr_input_u32, BuiltIn::SubgroupLocalInvocationId);
-    if pixel_mode {
+    if pixel_options.is_some() {
         b.decorate(lane_input, Decoration::Flat, []);
     }
     let (half_input, group_input, thread_input, exchange) = if pixel_mode {
@@ -390,6 +456,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         u32_,
         u64_,
         f32_,
+        uvec3,
         uvec4,
         wide,
         ptr_function_u32: b.type_pointer(None, StorageClass::Function, u32_),
@@ -473,11 +540,11 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     }
     let compute_options = match entry {
         Entry::Compute(options) => Some(*options),
-        Entry::Harness(_) | Entry::Pixel(_) => None,
+        _ => None,
     };
     let code_base = match entry {
         Entry::Harness(options) => options.code_base,
-        Entry::Compute(_) | Entry::Pixel(_) => 0,
+        _ => 0,
     };
     let mut e = Emitter {
         b,
@@ -522,9 +589,14 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         encode: [None; 2],
         image_cache: None,
         pixel: None,
+        geometry: None,
     };
     if let Some(options) = pixel_options.clone() {
         e.pixel_prologue(options, alive)?;
+    } else if let Some(options) = vertex_options.clone() {
+        e.vertex_prologue(options)?;
+    } else if let Some(options) = mesh_options {
+        e.mesh_prologue(options)?;
     } else if heap_mode {
         e.compute_prologue()?;
     } else {
@@ -554,7 +626,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     if !heap_mode {
         e.epilogue()?;
     }
-    if pixel_mode {
+    if pixel_options.is_some() {
         e.pixel_epilogue()?;
     }
     ok(e.b.ret())?;
@@ -564,7 +636,32 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     }
     e.lookup_bodies()?;
     e.encode_bodies()?;
-    if let Some(state) = &e.pixel {
+    if let Some(state) = &e.geometry {
+        interface.extend(state.interface());
+        match mesh_options {
+            Some(options) => {
+                let everything: Vec<Word> =
+                    e.b.module_ref()
+                        .types_global_values
+                        .iter()
+                        .filter(|inst| inst.class.opcode == rspirv::spirv::Op::Variable)
+                        .filter_map(|inst| inst.result_id)
+                        .collect();
+                e.b.entry_point(ExecutionModel::MeshEXT, main, "main", everything);
+                e.b.execution_mode(main, ExecutionMode::LocalSize, group_size);
+                e.b.execution_mode(main, ExecutionMode::OutputVertices, [options.max_vertices]);
+                e.b.execution_mode(
+                    main,
+                    ExecutionMode::OutputPrimitivesEXT,
+                    [options.max_primitives],
+                );
+                e.b.execution_mode(main, ExecutionMode::OutputTrianglesEXT, []);
+            }
+            None => {
+                e.b.entry_point(ExecutionModel::Vertex, main, "main", interface)
+            }
+        }
+    } else if let Some(state) = &e.pixel {
         interface.extend(state.interface());
         e.b.entry_point(ExecutionModel::Fragment, main, "main", interface);
         e.b.execution_mode(main, ExecutionMode::OriginUpperLeft, []);
@@ -1502,6 +1599,11 @@ impl Emitter {
                 self.pixel_export(*target, values, *done, *compressed)?;
             }
             Stmt::Message(..) | Stmt::FetchVertexInputs if self.pixel.is_some() => {}
+            Stmt::Export { target, values, .. } if self.geometry.is_some() => {
+                let values = values.map(|v| v.map(|t| self.values[t as usize]));
+                self.geometry_export(*target, values)?;
+            }
+            Stmt::Message(..) | Stmt::FetchVertexInputs if self.geometry.is_some() => {}
             Stmt::LdsStore(..) if self.pixel.is_some() => {
                 return Err(EmitError::Unsupported("LDS in a pixel shader"));
             }

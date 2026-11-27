@@ -187,6 +187,16 @@ writes `FragDepth`. Exec starts as the non-helper invocations, and pixels outsid
 discarded. Wave64 code runs on 32-wide subgroups: fragment shaders have no workgroup to emulate 64 lanes with. The
 vertex-side contract (which parameter export feeds which location) is the linker's job and still to come.
 
+**Vertex and mesh shaders.** Vertex shaders are the legacy kind: v0 is the vertex index, v3 the instance index less
+the base instance, user SGPRs start at s0, and an `s_swappc` at the first instruction calls the fetch shader. The
+entry does the fetch itself: each input-signature element that is not a system value is a four-component Vulkan input
+at the location of its register r, loaded into v[4+4r..7+4r]. Mesh shaders are primitive shaders: s3 holds the wave's
+index in the group in bits 24 and up, v5 the thread's index across the dispatch, and user SGPRs start at s8. The group
+size, vertex and primitive limits and shared memory come from the pipeline-state part. The entry sets its outputs to
+the limits at the start and culls every primitive slot; thread T's `pos0` and `paramN` exports fill vertex T, its
+`prim` export (three 9-bit indices at bits 0, 10 and 20, bit 31 for none) fills primitive T. In both stages `pos0` is
+`Position` and `paramN` the raw words at location N; `pos1`-`pos3` and allocation messages are ignored for now.
+
 **Images and samplers.** A shader names a texture by its 8-word T# and a sampler by its 4-word S#, both in SGPRs.
 The runtime registers every texture and sampler it creates in two lookup tables, and the shader finds the bindless
 slot by looking its descriptor up:
