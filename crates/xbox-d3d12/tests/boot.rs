@@ -212,10 +212,10 @@ fn the_measured_boot_sequence_creates_queues_allocators_lists_and_the_first_heap
     let more: Vec<Ptr> = (0..3).map(|_| make_queue(device, 3, true)).collect();
     assert_eq!(more.len(), 3);
 
-    // SAFETY: the object is a queue; slot 18 is `GetDesc` with the buffer first.
+    // SAFETY: the object is a queue; slot 20 is `GetDesc` with the buffer first.
     let desc = unsafe {
         let mut desc = [0u32; 4];
-        let get: unsafe extern "win64" fn(*mut u32, Ptr) -> *mut u32 = slot(compute, 18);
+        let get: unsafe extern "win64" fn(*mut u32, Ptr) -> *mut u32 = slot(compute, 20);
         get(desc.as_mut_ptr(), compute);
         desc
     };
@@ -475,7 +475,7 @@ fn a_queue_waits_for_a_fence_and_signals_another() {
     let device = new_device(Arc::default());
     let queue = make_queue(device, 0, false);
     let (a, b) = (make_fence(device, 0), make_fence(device, 0));
-    // SAFETY: queue slots 14 (`Signal`) and 15 (`Wait`), fence slots 9, 10 and 12.
+    // SAFETY: queue slots 16 (`Signal`) and 17 (`Wait`), fence slots 9, 10 and 12.
     unsafe {
         let wait: unsafe extern "win64" fn(Ptr, Ptr, u64) -> u32 = slot(queue, 17);
         let signal: unsafe extern "win64" fn(Ptr, Ptr, u64) -> u32 = slot(queue, 16);
@@ -729,5 +729,90 @@ fn children_give_their_device_back_and_keep_it_alive() {
         assert_eq!(release(device), 1);
         let queue_release: RefFn = slot(queue, 2);
         assert_eq!(queue_release(queue), 0);
+    }
+}
+
+#[test]
+fn the_queue_answers_the_slots_the_executable_calls() {
+    let capture = Arc::new(Capture::default());
+    let device = new_device(capture.clone());
+    let queue = make_queue(device, 0, true);
+    let allocator = make_allocator(device, 0);
+    let (result, list) = make_list(device, allocator, &guid_bytes(&iid::GRAPHICS_COMMAND_LIST));
+    assert_eq!(result, 0);
+    let fence = make_fence(device, 0);
+    // SAFETY: queue slots 16, 18, 19, 20, 31 and 35 and list slot 9 with the shapes the executable calls.
+    unsafe {
+        let vtable_before = *(queue as *const usize);
+        let frequency: unsafe extern "win64" fn(Ptr, *mut u64) -> u32 = slot(queue, 18);
+        let mut hertz = 0u64;
+        assert_eq!(frequency(queue, &mut hertz), 0);
+        assert_ne!(hertz, 0);
+        assert_eq!(frequency(queue, std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(*(queue as *const usize), vtable_before);
+
+        let calibration: unsafe extern "win64" fn(Ptr, *mut u64, *mut u64) -> u32 = slot(queue, 19);
+        let (mut gpu, mut cpu) = (0u64, 0u64);
+        assert_eq!(calibration(queue, &mut gpu, &mut cpu), 0);
+
+        let get_desc: unsafe extern "win64" fn(*mut u32, Ptr) -> *mut u32 = slot(queue, 20);
+        let mut desc = [0xFFFF_FFFFu32; 4];
+        assert_eq!(get_desc(desc.as_mut_ptr(), queue), desc.as_mut_ptr());
+        assert_eq!(desc[0], 0);
+
+        let tiles: unsafe extern "win64" fn(Ptr, u32, *const u8, *const u8, u32, u32) -> u32 =
+            slot(queue, 31);
+        assert_eq!(tiles(queue, 0, std::ptr::null(), std::ptr::null(), 0, 0), 0);
+        assert!(
+            com::notes()
+                .iter()
+                .any(|n| n.starts_with("ID3D12CommandQueue slot 31"))
+        );
+
+        let close: unsafe extern "win64" fn(Ptr) -> u32 = slot(list, 9);
+        assert_eq!(close(list), 0);
+        let execute: unsafe extern "win64" fn(Ptr, u32, *const Ptr, u64, u32) -> u32 =
+            slot(queue, 35);
+        assert_eq!(execute(queue, 1, &list, 0x1234, 3), 0);
+        assert_eq!(execute(queue, 1, &list, 0x1235, 0), 0);
+        let signal: unsafe extern "win64" fn(Ptr, Ptr, u64) -> u32 = slot(queue, 16);
+        assert_eq!(signal(queue, fence, 7), 0);
+        let on_completion: unsafe extern "win64" fn(Ptr, u64, Ptr) -> u32 = slot(fence, 9);
+        assert_eq!(on_completion(fence, 7, std::ptr::null_mut()), 0);
+        assert_eq!(completed(fence), 7);
+        assert_eq!(*(queue as *const usize), vtable_before);
+    }
+    assert_eq!(capture.streams.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn the_list_slots_called_before_close_at_boot_do_nothing() {
+    let capture = Arc::new(Capture::default());
+    let device = new_device(capture.clone());
+    let allocator = make_allocator(device, 0);
+    let (result, list) = make_list(device, allocator, &guid_bytes(&iid::GRAPHICS_COMMAND_LIST));
+    assert_eq!(result, 0);
+    // SAFETY: list slots 29, 30, 131, 132 and 9 with the shapes the executable calls.
+    unsafe {
+        let a: unsafe extern "win64" fn(Ptr, u64, u64, u64, u32) -> u32 = slot(list, 131);
+        let b: unsafe extern "win64" fn(Ptr, u64, u64, u64, u32) -> u32 = slot(list, 132);
+        assert_eq!(a(list, 0xc3c0, 0x8002_0000, 0, 0xFF), 0);
+        assert_eq!(b(list, 0x70_0000, 0, 0, 0xFF), 0);
+        let s29: unsafe extern "win64" fn(Ptr, *const u8, u32, u32) -> u32 = slot(list, 29);
+        assert_eq!(s29(list, std::ptr::null(), 1, 2), 0);
+        let s30: unsafe extern "win64" fn(Ptr, *const u8, u32, u32, u32, *const u8, u32) -> u32 =
+            slot(list, 30);
+        assert_eq!(s30(list, std::ptr::null(), 1, 2, 3, std::ptr::null(), 4), 0);
+        let close: unsafe extern "win64" fn(Ptr) -> u32 = slot(list, 9);
+        assert_eq!(close(list), 0);
+    }
+    let notes = com::notes();
+    for slot in [29, 30, 131, 132] {
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with(&format!("ID3D12GraphicsCommandList slot {slot} "))),
+            "{notes:?}"
+        );
     }
 }

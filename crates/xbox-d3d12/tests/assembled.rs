@@ -187,7 +187,7 @@ impl Harness {
     /// Executes the closed list and waits on a fence the queue signals behind it.
     fn run(&self, queue: Ptr, list: Ptr) {
         let mut fence = std::ptr::null_mut();
-        // SAFETY: device slot 36, queue slots 10 and 16, fence slot 9.
+        // SAFETY: device slot 36, queue slots 35 and 16, fence slot 9.
         unsafe {
             let create_fence: unsafe extern "win64" fn(Ptr, u64, u32, *const u8, *mut Ptr) -> u32 =
                 slot(self.device, 36);
@@ -195,8 +195,9 @@ impl Harness {
                 create_fence(self.device, 0, 0, guid(&iid::FENCE).as_ptr(), &mut fence),
                 0
             );
-            let execute: unsafe extern "win64" fn(Ptr, u32, *const Ptr) = slot(queue, 10);
-            execute(queue, 1, &list);
+            let execute: unsafe extern "win64" fn(Ptr, u32, *const Ptr, u64, u32) -> u32 =
+                slot(queue, 35);
+            assert_eq!(execute(queue, 1, &list, 0, 0), 0);
             let signal: unsafe extern "win64" fn(Ptr, Ptr, u64) -> u32 = slot(queue, 16);
             assert_eq!(signal(queue, fence, 1), 0);
             let wait: unsafe extern "win64" fn(Ptr, u64, Ptr) -> u32 = slot(fence, 9);
@@ -509,6 +510,19 @@ fn the_cache_creation_slots_fail_without_ending_the_run() {
                 .any(|n| n.starts_with(&format!("device slot {index} "))),
             "{notes:?}"
         );
+    }
+}
+
+#[test]
+fn suspend_and_resume_answer_at_their_console_slots() {
+    let Some(h) = harness() else { return };
+    let queue = h.queue();
+    // SAFETY: queue slots 23 `(0)` and 24 `()`, as the executable calls them.
+    unsafe {
+        let suspend: unsafe extern "win64" fn(Ptr, u32) -> u32 = slot(queue, 23);
+        let resume: unsafe extern "win64" fn(Ptr) -> u32 = slot(queue, 24);
+        assert_eq!(suspend(queue, 0), 0);
+        assert_eq!(resume(queue), 0);
     }
 }
 
