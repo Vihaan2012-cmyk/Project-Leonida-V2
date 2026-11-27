@@ -4,6 +4,19 @@
 //! at once: ready, still building (skip the draw this frame), or failed. A pool of workers builds through a
 //! callback; a key is built once however many callers ask, and what is needed now goes ahead of prefetching,
 //! which goes ahead of the start-up warm list.
+//!
+//! The number of builds at once is the number of workers, and a memory budget caps what they may weigh together:
+//! a build whose weight does not fit waits for the running ones to finish, and one heavier than the whole budget
+//! runs alone. A draw whose pipeline is not ready either [`waits`](CompileQueue::wait) for that one build or
+//! skips ([`DrawPolicy`]).
+
+mod seen;
+mod service;
+
+pub use seen::{BytecodeStore, MemoryBytecode, Pso, PsoKey, SeenEntry, SeenError, SeenLog};
+pub use service::{
+    PipelineBuilder, PipelineHandle, PipelineService, Resolved, ServiceConfig, ServiceStats,
+};
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::Hash;
@@ -25,6 +38,29 @@ pub enum Priority {
     Prefetch,
     /// A draw is waiting for it.
     Needed,
+}
+
+/// What a draw does when its pipeline is not ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DrawPolicy {
+    /// Wait for that pipeline's own build, whatever else is queued. Nothing is missing from the picture; the
+    /// frame takes as long as the build.
+    #[default]
+    Wait,
+    /// Leave the draw out and ask again next frame. No stall, at the cost of a missing object for a frame or two.
+    Skip,
+}
+
+impl std::str::FromStr for DrawPolicy {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<DrawPolicy, String> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "wait" => Ok(DrawPolicy::Wait),
+            "skip" => Ok(DrawPolicy::Skip),
+            other => Err(format!("`{other}` is not a draw policy (wait or skip)")),
+        }
+    }
 }
 
 /// Why a build failed, as the builder reports it.
@@ -182,6 +218,8 @@ pub struct Config {
     /// Runs first on each worker thread, for example to lower its priority.
     pub worker_init: Option<Arc<dyn Fn() + Send + Sync>>,
     pub persist: Option<Persist>,
+    /// The most the builds running together may weigh, by the queue's weight function; `None` for no cap.
+    pub memory_budget: Option<u64>,
 }
 
 impl Default for Config {
@@ -192,6 +230,7 @@ impl Default for Config {
             workers: cpus.saturating_sub(2).clamp(1, 8),
             worker_init: None,
             persist: None,
+            memory_budget: None,
         }
     }
 }
@@ -209,6 +248,10 @@ pub struct Stats {
     pub warm_done: usize,
     pub flushes: u64,
     pub flush_errors: u64,
+    /// The weight of the builds running now, and the most builds and weight there have been at once.
+    pub memory_in_use: u64,
+    pub peak_building: usize,
+    pub peak_memory: u64,
 }
 
 enum Slot<P> {
@@ -254,12 +297,15 @@ struct Inner<K, P> {
 }
 
 type Builder<K, P> = dyn Fn(&K) -> Result<P, BuildError> + Send + Sync;
+type Weigher<K> = dyn Fn(&K) -> u64 + Send + Sync;
 
 struct Shared<K, P> {
     inner: Mutex<Inner<K, P>>,
     work: Condvar,
     done: Condvar,
     builder: Box<Builder<K, P>>,
+    weigh: Option<Box<Weigher<K>>>,
+    budget: Option<u64>,
     persist: Option<Persist>,
 }
 
@@ -302,22 +348,35 @@ impl<K: Hash + Eq + Clone, P> Shared<K, P> {
     fn run(&self) {
         loop {
             let mut inner = self.lock();
-            let key = loop {
+            let (key, weight) = loop {
                 if inner.shutdown {
                     return;
                 }
-                match inner.heap.pop() {
-                    Some(job) => {
-                        if matches!(inner.slots.get(&job.key), Some(Slot::Queued(p)) if *p == job.priority)
-                        {
-                            inner.slots.insert(job.key.clone(), Slot::Building);
-                            inner.stats.queued -= 1;
-                            inner.stats.building += 1;
-                            break job.key;
-                        }
-                    }
-                    None => inner = self.work.wait(inner).unwrap_or_else(|e| e.into_inner()),
+                let Some(job) = inner.heap.peek() else {
+                    inner = self.work.wait(inner).unwrap_or_else(|e| e.into_inner());
+                    continue;
+                };
+                if !matches!(inner.slots.get(&job.key), Some(Slot::Queued(p)) if *p == job.priority)
+                {
+                    inner.heap.pop();
+                    continue;
                 }
+                let weight = self.weigh.as_ref().map_or(0, |weigh| weigh(&job.key));
+                let fits = self.budget.is_none_or(|budget| {
+                    inner.stats.building == 0 || inner.stats.memory_in_use + weight <= budget
+                });
+                if !fits {
+                    inner = self.work.wait(inner).unwrap_or_else(|e| e.into_inner());
+                    continue;
+                }
+                let job = inner.heap.pop().expect("peeked");
+                inner.slots.insert(job.key.clone(), Slot::Building);
+                inner.stats.queued -= 1;
+                inner.stats.building += 1;
+                inner.stats.memory_in_use += weight;
+                inner.stats.peak_building = inner.stats.peak_building.max(inner.stats.building);
+                inner.stats.peak_memory = inner.stats.peak_memory.max(inner.stats.memory_in_use);
+                break (job.key, weight);
             };
             drop(inner);
 
@@ -325,6 +384,7 @@ impl<K: Hash + Eq + Clone, P> Shared<K, P> {
 
             let mut inner = self.lock();
             inner.stats.building -= 1;
+            inner.stats.memory_in_use -= weight;
             let slot = match result {
                 Ok(Ok(pipeline)) => {
                     inner.stats.built += 1;
@@ -355,6 +415,7 @@ impl<K: Hash + Eq + Clone, P> Shared<K, P> {
             }
             drop(inner);
             self.done.notify_all();
+            self.work.notify_all();
             if flush {
                 let _ = self.flush();
                 self.done.notify_all();
@@ -378,6 +439,24 @@ where
         config: Config,
         builder: impl Fn(&K) -> Result<P, BuildError> + Send + Sync + 'static,
     ) -> CompileQueue<K, P> {
+        Self::start(config, None, builder)
+    }
+
+    /// As [`new`](Self::new), with a weight for each key, which the memory budget caps across running builds.
+    /// `weigh` runs under the queue's lock: it must be quick and must not call the queue.
+    pub fn weighted(
+        config: Config,
+        weigh: impl Fn(&K) -> u64 + Send + Sync + 'static,
+        builder: impl Fn(&K) -> Result<P, BuildError> + Send + Sync + 'static,
+    ) -> CompileQueue<K, P> {
+        Self::start(config, Some(Box::new(weigh)), builder)
+    }
+
+    fn start(
+        config: Config,
+        weigh: Option<Box<Weigher<K>>>,
+        builder: impl Fn(&K) -> Result<P, BuildError> + Send + Sync + 'static,
+    ) -> CompileQueue<K, P> {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 slots: HashMap::new(),
@@ -391,6 +470,8 @@ where
             work: Condvar::new(),
             done: Condvar::new(),
             builder: Box::new(builder),
+            weigh,
+            budget: config.memory_budget,
             persist: config.persist,
         });
         let workers = (0..config.workers.max(1))
@@ -438,28 +519,54 @@ where
     /// Like [`request`](Self::request) at [`Priority::Needed`], then waits up to `timeout` for the result.
     /// For loading screens and for a draw that cannot be skipped.
     pub fn request_wait(&self, key: &K, timeout: Duration) -> Poll<P> {
+        self.wait_until(key, Some(Instant::now() + timeout))
+    }
+
+    /// Like [`request`](Self::request) at [`Priority::Needed`], then waits for that one build: ready or failed,
+    /// never pending. The wait is on this key alone; other builds queue and finish around it.
+    pub fn wait(&self, key: &K) -> Poll<P> {
+        self.wait_until(key, None)
+    }
+
+    /// What a draw that needs `key` gets under `policy`.
+    pub fn for_draw(&self, key: &K, policy: DrawPolicy) -> Poll<P> {
+        match policy {
+            DrawPolicy::Wait => self.wait(key),
+            DrawPolicy::Skip => self.request(key, Priority::Needed),
+        }
+    }
+
+    fn wait_until(&self, key: &K, deadline: Option<Instant>) -> Poll<P> {
         let first = self.request(key, Priority::Needed);
         if !first.is_pending() {
             return first;
         }
-        let deadline = Instant::now() + timeout;
         let mut inner = self.shared.lock();
         loop {
             match inner.slots.get(key) {
                 Some(Slot::Ready(p)) => return Poll::Ready(p.clone()),
                 Some(Slot::Failed(e)) => return Poll::Failed(e.clone()),
-                _ => {}
+                Some(_) => {}
+                None => return Poll::Pending,
             }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Poll::Pending;
-            }
-            inner = self
-                .shared
-                .done
-                .wait_timeout(inner, left)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
+            inner = match deadline {
+                None => self
+                    .shared
+                    .done
+                    .wait(inner)
+                    .unwrap_or_else(|e| e.into_inner()),
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Poll::Pending;
+                    }
+                    self.shared
+                        .done
+                        .wait_timeout(inner, left)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0
+                }
+            };
         }
     }
 
@@ -569,6 +676,7 @@ mod tests {
             workers,
             worker_init: None,
             persist: None,
+            memory_budget: None,
         }
     }
 
@@ -761,6 +869,202 @@ mod tests {
         assert!(fake.order.lock().unwrap().len() < 101);
     }
 
+    /// Counts builds running at once and the weight they hold, and holds key 0 until the gate opens when asked.
+    #[derive(Default)]
+    struct Gauge {
+        running: AtomicUsize,
+        most: AtomicUsize,
+        held: AtomicUsize,
+        heaviest: AtomicUsize,
+        order: Mutex<Vec<u32>>,
+        gate: (Mutex<bool>, Condvar),
+    }
+
+    impl Gauge {
+        fn enter(&self, key: u32, weight: usize, wait_for_gate: bool) {
+            let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(running, Ordering::SeqCst);
+            let held = self.held.fetch_add(weight, Ordering::SeqCst) + weight;
+            self.heaviest.fetch_max(held, Ordering::SeqCst);
+            self.order.lock().unwrap().push(key);
+            if wait_for_gate {
+                let mut open = self.gate.0.lock().unwrap();
+                while !*open {
+                    open = self.gate.1.wait(open).unwrap();
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.held.fetch_sub(weight, Ordering::SeqCst);
+            self.running.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        fn open(&self) {
+            *self.gate.0.lock().unwrap() = true;
+            self.gate.1.notify_all();
+        }
+
+        fn started(&self) -> Vec<u32> {
+            self.order.lock().unwrap().clone()
+        }
+
+        fn wait_for_a_start(&self) {
+            let start = Instant::now();
+            while self.started().is_empty() {
+                assert!(start.elapsed() < LONG, "builder never started");
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    fn settle() {
+        std::thread::sleep(Duration::from_millis(60));
+    }
+
+    #[test]
+    fn no_more_builds_run_at_once_than_there_are_workers() {
+        let gauge = Arc::new(Gauge::default());
+        let for_builder = gauge.clone();
+        let queue = CompileQueue::new(config(3), move |key: &u32| {
+            for_builder.enter(*key, 0, false);
+            Ok(*key)
+        });
+        queue.prefetch(0..40);
+        assert!(queue.wait_idle(LONG));
+        assert!(gauge.most.load(Ordering::SeqCst) <= 3);
+        let stats = queue.stats();
+        assert!(stats.peak_building <= 3);
+        assert_eq!(stats.built, 40);
+    }
+
+    fn budgeted(
+        workers: usize,
+        budget: u64,
+        weights: fn(&u32) -> u64,
+        gate: bool,
+    ) -> (Arc<Gauge>, CompileQueue<u32, u32>) {
+        let gauge = Arc::new(Gauge::default());
+        let for_builder = gauge.clone();
+        let queue = CompileQueue::weighted(
+            Config {
+                memory_budget: Some(budget),
+                ..config(workers)
+            },
+            weights,
+            move |key: &u32| {
+                for_builder.enter(*key, weights(key) as usize, gate && *key == 0);
+                Ok(*key)
+            },
+        );
+        (gauge, queue)
+    }
+
+    #[test]
+    fn the_memory_budget_caps_what_builds_hold_together() {
+        let (gauge, queue) = budgeted(4, 100, |_| 40, false);
+        queue.prefetch(0..30);
+        assert!(queue.wait_idle(LONG));
+        assert!(gauge.heaviest.load(Ordering::SeqCst) <= 100);
+        assert!(gauge.most.load(Ordering::SeqCst) <= 2);
+        let stats = queue.stats();
+        assert!(stats.peak_memory <= 100 && stats.peak_memory >= 40);
+        assert_eq!((stats.built, stats.memory_in_use), (30, 0));
+    }
+
+    #[test]
+    fn a_build_heavier_than_the_whole_budget_runs_alone() {
+        let (gauge, queue) = budgeted(4, 100, |key| if *key == 7 { 500 } else { 10 }, false);
+        queue.prefetch(0..20);
+        assert!(queue.wait_idle(LONG));
+        assert_eq!(queue.stats().built, 20);
+        assert!(gauge.started().contains(&7));
+        assert_eq!(
+            gauge.heaviest.load(Ordering::SeqCst),
+            500,
+            "something ran beside the heavy build"
+        );
+    }
+
+    #[test]
+    fn a_build_that_does_not_fit_holds_back_everything_behind_it() {
+        let (gauge, queue) = budgeted(2, 100, |key| if *key == 10 { 10 } else { 60 }, true);
+        queue.request(&0, Priority::Needed);
+        gauge.wait_for_a_start();
+        queue.request(&1, Priority::Needed);
+        queue.warm([10]);
+        settle();
+        assert_eq!(
+            gauge.started(),
+            vec![0],
+            "1 does not fit and 10 may not pass it"
+        );
+        gauge.open();
+        assert!(queue.wait_idle(LONG));
+        assert_eq!(gauge.started(), vec![0, 1, 10]);
+    }
+
+    #[test]
+    fn a_draw_that_skips_gets_pending_at_once_and_the_build_moves_up() {
+        let fake = Fake::new();
+        let queue = fake.queue();
+        queue.request(&0, Priority::Needed);
+        fake.wait_started(0);
+        queue.warm([10, 11, 12]);
+        let start = Instant::now();
+        assert!(queue.for_draw(&12, DrawPolicy::Skip).is_pending());
+        assert!(start.elapsed() < Duration::from_millis(500));
+        fake.open();
+        assert!(queue.wait_idle(LONG));
+        assert_eq!(*fake.order.lock().unwrap(), vec![0, 12, 10, 11]);
+        assert!(queue.for_draw(&12, DrawPolicy::Skip).ready().is_some());
+    }
+
+    #[test]
+    fn a_draw_that_waits_waits_for_its_own_build_and_nothing_else() {
+        let gauge = Arc::new(Gauge::default());
+        let for_builder = gauge.clone();
+        let queue = Arc::new(CompileQueue::new(config(2), move |key: &u32| {
+            for_builder.enter(*key, 0, *key == 0);
+            Ok(*key)
+        }));
+        queue.request(&0, Priority::Needed);
+        gauge.wait_for_a_start();
+        let quick = queue.for_draw(&1, DrawPolicy::Wait);
+        assert_eq!(**quick.ready().unwrap(), 1);
+        assert!(queue.poll(&0).unwrap().is_pending());
+
+        let waiting = {
+            let queue = queue.clone();
+            std::thread::spawn(move || queue.for_draw(&0, DrawPolicy::Wait))
+        };
+        settle();
+        assert!(!waiting.is_finished());
+        gauge.open();
+        let done = waiting.join().unwrap();
+        assert_eq!(**done.ready().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_draw_sees_a_failed_build_as_failed_under_either_policy() {
+        let queue = CompileQueue::new(config(1), |_: &u32| Err::<u32, _>("no".into()));
+        assert!(matches!(
+            queue.for_draw(&1, DrawPolicy::Wait),
+            Poll::Failed(_)
+        ));
+        assert!(matches!(
+            queue.for_draw(&1, DrawPolicy::Skip),
+            Poll::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn the_draw_policy_reads_from_text_and_defaults_to_waiting() {
+        assert_eq!(DrawPolicy::default(), DrawPolicy::Wait);
+        assert_eq!(" Skip ".parse::<DrawPolicy>(), Ok(DrawPolicy::Skip));
+        assert_eq!("wait".parse::<DrawPolicy>(), Ok(DrawPolicy::Wait));
+        assert!("later".parse::<DrawPolicy>().is_err());
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/test-tmp/compile-queue")
@@ -799,6 +1103,7 @@ mod tests {
             Config {
                 workers: 2,
                 worker_init: None,
+                memory_budget: None,
                 persist: Some(Persist {
                     file: file.clone(),
                     snapshot: Box::new(move || {

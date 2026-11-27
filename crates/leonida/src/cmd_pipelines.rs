@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use gpu::{CacheLoad, Gpu};
 use shader_container::CarvedShader;
 use shader_store::{
-    Key, PipelineOutcome, Record, Store, container_programs, key_hex, translate_program,
+    Key, PipelineOutcome, Record, Store, container_programs, key_hex, translate_with_facts,
 };
 
 use crate::cli::PipelinesArgs;
@@ -52,6 +52,7 @@ struct Run<'a> {
     outcomes: Outcomes,
     seen: Mutex<HashSet<Key>>,
     batch: Mutex<Vec<(Key, Record)>>,
+    code_bases: Mutex<Vec<(Key, bool)>>,
     saving: Mutex<()>,
     counts: Mutex<Counts>,
     errors: Mutex<Vec<String>>,
@@ -71,6 +72,12 @@ impl Run<'_> {
         let batch = std::mem::take(&mut *self.batch.lock().expect("no worker panicked"));
         if !batch.is_empty()
             && let Err(error) = self.store.put_batch(&batch)
+        {
+            return self.fail(error);
+        }
+        let facts = std::mem::take(&mut *self.code_bases.lock().expect("no worker panicked"));
+        if !facts.is_empty()
+            && let Err(error) = self.store.put_code_bases(&facts)
         {
             return self.fail(error);
         }
@@ -130,7 +137,14 @@ impl Run<'_> {
                 }
                 None => {
                     self.counts.lock().expect("no worker panicked").translated += 1;
-                    translate_program(&source)
+                    let (record, built, uses) = translate_with_facts(&source, None);
+                    if let Some(uses) = uses {
+                        self.code_bases
+                            .lock()
+                            .expect("no worker panicked")
+                            .push((key, uses));
+                    }
+                    (record, built)
                 }
             };
             let program = self.store.resolve_with(key, record.clone(), built);
@@ -213,6 +227,7 @@ pub fn pipelines_command(args: &PipelinesArgs) -> Result<ExitCode> {
         outcomes: Arc::new(Mutex::new(HashMap::new())),
         seen: Mutex::default(),
         batch: Mutex::default(),
+        code_bases: Mutex::default(),
         saving: Mutex::default(),
         counts: Mutex::default(),
         errors: Mutex::default(),
