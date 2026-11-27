@@ -376,7 +376,7 @@ impl AddressSpace {
             .unwrap_or(support.max_window)
             .min(support.max_window);
         let host = external_memory_host::Device::new(&handles.instance, &handles.device);
-        let window = Self::make_window(&handles, config.base, size)?;
+        let window = Self::make_window(&handles, config.base, size, false)?;
         // SAFETY: `physical` came from `instance`.
         let types = unsafe {
             handles
@@ -402,27 +402,45 @@ impl AddressSpace {
             generation: 0,
         };
         space.backing = space.choose_backing()?;
+        if space.backing == Backing::Direct {
+            let external = Self::make_window(&space.h, config.base, size, true)?;
+            let host = space.probe_host_bits()?;
+            if host & external.type_bits != 0 {
+                let plain = std::mem::replace(&mut space.window, external);
+                // SAFETY: never bound or used.
+                unsafe { space.h.device.destroy_buffer(plain.buffer, None) };
+            } else {
+                // SAFETY: never bound or used.
+                unsafe { space.h.device.destroy_buffer(external.buffer, None) };
+                space.backing = Backing::Mirrored;
+            }
+        }
         Ok(space)
     }
 
-    /// Direct when a sparse buffer accepts the memory types imported host memory has.
-    fn choose_backing(&self) -> Result<Backing, MemoryError> {
+    /// The memory types imported host memory can have, asked of a probe allocation.
+    fn probe_host_bits(&self) -> Result<u32, MemoryError> {
         let layout = std::alloc::Layout::from_size_align(PAGE as usize, PAGE as usize)
             .expect("a valid layout");
         // SAFETY: a probe allocation only handed to the driver to ask its memory types, then freed.
         unsafe {
             let probe = std::alloc::alloc(layout);
             if probe.is_null() {
-                return Ok(Backing::Mirrored);
+                return Ok(0);
             }
             let bits = self.host_type_bits(probe as u64);
             std::alloc::dealloc(probe, layout);
-            Ok(if bits? & self.window.type_bits != 0 {
-                Backing::Direct
-            } else {
-                Backing::Mirrored
-            })
+            bits
         }
+    }
+
+    /// Direct when a sparse buffer accepts the memory types imported host memory has.
+    fn choose_backing(&self) -> Result<Backing, MemoryError> {
+        Ok(if self.probe_host_bits()? & self.window.type_bits != 0 {
+            Backing::Direct
+        } else {
+            Backing::Mirrored
+        })
     }
 
     fn host_type_bits(&self, va: u64) -> Result<u32, MemoryError> {
@@ -440,12 +458,23 @@ impl AddressSpace {
         Ok(host.memory_type_bits)
     }
 
-    fn make_window(h: &Handles, base: u64, size: u64) -> Result<Window, MemoryError> {
-        let info = vk::BufferCreateInfo::default()
+    /// `external` marks the buffer as able to take imported host memory, which a direct window needs.
+    fn make_window(
+        h: &Handles,
+        base: u64,
+        size: u64,
+        external: bool,
+    ) -> Result<Window, MemoryError> {
+        let mut host = vk::ExternalMemoryBufferCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+        let mut info = vk::BufferCreateInfo::default()
             .flags(vk::BufferCreateFlags::SPARSE_BINDING | vk::BufferCreateFlags::SPARSE_RESIDENCY)
             .size(size)
             .usage(WINDOW_USAGE)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        if external {
+            info = info.push_next(&mut host);
+        }
         // SAFETY: a fresh sparse buffer, destroyed by `AddressSpace::drop` or `reclaim`.
         unsafe {
             let buffer = h.device.create_buffer(&info, None)?;
@@ -551,7 +580,7 @@ impl AddressSpace {
                 max: self.support.max_window,
             });
         }
-        let window = Self::make_window(&self.h, new_base, needed)?;
+        let window = Self::make_window(&self.h, new_base, needed, self.backing == Backing::Direct)?;
         let old = std::mem::replace(&mut self.window, window);
         self.retired_buffers.push(old.buffer);
         self.generation += 1;
@@ -764,10 +793,13 @@ impl AddressSpace {
         // SAFETY: fresh objects; on failure each one made so far is destroyed. The host memory stays mapped, as
         // `map_host` requires.
         unsafe {
+            let mut host = vk::ExternalMemoryBufferCreateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
             let buffer = device.create_buffer(
                 &vk::BufferCreateInfo::default()
                     .size(len)
-                    .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST),
+                    .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+                    .push_next(&mut host),
                 None,
             )?;
             let needs = device.get_buffer_memory_requirements(buffer);
