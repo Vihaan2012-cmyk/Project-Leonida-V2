@@ -291,7 +291,8 @@ impl<'a> Awc<'a> {
             .collect())
     }
 
-    /// Cumulative sample positions per 2048-byte block (`0xa3`).
+    /// First sample of each 2048-byte block (`0xa3`); measured on XMA2 streams, where each entry is the
+    /// running total of decoded samples at the packet start.
     pub fn seek_table(&self, stream: &AwcStream) -> Result<Vec<u32>> {
         let d = self.tag_data(self.require(stream, TAG_SEEK_TABLE, "seek table (0xa3)")?)?;
         Ok(d.chunks_exact(4)
@@ -317,10 +318,10 @@ impl<'a> Awc<'a> {
     }
 }
 
-/// Block index for a sample position from a seek table of cumulative positions: the last block that starts at
-/// or before `sample` (block `i` starts where block `i - 1` ends, block 0 at sample 0).
+/// Block index for a sample position from a seek table: entry `i` is the first sample of block `i`, so this is
+/// the last block that starts at or before `sample`.
 pub fn seek_block(table: &[u32], sample: u32) -> usize {
-    table.partition_point(|&end| end <= sample).min(table.len().saturating_sub(1))
+    table.partition_point(|&start| start <= sample).saturating_sub(1)
 }
 
 #[cfg(test)]
@@ -485,7 +486,7 @@ mod tests {
                 m.extend_from_slice(&v.to_le_bytes());
             }
         }
-        let seek: Vec<u8> = [11520u32, 23040, 34560].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let seek: Vec<u8> = [0u32, 11520, 23040, 34560].iter().flat_map(|v| v.to_le_bytes()).collect();
         let bytes = bank(
             0,
             &[StreamSpec {
@@ -507,10 +508,10 @@ mod tests {
             ]
         );
         let table = awc.seek_table(s).unwrap();
-        assert_eq!(table, vec![11520, 23040, 34560]);
+        assert_eq!(table, vec![0, 11520, 23040, 34560]);
         assert_eq!(seek_block(&table, 0), 0);
         assert_eq!(seek_block(&table, 11519), 0);
         assert_eq!(seek_block(&table, 11520), 1);
-        assert_eq!(seek_block(&table, 999_999), 2);
+        assert_eq!(seek_block(&table, 999_999), 3);
     }
 }
