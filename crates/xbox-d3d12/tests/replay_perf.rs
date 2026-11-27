@@ -1714,38 +1714,40 @@ fn a_list_that_fails_to_record_fails_the_batch_and_a_single_worker_records_in_or
 #[ignore = "benchmark: run with --release --ignored --nocapture"]
 fn recording_eight_lists_in_parallel_beats_recording_them_in_turn() {
     let Some(world) = World::new(8) else { return };
-    let lists: Vec<Vec<Command>> = (0..8)
-        .map(|_| {
-            game_frame(
-                &world,
-                Shape {
-                    passes: 5,
-                    draws_per_pass: 250,
-                },
-            )
-        })
-        .collect();
-    let refs: Vec<&[Command]> = lists.iter().map(|l| l.as_slice()).collect();
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    for workers in [1, 2, 4, 8] {
-        let mut pools =
-            xbox_d3d12::execute::parallel::RecordPools::new(&world.ctx, workers).unwrap();
-        let mut times = Vec::new();
-        for _ in 0..30 {
-            // SAFETY: nothing is submitted, so no buffer is pending.
-            unsafe { pools.reset().unwrap() };
-            let start = Instant::now();
-            xbox_d3d12::execute::parallel::record_lists(&world.ctx, &mut pools, &refs, &|_| {
-                world.env()
+    for passes in [5, 20, 80] {
+        let lists: Vec<Vec<Command>> = (0..8)
+            .map(|_| {
+                game_frame(
+                    &world,
+                    Shape {
+                        passes,
+                        draws_per_pass: 250,
+                    },
+                )
             })
-            .unwrap();
-            times.push(start.elapsed());
+            .collect();
+        let refs: Vec<&[Command]> = lists.iter().map(|l| l.as_slice()).collect();
+        for workers in [1, 2, 4, 8] {
+            let mut pools =
+                xbox_d3d12::execute::parallel::RecordPools::new(&world.ctx, workers).unwrap();
+            let mut times = Vec::new();
+            for _ in 0..30 {
+                // SAFETY: nothing is submitted, so no buffer is pending.
+                unsafe { pools.reset().unwrap() };
+                let start = Instant::now();
+                xbox_d3d12::execute::parallel::record_lists(&world.ctx, &mut pools, &refs, &|_| {
+                    world.env()
+                })
+                .unwrap();
+                times.push(start.elapsed());
+            }
+            let med = median(&mut times);
+            println!(
+                "8 lists, {workers} worker(s) on {threads} hardware threads: median {:.2} ms for {} draws",
+                med.as_secs_f64() * 1e3,
+                8 * passes * 250
+            );
         }
-        let med = median(&mut times);
-        println!(
-            "8 lists, {workers} worker(s) on {threads} hardware threads: median {:.2} ms for {} draws",
-            med.as_secs_f64() * 1e3,
-            8 * 5 * 250
-        );
     }
 }
