@@ -5,7 +5,10 @@
 
 pub mod bc1;
 pub mod layout;
+mod passes;
 pub mod swizzle;
+
+pub use passes::{Barrier, Bc1Buffers, Bc1Job, Passes};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LayoutError {
