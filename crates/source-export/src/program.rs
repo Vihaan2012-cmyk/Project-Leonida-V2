@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use pe_image::{Function, Image};
 
 use crate::image_data::{ImportTable, text_at, thunk_target};
+use crate::symbols::{Symbols, default_name};
 
 /// The image as the decompiler sees it.
 pub struct ImageProgram<'a> {
@@ -10,10 +11,16 @@ pub struct ImageProgram<'a> {
     functions: Vec<Function>,
     primary: Vec<u32>,
     import_names: HashMap<u32, String>,
+    symbols: &'a dyn Symbols,
 }
 
 impl<'a> ImageProgram<'a> {
-    pub fn new(image: &'a Image<'a>, functions: &[Function], imports: &ImportTable) -> Self {
+    pub fn new(
+        image: &'a Image<'a>,
+        functions: &[Function],
+        imports: &ImportTable,
+        symbols: &'a dyn Symbols,
+    ) -> Self {
         let import_names = imports
             .iter()
             .map(|(_, import)| (import.slot, import.name.clone()))
@@ -23,11 +30,19 @@ impl<'a> ImageProgram<'a> {
             functions: functions.to_vec(),
             primary: functions.iter().map(|f| image.primary(*f).begin).collect(),
             import_names,
+            symbols,
         }
     }
 
-    fn rva(&self, va: u64) -> Option<u32> {
+    pub fn rva(&self, va: u64) -> Option<u32> {
         u32::try_from(va.checked_sub(self.image.image_base)?).ok()
+    }
+
+    /// The exception-table entry covering `rva`.
+    pub fn containing(&self, rva: u32) -> Option<Function> {
+        let index = self.functions.partition_point(|f| f.begin <= rva);
+        let function = self.functions[..index].last().copied()?;
+        (rva < function.end).then_some(function)
     }
 
     fn owner(&self, rva: u32) -> Option<u32> {
@@ -72,6 +87,15 @@ impl decompile::Program for ImageProgram<'_> {
             }
             Some(_) => text_at(self.image, rva).map_or(Symbol::Data, Symbol::Text),
             None => Symbol::Unknown,
+        }
+    }
+
+    fn name(&self, va: u64) -> Option<String> {
+        let rva = self.rva(va)?;
+        if self.image.section_of(rva)?.executable() {
+            Some(self.symbols.function_name(rva)).filter(|name| *name != default_name(rva))
+        } else {
+            self.symbols.global_name(rva)
         }
     }
 

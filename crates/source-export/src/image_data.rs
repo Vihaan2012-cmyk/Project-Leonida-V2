@@ -49,6 +49,10 @@ impl ImportTable {
         self.imports.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.imports.is_empty()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (usize, &ImportRef)> {
         self.imports.iter().enumerate()
     }
