@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, RwLock};
 pub mod convert;
 pub mod frames;
 pub mod generate;
+pub mod interleave;
 pub mod render;
 pub mod vulkan;
 pub mod window;
