@@ -37,6 +37,7 @@ xbox-d3d12 = { path = "crates/xbox-d3d12" }
 enhancements = { path = "crates/enhancements" }
 upscale = { path = "crates/upscale" }
 config = { path = "crates/config" }
+systems = { path = "crates/systems" }
 decompile = { path = "crates/decompile" }
 offline = { path = "crates/offline" }
 gpu = { path = "crates/gpu" }

@@ -26,6 +26,8 @@ pub enum Command {
     Run(RunArgs),
     /// Look at every file in the game folder for signs of tampering, without running or loading anything.
     Triage(TriageArgs),
+    /// Convert game behaviour data (binary XML, string tables) to readable text and back.
+    Systems(SystemsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -225,6 +227,7 @@ pub struct ScanArgs {
 }
 
 #[derive(Debug, Args)]
+
 pub struct ConfigArgs {
     /// The folder the settings files are in. Missing files are written with their defaults.
     #[arg(long, global = true, default_value = "Config")]
@@ -242,4 +245,32 @@ pub enum ConfigCommand {
         /// Only these files, such as graphics or input.toml. All of them when omitted.
         file: Vec<String>,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct SystemsArgs {
+    #[command(subcommand)]
+    pub command: SystemsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SystemsCommand {
+    /// Convert one loose game file to readable text: RBF0 to XML, a string table to JSON, plain XML as it is.
+    Export {
+        input: PathBuf,
+        /// A file to write, or a folder to write the file into under its Systems/ path.
+        output: PathBuf,
+    },
+    /// Convert readable text back: RBF0 XML to binary, or a text JSON patched into the resource it came from.
+    Import {
+        input: PathBuf,
+        output: PathBuf,
+        /// For a text JSON: the original string-table resource to patch.
+        #[arg(long)]
+        base: Option<PathBuf>,
+    },
+    /// Show which Systems/ folder each kind of file goes to and which systems are not decoded yet.
+    Map,
+    /// Write a NOT_DECODED.md note for every system whose format is not decoded, under this folder.
+    Notes { folder: PathBuf },
 }

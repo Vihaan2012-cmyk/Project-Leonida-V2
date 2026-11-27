@@ -5,6 +5,7 @@ mod cmd_exe;
 mod cmd_package;
 mod cmd_run;
 mod cmd_shaders;
+mod cmd_systems;
 mod cmd_verify;
 mod game;
 mod shader_build;
@@ -33,6 +34,7 @@ fn main() -> ExitCode {
         Some(Command::Config(args)) => cmd_config::config_command(args),
         Some(Command::Run(args)) => cmd_run::run_command(args),
         Some(Command::Triage(args)) => cmd_package::triage_command(args),
+        Some(Command::Systems(systems)) => cmd_systems::systems_command(systems),
     };
     result.unwrap_or_else(|error| {
         eprintln!("error: {error:#}");
