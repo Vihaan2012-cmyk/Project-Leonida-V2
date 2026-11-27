@@ -817,7 +817,9 @@ impl PipelineEnv {
             ];
             if !mesh {
                 dynamic.push(vk::DynamicState::PRIMITIVE_TOPOLOGY);
-                dynamic.push(vk::DynamicState::VERTEX_INPUT_BINDING_STRIDE);
+                if !bindings.is_empty() {
+                    dynamic.push(vk::DynamicState::VERTEX_INPUT_BINDING_STRIDE);
+                }
             }
             let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
             let mut rendering = vk::PipelineRenderingCreateInfo::default()
