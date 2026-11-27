@@ -635,3 +635,86 @@ impl Glb {
     }
 }
 
+type Mat = [f32; 16];
+
+fn mul(a: &Mat, b: &Mat) -> Mat {
+    let mut out = [0.0; 16];
+    for c in 0..4 {
+        for r in 0..4 {
+            out[c * 4 + r] = (0..4).map(|k| a[k * 4 + r] * b[c * 4 + k]).sum();
+        }
+    }
+    out
+}
+
+fn node_matrix(n: &Value) -> Mat {
+    let get = |k: &str, d: &[f32]| -> Vec<f32> {
+        n.get(k).map_or(d.to_vec(), |v| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect()
+        })
+    };
+    let (t, q, s) = (
+        get("translation", &[0.0; 3]),
+        get("rotation", &[0.0, 0.0, 0.0, 1.0]),
+        get("scale", &[1.0; 3]),
+    );
+    let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
+    let r = [
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - z * w),
+            2.0 * (x * z + y * w),
+        ],
+        [
+            2.0 * (x * y + z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - x * w),
+        ],
+        [
+            2.0 * (x * z - y * w),
+            2.0 * (y * z + x * w),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
+    ];
+    let mut m = [0.0; 16];
+    for c in 0..3 {
+        for row in 0..3 {
+            m[c * 4 + row] = r[row][c] * s[c];
+        }
+    }
+    m[12..15].copy_from_slice(&t);
+    m[15] = 1.0;
+    m
+}
+
+fn world_matrices(glb: &Glb) -> Vec<Mat> {
+    let nodes = glb.doc["nodes"].as_array().unwrap();
+    let mut world = vec![None; nodes.len()];
+    fn go(nodes: &[Value], world: &mut Vec<Option<Mat>>, at: usize, parent: Mat) {
+        let m = mul(&parent, &node_matrix(&nodes[at]));
+        world[at] = Some(m);
+        for c in nodes[at]["children"].as_array().into_iter().flatten() {
+            go(nodes, world, c.as_u64().unwrap() as usize, m);
+        }
+    }
+    let identity: Mat = [
+        1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+    ];
+    for s in glb.doc["scenes"][0]["nodes"].as_array().unwrap() {
+        go(nodes, &mut world, s.as_u64().unwrap() as usize, identity);
+    }
+    world.into_iter().map(|m| m.unwrap_or(identity)).collect()
+}
+
+fn export_one(set: &ModelSet) -> (ExportedModel, Glb) {
+    let mut out = export(set, &ExportOptions::default()).unwrap();
+    let e = out.remove(0);
+    let glb = parse_glb(&e.glb);
+    glb.validate();
+    (e, glb)
+}
+
