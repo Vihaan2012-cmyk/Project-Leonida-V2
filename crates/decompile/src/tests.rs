@@ -191,3 +191,45 @@ fn names_replace_addresses() {
     assert!(text.contains("g_last = "), "{text}");
     assert!(text.contains("Game::Finish(&g_table)"), "{text}");
 }
+
+#[test]
+fn windows_arguments_and_stack_locals() {
+    let mut image = Image::new(assemble(|a| {
+        a.sub(rsp, 0x58)?;
+        a.lea(eax, ptr(r8 + r9))?;
+        a.mov(dword_ptr(rsp + 0x30), eax)?;
+        a.mov(dword_ptr(rsp + 0x34), edx)?;
+        a.lea(rcx, ptr(rsp + 0x30))?;
+        a.call(START + 0x80)?;
+        a.mov(eax, dword_ptr(rsp + 0x30))?;
+        a.add(eax, dword_ptr(rsp + 0x34))?;
+        a.add(eax, dword_ptr(rsp + 0x58 + 0x28))?;
+        a.add(rsp, 0x58)?;
+        a.ret()
+    }));
+    image.function_len = 0x80;
+    image.code.resize(0x90, 0xCC);
+    let text = decompile(&image, START).expect("decompiles");
+    assert!(
+        text.contains("(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5)"),
+        "{text}"
+    );
+    assert!(text.contains("v_28 = a3 + a4;"), "{text}");
+    assert!(text.contains("sub_00001080(&v_28);"), "{text}");
+    assert!(text.contains("+ a5"), "{text}");
+    assert!(!text.contains("rsp"), "{text}");
+}
+
+#[test]
+fn float_result_comes_from_xmm0() {
+    let text = run(|a| {
+        a.mulss(xmm0, xmm1)?;
+        a.addss(xmm0, xmm2)?;
+        a.ret()
+    });
+    assert!(
+        text.contains("f32 sub_00001000(u64 a1, u64 a2, u64 a3)"),
+        "{text}"
+    );
+    assert!(text.contains("return a1 * a2 + a3;"), "{text}");
+}

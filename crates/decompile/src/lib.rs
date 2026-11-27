@@ -7,7 +7,7 @@ mod lift;
 mod simplify;
 mod structure;
 
-use expr::{Expr, Loc, Printer, register_name};
+use expr::{Expr, Loc, Printer, register_name, type_name};
 use lift::{Function, Stmt};
 use structure::Node;
 
@@ -73,7 +73,7 @@ pub fn decompile(program: &dyn Program, entry: u64) -> Result<String, Error> {
 
 fn stack_name(o: i64) -> String {
     if o < 0 {
-        format!("var_{:x}", -o)
+        format!("v_{:x}", -o)
     } else if o >= 0x28 && o % 8 == 0 {
         format!("a{}", 5 + (o - 0x28) / 8)
     } else {
@@ -136,11 +136,8 @@ impl<'f> Writer<'f> {
         let count = i64::from(registers).max(stack_params);
         let params: Vec<String> = (1..=count).map(|n| format!("u64 a{n}")).collect();
         let returns = match self.f.returns {
-            None => "void",
-            Some(1) => "u8",
-            Some(2) => "u16",
-            Some(4) => "u32",
-            Some(_) => "u64",
+            None => "void".to_string(),
+            Some((loc, w)) => type_name(w, loc.is_vector() && matches!(w, 4 | 8)),
         };
         self.line(&format!("{returns} {title}({}) {{", params.join(", ")));
         self.depth = 1;

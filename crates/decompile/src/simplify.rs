@@ -6,7 +6,7 @@ use crate::lift::{Block, Exit, Function, Stmt, volatile};
 fn partial(loc: Loc, w: u8) -> bool {
     match loc {
         Loc::Reg(r) if r < VECTOR => w < 4,
-        Loc::Reg(_) => w < 16,
+        Loc::Reg(_) => false,
         Loc::Stack(_) => w < 4,
         Loc::Flags => false,
     }

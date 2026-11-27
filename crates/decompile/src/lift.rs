@@ -40,7 +40,8 @@ pub struct Function {
     pub blocks: Vec<Block>,
     pub succ: Vec<Vec<usize>>,
     pub pred: Vec<Vec<usize>>,
-    pub returns: Option<u8>,
+    /// The register that carries the return value at `ret` and its width in bytes.
+    pub returns: Option<(Loc, u8)>,
     pub aliased: HashSet<i64>,
 }
 
@@ -104,6 +105,22 @@ fn op_width(i: &Instruction, op: u32) -> u8 {
         if op > 0 { op_width(i, 0) } else { 8 }
     } else {
         w.min(64) as u8
+    }
+}
+
+/// Scalar float instructions compute the low lane only, so their register result is 4 or 8 bytes wide.
+fn scalar_float_width(name: &str, i: &Instruction) -> Option<u8> {
+    if i.op_count() == 0 || i.op0_kind() != OpKind::Register || !i.op0_register().is_xmm() {
+        return None;
+    }
+    let name = name.to_ascii_lowercase();
+    if name.starts_with('p') || name.starts_with("vp") || name.contains("broadcast") {
+        return None;
+    }
+    match &name[name.len().saturating_sub(2)..] {
+        "ss" => Some(4),
+        "sd" => Some(8),
+        _ => None,
     }
 }
 
@@ -203,6 +220,8 @@ pub struct Lifter<'p> {
     factory: InstructionInfoFactory,
     saves: HashMap<i64, u8>,
     frame: Option<i64>,
+    /// The width of the vector register an instruction writes when it is a scalar float operation.
+    scalar: Option<u8>,
 }
 
 impl<'p> Lifter<'p> {
@@ -214,6 +233,7 @@ impl<'p> Lifter<'p> {
             factory: InstructionInfoFactory::new(),
             saves: HashMap::new(),
             frame: None,
+            scalar: None,
         }
     }
 
@@ -370,7 +390,11 @@ impl<'p> Lifter<'p> {
             OpKind::Register => match reg(i.op_register(op)) {
                 Some((RSP, ..)) => {}
                 Some((index, w, high)) => {
-                    let w = if high { 1 } else { w };
+                    let w = match self.scalar {
+                        Some(scalar) if index >= VECTOR => scalar,
+                        _ if high => 1,
+                        _ => w,
+                    };
                     out.push(Stmt::Def(Loc::Reg(index), w, value));
                     note(st, Loc::Reg(index), w);
                 }
@@ -435,6 +459,7 @@ impl<'p> Lifter<'p> {
         let w = op_width(i, 0);
         let last = i.op_count().saturating_sub(1);
         let name = format!("{m:?}");
+        self.scalar = scalar_float_width(&name, i);
         match m {
             M::Nop
             | M::Endbr64
@@ -1100,11 +1125,11 @@ pub fn lift(program: &dyn Program, entry: u64, raw: &[RawBlock]) -> Function {
             pred[t].push(b);
         }
     }
-    let returns = return_width(&blocks, &pred);
-    if let Some(w) = returns {
+    let returns = return_register(&blocks, &pred);
+    if let Some((loc, w)) = returns {
         for block in &mut blocks {
             if let Exit::Return(value) = &mut block.exit {
-                *value = Some(Expr::Var(Loc::Reg(RAX), w));
+                *value = Some(Expr::Var(loc, w));
             }
         }
     }
@@ -1159,29 +1184,39 @@ fn absorb_defaults(blocks: &mut [Block]) {
     }
 }
 
-fn last_rax(block: &Block) -> Option<u8> {
+const XMM0: Loc = Loc::Reg(VECTOR);
+
+/// The last result register a block defines, and the width of that definition (0 for a clobber).
+fn last_result(block: &Block) -> Option<(Loc, u8)> {
     block.stmts.iter().rev().find_map(|s| match s {
-        Stmt::Def(Loc::Reg(RAX), w, Expr::Call(..)) => Some(*w),
-        Stmt::Def(Loc::Reg(RAX), w, _) => Some(*w),
-        Stmt::Clobber(locs) if locs.contains(&Loc::Reg(RAX)) => Some(0),
+        Stmt::Def(loc @ Loc::Reg(RAX), w, _) => Some((*loc, *w)),
+        Stmt::Def(loc @ Loc::Reg(VECTOR), w, _) => Some((*loc, *w)),
+        Stmt::Clobber(locs) => [Loc::Reg(RAX), XMM0]
+            .into_iter()
+            .find(|l| locs.contains(l))
+            .map(|l| (l, 0)),
         _ => None,
     })
 }
 
-fn return_width(blocks: &[Block], pred: &[Vec<usize>]) -> Option<u8> {
-    let mut width: Option<u8> = None;
+fn return_register(blocks: &[Block], pred: &[Vec<usize>]) -> Option<(Loc, u8)> {
+    let mut width: Option<(Loc, u8)> = None;
     for (b, block) in blocks.iter().enumerate() {
         if !matches!(block.exit, Exit::Return(_)) {
             continue;
         }
-        let mut found: Vec<u8> = last_rax(block).into_iter().collect();
+        let mut found: Vec<(Loc, u8)> = last_result(block).into_iter().collect();
         if found.is_empty() {
             for &p in &pred[b] {
-                found.extend(last_rax(&blocks[p]));
+                found.extend(last_result(&blocks[p]));
             }
         }
-        for w in found.into_iter().filter(|w| *w > 0) {
-            width = Some(width.map_or(w, |current| current.min(w)));
+        for (loc, w) in found.into_iter().filter(|(_, w)| *w > 0) {
+            width = Some(match width {
+                Some((current, cw)) if current == loc => (loc, cw.min(w)),
+                Some((current, cw)) if current == Loc::Reg(RAX) => (current, cw),
+                _ => (loc, w),
+            });
         }
     }
     width
