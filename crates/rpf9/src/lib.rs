@@ -10,6 +10,7 @@ mod index;
 mod inflate;
 mod model;
 mod names;
+mod package;
 mod walk;
 
 pub use archive::{Archive, Header, ResourceData, ScanReport};
@@ -17,4 +18,5 @@ pub use error::Rpf9Error;
 pub use index::{ArchiveInfo, Index, Query};
 pub use model::{Codec, Kind, Layout, Resource, Segment, Space, hex};
 pub use names::{find_names, joaat, name_hash, stem};
+pub use package::{IndexOptions, Progress, index_archive, index_package, package_archives};
 pub use walk::WalkStats;
