@@ -13,6 +13,7 @@ use crate::Shim;
 mod com;
 #[cfg(windows)]
 mod devices;
+mod locale;
 #[cfg(windows)]
 mod modules;
 #[cfg(windows)]
@@ -29,6 +30,8 @@ mod system;
 mod tasks;
 #[cfg(windows)]
 mod user;
+
+pub use locale::set_language;
 
 pub(crate) const S_OK: i32 = 0;
 pub(crate) const E_NOTIMPL: i32 = 0x8000_4001_u32 as i32;
@@ -163,6 +166,7 @@ pub fn shims() -> Vec<Shim> {
     #[cfg(windows)]
     {
         let mut shims = modules::shims();
+        shims.extend(locale::shims());
         shims.extend(runtime::shims());
         shims
     }
