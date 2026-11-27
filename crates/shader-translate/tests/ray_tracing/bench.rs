@@ -134,7 +134,7 @@ fn intersect_cost_per_call() {
                 .collect();
             let (short, long) = (1u32, 2049u32);
             let lanes = (groups * 32) as f64;
-            for wide in [false] {
+            for wide in [false, true] {
                 let spirv_short = translate(&gpu, &looping_program(wide, short), "bench");
                 let spirv_long = translate(&gpu, &looping_program(wide, long), "bench");
                 let a = seconds(
