@@ -1,6 +1,8 @@
 //! Models: drawables, fragments, skeletons and skinning, decoded from a resource's system and
 //! graphics pages and exported as binary glTF with a JSON sidecar.
 
+mod pages;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
     #[error("the resource is not a drawable, fragment or drawable dictionary")]
