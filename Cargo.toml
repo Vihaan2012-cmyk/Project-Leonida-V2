@@ -49,6 +49,7 @@ shader-ir = { path = "crates/shader-ir" }
 shader-translate = { path = "crates/shader-translate" }
 shader-store = { path = "crates/shader-store" }
 testkit = { path = "crates/testkit" }
+content-filter = { path = "crates/content-filter" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

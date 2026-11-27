@@ -30,6 +30,8 @@ pub enum Command {
     Systems(SystemsArgs),
     /// Translate every shader, keep the results in the shader database and build each distinct pipeline once into the pipeline cache.
     Pipelines(PipelinesArgs),
+    /// The nudity filter: find what to hide.
+    Content(ContentArgs),
 }
 
 #[derive(Debug, Args)]
@@ -52,6 +54,44 @@ pub struct PipelinesArgs {
     /// A folder of <hash>.spv files that replace generated shaders. May be given more than once; the first match wins.
     #[arg(long = "overrides")]
     pub overrides: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ContentArgs {
+    #[command(subcommand)]
+    pub command: ContentCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ContentCommand {
+    /// Find the resources that show nudity and write the blocklist to OUTPUT. Reads archives, changes nothing.
+    Scan(ContentScanArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ContentScanArgs {
+    /// The game folder. Searched for when omitted.
+    #[arg(long)]
+    pub game: Option<PathBuf>,
+    /// An archive to read, relative to the game folder. Repeat for several. Default: packs.rpf and
+    /// pack/core_restofworld/core_restofworld.rpf (levels.rpf adds the mannequins and takes much longer).
+    #[arg(long = "archive")]
+    pub archives: Vec<String>,
+    /// Start reading at this byte offset instead of the start of the data area, for a quick sample.
+    #[arg(long)]
+    pub start: Option<u64>,
+    /// Only read this many bytes of each archive, for a quick sample.
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Decoded ped catalogues (JSON from a catalogue decoder) to derive replacements and texture rules from.
+    #[arg(long)]
+    pub catalogues: Option<PathBuf>,
+    /// Where Leonida writes what it makes. The blocklist goes to <OUTPUT>/content-blocklist.json.
+    #[arg(long, default_value = "Output")]
+    pub output: PathBuf,
+    /// Leonida.toml, to report whether nudity is set to block or allow.
+    #[arg(long, default_value = "Config/leonida.toml")]
+    pub config: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -251,7 +291,6 @@ pub struct ScanArgs {
 }
 
 #[derive(Debug, Args)]
-
 pub struct ConfigArgs {
     /// The folder the settings files are in. Missing files are written with their defaults.
     #[arg(long, global = true, default_value = "Config")]
