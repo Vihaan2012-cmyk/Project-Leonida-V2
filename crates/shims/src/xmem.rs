@@ -14,6 +14,12 @@
 //!   page is a 64 KiB section of the page file, since AWE needs a privilege ordinary users lack; its number is
 //!   an index into our own table.
 //! - `XMemIsToolsMemAvailable()`: there is no development kit memory, so false.
+//! - `XMemGetWorkingSetStatistics(kind, stats)`: `BOOL`. The executable passes 0x2000000a or 0x20000001 and
+//!   the upscaler 0x20000001, with a buffer of at least 0x80 bytes; the callers read a 64-bit size at +8.
+//!   The first 16 bytes are written (the title's memory limit at +0, its working set at +8), the rest is
+//!   left alone because nothing measured what it holds.
+//! - `XMemTransferMemory(direction, size)`: moves budget between the title's and the system's partitions on
+//!   the console; a PC has one pool, so it succeeds and moves nothing. Each distinct pair is traced.
 
 use crate::Shim;
 
@@ -32,6 +38,10 @@ mod imp {
         MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT, UnmapViewOfFile2, VirtualAlloc,
         VirtualAlloc2, VirtualFree,
     };
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
     use super::PAGE;
@@ -333,12 +343,69 @@ mod imp {
     pub extern "win64" fn tools_memory_available() -> i32 {
         FALSE
     }
+
+    const DEFAULT_LIMIT: u64 = 12 << 30;
+
+    /// # Safety
+    /// `stats` is null or points at a buffer of at least 16 bytes.
+    pub unsafe extern "win64" fn get_working_set_statistics(kind: u32, stats: *mut u64) -> i32 {
+        if stats.is_null() {
+            return FALSE;
+        }
+        let mut counters = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: fills a plain counters structure for this process.
+        if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) } == 0
+        {
+            return FALSE;
+        }
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: fills a plain status structure.
+        let physical =
+            if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 && status.ullTotalPhys != 0 {
+                status.ullTotalPhys
+            } else {
+                DEFAULT_LIMIT
+            };
+        // SAFETY: the callers' buffers are at least 0x80 bytes.
+        unsafe {
+            stats.write_unaligned(physical);
+            stats.add(1).write_unaligned(counters.WorkingSetSize as u64);
+        }
+        if let Ok(mut seen) = SEEN_KINDS.lock()
+            && !seen.contains(&kind)
+        {
+            seen.push(kind);
+            note(format!("xmem_working_set kind {kind:#x}"));
+        }
+        TRUE
+    }
+
+    static SEEN_KINDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    static SEEN_TRANSFERS: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
+
+    pub extern "win64" fn transfer_memory(direction: u32, size: usize) -> i32 {
+        if let Ok(mut seen) = SEEN_TRANSFERS.lock()
+            && !seen.contains(&(direction, size))
+        {
+            seen.push((direction, size));
+            note(format!(
+                "xmem_transfer direction {direction} size {size:#x}"
+            ));
+        }
+        TRUE
+    }
 }
 
 pub fn shims() -> Vec<Shim> {
     #[cfg(windows)]
     {
-        let list: [(&str, usize); 10] = [
+        let list: [(&str, usize); 12] = [
             ("XMemAlloc", imp::alloc as *const () as usize),
             ("XMemAllocDefault", imp::alloc as *const () as usize),
             ("XMemFree", imp::free as *const () as usize),
@@ -363,6 +430,14 @@ pub fn shims() -> Vec<Shim> {
             (
                 "XMemIsToolsMemAvailable",
                 imp::tools_memory_available as *const () as usize,
+            ),
+            (
+                "XMemGetWorkingSetStatistics",
+                imp::get_working_set_statistics as *const () as usize,
+            ),
+            (
+                "XMemTransferMemory",
+                imp::transfer_memory as *const () as usize,
             ),
         ];
         list.into_iter()
