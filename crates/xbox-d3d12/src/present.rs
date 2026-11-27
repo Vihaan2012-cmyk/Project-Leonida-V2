@@ -9,3 +9,29 @@
 
 pub mod convert;
 pub mod frames;
+pub mod window;
+
+#[derive(Debug, thiserror::Error)]
+pub enum PresentError {
+    #[error("Vulkan: {0}")]
+    Vulkan(String),
+    #[error("not presentable: {0}")]
+    Unsupported(String),
+    #[error("compose shader: {0}")]
+    Shader(String),
+    #[error("window: {0}")]
+    Window(String),
+}
+
+impl From<ash::vk::Result> for PresentError {
+    fn from(r: ash::vk::Result) -> Self {
+        PresentError::Vulkan(r.to_string())
+    }
+}
+
+/// A window that already exists, by its Win32 handles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeWindow {
+    pub hwnd: isize,
+    pub hinstance: Option<isize>,
+}
