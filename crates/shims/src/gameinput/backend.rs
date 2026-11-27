@@ -41,7 +41,9 @@ fn run(hub: &Hub) {
     let mut backend = match Backend::new() {
         Ok(b) => Some(b),
         Err(e) => {
-            note(format!("GameInput: no controller backend ({e}); keyboard and mouse only"));
+            note(format!(
+                "GameInput: no controller backend ({e}); keyboard and mouse only"
+            ));
             None
         }
     };
@@ -63,8 +65,11 @@ pub struct Backend {
 }
 
 impl Backend {
-    pub fn new() -> Result<Backend, gilrs::Error> {
-        let gilrs = GilrsBuilder::new().with_default_filters(false).build()?;
+    pub fn new() -> Result<Backend, Box<gilrs::Error>> {
+        let gilrs = GilrsBuilder::new()
+            .with_default_filters(false)
+            .build()
+            .map_err(Box::new)?;
         Ok(Backend {
             gilrs,
             pads: HashMap::new(),
@@ -222,7 +227,11 @@ fn battery(info: PowerInfo) -> BatteryState {
     };
     BatteryState {
         remaining_capacity: remaining,
-        full_charge_capacity: if status == abi::BATTERY_NOT_PRESENT { 0.0 } else { 1.0 },
+        full_charge_capacity: if status == abi::BATTERY_NOT_PRESENT {
+            0.0
+        } else {
+            1.0
+        },
         status,
         ..Default::default()
     }
