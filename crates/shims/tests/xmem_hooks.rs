@@ -36,6 +36,7 @@ enum Event {
     Pages(u64, u64, SyncPolicy),
     Scatter(Vec<u64>, SyncPolicy),
     Unmapped(u64, u64),
+    Written(u64, u64),
 }
 
 struct Recorder {
@@ -66,6 +67,9 @@ impl GpuMemoryHooks for Recorder {
     }
     fn unmapped(&self, va: u64, len: u64) -> Result<(), MemoryError> {
         self.record(Event::Unmapped(va, len))
+    }
+    fn host_written(&self, va: u64, len: u64) {
+        let _ = self.record(Event::Written(va, len));
     }
     fn window(&self) -> (u64, u64) {
         *self.window.lock().unwrap()
@@ -457,4 +461,52 @@ fn a_window_that_neither_starts_at_zero_nor_ends_on_a_power_of_two_is_honoured()
         }
     }
     assert_eq!(hooks.take().len(), 8);
+}
+
+#[test]
+fn a_page_write_tells_the_hooks_about_each_gpu_view_of_the_page() {
+    let window = (64 * GIB, 64 * GIB);
+    let hooks = Installed::new(window);
+    let reserve: VirtualAlloc = shim("XMemVirtualAlloc");
+    let allocate: Allocate = shim("XMemAllocatePhysicalPages");
+    let map: Map = shim("XMemMapPhysicalPages");
+    // SAFETY: the shapes the executable uses; every pointer is valid.
+    unsafe {
+        let base = reserve(std::ptr::null_mut(), 8 * PAGE as usize, 0x4_2000, 0x7, 0x1);
+        let gpu = (base as u64 + 2 * PAGE) as *mut c_void;
+        assert_eq!(
+            reserve(gpu, 2 * PAGE as usize, 0x2040_6000, 0x27, 0x2404),
+            gpu
+        );
+        let mut count = 3usize;
+        let mut pages = [0usize; 3];
+        assert_eq!(allocate(0x380, &mut count, pages.as_mut_ptr()), 1);
+        assert_eq!(map(gpu, 2, pages.as_ptr()), 1);
+        hooks.take();
+
+        assert_eq!(
+            shims::xmem::write_physical_page(pages[1] as u64, 0x40, &[7; 100]),
+            0
+        );
+        assert_eq!(
+            hooks.take(),
+            vec![Event::Written(gpu as u64 + PAGE + 0x40, 100)]
+        );
+        assert_eq!(
+            ((gpu as usize + PAGE as usize) as *const u8)
+                .add(0x40)
+                .read(),
+            7
+        );
+
+        assert_eq!(
+            shims::xmem::write_physical_page(pages[2] as u64, 0, &[9; 8]),
+            0
+        );
+        assert_eq!(
+            hooks.take(),
+            vec![],
+            "no view, so nothing for the GPU to refresh"
+        );
+    }
 }
