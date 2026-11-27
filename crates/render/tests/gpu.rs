@@ -2,10 +2,11 @@
 
 use render::shaders::SCALE_ADD;
 use render::{
-    BindlessSet, Buffer, BufferDesc, CommandStream, ComputePipeline, DescriptorSet, Device,
-    DeviceOptions, Format, Image, ImageDesc, MemoryLocation, PipelineLayout, SetLayout, StagingRing,
-    vk,
+    BindlessSet, BindlessSizes, BindlessView, Buffer, BufferDesc, CommandStream, ComputePipeline,
+    DescriptorSet, Device, DeviceOptions, Format, Image, ImageDesc, MemoryLocation, PipelineLayout,
+    Sampler, SamplerDesc, SetLayout, StagingRing, vk,
 };
+use shader_translate::images::{self, Number};
 
 fn device() -> Option<Device> {
     let options = DeviceOptions {
@@ -394,3 +395,183 @@ fn host_memory_can_be_aliased_by_a_gpu_buffer() {
     no_validation_errors();
 }
 
+fn small_sizes() -> BindlessSizes {
+    BindlessSizes {
+        images: [64, 32, 16],
+        samplers: 32,
+    }
+}
+
+#[test]
+fn bindless_set_registers_textures_and_samplers() {
+    let Some(device) = device() else { return };
+    if !device.features().bindless {
+        return;
+    }
+    let queue = device.queue(0);
+    let mut set = BindlessSet::new(&queue, small_sizes()).unwrap();
+    let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE;
+    let float_image = Image::new(
+        &device,
+        &ImageDesc::new_2d("float", Format::Rgba8Unorm, 4, 4, usage),
+    )
+    .unwrap();
+    let uint_image = Image::new(
+        &device,
+        &ImageDesc::new_2d("uint", Format::R32Uint, 4, 4, usage),
+    )
+    .unwrap();
+    let array = Image::new(
+        &device,
+        &ImageDesc::new_2d("array", Format::Rgba16Float, 4, 4, usage).layers(3),
+    )
+    .unwrap();
+    let volume = Image::new(
+        &device,
+        &ImageDesc::new_3d("volume", Format::Rg16Sint, [4, 4, 4], usage),
+    )
+    .unwrap();
+    queue
+        .immediate(|cb| {
+            for image in [&float_image, &uint_image, &array, &volume] {
+                cb.transition(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL);
+            }
+            Ok(())
+        })
+        .unwrap();
+    let key =
+        |n: u32| -> [u32; 8] { std::array::from_fn(|i| n.wrapping_mul(0x9E37_79B9) ^ i as u32) };
+    let view_of = |image: &Image| BindlessView::of_image(image);
+    let a = set
+        .add_texture(key(1), &float_image, &view_of(&float_image))
+        .unwrap();
+    let b = set
+        .add_texture(key(2), &uint_image, &view_of(&uint_image))
+        .unwrap();
+    let c = set.add_texture(key(3), &array, &view_of(&array)).unwrap();
+    let d = set.add_texture(key(4), &volume, &view_of(&volume)).unwrap();
+    assert_eq!((a, b, c, d), (1, 2, 1, 1));
+    assert_eq!(
+        set.add_texture(key(1), &float_image, &view_of(&float_image))
+            .unwrap(),
+        a
+    );
+    let plain = Sampler::new(&device, &SamplerDesc::linear()).unwrap();
+    let compare = Sampler::new(
+        &device,
+        &SamplerDesc {
+            compare: Some(vk::CompareOp::LESS),
+            ..SamplerDesc::linear()
+        },
+    )
+    .unwrap();
+    let s_sharp = [1, 2, 3, 4];
+    assert_eq!(set.add_sampler(s_sharp, &plain, &compare).unwrap(), 1);
+    let report = set.flush().unwrap();
+    assert!(report.texture_table_rewritten && report.sampler_table_rewritten);
+    let words = set.texture_table_words().to_vec();
+    assert_eq!(
+        images::lookup(&words, &key(1)),
+        images::slot(a, Number::Float)
+    );
+    assert_eq!(
+        images::lookup(&words, &key(2)),
+        images::slot(b, Number::Uint)
+    );
+    assert_eq!(
+        images::lookup(&words, &key(3)),
+        images::slot(c, Number::Float)
+    );
+    assert_eq!(
+        images::lookup(&words, &key(4)),
+        images::slot(d, Number::Sint)
+    );
+    assert_eq!(images::lookup(&words, &key(9)), 0);
+    let gpu_copy = set
+        .texture_table_buffer()
+        .read_vec(0, words.len() * 4)
+        .unwrap();
+    let gpu_words: Vec<u32> = gpu_copy
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(gpu_words, words);
+    assert_eq!(
+        images::lookup(set.sampler_table_words(), &images::sampler_key(&s_sharp)),
+        1
+    );
+
+    run_scale_add(&device, Some(&set));
+
+    assert!(set.remove_texture(&key(2)));
+    assert!(!set.remove_texture(&key(2)));
+    set.flush().unwrap();
+    assert_eq!(images::lookup(set.texture_table_words(), &key(2)), 0);
+    let again = set
+        .add_texture(key(5), &uint_image, &view_of(&uint_image))
+        .unwrap();
+    assert_eq!(again, b, "a released index is reused");
+    assert!(set.remove_sampler(&s_sharp));
+    set.flush().unwrap();
+    assert_eq!(
+        images::lookup(set.sampler_table_words(), &images::sampler_key(&s_sharp)),
+        0
+    );
+    no_validation_errors();
+}
+
+#[test]
+fn bindless_table_grows_with_many_textures() {
+    let Some(device) = device() else { return };
+    if !device.features().bindless {
+        return;
+    }
+    let queue = device.queue(0);
+    let mut set = BindlessSet::new(&queue, small_sizes()).unwrap();
+    let image = Image::new(
+        &device,
+        &ImageDesc::new_2d("i", Format::Rgba8Unorm, 2, 2, vk::ImageUsageFlags::SAMPLED),
+    )
+    .unwrap();
+    let keys: Vec<[u32; 8]> = (1..60u32)
+        .map(|n| [n, n ^ 5, 0, 0, 0, 0, 0, n * 3])
+        .collect();
+    for key in &keys {
+        set.add_texture(*key, &image, &BindlessView::of_image(&image))
+            .unwrap();
+    }
+    let report = set.flush().unwrap();
+    assert!(report.texture_table_rewritten);
+    for key in &keys {
+        assert_ne!(images::lookup(set.texture_table_words(), key), 0);
+    }
+    no_validation_errors();
+}
+
+#[test]
+fn bindless_arrays_report_when_full() {
+    let Some(device) = device() else { return };
+    if !device.features().bindless {
+        return;
+    }
+    let queue = device.queue(0);
+    let sizes = BindlessSizes {
+        images: [16, 16, 16],
+        samplers: 16,
+    };
+    let mut set = BindlessSet::new(&queue, sizes).unwrap();
+    let image = Image::new(
+        &device,
+        &ImageDesc::new_2d("i", Format::Rgba8Unorm, 2, 2, vk::ImageUsageFlags::SAMPLED),
+    )
+    .unwrap();
+    for n in 1..16u32 {
+        set.add_texture([n; 8], &image, &BindlessView::of_image(&image))
+            .unwrap();
+    }
+    assert!(matches!(
+        set.add_texture([99; 8], &image, &BindlessView::of_image(&image)),
+        Err(render::RenderError::BindlessFull(_))
+    ));
+    no_validation_errors();
+}
