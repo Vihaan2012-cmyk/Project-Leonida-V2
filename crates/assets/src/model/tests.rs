@@ -309,3 +309,52 @@ fn materials_lods_and_names_decode() {
     assert_eq!(d.materials[1].raw_parameters.len(), 3);
 }
 
+#[test]
+fn dictionary_and_fragment_resources_decode() {
+    let child = |hash: u32, name: &'static str| {
+        let mut d = DrawableSpec::simple(GeometrySpec::quad());
+        d.name = Some(name);
+        (hash, d)
+    };
+    let dict = dictionary_resource(&[child(0x1111, "one"), child(0x2222, "two")]);
+    let set = decode_resource(&dict, Some("props")).unwrap();
+    assert_eq!(set.kind, ResourceKind::Dictionary);
+    assert_eq!(set.drawables.len(), 2);
+    assert_eq!(set.drawables[1].name_hash, Some(0x2222));
+
+    let mut main = DrawableSpec::simple(GeometrySpec::quad());
+    main.skeleton = two_bones();
+    let frag = fragment_resource(&[main, DrawableSpec::simple(GeometrySpec::quad())]);
+    let set = decode_resource(&frag, Some("car")).unwrap();
+    assert_eq!(set.kind, ResourceKind::Fragment);
+    assert_eq!(set.drawables.len(), 2);
+    assert_eq!(set.drawables[0].skeleton.as_ref().unwrap().bones.len(), 2);
+    assert!(set.drawables[1].skeleton.is_none());
+}
+
+#[test]
+fn skeleton_decodes_with_hierarchy() {
+    let mut spec = DrawableSpec::simple(GeometrySpec::quad());
+    spec.skeleton = two_bones();
+    let set = decode_resource(&drawable_resource(&spec), None).unwrap();
+    let s = set.drawables[0].skeleton.as_ref().unwrap();
+    assert_eq!(s.bones[0].name.as_deref(), Some("SKEL_ROOT"));
+    assert_eq!(s.bones[1].parent, Some(0));
+    assert_eq!(s.bones[0].parent, None);
+    assert_eq!(s.find_hash(joaat("SKEL_Pelvis")), Some(1));
+    assert_eq!(s.bones[1].inverse_bind[12..15], [-0.5, 0.0, -2.0]);
+}
+
+#[test]
+fn parent_cycles_are_rejected() {
+    let mut spec = DrawableSpec::simple(GeometrySpec::quad());
+    spec.skeleton = vec![
+        bone("a", Some(1), [0.0; 3], [0.0; 3]),
+        bone("b", Some(0), [0.0; 3], [0.0; 3]),
+    ];
+    assert!(matches!(
+        decode_resource(&drawable_resource(&spec), None),
+        Err(ModelError::Invalid(_))
+    ));
+}
+
