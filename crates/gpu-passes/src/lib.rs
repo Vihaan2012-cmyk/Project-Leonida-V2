@@ -3,6 +3,7 @@
 //! an `ash` command buffer given raw buffers. `swizzle` and `layout` are the CPU reference the kernels repeat.
 #![allow(unsafe_code)]
 
+pub mod bc1;
 pub mod layout;
 pub mod swizzle;
 
