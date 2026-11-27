@@ -908,3 +908,46 @@ fn skinned_rest_pose_reproduces_vertices() {
     }
 }
 
+#[test]
+fn lod_selection_and_dictionary_exports() {
+    let mut a = DrawableSpec::simple(GeometrySpec::quad());
+    a.name = Some("alpha");
+    a.lods.push((
+        50.0,
+        vec![ModelSpec {
+            geometries: vec![GeometrySpec::quad()],
+            palette: vec![],
+        }],
+    ));
+    let b = DrawableSpec::simple(GeometrySpec::quad());
+    let set = decode_resource(&dictionary_resource(&[(0xAA, a), (0xBB, b)]), Some("dict")).unwrap();
+
+    let primary = export(&set, &ExportOptions::default()).unwrap();
+    assert_eq!(primary.len(), 2);
+    assert_eq!(primary[0].stem, "alpha");
+    assert_eq!(primary[1].stem, "dict_000000bb");
+    let glb = parse_glb(&primary[0].glb);
+    glb.validate();
+    assert_eq!(glb.doc["meshes"].as_array().unwrap().len(), 1);
+
+    let all = export(
+        &set,
+        &ExportOptions {
+            lods: LodSelection::All,
+            ..ExportOptions::default()
+        },
+    )
+    .unwrap();
+    let glb = parse_glb(&all[0].glb);
+    glb.validate();
+    assert_eq!(glb.doc["meshes"].as_array().unwrap().len(), 2);
+    assert_eq!(glb.doc["nodes"][1]["name"], "alpha_lod1_model0");
+
+    let sidecar: Value = serde_json::from_str(&all[0].sidecar).unwrap();
+    let lods = sidecar["drawables"][0]["lods"].as_array().unwrap();
+    assert_eq!(lods.len(), 2);
+    assert_eq!(lods[1]["distance"], 50.0);
+    assert_eq!(lods[0]["triangles"], 2);
+    assert_eq!(lods[0]["models"][0]["geometries"][0]["vertices"], 4);
+}
+
