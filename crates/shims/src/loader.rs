@@ -14,6 +14,8 @@ mod com;
 #[cfg(windows)]
 mod modules;
 #[cfg(windows)]
+mod runtime;
+#[cfg(windows)]
 mod system;
 #[cfg(windows)]
 mod tasks;
@@ -150,7 +152,9 @@ pub(crate) fn setting(name: &str, default: &str) -> String {
 pub fn shims() -> Vec<Shim> {
     #[cfg(windows)]
     {
-        modules::shims()
+        let mut shims = modules::shims();
+        shims.extend(runtime::shims());
+        shims
     }
     #[cfg(not(windows))]
     {
