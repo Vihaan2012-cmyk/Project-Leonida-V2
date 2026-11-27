@@ -4,6 +4,7 @@
 mod pages;
 mod skeleton;
 mod types;
+mod vertex;
 
 pub use skeleton::joaat;
 pub use types::*;
