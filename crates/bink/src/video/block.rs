@@ -103,7 +103,10 @@ pub fn read_flags(r: &mut BitReader, out: &mut Vec<bool>, start: bool, bits: usi
 
 /// The new quantiser index (0..=36) given the predicted one.
 pub fn read_quant(r: &mut BitReader, predicted: i32) -> Option<i32> {
-    let mut code = r.read_unary(4) as i32;
+    let mut code = 0;
+    while code < 4 && !r.read_bool() {
+        code += 1;
+    }
     if code == 0 {
         return Some(predicted);
     }
@@ -247,7 +250,7 @@ mod tests {
 
     #[test]
     fn quant_delta_adds_or_subtracts() {
-        let data = pack(&[(0, 1), (0b01, 2), (0, 1), (0b01, 2), (1, 1)]);
+        let data = pack(&[(1, 1), (0b10, 2), (0, 1), (0b10, 2), (1, 1)]);
         let mut r = BitReader::new(&data);
         assert_eq!(read_quant(&mut r, 20), Some(20));
         assert_eq!(read_quant(&mut r, 20), Some(21));

@@ -86,7 +86,7 @@ pub fn put_block(coefs: &mut [i32; 64], dst: &mut [u8], stride: usize) {
     idct(coefs);
     for y in 0..8 {
         for x in 0..8 {
-            dst[y * stride + x] = clip(coefs[x * 8 + y]);
+            dst[y * stride + x] = clip(coefs[y * 8 + x]);
         }
     }
 }
