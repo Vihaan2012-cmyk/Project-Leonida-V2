@@ -64,6 +64,7 @@ pub fn configure(plan: &RuntimePlan) -> Result<()> {
         frame_limit: plan.frame_limit,
         graphics: plan.graphics.clone(),
     });
+    shims::loader::set_language(&plan.language);
     audio::configure(plan);
     input::configure(&plan.input);
     for skipped in &plan.input_skipped {

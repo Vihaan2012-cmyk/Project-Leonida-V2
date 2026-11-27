@@ -35,12 +35,12 @@ unsafe extern "win64" fn is_packaged_process(_: This) -> u8 {
     1
 }
 
-/// `XPackageGetUserLocale(localeSize, locale)`: `LEONIDA_LOCALE`, `en-US` otherwise.
+/// `XPackageGetUserLocale(localeSize, locale)`: the `language` setting (`LEONIDA_LOCALE` overrides), `en-US` otherwise.
 unsafe extern "win64" fn user_locale(_: This, size: usize, buffer: *mut u8) -> i32 {
     if buffer.is_null() || size == 0 {
         return E_INVALIDARG;
     }
-    let locale = super::setting("LEONIDA_LOCALE", "en-US");
+    let locale = super::locale::locale_tag();
     // SAFETY: `size` bytes are writable.
     if unsafe { write_c_str(buffer, size, &locale) } {
         S_OK
