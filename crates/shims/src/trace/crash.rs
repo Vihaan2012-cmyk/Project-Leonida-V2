@@ -10,7 +10,7 @@ use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, CONTEXT, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
@@ -65,7 +65,8 @@ fn read_u64(address: usize) -> Option<u64> {
 
 /// Return addresses from `context` outward, at most `limit`.
 pub fn walk(context: &CONTEXT, limit: usize) -> Vec<usize> {
-    let mut context = *context;
+    let mut copy = Aligned(*context);
+    let context = &mut copy.0;
     let mut frames = Vec::new();
     while frames.len() < limit {
         let pc = context.Rip;
@@ -92,7 +93,7 @@ pub fn walk(context: &CONTEXT, limit: usize) -> Vec<usize> {
                     image_base,
                     pc,
                     entry,
-                    &mut context,
+                    context,
                     &mut data,
                     &mut frame,
                     std::ptr::null_mut(),
@@ -307,29 +308,68 @@ fn what_of(object: usize) -> Option<String> {
         .then(|| String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// `RtlCaptureContext` stores with aligned moves, and the bindings' `CONTEXT` is not declared 16-aligned.
+#[repr(C, align(16))]
+struct Aligned(CONTEXT);
+
 fn capture(headline: &str) {
     if BUSY.swap(true, Ordering::Acquire) {
         return;
     }
     // SAFETY: a zeroed CONTEXT is filled in by the call.
-    let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+    let mut context: Aligned = unsafe { std::mem::zeroed() };
     // SAFETY: captures this thread's registers.
-    unsafe { RtlCaptureContext(&mut context) };
-    let found = facts(0, context.Rip as usize, &context, None);
+    unsafe { RtlCaptureContext(&mut context.0) };
+    let found = facts(0, context.0.Rip as usize, &context.0, None);
     record(headline.to_string(), &found);
     BUSY.store(false, Ordering::Release);
 }
 
+type InvalidParameterHandler = unsafe extern "C" fn(*const u16, *const u16, *const u16, u32, usize);
+
+/// The handler the program installed over ours, called after the stop is recorded.
+static PREVIOUS: AtomicUsize = AtomicUsize::new(0);
+static INSTALLED: AtomicBool = AtomicBool::new(false);
+
 unsafe extern "C" fn invalid_parameter(
-    _expression: *const u16,
-    _function: *const u16,
-    _file: *const u16,
-    _line: u32,
-    _reserved: usize,
+    expression: *const u16,
+    function: *const u16,
+    file: *const u16,
+    line: u32,
+    reserved: usize,
 ) {
     capture("invalid parameter passed to the C runtime (the program's _invalid_parameter_noinfo)");
+    let previous = PREVIOUS.load(Ordering::Relaxed);
+    if previous != 0 {
+        // SAFETY: a handler the program registered with the C runtime, which has this signature.
+        let previous: InvalidParameterHandler = unsafe { std::mem::transmute(previous) };
+        // SAFETY: called with the arguments we were given.
+        unsafe { previous(expression, function, file, line, reserved) };
+    }
     // SAFETY: ends the process as the default handler would.
     unsafe { TerminateProcess(GetCurrentProcess(), 0xC000_000D) };
+}
+
+/// Puts the invalid-parameter handler back in front when the program has replaced it (its crash-dump library
+/// does at startup); the replacement is kept and called after ours.
+pub fn keep_hooks() {
+    if !INSTALLED.load(Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: sets the C runtime's handler to ours and gets the one it replaces.
+    let current = unsafe { _set_invalid_parameter_handler(Some(invalid_parameter)) };
+    if current != 0 && current != invalid_parameter as *const () as usize {
+        PREVIOUS.store(current, Ordering::Relaxed);
+        let (base, size) = image();
+        let place = if (base..base + size).contains(&current) {
+            format!("image offset {:#x}", current - base)
+        } else {
+            format!("{current:#x}")
+        };
+        super::note(format!(
+            "the program replaced the invalid-parameter handler with {place}; it is kept behind the trace's"
+        ));
+    }
 }
 
 extern "C" fn abort_signal(_signal: i32) {
@@ -343,9 +383,7 @@ extern "C" fn at_exit() {
 }
 
 unsafe extern "C" {
-    fn _set_invalid_parameter_handler(
-        handler: Option<unsafe extern "C" fn(*const u16, *const u16, *const u16, u32, usize)>,
-    ) -> usize;
+    fn _set_invalid_parameter_handler(handler: Option<InvalidParameterHandler>) -> usize;
     fn signal(signal: i32, handler: usize) -> usize;
     fn atexit(callback: extern "C" fn()) -> i32;
 }
@@ -358,4 +396,5 @@ pub fn install() {
         signal(22, abort_signal as extern "C" fn(i32) as usize);
         atexit(at_exit);
     }
+    INSTALLED.store(true, Ordering::Release);
 }

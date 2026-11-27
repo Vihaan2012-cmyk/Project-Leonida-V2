@@ -114,8 +114,11 @@ impl Trace {
     /// Writes `imports.txt`, `files.txt`, `summary.txt` and `notes.txt` into `folder`.
     pub fn write(&self, folder: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(folder)?;
+        #[cfg(windows)]
+        crash::keep_hooks();
         std::fs::write(folder.join("imports.txt"), self.report())?;
         std::fs::write(folder.join("files.txt"), files().join("\n"))?;
+        std::fs::write(folder.join("summary.txt"), summary_text())?;
         std::fs::write(folder.join("notes.txt"), notes().join("\n"))
     }
 }

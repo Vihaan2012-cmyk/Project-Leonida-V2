@@ -112,11 +112,39 @@ fn image(code: &[u8]) -> Vec<u8> {
     file
 }
 
+unsafe extern "C" {
+    fn _set_invalid_parameter_handler(
+        handler: Option<unsafe extern "C" fn(*const u16, *const u16, *const u16, u32, usize)>,
+    ) -> usize;
+    fn _invalid_parameter_noinfo_noreturn() -> !;
+}
+
+/// Stands for the crash-dump library the program installs over the trace's handler.
+unsafe extern "C" fn programs_handler(
+    _: *const u16,
+    _: *const u16,
+    _: *const u16,
+    _: u32,
+    _: usize,
+) {
+    if let Ok(folder) = std::env::var("LEONIDA_STOP_FOLDER") {
+        let _ = std::fs::write(Path::new(&folder).join("handler-ran.txt"), "yes");
+    }
+}
+
 /// Loads the program of `mode`, watches for stops into `folder` and runs it. Never returns.
 fn child(mode: &str, folder: &Path) {
     use windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode;
     // SAFETY: keeps Windows from showing an error dialog for the stop.
     unsafe { SetErrorMode(0x8003) };
+    if mode == "invalid" {
+        shims::trace::watch_crashes(folder.to_path_buf(), 0, 0);
+        // SAFETY: replaces the C runtime's handler as the program's own library would.
+        unsafe { _set_invalid_parameter_handler(Some(programs_handler)) };
+        shims::trace::Trace::new().write(folder).expect("written");
+        // SAFETY: ends the process through the handlers.
+        unsafe { _invalid_parameter_noinfo_noreturn() };
+    }
     let code = match mode {
         "fastfail" => fast_fail(),
         "violation" => null_write(),
@@ -197,6 +225,25 @@ fn a_stop_is_explained() {
     assert!(crash.contains("image offset 0x1006"), "{crash}");
     assert!(
         summary.starts_with("stopped: exception 0xc0000005"),
+        "{summary}"
+    );
+
+    let (crash, summary) = stop("invalid");
+    assert!(
+        crash.contains("invalid parameter passed to the C runtime"),
+        "{crash}"
+    );
+    assert!(
+        summary.starts_with("stopped: invalid parameter"),
+        "{summary}"
+    );
+    let folder = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stops-invalid");
+    assert!(
+        folder.join("handler-ran.txt").exists(),
+        "the program's own handler runs after the trace's"
+    );
+    assert!(
+        summary.contains("replaced the invalid-parameter handler"),
         "{summary}"
     );
 }
