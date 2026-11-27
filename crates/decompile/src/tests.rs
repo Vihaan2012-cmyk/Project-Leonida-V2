@@ -249,8 +249,8 @@ fn one_register_holding_two_values_gives_two_variables() {
         a.mov(qword_ptr(rcx + 0x30), rax)?;
         a.ret()
     });
-    assert!(text.contains("v1 = *(uint64_t *)a1;"), "{text}");
-    assert!(text.contains("v2 = *(uint64_t *)(a1 + 0x20);"), "{text}");
+    assert!(text.contains("v1 = a1->f_0;"), "{text}");
+    assert!(text.contains("v2 = a1->f_20;"), "{text}");
     assert!(!text.contains("rax"), "{text}");
 }
 
@@ -284,11 +284,11 @@ fn types_follow_width_float_and_dereference() {
         a.ret()
     });
     assert!(
-        text.contains("uint32_t sub_00001000(void *a1, double a2)"),
+        text.contains("uint32_t sub_00001000(struct S1 *a1, double a2)"),
         "{text}"
     );
-    assert!(text.contains("*(double *)(a1 + 8) = a2 * a2;"), "{text}");
-    assert!(text.contains("return *(uint8_t *)(a1 + 3);"), "{text}");
+    assert!(text.contains("a1->f_8 = a2 * a2;"), "{text}");
+    assert!(text.contains("return a1->f_3;"), "{text}");
 }
 
 #[test]
@@ -304,12 +304,12 @@ fn vectors_and_integer_locals_are_declared() {
         a.movaps(xmmword_ptr(rcx + 0x30), xmm0)?;
         a.ret()
     });
-    assert!(text.contains("(void *a1, uint32_t a2)"), "{text}");
+    assert!(text.contains("(struct S1 *a1, uint32_t a2)"), "{text}");
     assert!(text.contains("__m128 v1;"), "{text}");
 }
 
 #[test]
-fn pointer_locals_are_declared_with_a_star_each() {
+fn pointer_locals_to_structures_are_declared() {
     let text = run(|a| {
         let mut other = a.create_label();
         a.mov(rax, qword_ptr(rcx + 8))?;
@@ -323,5 +323,59 @@ fn pointer_locals_are_declared_with_a_star_each() {
         a.add(eax, dword_ptr(rdx + 8))?;
         a.ret()
     });
-    assert!(text.contains("void *v1, *v2;"), "{text}");
+    assert!(text.contains("struct S2 *v1;"), "{text}");
+    assert!(text.contains("struct S3 *v2;"), "{text}");
+    assert!(text.contains("struct S2 *f_8;"), "{text}");
+}
+
+#[test]
+fn one_pointer_read_at_several_offsets_becomes_a_structure() {
+    let text = run(|a| {
+        a.mov(eax, dword_ptr(rcx + 0x10))?;
+        a.add(eax, dword_ptr(rcx + 0x14))?;
+        a.mov(rdx, qword_ptr(rcx + 0x20))?;
+        a.add(eax, dword_ptr(rdx + 4))?;
+        a.add(eax, dword_ptr(rdx + 8))?;
+        a.ret()
+    });
+    assert!(text.contains("struct S1 {"), "{text}");
+    assert!(text.contains("uint32_t f_10;"), "{text}");
+    assert!(text.contains("struct S2 *f_20;"), "{text}");
+    assert!(text.contains("(struct S1 *a1)"), "{text}");
+    assert!(
+        text.contains("a1->f_10 + a1->f_14 + v1->f_4 + v1->f_8"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_virtual_call_on_the_first_argument_is_a_method_call() {
+    let text = run(|a| {
+        a.push(rbx)?;
+        a.sub(rsp, 0x20)?;
+        a.mov(rbx, rcx)?;
+        a.mov(rax, qword_ptr(rcx))?;
+        a.mov(edx, 7)?;
+        a.call(qword_ptr(rax + 0x70))?;
+        a.mov(rcx, qword_ptr(rbx + 0x18))?;
+        a.mov(rax, qword_ptr(rcx))?;
+        a.add(rsp, 0x20)?;
+        a.pop(rbx)?;
+        a.jmp(qword_ptr(rax + 8))
+    });
+    assert!(text.contains("struct S1 *this"), "{text}");
+    assert!(text.contains("void **vtable;"), "{text}");
+    assert!(text.contains("this->vf14(7);"), "{text}");
+    assert!(text.contains("v1->vf1()"), "{text}");
+}
+
+#[test]
+fn a_pointer_read_at_one_offset_stays_void() {
+    let text = run(|a| {
+        a.mov(eax, dword_ptr(rcx + 8))?;
+        a.ret()
+    });
+    assert!(text.contains("uint32_t sub_00001000(void *a1)"), "{text}");
+    assert!(text.contains("return *(uint32_t *)(a1 + 8);"), "{text}");
+    assert!(!text.contains("struct"), "{text}");
 }

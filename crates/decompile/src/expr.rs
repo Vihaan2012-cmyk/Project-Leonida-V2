@@ -1,5 +1,7 @@
 use iced_x86::ConditionCode;
 
+use crate::types::{Facts, stack_name, virtual_call};
+
 pub const RAX: u8 = 0;
 pub const RCX: u8 = 1;
 pub const RDX: u8 = 2;
@@ -83,7 +85,7 @@ pub fn mask(value: u64, width: u8) -> u64 {
     }
 }
 
-fn signed_value(value: u64, width: u8) -> i64 {
+pub fn signed_value(value: u64, width: u8) -> i64 {
     if width >= 8 {
         value as i64
     } else {
@@ -434,11 +436,7 @@ fn precedence(e: &Expr) -> u8 {
 }
 
 pub struct Printer<'a> {
-    pub stack_name: &'a dyn Fn(i64) -> String,
-    pub var_width: &'a dyn Fn(u32) -> u8,
-    pub var_name: &'a dyn Fn(u32) -> String,
-    pub param_name: &'a dyn Fn(u8) -> String,
-    pub param_width: &'a dyn Fn(u8) -> u8,
+    pub facts: &'a Facts,
 }
 
 impl Printer<'_> {
@@ -448,8 +446,20 @@ impl Printer<'_> {
         out
     }
 
+    /// Field accesses bind like postfix operators.
+    fn prec(&self, e: &Expr) -> u8 {
+        match e {
+            Expr::Load(addr, ..)
+                if !matches!(**addr, Expr::AddrOf(_)) && self.facts.field(addr).is_some() =>
+            {
+                1
+            }
+            _ => precedence(e),
+        }
+    }
+
     fn write(&self, e: &Expr, out: &mut String, outer: u8) {
-        let p = precedence(e);
+        let p = self.prec(e);
         if p > outer {
             out.push('(');
             self.write(e, out, 14);
@@ -458,19 +468,23 @@ impl Printer<'_> {
         }
         match e {
             Expr::Var(Loc::Reg(r), w) => out.push_str(&register_name(*r, *w)),
-            Expr::Var(Loc::Stack(o), _) => out.push_str(&(self.stack_name)(*o)),
+            Expr::Var(Loc::Stack(o), _) => out.push_str(&stack_name(*o)),
             Expr::Var(Loc::Flags, _) => out.push_str("flags"),
             Expr::Var(Loc::Var(n), w) => {
-                let width = (self.var_width)(*n);
+                let width = self.facts.var_width(*n);
                 if *w < width && width <= 8 {
-                    out.push_str(&format!("({}){}", unsigned_type(*w), (self.var_name)(*n)));
+                    out.push_str(&format!(
+                        "({}){}",
+                        unsigned_type(*w),
+                        self.facts.var_name(*n)
+                    ));
                 } else {
-                    out.push_str(&(self.var_name)(*n));
+                    out.push_str(&self.facts.var_name(*n));
                 }
             }
             Expr::Param(n, w, vector) => {
-                let name = (self.param_name)(*n);
-                let width = (self.param_width)(*n);
+                let name = self.facts.param_name(*n);
+                let width = self.facts.param_width(*n);
                 if *w < width && !*vector {
                     out.push_str(&format!("({}){name}", unsigned_type(*w)));
                 } else {
@@ -486,10 +500,17 @@ impl Printer<'_> {
             }
             Expr::Load(addr, w, float) => match &**addr {
                 Expr::AddrOf(inner) => self.write(inner, out, outer),
-                other => {
-                    out.push_str(&format!("*({} *)", type_name(*w, *float)));
-                    self.write(other, out, 2);
-                }
+                other => match self.facts.field(other) {
+                    Some((s, base, offset)) => {
+                        self.write(base, out, 1);
+                        out.push_str("->");
+                        out.push_str(&Facts::field_name(s, offset));
+                    }
+                    None => {
+                        out.push_str(&format!("*({} *)", type_name(*w, *float)));
+                        self.write(other, out, 2);
+                    }
+                },
             },
             Expr::Unary(op, a) => {
                 out.push_str(op);
@@ -526,6 +547,12 @@ impl Printer<'_> {
                 }
             }
             Expr::Call(target, args) => {
+                if let Some((receiver, slot)) = virtual_call(target, args) {
+                    self.write(receiver, out, 1);
+                    out.push_str(&format!("->vf{slot}"));
+                    self.arguments(&args[1..], out);
+                    return;
+                }
                 match &**target {
                     Expr::Name(_) | Expr::Var(..) | Expr::Param(..) => self.write(target, out, 0),
                     other => {

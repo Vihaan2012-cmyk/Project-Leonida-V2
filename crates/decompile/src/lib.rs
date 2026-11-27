@@ -12,6 +12,7 @@ mod vars;
 use expr::{Expr, Loc, Printer, register_name, type_name};
 use lift::{Function, Stmt};
 use structure::Node;
+use types::stack_name;
 
 pub enum Symbol {
     Import(String),
@@ -102,16 +103,6 @@ fn parameter_count(f: &Function, vars: &[vars::VarInfo], registers: u8) -> u8 {
     count
 }
 
-fn stack_name(o: i64) -> String {
-    if o < 0 {
-        format!("v_{:x}", -o)
-    } else if o >= 0x28 && o % 8 == 0 {
-        format!("a{}", 5 + (o - 0x28) / 8)
-    } else {
-        format!("home_{o:x}")
-    }
-}
-
 struct Writer<'f> {
     f: &'f Function,
     vars: &'f [vars::VarInfo],
@@ -131,27 +122,8 @@ impl<'f> Writer<'f> {
         }
     }
 
-    fn var_name(&self, n: u32) -> String {
-        match self.vars.get(n as usize) {
-            Some(v) if v.param != 0 => format!("a{}", v.param),
-            _ => format!("v{}", n + 1),
-        }
-    }
-
     fn expr(&self, e: &Expr) -> String {
-        Printer {
-            stack_name: &stack_name,
-            var_width: &|n| self.facts.vars.get(n as usize).map_or(8, |v| v.width),
-            var_name: &|n| self.var_name(n),
-            param_name: &|n| format!("a{n}"),
-            param_width: &|n| {
-                self.facts
-                    .params
-                    .get(usize::from(n).wrapping_sub(1))
-                    .map_or(8, |p| p.width)
-            },
-        }
-        .expr(e)
+        Printer { facts: self.facts }.expr(e)
     }
 
     fn line(&mut self, text: &str) {
@@ -171,16 +143,19 @@ impl<'f> Writer<'f> {
             .facts
             .params
             .iter()
-            .enumerate()
-            .map(|(k, p)| {
+            .map(|p| {
                 let space = if p.decl.ends_with('*') { "" } else { " " };
-                format!("{}{space}a{}", p.decl, k + 1)
+                format!("{}{space}{}", p.decl, p.name)
             })
             .collect();
         let returns = match self.f.returns {
             None => "void".to_string(),
             Some((loc, w)) => type_name(w, loc.is_vector() && matches!(w, 4 | 8)),
         };
+        for definition in self.facts.definitions() {
+            self.text.push_str(&definition);
+            self.text.push('\n');
+        }
         self.line(&format!("{returns} {title}({}) {{", params.join(", ")));
         self.depth = 1;
         self.declarations();
@@ -202,7 +177,7 @@ impl<'f> Writer<'f> {
             if self.vars[n].param != 0 {
                 continue;
             }
-            let name = self.var_name(n as u32);
+            let name = self.facts.var_name(n as u32);
             match groups.iter_mut().find(|(d, _)| *d == ty.decl) {
                 Some((_, names)) => names.push(name),
                 None => groups.push((&ty.decl, vec![name])),
@@ -238,7 +213,7 @@ impl<'f> Writer<'f> {
                 let target = Expr::Var(*loc, *w);
                 let lhs = match loc {
                     Loc::Reg(r) => register_name(*r, *w),
-                    Loc::Var(n) => self.var_name(*n),
+                    Loc::Var(n) => self.facts.var_name(*n),
                     _ => self.expr(&target),
                 };
                 assign(lhs, e, &target)
