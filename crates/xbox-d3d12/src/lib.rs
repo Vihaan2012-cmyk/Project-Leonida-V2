@@ -13,6 +13,7 @@ pub mod memory;
 pub mod pacing;
 pub mod pipeline;
 pub mod present;
+pub mod pso_stream;
 pub mod queue;
 pub mod resource;
 pub mod root;
