@@ -1,4 +1,13 @@
 //! Audio decoding and container handling for the game's audio.
+//!
+//! - [`xma2`]: streaming XMA2 decoder (packets in, PCM out) for the runtime's audio shims and the exporter.
+//! - [`awc`]: the `ADAT` bank container: streams, tags, markers, seek tables, loudness and peaks.
+//! - [`decode`]: whole-stream decoding of PCM16, PCM float and XMA2 to [`Pcm`] and WAV.
+//! - [`opus`] and [`ogg`]: lossless Ogg Opus repackaging of plain and streamed-music Opus (no Opus decoder).
+//! - [`wav`]: WAV writing and reading with cue and loop chunks.
+//!
+//! Not implemented: decoding Opus to PCM, and any XMA2 feature the bitstream flags as reserved; those return
+//! [`Error::Unsupported`] instead of producing audio.
 
 pub mod awc;
 pub mod bits;
