@@ -12,6 +12,7 @@ config.workspace = true
 content-filter.workspace = true
 decompile.workspace = true
 enhancements.workspace = true
+exe-analysis.workspace = true
 game-package.workspace = true
 gpu.workspace = true
 iced-x86.workspace = true

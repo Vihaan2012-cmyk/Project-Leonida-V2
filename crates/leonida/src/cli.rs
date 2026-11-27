@@ -277,6 +277,15 @@ pub enum ExeCommand {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    /// Build the whole-program database (functions, call graph, RTTI classes, evidence-based names) and save it.
+    Analyze {
+        /// Where to write the database.
+        #[arg(long, default_value = "Output/decomp/program.db")]
+        out: PathBuf,
+        /// Worker threads for the scan.
+        #[arg(long, default_value_t = 4)]
+        threads: usize,
+    },
     /// Readable text in the executable's data sections.
     Strings {
         /// Only strings containing this text.

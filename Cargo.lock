@@ -719,6 +719,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "exe-analysis"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+ "memchr",
+ "pe-image",
+ "postcard",
+ "rayon",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1139,6 +1153,7 @@ dependencies = [
  "decompile",
  "embed-manifest",
  "enhancements",
+ "exe-analysis",
  "game-package",
  "gpu",
  "iced-x86",
