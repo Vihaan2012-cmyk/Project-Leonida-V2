@@ -8,6 +8,7 @@
 //! - `blocklist`: the blocklist file (names, name hashes, content hashes) and its lookups. Derived from game data:
 //!   it lives in `Output/` and is never committed.
 //! - `filter`: `ContentFilter`, the hook the console D3D12 layer calls on resource creation, upload, bind and draw.
+//! - `global`: where `leonida run` installs the one filter and the D3D12 layer finds it.
 //! - `vfs_link`: the `ResourceFilter` trait the `vfs` content-filter layer calls, and catalogue rewriting.
 //!
 //! Measured (upstream documentation): the modular body parts and their names (`bodygenitalsgen_*`,
@@ -25,6 +26,7 @@
 pub mod archive;
 pub mod blocklist;
 pub mod filter;
+pub mod global;
 pub mod hash;
 pub mod names;
 pub mod rules;

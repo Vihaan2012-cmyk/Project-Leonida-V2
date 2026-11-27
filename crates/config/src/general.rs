@@ -21,6 +21,23 @@ pub struct Content {
     pub nudity: Nudity,
 }
 
+/// Whether the game's sound reaches the speakers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioOutput {
+    /// Opens the default audio device when the game starts its sound.
+    #[default]
+    Auto,
+    /// The game runs with its sound mixed but never played.
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Audio {
+    pub output: AudioOutput,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct General {
@@ -32,6 +49,7 @@ pub struct General {
     /// Language code for text Leonida shows and for the game's text, such as `en` or `pt-BR`.
     pub language: String,
     pub content: Content,
+    pub audio: Audio,
 }
 
 impl Default for General {
@@ -41,6 +59,7 @@ impl Default for General {
             output_folder: PathBuf::from("Output"),
             language: "en".to_string(),
             content: Content::default(),
+            audio: Audio::default(),
         }
     }
 }
@@ -75,6 +94,10 @@ language = \"en\"
 [content]
 # \"block\" keeps the game's nudity blocked; \"allow\" lets it through.
 nudity = \"block\"
+
+[audio]
+# \"auto\" plays the game's sound on the default audio device; \"off\" never opens one.
+output = \"auto\"
 "
         .to_string()
     }
@@ -113,6 +136,26 @@ mod tests {
         let general = General::parse("[content]\nnudity = \"allow\"\n").unwrap();
         assert_eq!(general.content.nudity, Nudity::Allow);
         assert!(General::parse("[content]\nnudity = \"maybe\"\n").is_err());
+    }
+
+    #[test]
+    fn audio_output_defaults_to_auto_and_can_be_turned_off() {
+        assert_eq!(General::default().audio.output, AudioOutput::Auto);
+        let general = General::parse(
+            "[audio]
+output = \"off\"
+",
+        )
+        .unwrap();
+        assert_eq!(general.audio.output, AudioOutput::Off);
+        assert!(
+            General::parse(
+                "[audio]
+output = \"loud\"
+"
+            )
+            .is_err()
+        );
     }
 
     #[test]

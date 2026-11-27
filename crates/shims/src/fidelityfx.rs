@@ -241,8 +241,8 @@ pub fn jitter_phase_count(render_width: i32, display_width: i32) -> i32 {
     (8.0 * (display_width as f32 / render_width as f32).powi(2)) as i32
 }
 
-// integration: what the game hands the upscaler, and where it goes. The `upscale` crate registers its
-// upscaler with `set_upscaler`; until one is registered a dispatch is accepted and draws nothing.
+// integration: what the game hands the upscaler, and where it goes. `leonida run` registers an upscaler built on the `upscale` crate
+// with `set_upscaler`; until one is registered a dispatch is accepted and draws nothing.
 pub mod integration {
     use std::sync::Mutex;
 
@@ -300,6 +300,39 @@ pub mod integration {
 
     pub type Upscaler = fn(&UpscaleInputs) -> Result<(), UpscaleFailure>;
 
+    /// How the upscaler reaches the game's textures and the GPU. The D3D12 layer owns both, so it implements this
+    /// and registers it with [`set_texture_access`] once it has a device; until then upscaler dispatches fail with a
+    /// trace note and the game keeps its own picture.
+    pub trait TextureAccess: Send + Sync {
+        /// The texels of a game texture as a host image (the top-left `render_size` at least).
+        fn read(&self, resource: &UpscaleResource) -> Result<upscale::Image, UpscaleFailure>;
+        /// Writes an image into the top-left of a game texture.
+        fn write(
+            &self,
+            resource: &UpscaleResource,
+            image: &upscale::Image,
+        ) -> Result<(), UpscaleFailure>;
+        /// The Vulkan compute device the D3D12 layer renders with, so the upscaler shares it instead of opening a
+        /// second one. `None` lets the upscaler open its own.
+        fn compute(&self) -> Option<upscale::SharedCompute> {
+            None
+        }
+    }
+
+    static TEXTURES: Mutex<Option<std::sync::Arc<dyn TextureAccess>>> = Mutex::new(None);
+
+    /// Registers the texture access of the D3D12 layer, or removes it.
+    pub fn set_texture_access(access: Option<std::sync::Arc<dyn TextureAccess>>) {
+        if let Ok(mut slot) = TEXTURES.lock() {
+            *slot = access;
+        }
+    }
+
+    /// The registered texture access, if the D3D12 layer has supplied one.
+    pub fn texture_access() -> Option<std::sync::Arc<dyn TextureAccess>> {
+        TEXTURES.lock().ok().and_then(|slot| slot.clone())
+    }
+
     static UPSCALER: Mutex<Option<Upscaler>> = Mutex::new(None);
 
     /// Registers the upscaler that dispatches go to, or removes it.
@@ -316,6 +349,33 @@ pub mod integration {
             Some(upscaler) => upscaler(inputs),
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::integration::*;
+    use std::sync::Arc;
+
+    struct Empty;
+
+    impl TextureAccess for Empty {
+        fn read(&self, _: &UpscaleResource) -> Result<upscale::Image, UpscaleFailure> {
+            Err(UpscaleFailure("no device".into()))
+        }
+        fn write(&self, _: &UpscaleResource, _: &upscale::Image) -> Result<(), UpscaleFailure> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_d3d12_layer_registers_and_removes_its_texture_access() {
+        set_texture_access(Some(Arc::new(Empty)));
+        let access = texture_access().expect("registered");
+        assert!(access.read(&UpscaleResource::default()).is_err());
+        assert!(access.compute().is_none());
+        set_texture_access(None);
+        assert!(texture_access().is_none());
     }
 }
 

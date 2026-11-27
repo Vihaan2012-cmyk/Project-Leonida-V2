@@ -13,6 +13,7 @@ mod cmd_systems;
 mod cmd_verify;
 mod game;
 mod pipeline_work;
+mod runtime;
 
 use std::process::ExitCode;
 

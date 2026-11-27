@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+audio-codec.workspace = true
+config.workspace = true
 cpal.workspace = true
 bvh-build.workspace = true
 offline.workspace = true
@@ -13,6 +15,7 @@ thiserror.workspace = true
 pe-loader.workspace = true
 gilrs.workspace = true
 xbox-d3d12.workspace = true
+upscale.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_System_ProcessStatus", "Win32_System_SystemInformation"] }
