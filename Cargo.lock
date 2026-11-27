@@ -450,6 +450,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu-passes"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "naga",
+ "thiserror",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
