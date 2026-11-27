@@ -12,6 +12,8 @@ use crate::Shim;
 #[cfg(windows)]
 mod com;
 #[cfg(windows)]
+mod devices;
+#[cfg(windows)]
 mod modules;
 #[cfg(windows)]
 mod package;
