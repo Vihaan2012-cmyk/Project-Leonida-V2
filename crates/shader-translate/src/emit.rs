@@ -14,6 +14,7 @@ use shader_ir::{
 use crate::images::{Number, View};
 
 mod image;
+mod memory;
 
 pub const STATE_SCC: u32 = 128;
 pub const STATE_VGPR: u32 = 256;
@@ -151,6 +152,7 @@ struct Emitter {
     views: HashMap<(View, Number, bool), image::ViewIds>,
     compare_samplers: Option<Word>,
     lookups: [Option<Word>; 2],
+    encode: [Option<Word>; 2],
     image_cache: Option<(Image, [Word; 4])>,
 }
 
@@ -451,6 +453,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         views: HashMap::new(),
         compare_samplers: None,
         lookups: [None; 2],
+        encode: [None; 2],
         image_cache: None,
     };
     if heap_mode {
@@ -488,6 +491,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         e.decode_function(decode)?;
     }
     e.lookup_bodies()?;
+    e.encode_bodies()?;
     e.b.entry_point(ExecutionModel::GLCompute, main, "main", interface);
     e.b.execution_mode(main, ExecutionMode::LocalSize, group_size);
     if float.nan_preserve {
@@ -576,6 +580,13 @@ impl Emitter {
     fn barrier(&mut self) -> Result<(), EmitError> {
         let workgroup = self.u32c(2);
         let semantics = self.u32c(0x108);
+        ok(self.b.control_barrier(workgroup, workgroup, semantics))
+    }
+
+    /// Orders buffer memory between the two halves of an emulated 64-lane wave, as one instruction would.
+    fn memory_barrier(&mut self) -> Result<(), EmitError> {
+        let workgroup = self.u32c(2);
+        let semantics = self.u32c(0x148);
         ok(self.b.control_barrier(workgroup, workgroup, semantics))
     }
 
@@ -1332,6 +1343,28 @@ impl Emitter {
     }
 
     fn stmt(&mut self, stmt: &Stmt) -> Result<(), EmitError> {
+        self.stmt_body(stmt)?;
+        let memory = match stmt {
+            Stmt::Store { .. } | Stmt::TypedStore { .. } | Stmt::ImageStore { .. } => true,
+            Stmt::Let(_, expr) => matches!(
+                expr,
+                Expr::Load { .. }
+                    | Expr::TypedLoad { .. }
+                    | Expr::ScalarLoad(_)
+                    | Expr::Atomic {
+                        space: shader_ir::Space::Memory,
+                        ..
+                    }
+            ),
+            _ => false,
+        };
+        if memory && self.lanes == 64 {
+            self.memory_barrier()?;
+        }
+        Ok(())
+    }
+
+    fn stmt_body(&mut self, stmt: &Stmt) -> Result<(), EmitError> {
         let v = |e: &Self, t: &u32| e.values[*t as usize];
         match stmt {
             Stmt::Let(tmp, expr) => {
@@ -1441,6 +1474,18 @@ impl Emitter {
                 if self.lanes == 64 {
                     self.barrier()?;
                 }
+            }
+            Stmt::TypedStore {
+                format,
+                address,
+                in_range,
+                values,
+                d16,
+            } => {
+                let values = values.map(|t| v(self, &t));
+                let (format, address, in_range) =
+                    (v(self, format), v(self, address), v(self, in_range));
+                self.typed_store(format, address, in_range, values, *d16)?;
             }
             Stmt::ImageStore { image, values } => {
                 let active = self.active()?;
@@ -1715,6 +1760,19 @@ impl Emitter {
                 self.load(ptr)?
             }
             Expr::Image(image) => self.image(image)?,
+            Expr::Atomic {
+                space,
+                op,
+                address,
+                value,
+                compare,
+                when,
+            } => {
+                let compare = compare.map(|t| v(self, &t));
+                let when = when.map(|t| v(self, &t));
+                let (address, value) = (v(self, address), v(self, value));
+                self.atomic(*space, *op, address, value, compare, when)?
+            }
             Expr::Attribute {
                 attr,
                 channel,

@@ -101,8 +101,10 @@ impl Generator {
         format!("s{}", self.rng.below(16))
     }
 
+    /// On the GPU, integer operations read only v0-v4: the float registers carry signed-zero and NaN-payload
+    /// differences the comparison forgives, and integer use of those bits would amplify them.
     fn vreg(&mut self) -> String {
-        format!("v{}", self.rng.below(9))
+        format!("v{}", self.rng.below(if self.gpu { 5 } else { 9 }))
     }
 
     fn vdst(&mut self) -> String {
@@ -224,6 +226,97 @@ impl Generator {
             format!(
                 "s_mov_b32 s23, 0x{:x}\nbuffer_load_format_{suffix} {target}, v9, s[20:23], 0 offen offset:{offset}",
                 (code << 12) | select
+            )
+        }
+    }
+
+    fn typed_store(&mut self) -> String {
+        let address = if self.gpu {
+            "v_lshlrev_b32_e32 v9, 4, v0\n".to_string()
+        } else {
+            format!("v_and_b32_e32 v9, 0xfc, {}\n", self.vreg())
+        };
+        let count = 1 + self.rng.below(4);
+        let suffix = ["x", "xy", "xyz", "xyzw"][count - 1];
+        let d16 = self.rng.chance(4);
+        let registers = if d16 { count.div_ceil(2) } else { count };
+        let first = if self.gpu {
+            if d16 {
+                1 + self.rng.below(5 - registers)
+            } else {
+                5 + self.rng.below(5 - registers)
+            }
+        } else {
+            1 + self.rng.below(9 - registers)
+        };
+        let data = if registers == 1 {
+            format!("v{first}")
+        } else {
+            format!("v[{first}:{}]", first + registers - 1)
+        };
+        let name = if d16 {
+            format!("d16_{suffix}")
+        } else {
+            suffix.to_string()
+        };
+        let offset = 4 * self.rng.below(16) + self.rng.below(4);
+        let code = 1 + self.rng.word() % 77;
+        let format = rdna::format::name(code).expect("codes 1 to 77 have names");
+        if self.rng.chance(2) {
+            format!(
+                "{address}tbuffer_store_format_{name} {data}, v9, s[20:23], 0 offen offset:{offset} format:[{format}]"
+            )
+        } else {
+            format!(
+                "{address}s_mov_b32 s23, 0x{:x}\nbuffer_store_format_{name} {data}, v9, s[20:23], 0 offen offset:{offset}",
+                code << 12
+            )
+        }
+    }
+
+    fn atomic(&mut self, offset: usize) -> String {
+        let returns = self.rng.chance(2);
+        if self.rng.chance(2) {
+            let op = self.rng.pick(&[
+                "add_u32",
+                "sub_u32",
+                "min_i32",
+                "min_u32",
+                "max_i32",
+                "max_u32",
+                "and_b32",
+                "or_b32",
+                "xor_b32",
+                "cmpst_b32",
+                "wrxchg_b32",
+            ]);
+            let returns = returns || op == "wrxchg_b32";
+            let (name, target) = if returns {
+                let (body, size) = op.split_at(op.len() - 4);
+                (format!("ds_{body}_rtn{size}"), format!("{}, ", self.vdst()))
+            } else {
+                (format!("ds_{op}"), String::new())
+            };
+            let extra = if op == "cmpst_b32" {
+                format!(", {}", self.vreg())
+            } else {
+                String::new()
+            };
+            format!("{name} {target}v9, {}{extra} offset:{offset}", self.vreg())
+        } else {
+            let op = self.rng.pick(&[
+                "swap", "cmpswap", "add", "sub", "smin", "umin", "smax", "umax", "and", "or", "xor",
+            ]);
+            let data = if op == "cmpswap" {
+                let first = 1 + self.rng.below(if self.gpu { 3 } else { 7 });
+                format!("v[{first}:{}]", first + 1)
+            } else {
+                self.vdst()
+            };
+            let glc = if returns { " glc" } else { "" };
+            format!(
+                "buffer_atomic_{op} {data}, v9, s[20:23], {} offen offset:{offset}{glc}",
+                self.rng.pick(&["0", "s17"])
             )
         }
     }
@@ -692,7 +785,7 @@ impl Generator {
     }
 
     fn vreg_pair(&mut self) -> String {
-        let first = self.rng.below(8);
+        let first = self.rng.below(if self.gpu { 4 } else { 8 });
         format!("v[{first}:{}]", first + 1)
     }
 
@@ -1229,6 +1322,12 @@ impl Generator {
         let offset = 4 * self.rng.below(16);
         if self.rng.chance(4) {
             return address + &self.typed_load();
+        }
+        if self.rng.chance(5) {
+            return self.typed_store();
+        }
+        if self.rng.chance(4) {
+            return address + &self.atomic(offset);
         }
         let op = match self.rng.below(7) {
             0 if self.rng.chance(2) => {

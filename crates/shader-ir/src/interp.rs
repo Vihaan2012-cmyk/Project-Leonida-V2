@@ -1,5 +1,5 @@
 use crate::ir::{
-    ATTRIBUTES, Bin, Cmp, Expr, Function, Reg, Stmt, Terminator, Tri, Un, attribute_slot,
+    ATTRIBUTES, Bin, Cmp, Expr, Function, Reg, Space, Stmt, Terminator, Tri, Un, attribute_slot,
 };
 
 const VCC: usize = 106;
@@ -457,6 +457,7 @@ impl Run<'_> {
                 )
             }
             Expr::Image(_) => return Err(RunError::Image),
+            Expr::Atomic { .. } => unreachable!("atomics are run by their statement"),
             Expr::Attribute {
                 attr,
                 channel,
@@ -467,6 +468,37 @@ impl Run<'_> {
 
     fn stmt(&mut self, stmt: &Stmt) -> Result<(), RunError> {
         match stmt {
+            Stmt::Let(
+                tmp,
+                Expr::Atomic {
+                    space,
+                    op,
+                    address,
+                    value,
+                    compare,
+                    when,
+                },
+            ) => {
+                let slot = *tmp as usize;
+                for lane in 0..self.lanes {
+                    let enabled = self.active(lane)
+                        && when.is_none_or(|w| self.values[w as usize][lane] != 0);
+                    if !enabled {
+                        self.values[slot][lane] = 0;
+                        continue;
+                    }
+                    let at = self.values[*address as usize][lane] & !3;
+                    let operand = self.values[*value as usize][lane] as u32;
+                    let expected = compare.map_or(0, |c| self.values[c as usize][lane] as u32);
+                    let (bytes, failure) = match space {
+                        Space::Lds => (&mut self.machine.lds, RunError::LdsOutOfBounds(at)),
+                        Space::Memory => (&mut self.machine.memory, RunError::OutOfBounds(at)),
+                    };
+                    let old = word(bytes, at).ok_or(failure.clone())?;
+                    put(bytes, at, op.apply(old, operand, expected)).ok_or(failure)?;
+                    self.values[slot][lane] = u64::from(old);
+                }
+            }
             Stmt::Let(tmp, expr) => {
                 let slot = *tmp as usize;
                 if self.varying[slot] {
@@ -534,6 +566,33 @@ impl Run<'_> {
                 }
             }
             Stmt::ImageStore { .. } => return Err(RunError::Image),
+            Stmt::TypedStore {
+                format,
+                address,
+                in_range,
+                values,
+                d16,
+            } => {
+                for lane in 0..self.lanes {
+                    if !self.active(lane) || self.values[*in_range as usize][lane] == 0 {
+                        continue;
+                    }
+                    let code = self.values[*format as usize][lane] as u32;
+                    let Some(layout) = rdna::format::buffer_format(code) else {
+                        continue;
+                    };
+                    let words =
+                        values.map(|v| widen(self.values[v as usize][lane] as u32, &layout, *d16));
+                    let bytes = layout.encode_element(words);
+                    let at = self.values[*address as usize][lane];
+                    let start = usize::try_from(at).map_err(|_| RunError::OutOfBounds(at))?;
+                    self.machine
+                        .memory
+                        .get_mut(start..start + bytes.len())
+                        .ok_or(RunError::OutOfBounds(at))?
+                        .copy_from_slice(&bytes);
+                }
+            }
             Stmt::Store {
                 when,
                 address,
@@ -551,6 +610,20 @@ impl Run<'_> {
             }
         }
         Ok(())
+    }
+}
+
+/// A register value for a store: halves become what a full register would hold for the format's number type.
+pub fn widen(value: u32, layout: &rdna::format::BufferFormat, d16: bool) -> u32 {
+    use rdna::format::Number;
+    if !d16 {
+        return value;
+    }
+    let half = value & 0xFFFF;
+    match layout.number {
+        Number::Uint => half,
+        Number::Sint => half as u16 as i16 as i32 as u32,
+        _ => rdna::format::f16_to_f32(half, true),
     }
 }
 

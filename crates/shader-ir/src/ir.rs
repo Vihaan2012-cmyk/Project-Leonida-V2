@@ -132,6 +132,52 @@ pub enum Cmp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AtomicOp {
+    Swap,
+    CompareSwap,
+    Add,
+    Sub,
+    MinS,
+    MinU,
+    MaxS,
+    MaxU,
+    And,
+    Or,
+    Xor,
+}
+
+impl AtomicOp {
+    /// The new word, from the old one, the operand and (for compare-swap) the expected value.
+    pub fn apply(self, old: u32, value: u32, compare: u32) -> u32 {
+        match self {
+            AtomicOp::Swap => value,
+            AtomicOp::CompareSwap => {
+                if old == compare {
+                    value
+                } else {
+                    old
+                }
+            }
+            AtomicOp::Add => old.wrapping_add(value),
+            AtomicOp::Sub => old.wrapping_sub(value),
+            AtomicOp::MinS => (old as i32).min(value as i32) as u32,
+            AtomicOp::MinU => old.min(value),
+            AtomicOp::MaxS => (old as i32).max(value as i32) as u32,
+            AtomicOp::MaxU => old.max(value),
+            AtomicOp::And => old & value,
+            AtomicOp::Or => old | value,
+            AtomicOp::Xor => old ^ value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Space {
+    Lds,
+    Memory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImageDim {
     D1,
     D2,
@@ -267,6 +313,15 @@ pub enum Expr {
         channel: u8,
         vertex: u8,
     },
+    /// Updates one aligned word for each active lane, in lane order, and yields the word it found.
+    Atomic {
+        space: Space,
+        op: AtomicOp,
+        address: Tmp,
+        value: Tmp,
+        compare: Option<Tmp>,
+        when: Option<Tmp>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -287,6 +342,14 @@ pub enum Stmt {
         when: Option<Tmp>,
         address: Tmp,
         value: Tmp,
+    },
+    /// Writes one element of the buffer format `format` at `address`, converting each channel's register value.
+    TypedStore {
+        format: Tmp,
+        address: Tmp,
+        in_range: Tmp,
+        values: [Tmp; 4],
+        d16: bool,
     },
     /// Writes a texel; `image.op` is `ImageOp::Store` and components without a value are written as zero.
     ImageStore {
@@ -338,6 +401,17 @@ impl Expr {
                 .chain(*select)
                 .collect(),
             Expr::Image(image) => image.operands(),
+            Expr::Atomic {
+                address,
+                value,
+                compare,
+                when,
+                ..
+            } => [*address, *value]
+                .into_iter()
+                .chain(*compare)
+                .chain(*when)
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -352,6 +426,7 @@ impl Expr {
                 | Expr::TypedLoad { .. }
                 | Expr::Image(_)
                 | Expr::Attribute { .. }
+                | Expr::Atomic { .. }
                 | Expr::Shuffle(..)
                 | Expr::GetRelative(..)
         )

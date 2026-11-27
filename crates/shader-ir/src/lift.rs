@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use rdna::{Arg, Inst, Operand};
 
 use crate::ir::{
-    Bin, Block, Cmp, Expr, Function, Image, ImageDim, ImageOp, Reg, Round, Stmt, Terminator, Tmp,
-    Tri, Un,
+    AtomicOp, Bin, Block, Cmp, Expr, Function, Image, ImageDim, ImageOp, Reg, Round, Space, Stmt,
+    Terminator, Tmp, Tri, Un,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -2601,6 +2601,106 @@ impl Lifter {
                 }
                 Ok(true)
             }
+            _ if lds_atomic(name).is_some() => {
+                let (op, returns) = lds_atomic(name).expect("checked by the guard");
+                let first = usize::from(returns);
+                let base = self.lane(arg(first)?, inst)?;
+                let immediate = self.c(offset as u32);
+                let address = self.bin(Bin::Add, base, immediate);
+                let data = self.lane(arg(first + 1)?, inst)?;
+                let (value, compare) = if op == AtomicOp::CompareSwap {
+                    (self.lane(arg(first + 2)?, inst)?, Some(data))
+                } else {
+                    (data, None)
+                };
+                let old = self.value(Expr::Atomic {
+                    space: Space::Lds,
+                    op,
+                    address,
+                    value,
+                    compare,
+                    when: None,
+                });
+                if returns {
+                    self.set_lane(arg(0)?, old, inst)?;
+                }
+                Ok(true)
+            }
+            _ if name.starts_with("buffer_atomic_") => {
+                let op = buffer_atomic(&name["buffer_atomic_".len()..])
+                    .ok_or_else(|| unsupported(inst))?;
+                let (data, count) = vgprs(arg(0)?, inst)?;
+                let wanted = if op == AtomicOp::CompareSwap { 2 } else { 1 };
+                if count != wanted {
+                    return Err(unsupported(inst));
+                }
+                let (address, in_range) = self.buffer_address(inst)?;
+                let value = self.value(Expr::Get(Reg::V(data)));
+                let compare =
+                    (op == AtomicOp::CompareSwap).then(|| self.value(Expr::Get(Reg::V(data + 1))));
+                let old = self.value(Expr::Atomic {
+                    space: Space::Memory,
+                    op,
+                    address,
+                    value,
+                    compare,
+                    when: Some(in_range),
+                });
+                if inst.mods.iter().any(|m| m == "glc") {
+                    self.stmts.push(Stmt::SetLane(data, old));
+                }
+                Ok(true)
+            }
+            _ if name.starts_with("buffer_store_format_")
+                || name.starts_with("tbuffer_store_format_") =>
+            {
+                let d16 = name.contains("_d16_");
+                let suffix = name.rsplit('_').next().unwrap_or("");
+                let count: usize = match suffix {
+                    "x" => 1,
+                    "xy" => 2,
+                    "xyz" => 3,
+                    "xyzw" => 4,
+                    _ => return Err(unsupported(inst)),
+                };
+                let (data, registers) = vgprs(arg(0)?, inst)?;
+                let needed = if d16 { count.div_ceil(2) } else { count };
+                if usize::from(registers) < needed {
+                    return Err(unsupported(inst));
+                }
+                let (address, in_range) = self.buffer_address(inst)?;
+                let format = if name.starts_with("tbuffer") {
+                    let code = rdna::format::instruction_format(&inst.mods)
+                        .ok_or_else(|| unsupported(inst))?;
+                    self.c(code)
+                } else {
+                    let (_, words) = self.descriptor(arg(2)?, inst)?;
+                    let twelve = self.c(12);
+                    let format = self.bin(Bin::ShrU, words[3], twelve);
+                    let mask = self.c(0x7F);
+                    self.bin(Bin::And, format, mask)
+                };
+                let zero = self.c(0);
+                let mut values = [zero; 4];
+                for (component, slot) in values.iter_mut().enumerate().take(count) {
+                    let reg = data + if d16 { component / 2 } else { component } as u8;
+                    let word = self.value(Expr::Get(Reg::V(reg)));
+                    *slot = if d16 && component % 2 == 1 {
+                        let sixteen = self.c(16);
+                        self.bin(Bin::ShrU, word, sixteen)
+                    } else {
+                        word
+                    };
+                }
+                self.stmts.push(Stmt::TypedStore {
+                    format,
+                    address,
+                    in_range,
+                    values,
+                    d16,
+                });
+                Ok(true)
+            }
             "ds_write_b32" | "ds_read_b32" => {
                 let address_arg = if name == "ds_read_b32" {
                     arg(1)?
@@ -2996,6 +3096,47 @@ fn coverage_name(inst: &Inst, base: &str) -> String {
         }
     }
     name
+}
+
+/// An LDS atomic's operation and whether it returns the old word; compare-store takes the compare value first.
+fn lds_atomic(name: &str) -> Option<(AtomicOp, bool)> {
+    let body = name.strip_prefix("ds_")?;
+    let (body, returns) = match body.split_once("_rtn") {
+        Some((op, rest)) => (format!("{op}{rest}"), true),
+        None => (body.to_string(), false),
+    };
+    let op = match body.as_str() {
+        "add_u32" => AtomicOp::Add,
+        "sub_u32" => AtomicOp::Sub,
+        "min_i32" => AtomicOp::MinS,
+        "min_u32" => AtomicOp::MinU,
+        "max_i32" => AtomicOp::MaxS,
+        "max_u32" => AtomicOp::MaxU,
+        "and_b32" => AtomicOp::And,
+        "or_b32" => AtomicOp::Or,
+        "xor_b32" => AtomicOp::Xor,
+        "wrxchg_b32" if returns => AtomicOp::Swap,
+        "cmpst_b32" => AtomicOp::CompareSwap,
+        _ => return None,
+    };
+    Some((op, returns))
+}
+
+fn buffer_atomic(op: &str) -> Option<AtomicOp> {
+    Some(match op {
+        "swap" => AtomicOp::Swap,
+        "cmpswap" => AtomicOp::CompareSwap,
+        "add" => AtomicOp::Add,
+        "sub" => AtomicOp::Sub,
+        "smin" => AtomicOp::MinS,
+        "umin" => AtomicOp::MinU,
+        "smax" => AtomicOp::MaxS,
+        "umax" => AtomicOp::MaxU,
+        "and" => AtomicOp::And,
+        "or" => AtomicOp::Or,
+        "xor" => AtomicOp::Xor,
+        _ => return None,
+    })
 }
 
 fn vgprs(arg: &Arg, inst: &Inst) -> Result<(u8, u8), LiftError> {

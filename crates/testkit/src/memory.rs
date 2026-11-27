@@ -48,6 +48,14 @@ pub fn execute(name: &str, inst: &Inst, wave: &mut Wave, memory: &mut Memory) ->
         typed(name, inst, wave, memory)?;
         return Ok(true);
     }
+    if name.starts_with("tbuffer_store_format_") || name.starts_with("buffer_store_format_") {
+        typed_store(name, inst, wave, memory)?;
+        return Ok(true);
+    }
+    if let Some(op) = name.strip_prefix("buffer_atomic_") {
+        buffer_atomic(op, inst, wave, memory)?;
+        return Ok(true);
+    }
     if name.starts_with("s_load_dword") || name.starts_with("s_buffer_load_dword") {
         scalar_load(name, inst, wave, memory)?;
         return Ok(true);
@@ -151,6 +159,11 @@ fn lds(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
     let first = usize::from(returns);
     for lane in wave.active_lanes() {
         let address = u64::from(wave.read_lane(arg(inst, first)?, lane, inst)?) + offset;
+        let address = if name.starts_with("ds_read") || name.starts_with("ds_write") {
+            address
+        } else {
+            address & !3
+        };
         match name {
             "ds_write_b32" => {
                 let data = wave.read_lane(arg(inst, first + 1)?, lane, inst)?;
@@ -169,6 +182,12 @@ fn lds(name: &str, inst: &Inst, wave: &mut Wave) -> Result<()> {
                     "sub_u32" => old.wrapping_sub(data),
                     "min_u32" => old.min(data),
                     "max_u32" => old.max(data),
+                    "min_i32" => (old as i32).min(data as i32) as u32,
+                    "max_i32" => (old as i32).max(data as i32) as u32,
+                    "cmpst_b32" => {
+                        let source = wave.read_lane(arg(inst, first + 2)?, lane, inst)?;
+                        if old == data { source } else { old }
+                    }
                     "and_b32" => old & data,
                     "or_b32" => old | data,
                     "xor_b32" => old ^ data,
@@ -309,6 +328,142 @@ fn typed(name: &str, inst: &Inst, wave: &mut Wave, memory: &Memory) -> Result<()
                 return Err(error);
             }
             wave.vgpr[reg + component][lane] = value;
+        }
+    }
+    Ok(())
+}
+
+fn buffer_lane(
+    inst: &Inst,
+    wave: &Wave,
+    rsrc: &Descriptor,
+    lane: usize,
+    typed: bool,
+) -> Result<(u64, bool)> {
+    let soffset = u64::from(wave.read_scalar(arg(inst, 3)?, inst)?);
+    let immediate = offset_mod(inst, "offset") as u64;
+    let (offen, idxen) = (has(inst, "offen"), has(inst, "idxen"));
+    let address_arg = arg(inst, 1)?;
+    let (index, voffset) = match (idxen, offen) {
+        (false, false) => (0, 0),
+        (true, false) => (u64::from(wave.read_lane(address_arg, lane, inst)?), 0),
+        (false, true) => (0, u64::from(wave.read_lane(address_arg, lane, inst)?)),
+        (true, true) => {
+            let first = vreg(address_arg, inst)?;
+            (
+                u64::from(wave.vgpr[first][lane]),
+                u64::from(wave.vgpr[first + 1][lane]),
+            )
+        }
+    };
+    let offset = voffset + immediate;
+    let offset = if typed { offset & 0xFFFF_FFFF } else { offset };
+    let in_range = if rsrc.stride == 0 {
+        offset < rsrc.records
+    } else {
+        index < rsrc.records
+    };
+    let start = if typed {
+        rsrc.base + rsrc.stride * index + ((offset + soffset) & 0xFFFF_FFFF)
+    } else {
+        rsrc.base + soffset + rsrc.stride * index + offset
+    };
+    Ok((start, in_range))
+}
+
+fn typed_store(name: &str, inst: &Inst, wave: &mut Wave, memory: &mut Memory) -> Result<()> {
+    let d16 = name.contains("_d16_");
+    let count = match name.rsplit('_').next() {
+        Some("x") => 1,
+        Some("xy") => 2,
+        Some("xyz") => 3,
+        Some("xyzw") => 4,
+        _ => return Err(bad(inst)),
+    };
+    let reg = vreg(arg(inst, 0)?, inst)?;
+    let rsrc = descriptor(wave, arg(inst, 2)?, inst)?;
+    let slot = sgpr_slot(arg(inst, 2)?).ok_or_else(|| bad(inst))?;
+    let format = if name.starts_with("tbuffer") {
+        rdna::format::instruction_format(&inst.mods).ok_or_else(|| bad(inst))?
+    } else {
+        (wave.sgpr[slot + 3] >> 12) & 0x7F
+    };
+    let Some(layout) = rdna::format::buffer_format(format) else {
+        return Ok(());
+    };
+    for lane in wave.active_lanes() {
+        let (start, in_range) = buffer_lane(inst, wave, &rsrc, lane, true)?;
+        if !in_range {
+            continue;
+        }
+        let mut values = [0u32; 4];
+        for (component, value) in values.iter_mut().enumerate().take(count) {
+            *value = if d16 {
+                let word = wave.vgpr[reg + component / 2][lane];
+                let half = (word >> (16 * (component % 2))) & 0xFFFF;
+                match layout.number {
+                    rdna::format::Number::Uint => half,
+                    rdna::format::Number::Sint => half as u16 as i16 as i32 as u32,
+                    _ => rdna::format::f16_to_f32(half, true),
+                }
+            } else {
+                wave.vgpr[reg + component][lane]
+            };
+        }
+        let bytes = layout.encode_element(values);
+        let at = start as usize;
+        memory
+            .bytes
+            .get_mut(at..at + bytes.len())
+            .ok_or(ExecError::OutOfBounds { address: start })?
+            .copy_from_slice(&bytes);
+    }
+    Ok(())
+}
+
+fn buffer_atomic(op: &str, inst: &Inst, wave: &mut Wave, memory: &mut Memory) -> Result<()> {
+    let reg = vreg(arg(inst, 0)?, inst)?;
+    let rsrc = descriptor(wave, arg(inst, 2)?, inst)?;
+    let returns = has(inst, "glc");
+    for lane in wave.active_lanes() {
+        let (start, in_range) = buffer_lane(inst, wave, &rsrc, lane, false)?;
+        if !in_range {
+            if returns {
+                wave.vgpr[reg][lane] = 0;
+            }
+            continue;
+        }
+        let address = start & !3;
+        let old = memory.read(address)?;
+        let data = wave.vgpr[reg][lane];
+        let new = match op {
+            "swap" => data,
+            "cmpswap" => {
+                if old == wave.vgpr[reg + 1][lane] {
+                    data
+                } else {
+                    old
+                }
+            }
+            "add" => old.wrapping_add(data),
+            "sub" => old.wrapping_sub(data),
+            "smin" => (old as i32).min(data as i32) as u32,
+            "umin" => old.min(data),
+            "smax" => (old as i32).max(data as i32) as u32,
+            "umax" => old.max(data),
+            "and" => old & data,
+            "or" => old | data,
+            "xor" => old ^ data,
+            _ => {
+                return Err(ExecError::Unsupported {
+                    pc: inst.pc,
+                    text: inst.text(),
+                });
+            }
+        };
+        memory.write(address, new)?;
+        if returns {
+            wave.vgpr[reg][lane] = old;
         }
     }
     Ok(())

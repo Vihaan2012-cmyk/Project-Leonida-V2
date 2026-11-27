@@ -91,6 +91,45 @@ impl BufferFormat {
         }
     }
 
+    /// A channel's stored bits for a register value; the inverse of `convert`, rounding to nearest even.
+    pub fn encode(&self, channel: usize, value: u32) -> u32 {
+        let width = u32::from(self.widths[channel]);
+        let mask = u32::MAX >> (32 - width);
+        let float = f32::from_bits(value);
+        let unit = |low: f32| {
+            if float.is_nan() {
+                0.0
+            } else {
+                float.clamp(low, 1.0)
+            }
+        };
+        let field = match self.number {
+            Number::Uint | Number::Sint => value,
+            Number::Uscaled => (float as u32).min(mask),
+            Number::Sscaled => {
+                let limit = 1i64 << (width - 1);
+                (float as i64).clamp(-limit, limit - 1) as u32
+            }
+            Number::Unorm => (f64::from(unit(0.0)) * mask as f64).round_ties_even() as u32,
+            Number::Snorm => {
+                let max = (1u64 << (width - 1)) - 1;
+                (f64::from(unit(-1.0)) * max as f64).round_ties_even() as i64 as u32
+            }
+            Number::Float if width == 32 => value,
+            Number::Float if width == 16 => f32_to_f16(value),
+            Number::Float => f32_to_small_float(value, width - 5),
+        };
+        field & mask
+    }
+
+    pub fn encode_element(&self, values: [u32; 4]) -> Vec<u8> {
+        let mut bits = 0u128;
+        for (channel, value) in values.iter().enumerate().take(self.count) {
+            bits |= u128::from(self.encode(channel, *value)) << self.offset(channel);
+        }
+        bits.to_le_bytes()[..self.bytes()].to_vec()
+    }
+
     pub fn decode(&self, element: &[u8]) -> [u32; 4] {
         let mut bits = 0u128;
         for (i, byte) in element.iter().enumerate().take(16) {
@@ -253,6 +292,42 @@ pub fn f32_to_f16_round(single: u32, mode: Round) -> u32 {
     sign | round(((biased as u32) << 23) | mantissa, 13).min(largest)
 }
 
+/// Rounds a single to nearest even as an unsigned float with a five-bit exponent and `mantissa` bits, as
+/// the 11- and 10-bit channels store them; negative values become zero.
+pub fn f32_to_small_float(single: u32, mantissa: u32) -> u32 {
+    let exponent = ((single >> 23) & 0xFF) as i32;
+    let fraction = single & 0x7F_FFFF;
+    let top = 0x1F << mantissa;
+    if exponent == 0xFF {
+        return match (fraction != 0, single >> 31 != 0) {
+            (true, _) => top | (1 << (mantissa - 1)),
+            (false, true) => 0,
+            (false, false) => top,
+        };
+    }
+    if single >> 31 != 0 {
+        return 0;
+    }
+    let shift = 23 - mantissa;
+    let round = |value: u32, shift: u32| {
+        let half = 1u64 << (shift - 1);
+        let rest = u64::from(value) & ((1u64 << shift) - 1);
+        let quotient = value >> shift;
+        quotient + u32::from(Round::Even.away(false, rest, half, quotient & 1 != 0))
+    };
+    let biased = exponent - 112;
+    if biased >= 31 {
+        return top;
+    }
+    if biased <= 0 {
+        if biased < -(mantissa as i32) {
+            return 0;
+        }
+        return round(fraction | 0x80_0000, (shift as i32 + 1 - biased) as u32);
+    }
+    round(((biased as u32) << 23) | fraction, shift)
+}
+
 /// Rounds a double to half precision, for results that are exact before their one rounding.
 pub fn f64_to_f16_round(double: u64, mode: Round) -> u32 {
     let negative = double >> 63 != 0;
@@ -289,6 +364,57 @@ mod tests {
 
     fn load(code: u32, bytes: &[u8]) -> [u32; 4] {
         buffer_format(code).unwrap().decode(bytes)
+    }
+
+    #[test]
+    fn stored_channels_decode_to_what_was_stored() {
+        for code in 1..=77 {
+            let Some(layout) = buffer_format(code) else {
+                continue;
+            };
+            for channel in 0..layout.count {
+                let width = u32::from(layout.widths[channel]);
+                let fields: Vec<u32> = if width <= 16 {
+                    (0..1u32 << width).collect()
+                } else {
+                    vec![
+                        0,
+                        1,
+                        7,
+                        0x8000_0000,
+                        0x7F7F_FFFF,
+                        0x3F80_0000,
+                        u32::MAX >> 1,
+                    ]
+                };
+                for field in fields {
+                    let field = field & (u32::MAX >> (32 - width));
+                    let value = layout.convert(channel, field);
+                    if layout.number == Number::Float && f32::from_bits(value).is_nan() {
+                        continue;
+                    }
+                    let stored = layout.encode(channel, value);
+                    let negative_zero = layout.number == Number::Snorm
+                        && value == (-1.0f32).to_bits()
+                        && field == 1 << (width - 1);
+                    if negative_zero {
+                        continue;
+                    }
+                    assert_eq!(
+                        layout.convert(channel, stored),
+                        value,
+                        "format {code} channel {channel} field {field:#x}"
+                    );
+                }
+            }
+        }
+        let layout = buffer_format(56).unwrap();
+        assert_eq!(
+            layout.encode_element([0, 0x3F80_0000, 0x3F00_0000, 0xBF80_0000]),
+            [0, 255, 128, 0]
+        );
+        assert_eq!(f32_to_small_float(0x3F80_0000, 6), 15 << 6);
+        assert_eq!(f32_to_small_float(0xBF80_0000, 6), 0);
     }
 
     #[test]

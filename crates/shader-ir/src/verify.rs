@@ -198,6 +198,28 @@ impl Checker<'_> {
                 }
                 Ty::U32
             }
+            Expr::Atomic {
+                space,
+                address,
+                value,
+                compare,
+                when,
+                ..
+            } => {
+                let address_type = match space {
+                    crate::ir::Space::Lds => Ty::U32,
+                    crate::ir::Space::Memory => Ty::U64,
+                };
+                self.expect(*address, address_type)?;
+                self.expect(*value, Ty::U32)?;
+                if let Some(compare) = compare {
+                    self.expect(*compare, Ty::U32)?;
+                }
+                if let Some(when) = when {
+                    self.expect(*when, Ty::Bool)?;
+                }
+                Ty::U32
+            }
         })
     }
 
@@ -246,6 +268,20 @@ impl Checker<'_> {
                 }
                 self.expect(*address, Ty::U64)?;
                 self.expect(*value, Ty::U32)?;
+            }
+            Stmt::TypedStore {
+                format,
+                address,
+                in_range,
+                values,
+                ..
+            } => {
+                self.expect(*format, Ty::U32)?;
+                self.expect(*address, Ty::U64)?;
+                self.expect(*in_range, Ty::Bool)?;
+                for value in values {
+                    self.expect(*value, Ty::U32)?;
+                }
             }
             Stmt::ImageStore { image, values } => {
                 for tmp in image

@@ -376,14 +376,23 @@ fn compute_suite(wave64: bool) {
     let Some(gpu) = gpu() else { return };
     let lanes = if wave64 { 64 } else { 32 };
     let mut completed = 0;
+    let only: Option<u64> = std::env::var("LEONIDA_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok());
     for seed in 1..=200u64 {
+        if only.is_some_and(|o| o != seed) {
+            continue;
+        }
         let mut generator = Generator::new(
             Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1),
             wave64,
             true,
         );
         generator.interpolation = false;
-        let program = generator.program();
+        let program = match std::env::var("LEONIDA_PROGRAM") {
+            Ok(path) => std::fs::read_to_string(path).unwrap(),
+            Err(_) => generator.program(),
+        };
         let body = program
             .strip_suffix("s_endpgm")
             .expect("programs end with s_endpgm");
@@ -416,6 +425,13 @@ fn compute_suite(wave64: bool) {
         spirv_val(&spirv, &name);
         let mut heap = words(&heap_bytes);
         run_compute(&gpu, &spirv, &mut heap, &user, [1, 1, 1]);
+        if std::env::var_os("LEONIDA_DEBUG").is_some() {
+            for (i, (a, b)) in heap.iter().zip(words(&reference_memory.bytes)).enumerate() {
+                if !same(*a, b) {
+                    eprintln!("heap {i:#x}: gpu {a:#x} cpu {b:#x}");
+                }
+            }
+        }
         for (i, (a, b)) in heap.iter().zip(words(&reference_memory.bytes)).enumerate() {
             assert!(
                 same(*a, b),
@@ -424,7 +440,7 @@ fn compute_suite(wave64: bool) {
         }
         completed += 1;
     }
-    assert!(completed > 150, "{completed}");
+    assert!(only.is_some() || completed > 150, "{completed}");
 }
 
 #[test]
