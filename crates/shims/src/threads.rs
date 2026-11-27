@@ -3,7 +3,8 @@
 //!
 //! The executable imports `SetThreadGroupAffinity`, `GetThreadGroupAffinity`, `GetLogicalProcessorInformation`,
 //! `SetThreadPriority` and `GetThreadPriority` for this; `CreateThread`, `SetProcessPriorityBoost` and
-//! `IsProcessorFeaturePresent` also appear and go to Windows unchanged. `SetThreadAffinityMask`,
+//! `IsProcessorFeaturePresent` also appear and go to Windows unchanged. `Sleep` is shimmed too, see
+//! [`sleep_plan`]. `SetThreadAffinityMask`,
 //! `SetThreadIdealProcessor(Ex)`, `GetSystemInfo`, `GetNativeSystemInfo`, `GetCurrentProcessorNumber` and
 //! `GetActiveProcessorCount` are not imported by the executable but are shimmed too, since the satellite DLLs
 //! may use them.
@@ -281,14 +282,42 @@ pub fn host_priority(requested: i32) -> i32 {
     }
 }
 
+/// How `Sleep` is carried out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepPlan {
+    /// Windows' own `Sleep`: yields the time slice for 0, waits forever for `INFINITE`, and is precise
+    /// enough for long waits.
+    Host,
+    /// A high-resolution timer wait: a negative count of 100 ns ticks, relative to now.
+    Timer(i64),
+}
+
+const SLEEP_INFINITE: u32 = u32::MAX;
+const SLEEP_TIMER_LIMIT_MS: u32 = 100;
+
+/// The game never raises the timer resolution but spins on `Sleep(1)`, `Sleep(2)` and `Sleep(5)` in its
+/// thread start-up, frame hand-over and streaming waits. Windows rounds those up to its timer tick
+/// (15.6 ms by default), which at a high frame rate stalls a thread for whole frames, so short sleeps wait
+/// on a high-resolution timer instead.
+pub fn sleep_plan(milliseconds: u32) -> SleepPlan {
+    if milliseconds == 0 || milliseconds == SLEEP_INFINITE || milliseconds > SLEEP_TIMER_LIMIT_MS {
+        SleepPlan::Host
+    } else {
+        SleepPlan::Timer(-i64::from(milliseconds) * 10_000)
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::collections::BTreeMap;
     use std::ffi::c_void;
     use std::sync::{Mutex, OnceLock};
 
-    use windows_sys::Win32::Foundation::SetLastError;
-    use windows_sys::Win32::System::Threading::{GetThreadPriority, SetThreadPriority};
+    use windows_sys::Win32::Foundation::{CloseHandle, SetLastError};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, GetThreadPriority, INFINITE,
+        SetThreadPriority, SetWaitableTimer, Sleep, TIMER_ALL_ACCESS, WaitForSingleObject,
+    };
 
     use super::*;
     use crate::trace::note;
@@ -634,6 +663,63 @@ mod imp {
         }
     }
 
+    /// A thread's high-resolution timer; `None` when Windows lacks them, which makes `Sleep` pass through.
+    struct SleepTimer(Option<Handle>);
+
+    impl SleepTimer {
+        fn new() -> SleepTimer {
+            // SAFETY: null attributes and name are allowed; the handle is closed in `drop`.
+            let handle = unsafe {
+                CreateWaitableTimerExW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_ALL_ACCESS,
+                )
+            };
+            SleepTimer((!handle.is_null()).then_some(handle))
+        }
+
+        fn wait(&self, due: i64) -> bool {
+            let Some(handle) = self.0 else {
+                return false;
+            };
+            // SAFETY: `handle` is a live timer; `due` outlives the call; no completion routine is given.
+            unsafe {
+                if SetWaitableTimer(handle, &due, 0, None, std::ptr::null(), 0) == 0 {
+                    return false;
+                }
+                WaitForSingleObject(handle, INFINITE);
+            }
+            true
+        }
+    }
+
+    impl Drop for SleepTimer {
+        fn drop(&mut self) {
+            if let Some(handle) = self.0 {
+                // SAFETY: the handle came from `CreateWaitableTimerExW` and is closed once.
+                unsafe { CloseHandle(handle) };
+            }
+        }
+    }
+
+    thread_local! {
+        static SLEEP_TIMER: SleepTimer = SleepTimer::new();
+    }
+
+    pub extern "win64" fn sleep(milliseconds: u32) {
+        if let SleepPlan::Timer(due) = sleep_plan(milliseconds)
+            && SLEEP_TIMER
+                .try_with(|timer| timer.wait(due))
+                .unwrap_or(false)
+        {
+            return;
+        }
+        // SAFETY: a plain wait on the calling thread.
+        unsafe { Sleep(milliseconds) };
+    }
+
     pub extern "win64" fn set_thread_priority(thread: Handle, priority: i32) -> i32 {
         // SAFETY: Windows validates the handle and value.
         let ok = unsafe { SetThreadPriority(thread, host_priority(priority)) };
@@ -670,6 +756,16 @@ const DLLS: &[&str] = &[
     "api-ms-win-core-sysinfo-l1-1-0.dll",
     "api-ms-win-core-sysinfo-l1-2-0.dll",
     "api-ms-win-core-sysinfo-l1-2-1.dll",
+];
+
+/// The names `Sleep` is imported under.
+#[cfg(windows)]
+const SLEEP_DLLS: &[&str] = &[
+    "kernel32.dll",
+    "kernelbase.dll",
+    "api-ms-win-core-synch-l1-1-0.dll",
+    "api-ms-win-core-synch-l1-2-0.dll",
+    "api-ms-win-core-synch-l1-2-1.dll",
 ];
 
 pub fn shims() -> Vec<Shim> {
@@ -726,9 +822,16 @@ pub fn shims() -> Vec<Shim> {
                 imp::get_thread_priority as *const () as usize,
             ),
         ];
-        list.into_iter()
+        let mut shims: Vec<Shim> = list
+            .into_iter()
             .flat_map(|(name, address)| DLLS.iter().map(move |dll| Shim { dll, name, address }))
-            .collect()
+            .collect();
+        shims.extend(SLEEP_DLLS.iter().map(|dll| Shim {
+            dll,
+            name: "Sleep",
+            address: imp::sleep as *const () as usize,
+        }));
+        shims
     }
     #[cfg(not(windows))]
     {
@@ -1028,6 +1131,36 @@ mod tests {
     }
 
     #[test]
+    fn short_sleeps_use_the_timer_and_the_rest_pass_through() {
+        assert_eq!(sleep_plan(0), SleepPlan::Host);
+        assert_eq!(sleep_plan(1), SleepPlan::Timer(-10_000));
+        assert_eq!(sleep_plan(5), SleepPlan::Timer(-50_000));
+        assert_eq!(sleep_plan(100), SleepPlan::Timer(-1_000_000));
+        assert_eq!(sleep_plan(101), SleepPlan::Host);
+        assert_eq!(sleep_plan(u32::MAX), SleepPlan::Host);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_one_millisecond_sleep_does_not_wait_for_the_system_tick() {
+        let mut times: Vec<std::time::Duration> = (0..20)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                imp::sleep(1);
+                start.elapsed()
+            })
+            .collect();
+        times.sort();
+        assert!(times[0] >= std::time::Duration::from_micros(500));
+        assert!(
+            times[10] < std::time::Duration::from_millis(8),
+            "median {:?}",
+            times[10]
+        );
+        imp::sleep(0);
+    }
+
+    #[test]
     fn time_critical_is_lowered_and_the_rest_passes() {
         assert_eq!(host_priority(15), 2);
         for p in [-15, -2, -1, 0, 1, 2] {
@@ -1072,6 +1205,7 @@ mod tests {
                 "GetThreadPriority",
             ),
             ("kernel32.dll", "SetThreadAffinityMask"),
+            ("api-ms-win-core-synch-l1-2-0.dll", "Sleep"),
         ] {
             assert!(
                 shims.iter().any(|s| s.dll == dll && s.name == name),
