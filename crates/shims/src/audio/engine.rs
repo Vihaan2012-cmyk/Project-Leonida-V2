@@ -6,11 +6,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::apu::ApuSpace;
-use super::hal::Hal;
+use super::hal::{Hal, HalCommand};
 use super::mixer::{Buffer, BufferId, Completion, Looping, Mixer, VoiceId, VoiceParams};
 use super::output::{Output, SharedMixer};
 use super::xapu::XApu;
 use super::xma::{self, DecodeError, OwnedXmaRequest, XmaRequest};
+use super::xma_hw::{self, CONTEXT_BYTES as CTX_BYTES, XmaHw};
 
 /// Rate the mixer runs at until a device sets its own.
 pub const DEFAULT_RATE: u32 = 48_000;
@@ -56,6 +57,7 @@ pub struct Engine {
     pub apu: ApuSpace,
     pub xapu: XApu,
     hal: Hal,
+    xma_hw: XmaHw,
     #[cfg(windows)]
     hal_object: Option<Box<super::hal::object::Object>>,
     mixer: SharedMixer,
@@ -83,6 +85,7 @@ impl Engine {
             apu: ApuSpace::new(),
             xapu: XApu::default(),
             hal: Hal::default(),
+            xma_hw: XmaHw::default(),
             #[cfg(windows)]
             hal_object: None,
             mixer: Arc::new(Mutex::new(Mixer::new(DEFAULT_RATE))),
@@ -120,6 +123,74 @@ impl Engine {
         &mut self.hal
     }
 
+    /// Records a command the title sent through the hardware object and acts on it: an enabled XMA context starts
+    /// decoding on the worker, a disabled one stops, and blocks the title read free room in the ring.
+    pub fn apply_hal(&mut self, command: HalCommand) {
+        self.hal.submit(command);
+        let Some(base) = self.contexts.as_ref().map(|c| c.as_ptr() as usize) else {
+            return;
+        };
+        let total = self
+            .contexts
+            .as_ref()
+            .map_or(0, |c| c.len() * 8 / CTX_BYTES);
+        let address = |context: u32| {
+            ((context as usize) < total).then(|| base + context as usize * CTX_BYTES)
+        };
+        match command {
+            HalCommand::Enable { context } => {
+                if let Some(address) = address(context) {
+                    self.enable_xma_context(address);
+                }
+            }
+            HalCommand::Disable { context } => {
+                if let Some(address) = address(context) {
+                    self.xma_hw.disable(address);
+                }
+            }
+            HalCommand::OutputRead { context, blocks } => {
+                if let Some(address) = address(context) {
+                    xma_hw::output_read(address, blocks);
+                }
+            }
+            HalCommand::Configure | HalCommand::Other { .. } => {}
+        }
+    }
+
+    pub fn stop_hal(&mut self) {
+        self.xma_hw.shutdown();
+        self.hal.stop();
+    }
+
+    fn enable_xma_context(&mut self, context: usize) {
+        let word = |i: usize| {
+            // SAFETY: `context` lies inside the context block this engine owns.
+            unsafe { ((context + i * 4) as *const u32).read_volatile() }
+        };
+        let (packets, input_apu, ring_apu) = ((word(0) & 0xfff) as usize, word(5), word(7));
+        let (Some(input), Some(ring)) = (self.apu.map_apu(input_apu), self.apu.map_apu(ring_apu))
+        else {
+            self.note_once("xma-unmapped", || {
+                "an XMA context was enabled with an input or output address nothing mapped".into()
+            });
+            return;
+        };
+        if packets == 0 {
+            return;
+        }
+        // SAFETY: the title's input buffer holds `packets` 2048-byte packets, as it declared in the context.
+        let data =
+            unsafe { std::slice::from_raw_parts(input as *const u8, packets * 2048) }.to_vec();
+        match xma_hw::setup_from_context(context, data, ring) {
+            Ok(setup) => self.xma_hw.enable(context, setup),
+            Err(error) => {
+                self.note_once("xma-setup", || {
+                    format!("an XMA context could not start: {error}")
+                });
+            }
+        }
+    }
+
     /// The address of the hardware layer's object: allocated on first use, stable until reset. On Windows it
     /// starts with the vtable the title calls through; elsewhere it is a zeroed block.
     pub fn acp_create(&mut self) -> usize {
@@ -141,6 +212,7 @@ impl Engine {
     }
 
     pub fn release_shape_contexts(&mut self) {
+        self.xma_hw.shutdown();
         self.contexts = None;
     }
 
@@ -398,6 +470,37 @@ mod tests {
         let done = e.take_completions();
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].buffer, buffer);
+    }
+
+    #[test]
+    fn enabling_a_context_maps_its_buffers_and_output_reads_move_its_read_offset() {
+        let mut e = Engine::new(OutputMode::Off);
+        e.apu.create_heap(0, 0x226e00);
+        let (input, input_apu) = e.apu.alloc(2048 * 2, 0x800).unwrap();
+        let (ring, ring_apu) = e.apu.alloc(0x1700, 0x800).unwrap();
+        let contexts = e.allocate_shape_contexts(4);
+        let ctx = contexts + CTX_BYTES;
+        // SAFETY: context 1 lies inside the four contexts just allocated.
+        unsafe {
+            let w = ctx as *mut u32;
+            w.write(2 | (255 << 12) | (23 << 22));
+            w.add(1).write(3 << 27);
+            w.add(5).write(input_apu);
+            w.add(7).write(ring_apu);
+        }
+        assert_ne!((input, ring), (0, 0));
+        e.apply_hal(HalCommand::Enable { context: 1 });
+        assert!(e.hal_mut().is_enabled(1));
+        e.apply_hal(HalCommand::OutputRead {
+            context: 1,
+            blocks: 5,
+        });
+        // SAFETY: as above.
+        let read = unsafe { (ctx as *const u32).add(9).read() };
+        assert_eq!(read & 0x1f, 5);
+        e.apply_hal(HalCommand::Enable { context: 99 });
+        e.stop_hal();
+        e.release_shape_contexts();
     }
 
     #[test]

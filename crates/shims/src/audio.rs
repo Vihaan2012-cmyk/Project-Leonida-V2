@@ -32,6 +32,7 @@ mod mixer;
 mod output;
 pub mod xapu;
 mod xma;
+pub mod xma_hw;
 
 pub use apu::{ApuError, ApuSpace};
 pub use engine::{DEFAULT_RATE, Engine, OutputMode, ReopenGate};

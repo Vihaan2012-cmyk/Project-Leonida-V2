@@ -147,7 +147,7 @@ pub mod object {
     }
 
     extern "win64" fn stop(_this: *mut Object) {
-        engine().hal_mut().stop();
+        engine().stop_hal();
     }
 
     extern "win64" fn submit(
@@ -179,7 +179,7 @@ pub mod object {
                 format!("hardware layer command {op:#x} (key {key:#x}) is not one the title has been seen to use")
             });
         }
-        e.hal_mut().submit(command);
+        e.apply_hal(command);
         S_OK
     }
 

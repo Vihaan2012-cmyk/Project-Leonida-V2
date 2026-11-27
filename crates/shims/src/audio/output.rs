@@ -142,12 +142,12 @@ fn open(
     let stream = match buffer {
         Some(frames) => {
             config.buffer_size = BufferSize::Fixed(frames);
-            build_with(config.clone()).or_else(|_| {
+            build_with(config).or_else(|_| {
                 config.buffer_size = BufferSize::Default;
-                build_with(config.clone())
+                build_with(config)
             })
         }
-        None => build_with(config.clone()),
+        None => build_with(config),
     }?;
     stream
         .play()
