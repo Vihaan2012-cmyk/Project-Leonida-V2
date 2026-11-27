@@ -758,3 +758,93 @@ fn bench_write_watch_fault_cost() {
         );
     }
 }
+
+/// Whether a sparse window accepts the device-local host-visible memory of a resizable BAR, and how fast the CPU
+/// writes into it.
+#[test]
+#[ignore = "benchmark"]
+fn bench_resizable_bar() {
+    for gpu in &TestGpu::open_all() {
+        let space = big_space(gpu, None);
+        let h = &gpu.handles;
+        // SAFETY: bench-only Vulkan use on this test's device.
+        unsafe {
+            let types = h.instance.get_physical_device_memory_properties(h.physical);
+            let extensions = h
+                .instance
+                .enumerate_device_extension_properties(h.physical)
+                .unwrap();
+            let placed = extensions
+                .iter()
+                .any(|e| e.extension_name_as_c_str() == Ok(c"VK_EXT_map_memory_placed"));
+            eprintln!(
+                "== {} ({:?}): window memory types {:#b}, VK_EXT_map_memory_placed {placed}",
+                gpu.name(),
+                space.backing(),
+                space.window.type_bits
+            );
+            let bar = (0..types.memory_type_count).find(|i| {
+                types.memory_types[*i as usize].property_flags.contains(
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE,
+                )
+            });
+            for i in 0..types.memory_type_count {
+                let t = types.memory_types[i as usize];
+                eprintln!(
+                    "  type {i}: heap {} ({} MiB) {:?} accepted by the sparse window: {}",
+                    t.heap_index,
+                    types.memory_heaps[t.heap_index as usize].size >> 20,
+                    t.property_flags,
+                    space.window.type_bits & (1 << i) != 0
+                );
+            }
+            let Some(bar) = bar else {
+                eprintln!("  no device-local host-visible type");
+                continue;
+            };
+            let len = 256u64 << 20;
+            let device = &h.device;
+            let memory = device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(len)
+                        .memory_type_index(bar),
+                    None,
+                )
+                .unwrap();
+            let pointer = device
+                .map_memory(memory, 0, len, vk::MemoryMapFlags::empty())
+                .unwrap() as u64;
+            let source = Region::new_in(len, false, 4 << 30, 8 << 30, 8);
+            for offset in (0..len).step_by(4096) {
+                source.touch(offset, 1);
+            }
+            for threads in [1u64, 2, 4] {
+                let part = len / threads;
+                let start = Instant::now();
+                std::thread::scope(|scope| {
+                    for t in 0..threads {
+                        let (from, to) = (source.address + t * part, pointer + t * part);
+                        scope.spawn(move || {
+                            std::ptr::copy_nonoverlapping(
+                                from as *const u8,
+                                to as *mut u8,
+                                part as usize,
+                            )
+                        });
+                    }
+                });
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(
+                    "  CPU copy of 256 MiB into the BAR on {threads} threads: {ms:.1} ms ({:.1} GB/s)",
+                    len as f64 / ms / 1e6
+                );
+            }
+            device.unmap_memory(memory);
+            if space.window.type_bits & (1 << bar) != 0 {
+                eprintln!("  the sparse window accepts the BAR type");
+            }
+            device.free_memory(memory, None);
+        }
+    }
+}

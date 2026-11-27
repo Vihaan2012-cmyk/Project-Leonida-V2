@@ -12,7 +12,8 @@
 //! - **Mirrored**: NVIDIA's sparse buffers accept only device-local memory, so the window is bound to device-local
 //!   memory and the imported host buffer is copied to it before the GPU reads (`record_uploads`) and back after
 //!   the GPU writes (`record_downloads`). Writes the CPU made are found by `GetWriteWatch`, by the caller's
-//!   `mark_dirty`, or by copying the whole region.
+//!   `mark_dirty`, or by copying the whole region. The `sync` module says how uploads, the transfer queue
+//!   (`submit_uploads`) and the copies back (`note_gpu_write`, `HostAccess`, `read_back`) keep neither side stale.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, c_void};
