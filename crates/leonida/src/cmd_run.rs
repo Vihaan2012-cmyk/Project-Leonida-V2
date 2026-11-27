@@ -24,6 +24,11 @@ pub fn run_command(args: &RunArgs) -> Result<ExitCode> {
         None => executable(&game)?,
     };
     if !args.dry_run {
+        if !args.start_the_game {
+            bail!(
+                "this would start the game. Add --start-the-game if you mean to; --dry-run only reads its imports."
+            );
+        }
         return run(&path, args);
     }
     let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;

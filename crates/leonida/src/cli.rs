@@ -47,6 +47,9 @@ pub struct RunArgs {
     /// List how every import would be provided, without running anything.
     #[arg(long)]
     pub dry_run: bool,
+    /// Really start the game. Without it, `run` refuses, so nothing starts the game by accident.
+    #[arg(long)]
+    pub start_the_game: bool,
     /// With --dry-run, also list every function each DLL provides.
     #[arg(long)]
     pub all: bool,
