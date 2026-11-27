@@ -571,3 +571,163 @@ fn a_dropped_queue_with_a_wait_that_never_comes_shuts_down() {
         assert_eq!(release(queue), 0);
     }
 }
+
+#[test]
+fn recorded_structs_are_decoded_from_their_console_layouts() {
+    use xbox_d3d12::stream::{Barrier, CopyLocation};
+    let capture = Arc::new(Capture::default());
+    let device = new_device(capture.clone());
+    let queue = make_queue(device, 0, false);
+    let allocator = make_allocator(device, 0);
+    let (_, list) = make_list(device, allocator, &guid_bytes(&iid::GRAPHICS_COMMAND_LIST));
+    let (resource_a, resource_b) = (make_fence(device, 0), make_fence(device, 0));
+
+    // D3D12_RESOURCE_BARRIER: type, flags, then the transition at offset 8
+    let mut barrier = [0u8; 32];
+    barrier[8..16].copy_from_slice(&(resource_a as u64).to_le_bytes());
+    barrier[16..20].copy_from_slice(&3u32.to_le_bytes());
+    barrier[20..24].copy_from_slice(&0x4u32.to_le_bytes());
+    barrier[24..28].copy_from_slice(&0x80u32.to_le_bytes());
+    // D3D12_TEXTURE_COPY_LOCATION: resource, type 1 (placed), offset and footprint
+    let mut placed = [0u8; 48];
+    placed[0..8].copy_from_slice(&(resource_a as u64).to_le_bytes());
+    placed[8..12].copy_from_slice(&1u32.to_le_bytes());
+    placed[16..24].copy_from_slice(&512u64.to_le_bytes());
+    placed[24..28].copy_from_slice(&28u32.to_le_bytes());
+    placed[28..32].copy_from_slice(&64u32.to_le_bytes());
+    placed[32..36].copy_from_slice(&32u32.to_le_bytes());
+    placed[36..40].copy_from_slice(&1u32.to_le_bytes());
+    placed[40..44].copy_from_slice(&256u32.to_le_bytes());
+    let mut subresource = [0u8; 48];
+    subresource[0..8].copy_from_slice(&(resource_b as u64).to_le_bytes());
+    subresource[16..20].copy_from_slice(&5u32.to_le_bytes());
+
+    // SAFETY: the console slots and shapes named in `d3d12_slots.txt`.
+    unsafe {
+        let resource_barrier: unsafe extern "win64" fn(Ptr, u32, *const u8) = slot(list, 26);
+        resource_barrier(list, 1, barrier.as_ptr());
+        let copy_texture: unsafe extern "win64" fn(Ptr, *const u8, u32, u32, u32, *const u8, Ptr) =
+            slot(list, 85);
+        copy_texture(
+            list,
+            subresource.as_ptr(),
+            1,
+            2,
+            3,
+            placed.as_ptr(),
+            std::ptr::null_mut(),
+        );
+        let clear_dsv: unsafe extern "win64" fn(Ptr, u64, u32, f32, u8, u32, Ptr) = slot(list, 51);
+        clear_dsv(list, 0x1000, 3, 0.5, 7, 0, std::ptr::null_mut());
+        let clear_rtv: unsafe extern "win64" fn(Ptr, u64, *const f32, u32, Ptr) = slot(list, 52);
+        clear_rtv(
+            list,
+            0x2000,
+            [0.25f32, 0.5, 0.75, 1.0].as_ptr(),
+            0,
+            std::ptr::null_mut(),
+        );
+        let viewports: unsafe extern "win64" fn(Ptr, u32, *const f32) = slot(list, 21);
+        viewports(list, 1, [0.0f32, 0.0, 1920.0, 1080.0, 0.0, 1.0].as_ptr());
+        let copy_buffer: unsafe extern "win64" fn(Ptr, Ptr, u64, Ptr, u64, u64) = slot(list, 15);
+        copy_buffer(list, resource_a, 16, resource_b, 32, 64);
+        let close: unsafe extern "win64" fn(Ptr) -> u32 = slot(list, 9);
+        assert_eq!(close(list), 0);
+        let execute: unsafe extern "win64" fn(Ptr, u32, *const Ptr) = slot(queue, 10);
+        execute(queue, 1, &list);
+        xbox_d3d12::queue::queue_of(queue).unwrap().flush();
+    }
+
+    let streams = capture.streams.lock().unwrap();
+    let commands = &streams[0].commands;
+    match &commands[0] {
+        Command::ResourceBarrier(barriers) => match &barriers[0] {
+            Barrier::Transition {
+                resource,
+                subresource,
+                before,
+                after,
+                ..
+            } => {
+                assert_eq!(resource.as_ptr(), resource_a);
+                assert_eq!((*subresource, *before, *after), (3, 4, 0x80));
+            }
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    }
+    match &commands[1] {
+        Command::CopyTextureRegion {
+            dst,
+            x,
+            y,
+            z,
+            src,
+            src_box,
+        } => {
+            assert!(matches!(dst, CopyLocation::Subresource { index: 5, .. }));
+            assert_eq!((*x, *y, *z), (1, 2, 3));
+            assert!(src_box.is_none());
+            match src {
+                CopyLocation::Placed { footprint, .. } => {
+                    assert_eq!(
+                        (
+                            footprint.offset,
+                            footprint.format,
+                            footprint.width,
+                            footprint.height
+                        ),
+                        (512, 28, 64, 32)
+                    );
+                    assert_eq!((footprint.depth, footprint.row_pitch), (1, 256));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        commands[2],
+        Command::ClearDepthStencilView { dsv: 0x1000, flags: 3, depth, stencil: 7, .. } if depth == 0.5
+    ));
+    assert!(matches!(
+        commands[3],
+        Command::ClearRenderTargetView {
+            rtv: 0x2000,
+            color: [0.25, 0.5, 0.75, 1.0],
+            ..
+        }
+    ));
+    assert!(
+        matches!(&commands[4], Command::SetViewports(v) if v.len() == 1 && v[0].width == 1920.0)
+    );
+    assert!(matches!(
+        &commands[5],
+        Command::CopyBufferRegion {
+            dst_offset: 16,
+            src_offset: 32,
+            bytes: 64,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn children_give_their_device_back_and_keep_it_alive() {
+    let device = new_device(Arc::default());
+    let queue = make_queue(device, 0, false);
+    let iid = guid_bytes(&iid::DEVICE);
+    // SAFETY: queue slot 7 (`GetDevice`), `Release`.
+    unsafe {
+        let get_device: QueryFn = slot(queue, 7);
+        let mut got = std::ptr::null_mut();
+        assert_eq!(get_device(queue, iid.as_ptr(), &mut got), 0);
+        assert_eq!(got, device);
+        let release: RefFn = slot(device, 2);
+        // creation reference, the queue's own, the one just handed out: dropping the title's two leaves one
+        assert_eq!(release(device), 2);
+        assert_eq!(release(device), 1);
+        let queue_release: RefFn = slot(queue, 2);
+        assert_eq!(queue_release(queue), 0);
+    }
+}
