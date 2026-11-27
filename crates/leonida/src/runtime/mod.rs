@@ -19,7 +19,7 @@ use config::{Config, Section};
 
 pub use plan::{RuntimePlan, Settings};
 
-/// Reads the four settings files. Missing files are written with their documented defaults only when
+/// Reads the settings files. Missing files are written with their documented defaults only when
 /// `write_missing` is set, so a dry run leaves the folder as it was.
 pub fn load_settings(dir: &Path, write_missing: bool) -> Result<Settings> {
     if write_missing {
@@ -39,6 +39,9 @@ pub fn load_settings(dir: &Path, write_missing: bool) -> Result<Settings> {
             graphics: one(dir)?,
             input: one(dir)?,
             mods: one(dir)?,
+            display: one(dir)?,
+            widescreen: one(dir)?,
+            upscaling: one(dir)?,
         })
     };
     read().with_context(|| format!("reading the settings in {}", dir.display()))
