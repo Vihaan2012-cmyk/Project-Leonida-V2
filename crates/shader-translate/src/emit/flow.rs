@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use rspirv::dr::Builder;
-use rspirv::spirv::{LoopControl, StorageClass, Word};
+use rspirv::spirv::{StorageClass, Word};
 use shader_ir::{Function, Terminator};
 
 use super::{EmitError, Emitter, ITERATION_LIMIT, ok};
@@ -158,7 +158,7 @@ impl Emitter {
         let (header, body, next, merge) = (self.b.id(), self.b.id(), self.b.id(), self.b.id());
         ok(self.b.branch(header))?;
         self.begin(header)?;
-        ok(self.b.loop_merge(merge, next, LoopControl::NONE, []))?;
+        self.looping(merge, next)?;
         ok(self.b.branch(body))?;
         self.begin(body)?;
         self.span(function, flow, iterations, head..end + 1, Some((head, end)))?;

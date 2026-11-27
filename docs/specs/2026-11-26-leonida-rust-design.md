@@ -304,6 +304,11 @@ a descriptor goes through a 128-entry table of layouts. The words of one load ar
 Together with the two items above this took the slowest mesh shader in the game from 168 s and 8.5 GB of driver
 time and memory to 9 s and 0.6 GB.
 
+**Image descriptors.** Each texture and sampler descriptor is looked up once for the blocks that can see the
+lookup, and scalar registers are loaded once until written, so repeated reads of one descriptor share a lookup.
+Filtered samples (every `image_sample` form) only use the float view, since only float formats can be filtered;
+loads and gathers still choose a view by the descriptor's number type at run time.
+
 **Checking against the driver.** `leonida shaders verify` translates every shader and has the graphics driver build
 each into a pipeline: compute shaders alone, pixel shaders after a vertex shader writing every parameter, vertex and
 mesh shaders before a fragment shader that does nothing, geometry shaders after a first half writing items of their

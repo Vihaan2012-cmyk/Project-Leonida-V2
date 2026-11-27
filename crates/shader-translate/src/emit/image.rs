@@ -1,7 +1,7 @@
 use rspirv::dr::Operand;
 use rspirv::spirv::{
     Capability, Decoration, Dim, FunctionControl, ImageFormat, ImageOperands, LoopControl,
-    SelectionControl, StorageClass, Word,
+    StorageClass, Word,
 };
 use shader_ir::{AtomicOp, Image, ImageDim, ImageOp};
 
@@ -252,7 +252,7 @@ impl Emitter {
         let active = self.active()?;
         let before = self.label;
         let (then, merge) = (self.b.id(), self.b.id());
-        ok(self.b.selection_merge(merge, SelectionControl::NONE))?;
+        self.selection(merge)?;
         ok(self.b.branch_conditional(active, then, merge, []))?;
         self.begin(then)?;
         let ids = self.atomic_view(view, wide);
@@ -332,6 +332,21 @@ impl Emitter {
                 id
             }
         }
+    }
+
+    /// A descriptor's table entry, looked up once for each set of words in the blocks that can see it.
+    fn descriptor(&mut self, which: usize, key: Vec<Word>) -> Result<Word, EmitError> {
+        if let Some((frame, entry)) = self.descriptor_lookups.get(&(which, key.clone())).copied()
+            && self.visible(frame)
+        {
+            return Ok(entry);
+        }
+        let u32_ = self.t.u32_;
+        let lookup = self.lookup_function(which);
+        let entry = ok(self.b.function_call(u32_, None, lookup, key.clone()))?;
+        let frame = self.frames.last().map_or(0, |top| top.1);
+        self.descriptor_lookups.insert((which, key), (frame, entry));
+        Ok(entry)
     }
 
     pub(super) fn lookup_bodies(&mut self) -> Result<(), EmitError> {
@@ -427,8 +442,7 @@ impl Emitter {
     fn texture_slot(&mut self, image: &Image) -> Result<(Word, Word), EmitError> {
         let u32_ = self.t.u32_;
         let key: Vec<Word> = image.resource.iter().map(|t| self.val(*t)).collect();
-        let lookup = self.lookup_function(0);
-        let entry = ok(self.b.function_call(u32_, None, lookup, key))?;
+        let entry = self.descriptor(0, key)?;
         let mask = self.u32c(images::SLOT_MASK);
         let index = ok(self.b.bitwise_and(u32_, None, entry, mask))?;
         let thirty = self.u32c(30);
@@ -445,8 +459,7 @@ impl Emitter {
             .map(|t| self.val(*t))
             .chain([zero; 4])
             .collect();
-        let lookup = self.lookup_function(1);
-        let entry = ok(self.b.function_call(u32_, None, lookup, key))?;
+        let entry = self.descriptor(1, key)?;
         let mask = self.u32c(images::SLOT_MASK);
         let slot = ok(self.b.bitwise_and(u32_, None, entry, mask))?;
         let array = if compare {
@@ -468,7 +481,7 @@ impl Emitter {
     ) -> Result<Option<Word>, EmitError> {
         let labels = [self.b.id(), self.b.id(), self.b.id()];
         let merge = self.b.id();
-        ok(self.b.selection_merge(merge, SelectionControl::NONE))?;
+        self.selection(merge)?;
         ok(self.b.switch(
             number,
             labels[0],
@@ -535,11 +548,31 @@ impl Emitter {
             _ => self.load_coordinates(image.dim, &values)?,
         };
         let extras = self.sample_extras(image, view, coordinates)?;
-        let result = self.per_number(number, |e, number| {
-            e.image_arm(image, view, number, index, sampler, coordinates, &extras)
-                .map(Some)
-        })?;
-        let result = result.expect("every arm returns a value");
+        let filtered = matches!(
+            image.op,
+            ImageOp::Sample
+                | ImageOp::SampleBias
+                | ImageOp::SampleLod
+                | ImageOp::SampleLodZero
+                | ImageOp::SampleGrad
+        );
+        let result = if filtered {
+            self.image_arm(
+                image,
+                view,
+                Number::Float,
+                index,
+                sampler,
+                coordinates,
+                &extras,
+            )?
+        } else {
+            self.per_number(number, |e, number| {
+                e.image_arm(image, view, number, index, sampler, coordinates, &extras)
+                    .map(Some)
+            })?
+            .expect("every arm returns a value")
+        };
         let mut words = [0; 4];
         for (component, word) in words.iter_mut().enumerate() {
             *word = ok(self

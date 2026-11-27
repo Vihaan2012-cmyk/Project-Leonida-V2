@@ -1,5 +1,5 @@
 use rspirv::dr::Operand;
-use rspirv::spirv::{Capability, FunctionControl, SelectionControl, Word};
+use rspirv::spirv::{Capability, FunctionControl, Word};
 use shader_ir::{AtomicOp, Space};
 
 use super::{EmitError, Emitter, GLOp, ok};
@@ -26,7 +26,7 @@ impl Emitter {
         let before = self.label;
         let then = self.b.id();
         let merge = self.b.id();
-        ok(self.b.selection_merge(merge, SelectionControl::NONE))?;
+        self.selection(merge)?;
         ok(self.b.branch_conditional(condition, then, merge, []))?;
         self.begin(then)?;
         let (ptr, scope) = match space {
@@ -122,7 +122,7 @@ impl Emitter {
             .filter(|c| rdna::format::buffer_format(*c).is_some())
             .collect();
         let labels: Vec<Word> = codes.iter().map(|_| self.b.id()).collect();
-        ok(self.b.selection_merge(merge, SelectionControl::NONE))?;
+        self.selection(merge)?;
         let targets: Vec<(Operand, Word)> = codes
             .iter()
             .zip(&labels)
@@ -414,7 +414,7 @@ impl Emitter {
             };
             let whole = ok(e.b.i_equal(bool_, None, mask, full))?;
             let (store, merge_label, done) = (e.b.id(), e.b.id(), e.b.id());
-            ok(e.b.selection_merge(done, SelectionControl::NONE))?;
+            e.selection(done)?;
             ok(e.b.branch_conditional(whole, store, merge_label, []))?;
             e.begin(store)?;
             if e.heap.is_some() {

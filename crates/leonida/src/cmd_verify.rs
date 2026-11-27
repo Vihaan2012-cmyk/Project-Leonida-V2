@@ -241,6 +241,7 @@ struct Tally {
 struct Verify {
     each: bool,
     save: Option<PathBuf>,
+    saved: HashMap<String, usize>,
     replacement: Option<Vec<u32>>,
     no_build: bool,
     kinds: BTreeMap<&'static str, Tally>,
@@ -285,7 +286,10 @@ impl Verify {
         };
         if let Some(folder) = &self.save {
             let bytes: Vec<u8> = built.spirv().iter().flat_map(|w| w.to_le_bytes()).collect();
-            let path = folder.join(format!("{name}.{}.spv", kind(&built).replace(' ', "_")));
+            let count = self.saved.entry(name.to_string()).or_default();
+            *count += 1;
+            let kind = kind(&built).replace(' ', "_");
+            let path = folder.join(format!("{name}.{count}.{kind}.spv"));
             if let Err(error) = std::fs::write(&path, bytes) {
                 println!("could not write {}: {error}", path.display());
             }

@@ -268,6 +268,11 @@ struct Emitter {
     /// Per block and statement: `SetLane`s whose skipped lanes are never read again, so they write every lane.
     free_writes: Vec<Vec<bool>>,
     free_write: bool,
+    /// Open selections and loops: each merge block and the frame of the block being written inside it.
+    frames: Vec<(Word, u32)>,
+    next_frame: u32,
+    scalar_loads: HashMap<Word, (u32, Word)>,
+    descriptor_lookups: HashMap<(usize, Vec<Word>), (u32, Word)>,
     code_base: u64,
     heap: Option<Word>,
     code: Option<Word>,
@@ -704,6 +709,10 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         float64: false,
         free_writes: shader_ir::free_writes(function, !heap_mode),
         free_write: false,
+        frames: vec![(0, 0)],
+        next_frame: 0,
+        scalar_loads: HashMap::new(),
+        descriptor_lookups: HashMap::new(),
         code_base,
         heap: None,
         code: None,
@@ -961,6 +970,7 @@ impl Emitter {
     }
 
     fn store(&mut self, ptr: Word, value: Word) -> Result<(), EmitError> {
+        self.scalar_loads.remove(&ptr);
         ok(self.b.store(ptr, value, None, []))
     }
 
@@ -977,7 +987,7 @@ impl Emitter {
     ) -> Result<(), EmitError> {
         let then = self.b.id();
         let merge = self.b.id();
-        ok(self.b.selection_merge(merge, SelectionControl::NONE))?;
+        self.selection(merge)?;
         ok(self.b.branch_conditional(condition, then, merge, []))?;
         self.begin(then)?;
         body(self)?;
@@ -1126,11 +1136,11 @@ impl Emitter {
         let cases: Vec<Word> = function.blocks.iter().map(|_| self.b.id()).collect();
         ok(self.b.branch(header))?;
         self.begin(header)?;
-        ok(self.b.loop_merge(merge, cont, LoopControl::NONE, []))?;
+        self.looping(merge, cont)?;
         ok(self.b.branch(body))?;
         self.begin(body)?;
         let selector = self.load(current)?;
-        ok(self.b.selection_merge(switch_merge, SelectionControl::NONE))?;
+        self.selection(switch_merge)?;
         let targets: Vec<(Operand, Word)> = cases
             .iter()
             .enumerate()
@@ -1226,9 +1236,55 @@ impl Emitter {
     fn begin(&mut self, label: Word) -> Result<(), EmitError> {
         ok(self.b.begin_block(Some(label)))?;
         self.label = label;
+        let open = self.frames.len() > 1;
+        match self.frames.last_mut() {
+            Some(top) if top.0 == label => {
+                self.frames.pop();
+            }
+            Some(top) if open => {
+                self.next_frame += 1;
+                top.1 = self.next_frame;
+            }
+            _ => {}
+        }
         self.image_cache = [None, None];
         self.active_cache = [None, None];
         Ok(())
+    }
+
+    /// Opens a selection: the blocks until `merge` neither see values made in each other nor are seen after it.
+    fn selection(&mut self, merge: Word) -> Result<(), EmitError> {
+        self.next_frame += 1;
+        self.frames.push((merge, self.next_frame));
+        ok(self.b.selection_merge(merge, SelectionControl::NONE))
+    }
+
+    /// Opens a loop; registers read before it may change before its body runs again.
+    fn looping(&mut self, merge: Word, next: Word) -> Result<(), EmitError> {
+        self.next_frame += 1;
+        self.frames.push((merge, self.next_frame));
+        self.scalar_loads.clear();
+        ok(self.b.loop_merge(merge, next, LoopControl::NONE, []))
+    }
+
+    fn frame(&self) -> u32 {
+        self.frames.last().map_or(0, |top| top.1)
+    }
+
+    /// Whether a value made in `frame` dominates the block being written.
+    pub(super) fn visible(&self, frame: u32) -> bool {
+        self.frames.iter().any(|top| top.1 == frame)
+    }
+
+    fn scalar_load(&mut self, var: Word) -> Result<Word, EmitError> {
+        if let Some((frame, id)) = self.scalar_loads.get(&var).copied()
+            && self.visible(frame)
+        {
+            return Ok(id);
+        }
+        let id = self.load(var)?;
+        self.scalar_loads.insert(var, (self.frame(), id));
+        Ok(id)
     }
 
     fn storage_block(&mut self) -> Word {
@@ -1297,7 +1353,7 @@ impl Emitter {
         let before = self.label;
         let then = self.b.id();
         let merge = self.b.id();
-        ok(self.b.selection_merge(merge, SelectionControl::NONE))?;
+        self.selection(merge)?;
         ok(self.b.branch_conditional(condition, then, merge, []))?;
         self.begin(then)?;
         let mut loaded = Vec::new();
@@ -1893,7 +1949,7 @@ impl Emitter {
                 let new = v(self, value);
                 let merge = self.b.id();
                 let labels: Vec<(u8, Word)> = (*base..=255u8).map(|r| (r, self.b.id())).collect();
-                ok(self.b.selection_merge(merge, SelectionControl::NONE))?;
+                self.selection(merge)?;
                 let targets: Vec<(Operand, Word)> = labels
                     .iter()
                     .map(|(r, label)| (Operand::LiteralBit32(u32::from(*r)), *label))
@@ -2072,7 +2128,7 @@ impl Emitter {
             Expr::Const(c) => self.u32c(*c),
             Expr::Const64(c) => self.u64c(*c),
             Expr::Get(reg) => match reg {
-                Reg::S(r) => self.load(self.sgpr_var(*r))?,
+                Reg::S(r) => self.scalar_load(self.sgpr_var(*r))?,
                 Reg::M0 => self.load(self.sgpr_var(M0))?,
                 Reg::V(r) => self.load(self.vgpr_var(*r))?,
                 Reg::Exec => self.get_pair(EXEC)?,

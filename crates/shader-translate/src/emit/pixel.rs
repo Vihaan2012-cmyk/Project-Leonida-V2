@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use rspirv::dr::Operand;
-use rspirv::spirv::{BuiltIn, Capability, Decoration, SelectionControl, StorageClass, Word};
+use rspirv::spirv::{BuiltIn, Capability, Decoration, StorageClass, Word};
 
 use super::{
     DepthOutput, EXEC, EmitError, Emitter, PUSH_CODE, PUSH_HEAP, PixelOptions, PixelOutput, ok,
@@ -181,7 +181,7 @@ impl Emitter {
         let bool_ = self.t.bool_;
         let keep = ok(self.b.load(bool_, None, alive, None, []))?;
         let (discard, done) = (self.b.id(), self.b.id());
-        ok(self.b.selection_merge(done, SelectionControl::NONE))?;
+        self.selection(done)?;
         ok(self.b.branch_conditional(keep, done, discard, []))?;
         self.begin(discard)?;
         ok(self.b.kill())?;
