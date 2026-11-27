@@ -6,12 +6,13 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::dstorage::{
-    GpuDestination, GpuUpload, set_decompressor, set_fence_signal, set_gpu_copy,
+    GpuDestination, GpuUpload, set_bcpack_format, set_decompressor, set_fence_signal, set_gpu_copy,
 };
 
 static LOCK: Mutex<()> = Mutex::new(());
 
 const E_NOTIMPL: i32 = 0x8000_4001u32 as i32;
+const E_FAIL: i32 = 0x8000_4005u32 as i32;
 const E_PENDING: i32 = 0x8000_000Au32 as i32;
 const FILE_NOT_FOUND: i32 = 0x8007_0002u32 as i32;
 
@@ -471,4 +472,50 @@ fn an_unexpected_interface_id_still_gets_a_factory() {
     // SAFETY: valid pointers.
     assert_eq!(unsafe { get_factory(unknown.as_ptr(), &mut factory) }, 0);
     assert!(!factory.is_null());
+}
+
+/// One BC1 block of BCPack lanes that all carry symbol 0.
+const ZERO_BLOCK: [u8; 72] = [
+    0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x01, 0x20, 0x40, 0x20, 0x20, 0x40, 0x20, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x1f, 0x1f, 0x1f, 0x1f, 0x03, 0x03, 0x03, 0x03, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+];
+
+#[test]
+fn bcpack_requests_decode_through_the_registered_formats() {
+    let s = setup();
+    assert!(set_bcpack_format(0x91, 1));
+    assert!(set_bcpack_format(0x97, 7));
+    assert!(!set_bcpack_format(0x98, 8));
+    let run = |format: u8, source: &[u8], size: u32, out: &mut Vec<u8>, id: u32| {
+        enqueue(
+            &s,
+            &Spec {
+                memory_source: source.as_ptr(),
+                size: source.len() as u32,
+                compression: format,
+                uncompressed: size,
+                target: out.as_mut_ptr() as usize,
+                target_size: size,
+                ..Spec::default()
+            },
+        );
+        mark_and_submit(&s, id);
+        wait(&s, id)
+    };
+    let mut out = vec![0u8; 8];
+    assert_eq!(run(0x91, &ZERO_BLOCK, 8, &mut out, 1), 0);
+    assert_eq!(out, [0, 0, 0, 0, 0xaa, 0xaa, 0xaa, 0xaa]);
+
+    let mut junk = vec![0u8; 8];
+    assert_eq!(run(0x91, &[0x55; 96], 8, &mut junk, 2), E_FAIL);
+    let mut bc7 = vec![0u8; 16];
+    assert_eq!(run(0x97, &[0; 96], 16, &mut bc7, 3), E_NOTIMPL);
+    assert!(
+        crate::trace::notes()
+            .iter()
+            .any(|n| n.contains("BCPack Bc7"))
+    );
 }
