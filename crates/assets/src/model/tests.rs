@@ -179,3 +179,71 @@ fn skinned_spec(
     d
 }
 
+#[test]
+fn skin_layouts_decode_sorted_by_weight() {
+    let influences = vec![
+        vec![(0, 255)],
+        vec![(1, 100), (0, 155)],
+        vec![(2, 255)],
+        vec![
+            (0, 10),
+            (1, 20),
+            (2, 30),
+            (0, 40),
+            (1, 50),
+            (2, 60),
+            (0, 20),
+            (1, 25),
+        ],
+    ];
+    let palette = vec![0x11, 0x22, 0x33];
+    for skin in [SkinForm::Bytes(2), SkinForm::Packed(2), SkinForm::Words(2)] {
+        let set = decode_resource(
+            &drawable_resource(&skinned_spec(skin, influences.clone(), palette.clone())),
+            None,
+        )
+        .unwrap();
+        let g = &set.drawables[0].lods[0].models[0].geometries[0];
+        let s = g.skin.as_ref().expect("skin");
+        assert_eq!(s.joints[0][0], 0);
+        assert_eq!(s.weights[0], [255, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&s.weights[1][..2], &[155, 100]);
+        assert_eq!(&s.joints[1][..2], &[0, 1]);
+        assert_eq!(s.weights[3], [60, 50, 40, 30, 25, 20, 20, 10]);
+        assert!(s.weights.iter().all(|w| w.windows(2).all(|p| p[0] >= p[1])));
+    }
+}
+
+#[test]
+fn rigid_and_constant_skin_bind_one_bone() {
+    let rigid = skinned_spec(
+        SkinForm::Rigid8,
+        vec![
+            vec![(1, 255)],
+            vec![(0, 255)],
+            vec![(2, 255)],
+            vec![(1, 255)],
+        ],
+        vec![1, 2, 3],
+    );
+    let set = decode_resource(&drawable_resource(&rigid), None).unwrap();
+    let s = set.drawables[0].lods[0].models[0].geometries[0]
+        .skin
+        .clone()
+        .unwrap();
+    assert_eq!(s.layout, SkinLayout::Rigid);
+    assert_eq!(
+        s.joints.iter().map(|j| j[0]).collect::<Vec<_>>(),
+        vec![1, 0, 2, 1]
+    );
+
+    let constant = skinned_spec(SkinForm::Constant(2), Vec::new(), vec![1, 2, 3]);
+    let set = decode_resource(&drawable_resource(&constant), None).unwrap();
+    let s = set.drawables[0].lods[0].models[0].geometries[0]
+        .skin
+        .clone()
+        .unwrap();
+    assert_eq!(s.layout, SkinLayout::Constant);
+    assert!(s.joints.iter().all(|j| j[0] == 2) && s.weights.iter().all(|w| w[0] == 255));
+}
+
