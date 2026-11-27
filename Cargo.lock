@@ -709,6 +709,7 @@ dependencies = [
  "iced-x86",
  "pe-image",
  "pe-loader",
+ "shims",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
 ]

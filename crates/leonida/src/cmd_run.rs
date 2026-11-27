@@ -117,6 +117,16 @@ fn run(path: &Path, args: &RunArgs, plan: &RuntimePlan) -> Result<ExitCode> {
     let boot = plan.output_dir.join("boot");
     if let Some(trace) = binder.trace() {
         shims::trace::watch_crashes(boot.clone(), module.base(), module.size());
+        trace.attach();
+        // SAFETY: the mapping of the module just loaded, which stays loaded.
+        let mut memory = unsafe { enhancements::patch::Mapped::new(module.base(), module.size()) };
+        match enhancements::diagnostics::enable(
+            &mut memory,
+            &enhancements::diagnostics::FASTFAIL_SITES,
+        ) {
+            Ok(applied) => println!("trace: {} fast-fail sites made visible", applied.len()),
+            Err(error) => eprintln!("warning: fast-fail sites stay hidden from the trace: {error}"),
+        }
         let folder = boot.clone();
         std::thread::spawn(move || {
             loop {
