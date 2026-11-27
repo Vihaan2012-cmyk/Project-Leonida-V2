@@ -778,6 +778,47 @@ pub fn base_iids(kind: Kind) -> &'static [Guid] {
             iid::PAGEABLE,
             iid::DESCRIPTOR_HEAP,
         ],
+        Kind::Resource => &[
+            iid::UNKNOWN,
+            iid::OBJECT,
+            iid::DEVICE_CHILD,
+            iid::PAGEABLE,
+            iid::RESOURCE,
+        ],
+        Kind::Heap => &[
+            iid::UNKNOWN,
+            iid::OBJECT,
+            iid::DEVICE_CHILD,
+            iid::PAGEABLE,
+            iid::HEAP,
+        ],
+        Kind::RootSignature => &[
+            iid::UNKNOWN,
+            iid::OBJECT,
+            iid::DEVICE_CHILD,
+            iid::ROOT_SIGNATURE,
+        ],
+        Kind::PipelineState => &[
+            iid::UNKNOWN,
+            iid::OBJECT,
+            iid::DEVICE_CHILD,
+            iid::PAGEABLE,
+            iid::PIPELINE_STATE,
+        ],
+        Kind::QueryHeap => &[
+            iid::UNKNOWN,
+            iid::OBJECT,
+            iid::DEVICE_CHILD,
+            iid::PAGEABLE,
+            iid::QUERY_HEAP,
+        ],
+        Kind::CommandSignature => &[
+            iid::UNKNOWN,
+            iid::OBJECT,
+            iid::DEVICE_CHILD,
+            iid::PAGEABLE,
+            iid::COMMAND_SIGNATURE,
+        ],
         _ => &[iid::UNKNOWN],
     }
 }
