@@ -64,6 +64,46 @@ fn physical_pages_map_into_reservations_and_alias() {
     }
 }
 
+/// The boot sequence upstream measured: a large `MEM_RESERVE_PLACEHOLDER` reservation (type 0x42000), physical
+/// reserves carved out of it (`MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | MEM_PHYSICAL | MEM_LARGE_PAGES`,
+/// 0x20406000) that pages are then mapped into, and an ordinary reservation replacing part of it.
+#[test]
+fn physical_reserves_carve_the_placeholder_they_lie_in() {
+    let reserve: VirtualAlloc = shim("XMemVirtualAlloc");
+    let allocate: Allocate = shim("XMemAllocatePhysicalPages");
+    let map: Map = shim("XMemMapPhysicalPages");
+    // SAFETY: the shapes the executable uses; every pointer is valid.
+    unsafe {
+        let base = reserve(std::ptr::null_mut(), 16 * PAGE, 0x4_2000, 0x7, 0x1);
+        assert!(!base.is_null());
+        let inner = (base as usize + 4 * PAGE) as *mut c_void;
+        assert_eq!(reserve(inner, 2 * PAGE, 0x2040_6000, 0x27, 0x2404), inner);
+        let mut count = 2usize;
+        let mut pages = [0usize; 2];
+        assert_eq!(allocate(0x380, &mut count, pages.as_mut_ptr()), 1);
+        assert_eq!(
+            map(inner, 2, pages.as_ptr()),
+            1,
+            "{:?}",
+            shims::trace::notes()
+        );
+        (inner as *mut u32).write_volatile(0xABCD);
+        assert_eq!((inner as *const u32).read_volatile(), 0xABCD);
+        let other = (base as usize + 10 * PAGE) as *mut c_void;
+        assert_eq!(
+            reserve(other, PAGE, 0x6000, 0x3, 0x1),
+            other,
+            "a plain reservation in place"
+        );
+        assert_eq!(
+            reserve(other, PAGE, 0x1000, 0x3, 0x4),
+            other,
+            "then committed"
+        );
+        (other as *mut u64).write_volatile(7);
+    }
+}
+
 #[test]
 fn ordinary_allocations_drop_console_bits() {
     let alloc: VirtualAlloc = shim("XMemVirtualAlloc");

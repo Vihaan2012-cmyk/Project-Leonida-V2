@@ -40,6 +40,7 @@ mod imp {
     const TRUE: i32 = 1;
     const FALSE: i32 = 0;
     const MEM_TOP_DOWN: u32 = 0x10_0000;
+    const MEM_PHYSICAL: u32 = 0x40_0000;
 
     struct State {
         /// Placeholder reservations: start to length.
@@ -88,6 +89,31 @@ mod imp {
             access => access,
         };
         let reserve_only = kind & MEM_COMMIT == 0 && kind & MEM_RESERVE != 0;
+        if reserve_only && !address.is_null() && inside_placeholder(address as usize, size) {
+            if allocation_type & MEM_PHYSICAL != 0 {
+                return if carve(address as usize, size) {
+                    address
+                } else {
+                    std::ptr::null_mut()
+                };
+            }
+            if carve(address as usize, size) {
+                // SAFETY: a reservation replacing a placeholder carved to exactly this range.
+                let base = unsafe {
+                    VirtualAlloc2(
+                        GetCurrentProcess(),
+                        address,
+                        size,
+                        MEM_RESERVE | MEM_REPLACE_PLACEHOLDER,
+                        PAGE_NOACCESS,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                replaced(base, address);
+                return base;
+            }
+        }
         if reserve_only && size.is_multiple_of(PAGE) && (address as usize).is_multiple_of(PAGE) {
             // SAFETY: a placeholder reservation, at the program's address if it named one.
             let base = unsafe {
@@ -108,9 +134,13 @@ mod imp {
                 return base;
             }
         }
-        if kind & MEM_COMMIT != 0 && carve(address as usize, size) {
+        if kind & MEM_COMMIT != 0
+            && !address.is_null()
+            && inside_placeholder(address as usize, size)
+            && carve(address as usize, size)
+        {
             // SAFETY: committed memory replacing a placeholder carved to exactly this range.
-            return unsafe {
+            let base = unsafe {
                 VirtualAlloc2(
                     GetCurrentProcess(),
                     address,
@@ -121,6 +151,8 @@ mod imp {
                     0,
                 )
             };
+            replaced(base, address);
+            return base;
         }
         // SAFETY: an ordinary allocation.
         let base = unsafe { VirtualAlloc(address, size, kind, access) };
@@ -131,6 +163,25 @@ mod imp {
             ));
         }
         base
+    }
+
+    /// Forgets the placeholder at `address` once an allocation replaced it.
+    fn replaced(base: *mut c_void, address: *mut c_void) {
+        if !base.is_null()
+            && let Ok(mut state) = STATE.lock()
+        {
+            state.placeholders.remove(&(address as usize));
+        }
+    }
+
+    fn inside_placeholder(start: usize, size: usize) -> bool {
+        STATE.lock().is_ok_and(|state| {
+            state
+                .placeholders
+                .range(..=start)
+                .next_back()
+                .is_some_and(|(&base, &length)| start + size <= base + length)
+        })
     }
 
     /// Splits the placeholder holding `start..start + size` so that range is a placeholder of its own.
@@ -167,6 +218,7 @@ mod imp {
                 .placeholders
                 .insert(start + size, base + length - start - size);
         }
+        state.placeholders.insert(start, size);
         true
     }
 
