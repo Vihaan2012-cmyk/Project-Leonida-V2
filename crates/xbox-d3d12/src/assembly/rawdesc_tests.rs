@@ -380,3 +380,24 @@ fn the_console_compute_description_is_four_pairs_after_the_root_signature() {
     assert_eq!(parts.program, c);
     assert_eq!(parts.records, d);
 }
+
+#[test]
+fn a_root_signature_the_reader_refuses_says_why() {
+    let mut params = Block::new(32);
+    params.u32(0, 1).u32(24, 9);
+    let mut desc = Block::new(48);
+    desc.u32(0, 2).u32(8, 1).u64(16, params.p() as u64);
+    // SAFETY: a description whose parameter array is the live block above.
+    let err = unsafe { read_versioned_root_signature(desc.p()) }.unwrap_err();
+    assert_eq!(err, RootDescError::Visibility { index: 0, value: 9 });
+
+    params.u32(24, 0).u32(0, 6);
+    // SAFETY: as above.
+    let err = unsafe { read_versioned_root_signature(desc.p()) }.unwrap_err();
+    assert_eq!(err, RootDescError::ParameterType { index: 0, value: 6 });
+
+    desc.u32(0, 7);
+    // SAFETY: as above.
+    let err = unsafe { read_versioned_root_signature(desc.p()) }.unwrap_err();
+    assert_eq!(err, RootDescError::Version(7));
+}
