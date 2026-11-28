@@ -1,10 +1,10 @@
 //! The audio coprocessor libraries: `AcpHal.dll`, `xapu.dll` and `chad.dll`.
 
 use iced_x86::Register;
-use iced_x86::code_asm::eax;
+use iced_x86::code_asm::{dword_ptr, eax, rax};
 
 use super::SLEEP;
-use crate::emit::{Arg, Emitter, Res};
+use crate::emit::{Arg, Emitter, Res, Target};
 use crate::script::{Script, Stage};
 
 const ACP: &str = "AcpHal.dll";
@@ -136,17 +136,86 @@ fn dsp(e: &mut Emitter) -> Res {
     let submit = e.import(CHAD, "XDspSubmitCommand");
     let deactivate = e.import(CHAD, "XDspDeactivate");
     let disconnect = e.import(CHAD, "XDspDisconnect");
+    let handle = e.buffer("dsp_handle", 8);
+    let status = e.buffer("dsp_status", 8);
+    let stream = e.buffer("dsp_stream", 8);
+    let fence = e.buffer("dsp_fence", 4);
+    // A response of 16 samples whose second sample is 1.0, so a batch comes back delayed by one sample.
+    let mut response = [0u8; 64];
+    response[4..8].copy_from_slice(&1.0f32.to_le_bytes());
+    let response = e.bytes("dsp_response", &response);
+    let mut input = vec![0u8; 4096];
+    input[..4].copy_from_slice(&1.0f32.to_le_bytes());
+    let input = e.bytes("dsp_input", &input);
+    let output = e.buffer("dsp_output", 4096);
+    // The reverb node's 0x1c-byte stream description: kind 1, mono, block 0x400, one channel, 16 words, then the
+    // response's address in the unaligned field at +0x14.
+    let mut info = [0u8; 0x1c];
+    info[0] = 1;
+    info[9] = 4;
+    info[0xc] = 1;
+    info[0x10] = 16;
+    let info = e.bytes_with_pointers(
+        "dsp_info",
+        &info,
+        vec![(0x14, Target::Place(response.into()))],
+    );
+    let mut command = [0u8; 0x20];
+    command[..4].copy_from_slice(&1.0f32.to_le_bytes());
+    command[4..8].copy_from_slice(&1.0f32.to_le_bytes());
+    let command = e.bytes_with_pointers(
+        "dsp_command",
+        &command,
+        vec![
+            (8, Target::Place(input.into())),
+            (0x10, Target::Place(output.into())),
+        ],
+    );
     e.call(
         connect,
-        &[Arg::Imm(0), Arg::Imm(0), Arg::Imm(0), Arg::Imm(0x80)],
+        &[
+            Arg::Imm(0),
+            Arg::Imm(0x60000),
+            Arg::Imm(0x18),
+            Arg::Imm(0x80),
+            Arg::Imm(1),
+            Arg::addr(handle),
+        ],
     )?;
     e.fail_if_nonzero32()?;
-    e.call(activate, &[])?;
+    e.load64(Register::RAX, handle)?;
+    e.fail_if_zero64()?;
+    e.call(
+        activate,
+        &[
+            Arg::load64(handle),
+            Arg::addr(info),
+            Arg::addr(status),
+            Arg::addr(stream),
+        ],
+    )?;
     e.fail_if_nonzero32()?;
-    e.call(submit, &[Arg::Imm(0), Arg::Imm(0)])?;
+    e.load64(Register::RAX, status)?;
+    e.fail_if_zero64()?;
+    e.load64(Register::RAX, stream)?;
+    e.fail_if_zero64()?;
+    e.call(
+        submit,
+        &[Arg::load64(stream), Arg::addr(command), Arg::addr(fence)],
+    )?;
     e.fail_if_nonzero32()?;
-    e.call(deactivate, &[])?;
+    e.fail_if_mem32_ne(fence, 1)?;
+    // The title's own check before it reads the batch: the status block's finished fence matches and no error.
+    e.load64(Register::RAX, status)?;
+    e.asm.mov(eax, dword_ptr(rax + 4))?;
+    e.fail_if_ne32(1)?;
+    e.load64(Register::RAX, status)?;
+    e.asm.mov(eax, dword_ptr(rax + 0xc))?;
     e.fail_if_nonzero32()?;
-    e.call(disconnect, &[])?;
+    e.fail_if_mem32_ne(output.at(0), 0)?;
+    e.fail_if_mem32_ne(output.at(4), 0x3f80_0000)?;
+    e.call(deactivate, &[Arg::load64(stream)])?;
+    e.fail_if_nonzero32()?;
+    e.call(disconnect, &[Arg::load64(handle)])?;
     e.fail_if_nonzero32()
 }
