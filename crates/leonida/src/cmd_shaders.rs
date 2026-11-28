@@ -158,7 +158,7 @@ struct Report {
     approximate: BTreeMap<&'static str, [usize; 3]>,
     approximate_shaders: [usize; 3],
     hazard_examples: BTreeMap<&'static str, Vec<String>>,
-    patterns: BTreeMap<Pattern, [usize; 3]>,
+    patterns: BTreeMap<Pattern, ([usize; 3], String)>,
     wide_ops: BTreeMap<String, ([usize; 3], String)>,
     instructions: usize,
     unsupported: usize,
@@ -244,7 +244,11 @@ impl Report {
             }
         }
         for pattern in shader_ir::lane_patterns(code) {
-            self.patterns.entry(pattern).or_default()[slot] += 1;
+            let entry = self.patterns.entry(pattern).or_default();
+            entry.0[slot] += 1;
+            if entry.1.is_empty() {
+                entry.1 = name.to_string();
+            }
         }
         for op in shader_ir::wide_scalar_ops(code) {
             let entry = self.wide_ops.entry(op).or_default();
@@ -341,13 +345,16 @@ impl Report {
             );
         }
         println!("lane-mask patterns in those programs (pixel / vertex / geometry):");
-        for (pattern, [p, v, g]) in &self.patterns {
+        for (pattern, ([p, v, g], example)) in &self.patterns {
             let kind = if pattern.needs_upper_lanes() {
                 "needs upper lanes"
             } else {
                 "empty upper half is enough"
             };
-            println!("  {p} / {v} / {g} {} [{kind}]", pattern.describe());
+            println!(
+                "  {p} / {v} / {g} {} [{kind}]  e.g. {example}",
+                pattern.describe()
+            );
         }
         if self.examples {
             println!("64-bit scalar instructions in those programs (pixel / vertex / geometry):");
