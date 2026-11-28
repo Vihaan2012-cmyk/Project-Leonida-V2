@@ -49,7 +49,7 @@ ID3D12Device 49 SetFeature49X measured (called as (0x11f, 1) once after creation
 ID3D12Device 50 RegisterGpuCrashCallbackX measured (called as (callback, 0, callback) in the crash-handler set-up; accepted)
 ID3D12Device 55 CreatePipelineStateFromCacheX inferred
 ID3D12Device 57 CreateGraphicsPipelineStateFromCacheX inferred
-ID3D12Device 61 CreateSamplerX measured (called as (desc, handle) from the one sampler builder, rva 0x012b96b0; the console's own 0x54-byte description)
+ID3D12Device 61 CreateSamplerX measured (called as (desc, handle) from the one sampler builder, rva 0x012b96b0; the console's own 0x54-byte description: S# XY filter codes, mip and Z filters, reduction, D3D12 address modes, anisotropy at +0x34, comparison function at +0x40)
 ID3D12Device 62 CreateComputePipelineStateX measured
 ID3D12Device 67 CreateComputePipelineStateFromNativeCodeX measured
 ID3D12Device 70 CreateShaderResourceViewX measured (called as (resource desc, view desc, handle) with the GPU address in the view description's word at 0x28; six sites)

@@ -146,68 +146,60 @@ pub fn sampler(desc: &SamplerDesc, borders: &mut BorderTable) -> Sampler {
 
 /// The console's own sampler description, as the title's sampler builder (rva 0x012b96b0) fills it for
 /// `CreateSamplerX` (device slot 61): 0x54 bytes of u32 and f32 fields at the offsets `assembly::rawdesc` reads.
-/// Measured: which field sits where. Not measured: the meaning of the filter codes (the title writes 1, 2 or 3 for
-/// each of magnification and minimisation) and of the compare field's upper bits; they are read as below.
+///
+/// The builder takes the title's sampler settings, which hold a `D3D12_FILTER` (u16 at +0xA), the three
+/// `D3D12_TEXTURE_ADDRESS_MODE` bytes (+1 to +3), `MaxAnisotropy` (+8), `ComparisonFunc` (+9), the bias, the border
+/// colour and the LOD range, and writes the GFX10 sampler fields: the XY filter codes of the S# (point 0, bilinear 1,
+/// anisotropic point 2, anisotropic bilinear 3) from the filter's bit 2 (magnification) and bit 4 (minimisation) with
+/// both forced to 3 when bit 6 (anisotropic) is set, the mip and Z filters (none 0, point 1, linear 2) from bit 0 and
+/// bit 2, the reduction (0 weighted average, 1 minimum, 2 maximum) from bits 7 and 8 through the table at rva
+/// 0x06172fa0 (comparison filters map to 0), the anisotropy as the raw ratio, and the comparison function as the
+/// raw `D3D12_COMPARISON_FUNC` only when bit 7 of the filter is set (1, NEVER, otherwise).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ConsoleSampler {
-    /// Magnification and minimisation: 1 bilinear, 3 anisotropic bilinear, anything else point.
+    /// +4 and +8: S# XY filter codes. The builder writes 1 for a linear bit, 2 for a clear one and 3 when anisotropic.
     pub mag: u32,
     pub min: u32,
-    /// Mip filter: 0 point, 1 or more linear.
+    /// +0xC: 0 none, 1 point, 2 linear.
     pub mip: u32,
-    /// The anisotropy table's value: a ratio of 1, 2, 4, 8 or 16 (0 or 3 are read as log2 codes).
-    pub aniso: u32,
-    /// `SQ_TEX_CLAMP` codes for U, V and W.
+    /// +0x14: 0 weighted average, 1 minimum, 2 maximum.
+    pub reduction: u32,
+    /// +0x18, +0x1C, +0x20: `D3D12_TEXTURE_ADDRESS_MODE`, wrap 1 to mirror once 5.
     pub clamp: [u32; 3],
     pub min_lod: f32,
     pub max_lod: f32,
     pub lod_bias: f32,
-    /// Low three bits `SQ_TEX_DEPTH_COMPARE`; bit 4 marks a comparison that is NEVER.
+    /// +0x34: the title's `MaxAnisotropy`, 1 to 16 (the builder keeps its low five bits).
+    pub max_anisotropy: u32,
+    /// +0x40: `D3D12_COMPARISON_FUNC`, NEVER 1 up to ALWAYS 8. It is 1 unless the filter compares, so a comparison
+    /// that is NEVER cannot be told from none, as in the hardware's own field.
     pub compare: u32,
     pub border_color: [f32; 4],
 }
 
 pub fn from_console(c: &ConsoleSampler, borders: &mut BorderTable) -> Sampler {
-    let pick = |code: u32| match code {
-        3 => Filter::AnisoBilinear,
-        1 => Filter::Bilinear,
-        _ => Filter::Point,
-    };
-    let aniso = c.mag == 3 || c.min == 3;
-    let ratio = match c.aniso {
-        0 => 1,
-        3 => 8,
-        v if v <= 4 => v,
-        v => v.min(16),
-    };
-    let address = |code: u32| AddressMode::from_bits(code);
+    let anisotropic = c.mag >= 2 || c.min >= 2;
+    let function = c.compare.clamp(1, 8) - 1;
     let mut s = Sampler {
         address_u: address(c.clamp[0]),
         address_v: address(c.clamp[1]),
         address_w: address(c.clamp[2]),
-        mag: pick(c.mag),
-        min: pick(c.min),
-        mip: if c.mip >= 1 {
-            MipFilter::Linear
-        } else {
-            MipFilter::Point
-        },
-        max_anisotropy: if aniso {
-            ratio.next_power_of_two().min(16)
+        mag: Filter::from_bits(c.mag),
+        min: Filter::from_bits(c.min),
+        mip: MipFilter::from_bits(c.mip),
+        max_anisotropy: if anisotropic {
+            c.max_anisotropy.clamp(1, 16).next_power_of_two().min(16)
         } else {
             1
         },
         min_lod: c.min_lod,
         max_lod: c.max_lod,
         lod_bias: c.lod_bias,
-        compare: Compare::from_bits(c.compare),
-        compare_never: c.compare & 0x10 != 0 && c.compare & 7 == 0,
+        reduction: Reduction::from_bits(c.reduction),
+        compare: Compare::from_bits(function),
         ..Sampler::default()
     };
-    let uses_border = [c.clamp[0], c.clamp[1], c.clamp[2]]
-        .iter()
-        .any(|m| matches!(m, 4..=7));
-    if uses_border {
+    if c.clamp.contains(&4) {
         match c.border_color {
             [0.0, 0.0, 0.0, 0.0] => s.border = Border::TransparentBlack,
             [0.0, 0.0, 0.0, 1.0] => s.border = Border::OpaqueBlack,
