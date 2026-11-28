@@ -23,8 +23,9 @@ use crate::execute::barrier::{
     UNORDERED_ACCESS,
 };
 use crate::execute::{
-    Barrier, BindPoint, BufferFootprint, Command, ImageRef, IndexBufferView, IndirectKind, Rect,
-    Rects, Resource, Subresource, TargetView, TexelBox, VertexBufferView, VertexViews, Viewport,
+    Barrier, BindPoint, BufferFootprint, Command, ImageCopy, ImageRef, ImageResolve,
+    IndexBufferView, IndirectKind, Rect, Rects, Resource, Subresource, TargetView, TexelBox,
+    VertexBufferView, VertexViews, Viewport,
 };
 use crate::heap;
 use crate::pipeline::Pipeline;
@@ -265,14 +266,17 @@ fn convert_into(
                 }
                 _ => r.note("CopyBufferRegion between resources that are not both buffers"),
             },
-            C::CopyTextureRegion {
-                dst,
-                x,
-                y,
-                z,
-                src,
-                src_box,
-            } => copy_texture(r, out, dst, [*x, *y, *z], src, src_box.as_ref()),
+            C::CopyTextureRegion(copy) => {
+                let stream::TextureCopy {
+                    dst,
+                    x,
+                    y,
+                    z,
+                    src,
+                    src_box,
+                } = &**copy;
+                copy_texture(r, out, dst, [*x, *y, *z], src, src_box.as_ref())
+            }
             C::CopyResource { dst, src } => copy_resource(r, out, dst, src),
             C::ResolveSubresource {
                 dst,
@@ -281,12 +285,15 @@ fn convert_into(
                 src_subresource,
                 ..
             } => match (r.image(dst), r.image(src)) {
-                (Some(d), Some(s)) => out.commands.push(Command::ResolveImage {
-                    dst: d,
-                    dst_sub: subresource(&d, *dst_subresource),
-                    src: s,
-                    src_sub: subresource(&s, *src_subresource),
-                }),
+                (Some(d), Some(s)) => {
+                    out.commands
+                        .push(Command::ResolveImage(Box::new(ImageResolve {
+                            dst: d,
+                            dst_sub: subresource(&d, *dst_subresource),
+                            src: s,
+                            src_sub: subresource(&s, *src_subresource),
+                        })))
+                }
                 _ => r.note("ResolveSubresource between resources that are not both textures"),
             },
             C::SetPrimitiveTopology(topology) => out.commands.push(Command::SetTopology(*topology)),
@@ -413,7 +420,7 @@ fn convert_into(
                 dsv,
             } => {
                 let step = u64::from(heap::increment_size(heap::TYPE_RTV));
-                let handles: SmallVec<[u64; 8]> = if *single_range {
+                let handles: stream::TargetHandles = if *single_range {
                     rtvs.first()
                         .map(|first| (0..u64::from(*count)).map(|k| first + k * step).collect())
                         .unwrap_or_default()
@@ -748,14 +755,14 @@ fn copy_texture(
                     size: s.mip_extent(src_sub.mip),
                 },
             };
-            out.commands.push(Command::CopyImage {
+            out.commands.push(Command::CopyImage(Box::new(ImageCopy {
                 dst: d,
                 dst_sub: subresource(&d, *di),
                 at,
                 src: s,
                 src_sub,
                 region,
-            });
+            })));
         }
         _ => r.note("CopyTextureRegion between two footprints"),
     }
@@ -779,7 +786,7 @@ fn copy_resource(r: &dyn Resolver, out: &mut Converted, dst: &ComPtr, src: &ComP
     for layer in 0..d.layers.min(s.layers) {
         for mip in 0..d.mips.min(s.mips) {
             let sub = Subresource { mip, layer };
-            out.commands.push(Command::CopyImage {
+            out.commands.push(Command::CopyImage(Box::new(ImageCopy {
                 dst: d,
                 dst_sub: sub,
                 at: [0; 3],
@@ -789,7 +796,7 @@ fn copy_resource(r: &dyn Resolver, out: &mut Converted, dst: &ComPtr, src: &ComP
                     origin: [0; 3],
                     size: s.mip_extent(mip),
                 },
-            });
+            })));
         }
     }
 }

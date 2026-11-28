@@ -22,8 +22,8 @@ use crate::com::{
 use crate::device::DeviceCore;
 use crate::stream::{
     Barrier, BarrierGroup, Box3, BufferBarrier, Command, CommandStream, CopyLocation, Footprint,
-    GlobalBarrier, IndexBufferView, Rect, Rects, RootView, TextureBarrier, VertexBufferView,
-    Viewport,
+    GlobalBarrier, IndexBufferView, Rect, Rects, RootView, TextureBarrier, TextureCopy,
+    VertexBufferView, Viewport,
 };
 
 pub const LIST_TYPE_DIRECT: u32 = 0;
@@ -562,14 +562,14 @@ unsafe extern "win64" fn l_copy_texture_region(
         if let (Some(dst), Some(src)) = (read_location(dst), read_location(src)) {
             push(
                 this,
-                Command::CopyTextureRegion {
+                Command::CopyTextureRegion(Box::new(TextureCopy {
                     dst,
                     x,
                     y,
                     z,
                     src,
                     src_box: src_box.as_ref().copied(),
-                },
+                })),
             );
         }
     }

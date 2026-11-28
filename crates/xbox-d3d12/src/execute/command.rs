@@ -81,11 +81,10 @@ pub type Rects = SmallVec<[Rect; 1]>;
 /// The viewports of one call: a pass sets one.
 pub type Viewports = SmallVec<[Viewport; 2]>;
 
-/// Root constants of one call: up to 16 dwords stay inline, the limit is 64.
-pub type RootValues = SmallVec<[u32; 16]>;
+pub use crate::stream::RootValues;
 
 /// The vertex buffers of one call: a draw reads a few streams, the limit is 16.
-pub type VertexViews = SmallVec<[VertexBufferView; 4]>;
+pub type VertexViews = SmallVec<[VertexBufferView; 2]>;
 
 /// The colour targets of one pass.
 pub type ColorTargets = SmallVec<[TargetView; 2]>;
@@ -158,6 +157,25 @@ pub enum QueryKind {
     BinaryOcclusion,
     Timestamp,
     PipelineStatistics,
+}
+
+/// An image to image copy, boxed in `Command` because two image references make it the largest command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageCopy {
+    pub dst: ImageRef,
+    pub dst_sub: Subresource,
+    pub at: [u32; 3],
+    pub src: ImageRef,
+    pub src_sub: Subresource,
+    pub region: TexelBox,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageResolve {
+    pub dst: ImageRef,
+    pub dst_sub: Subresource,
+    pub src: ImageRef,
+    pub src_sub: Subresource,
 }
 
 #[derive(Debug, Clone)]
@@ -265,20 +283,8 @@ pub enum Command {
         sub: Subresource,
         region: TexelBox,
     },
-    CopyImage {
-        dst: ImageRef,
-        dst_sub: Subresource,
-        at: [u32; 3],
-        src: ImageRef,
-        src_sub: Subresource,
-        region: TexelBox,
-    },
-    ResolveImage {
-        dst: ImageRef,
-        dst_sub: Subresource,
-        src: ImageRef,
-        src_sub: Subresource,
-    },
+    CopyImage(Box<ImageCopy>),
+    ResolveImage(Box<ImageResolve>),
     Barriers(Vec<Barrier>),
     BeginQuery {
         pool: vk::QueryPool,
