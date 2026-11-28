@@ -84,7 +84,7 @@
 //!
 //! The frame counter is used mostly to mean "updated this or last frame" (83 functions subtract it and compare with 1,
 //! 2 or 3), which does not depend on the rate. A few use it as time, and a few functions floor their time step at
-//! 1/60 s: both are patched, see [`crate::frame_timers`] ([`DT_FLOOR`], [`FRAME_TIMERS`]).
+//! 1/60 s: both are patched, see [`crate::frame_timers`] ([`FRAME_TIMERS`]).
 
 use crate::patch::{Finder, Patch, PatchError, Pattern, Site};
 use iced_x86::{Mnemonic, OpKind, Register};
@@ -187,56 +187,34 @@ pub const CLOCK_FLOOR: Entry = Entry {
     find: Some(crate::clock_floor::find),
 };
 
-pub const DT_FLOOR: Entry = Entry {
-    id: "dt-floor-60",
-    summary: "Stop four time step consumers from flooring their step at 1/60 s",
-    proof: Proof::Static,
-    activation: Activation::WithCustomLimit,
-    evidence: &[
-        Evidence {
-            rva: 0x00b7_4dd0,
-            what: "time step of one entity: floor 1/60 s at 0xb74e03 and 0xb74df6, cap 0.1 s",
-        },
-        Evidence {
-            rva: 0x0124_1ed0,
-            what: "floor 1/60 s at 0x12421e0 and 0x12421e9",
-        },
-        Evidence {
-            rva: 0x031e_5bc0,
-            what: "floor 1/60 s at 0x31e5c7f and 0x31e5c88",
-        },
-        Evidence {
-            rva: 0x031e_67e0,
-            what: "floor 1/60 s at 0x31e69c7 and 0x31e69d0",
-        },
-        Evidence {
-            rva: 0x0615_9e10,
-            what: "the 1/60 s literal the eight loads read",
-        },
-    ],
-    find: Some(crate::frame_timers::find_dt_floor),
-};
-
 pub const FRAME_TIMERS: Entry = Entry {
     id: "frame-timers",
-    summary: "Scale timers that count frames of the main clock to 60 per second above 60 fps",
+    summary: "Keep logic that floors its time step at 1/60 s or counts frames at the 60 per second rate above 60 fps",
     proof: Proof::Unproven,
     activation: Activation::WithCustomLimit,
     evidence: &[
         Evidence {
             rva: 0x0222_6759,
-            what: "call in sub_022264d0 that updates the main clock; wrapped to average the frame rate",
+            what: "call in sub_022264d0 that updates the main clock; wrapped to average the frame rate and set the floor",
         },
         Evidence {
             rva: 0x0222_6040,
-            what: "sub_02226040 adds 1 to the frame counter at record +4; the padding at +0x1c holds the average",
+            what: "sub_02226040 adds 1 to the frame counter at record +4 and stores the step at +0xc",
+        },
+        Evidence {
+            rva: 0x00b7_4dd0,
+            what: "entity time step floored at 1/60 s (loads at 0xb74df6 and 0xb74e03); three more floors in sub_01241ed0, sub_031e5bc0, sub_031e67e0",
         },
         Evidence {
             rva: 0x031b_248f,
             what: "one of thirteen frame - stamp deltas that the patch scales (see frame_timers::TICK_SITES)",
         },
+        Evidence {
+            rva: 0x0615_9e10,
+            what: "the 1/60 s literal the eight floor loads read",
+        },
     ],
-    find: Some(crate::frame_timers::find_tick_scale),
+    find: Some(crate::frame_timers::find_frame_timers),
 };
 
 pub const FRAME_EVENT_INTERVAL: Entry = Entry {
@@ -364,10 +342,9 @@ pub const FIXED_STEP_CONSTANTS: Entry = Entry {
 };
 
 /// Every entry, patches first.
-pub const ENTRIES: [&Entry; 9] = [
+pub const ENTRIES: [&Entry; 8] = [
     &STEP_FLOOR,
     &CLOCK_FLOOR,
-    &DT_FLOOR,
     &FRAME_TIMERS,
     &FRAME_EVENT_INTERVAL,
     &CEILING,

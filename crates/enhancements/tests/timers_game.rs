@@ -1,13 +1,14 @@
 //! The frame timer patches against the real executable, read as plain bytes (never loaded or run). Skipped without
 //! `LEONIDA_GAME_DIR`.
 
-use enhancements::frame_timers::{self, DT_FLOOR_FUNCTIONS, FLOOR_BITS, TICK_SITES};
-use enhancements::framerate::{DT_FLOOR, FRAME_TIMERS};
-use enhancements::patch::{Finder, Patch};
+use enhancements::frame_timers::{self, DT_FLOOR_FUNCTIONS, TICK_SITES};
+use enhancements::framerate::FRAME_TIMERS;
+use enhancements::patch::Finder;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind};
 use pe_image::Image;
 
 const BASE: u64 = 0x1_4000_0000;
+const CONSTANTS: usize = 32;
 
 fn executable() -> Option<Vec<u8>> {
     let dir = std::env::var_os("LEONIDA_GAME_DIR")?;
@@ -40,9 +41,13 @@ fn every_frame_delta_site_is_where_the_notes_say() {
     let image = Image::parse(&bytes).unwrap();
     let finder = Finder::new(&image);
     let patches = FRAME_TIMERS.patches(&finder).unwrap();
-    assert_eq!(patches.len(), 2 + TICK_SITES.len());
+    assert_eq!(
+        patches.len(),
+        2 + TICK_SITES.len() + 1 + 2 * DT_FLOOR_FUNCTIONS.len()
+    );
     let (cave, rest) = patches.split_first().unwrap();
-    let (hook, jumps) = rest.split_first().unwrap();
+    let (hook, rest) = rest.split_first().unwrap();
+    let jumps = &rest[..TICK_SITES.len()];
 
     for site in &TICK_SITES {
         let function = image.function_containing(site.rva).unwrap();
@@ -65,17 +70,17 @@ fn every_frame_delta_site_is_where_the_notes_say() {
     }
 
     assert_eq!(hook.rva, 0x0222_6759);
-    let wrapper = decode(&cave.replacement[16..], cave.rva + 16);
+    let wrapper = decode(&cave.replacement[CONSTANTS..], cave.rva + CONSTANTS as u32);
     assert!(wrapper.iter().all(|i| !i.is_invalid()));
     assert_eq!(wrapper[0].mnemonic(), Mnemonic::Sub);
     assert_eq!(wrapper[1].mnemonic(), Mnemonic::Call);
     assert_eq!(target(&wrapper[1]), 0x0222_6040);
     assert_eq!(
         target(&decode(&hook.replacement, hook.rva)[0]),
-        cave.rva + 16
+        cave.rva + CONSTANTS as u32
     );
 
-    let mut returns: Vec<u32> = decode(&cave.replacement[16..], cave.rva + 16)
+    let mut returns: Vec<u32> = decode(&cave.replacement[CONSTANTS..], cave.rva + CONSTANTS as u32)
         .iter()
         .filter(|i| i.mnemonic() == Mnemonic::Jmp)
         .map(target)
@@ -98,7 +103,7 @@ fn every_frame_delta_site_is_where_the_notes_say() {
         );
     }
     let end = cave.rva + cave.replacement.len() as u32;
-    assert!(end <= 0x05f4_1000 - frame_timers::DT_SLOT);
+    assert!(end <= 0x05f4_1000);
     assert!(cave.rva >= 0x05f4_0a00);
     assert!(cave.original.iter().all(|b| *b == 0));
 }
@@ -112,7 +117,7 @@ fn the_stubs_end_where_the_patched_code_resumes() {
     let finder = Finder::new(&image);
     let patches = FRAME_TIMERS.patches(&finder).unwrap();
     let cave = &patches[0];
-    let code = decode(&cave.replacement[16..], cave.rva + 16);
+    let code = decode(&cave.replacement[CONSTANTS..], cave.rva + CONSTANTS as u32);
     for site in &TICK_SITES {
         let resume = site.rva + u32::from(site.len);
         let at = code
@@ -131,10 +136,6 @@ fn the_stubs_end_where_the_patched_code_resumes() {
     }
 }
 
-fn floor_patches(finder: &Finder) -> Vec<Patch> {
-    DT_FLOOR.patches(finder).unwrap()
-}
-
 #[test]
 fn the_time_step_floors_are_where_the_notes_say() {
     let Some(bytes) = executable() else {
@@ -142,13 +143,17 @@ fn the_time_step_floors_are_where_the_notes_say() {
     };
     let image = Image::parse(&bytes).unwrap();
     let finder = Finder::new(&image);
-    let patches = floor_patches(&finder);
-    assert_eq!(patches.len(), 1 + 2 * DT_FLOOR_FUNCTIONS.len());
-    let constant = &patches[0];
-    assert_eq!(constant.rva, 0x05f4_0ff0);
-    assert_eq!(constant.replacement, FLOOR_BITS.to_le_bytes());
+    let patches = FRAME_TIMERS.patches(&finder).unwrap();
+    let floors = &patches[2 + TICK_SITES.len()..];
+    let cells = frame_timers::cells(&finder).unwrap();
+    assert_eq!(cells.deficit, 0x0abc_eff0);
+    assert_eq!(cells.floor, 0x0abc_eff4);
+    let (cell, loads) = floors.split_first().unwrap();
+    assert_eq!(cell.rva, cells.floor);
+    assert_eq!(cell.replacement, 0x3c88_8889u32.to_le_bytes());
+    assert_eq!(loads.len(), 2 * DT_FLOOR_FUNCTIONS.len());
     let mut seen: Vec<u32> = Vec::new();
-    for patch in &patches[1..] {
+    for patch in loads {
         let function = image.function_containing(patch.rva).unwrap();
         assert!(
             DT_FLOOR_FUNCTIONS.contains(&function.begin),
@@ -166,7 +171,7 @@ fn the_time_step_floors_are_where_the_notes_say() {
             "{literal:#x}"
         );
         let new = (i64::from(next) + i64::from(displacement)) as u32;
-        assert!(new == constant.rva || new + 1 == constant.rva, "{new:#x}");
+        assert!(new == cells.floor || new + 1 == cells.floor, "{new:#x}");
     }
     for rva in [
         0x00b7_4dfb,

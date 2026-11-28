@@ -12,7 +12,7 @@
 //!
 //! # Findings, ranked by what a player notices
 //!
-//! 1. **Time step floors of 1/60 s** ([`find_dt_floor`], patched). Four functions clamp their time step to at least
+//! 1. **Time step floors of 1/60 s** (patched by [`dt_floor_patches`]). Four functions clamp their time step to at least
 //!    1/60 s (`step < 1/60 ? 1/60 : min(0.1, step)`, a literal at `0x6159e10`), the same mistake as the second
 //!    floor of `sub_022264d0`. Above 60 fps they advance 1/60 s per frame, so everything they drive runs at up to
 //!    twice the speed at 120 fps. `sub_00b74dd0` (compare `0xb74e03`, blend value `0xb74df6`) returns the time step of one
@@ -23,9 +23,12 @@
 //!    (`0x31e5c7f`, `0x31e5c88`) and `sub_031e67e0` (`0x31e69c7`, `0x31e69d0`) floor the step they receive and then
 //!    ease a value towards a target in sub-steps of a per-object rate (`sub_031e5bc0` loops over whole sub-steps and
 //!    interpolates the remainder), so the floor makes the easing run fast. All three look up per-entity extension
-//!    records from an entity handle (`sub_04d9f7c0`); what exactly they animate could not be determined. The patch points both loads of each function at a constant
-//!    `1/3000 s` that the patch writes itself, the same floor `STEP_FLOOR` uses.
-//! 2. **Timers counted in frames of the main clock** ([`find_tick_scale`], patched). The frame counter of the main
+//!    records from an entity handle (`sub_04d9f7c0`); what exactly they animate could not be determined. The entity
+//!    step is the global step times the entity's own time scale, so slow motion below 1/60 s per frame is held at the
+//!    floor even at 30 fps: a patch that simply lowered the floor would change that, so the floor becomes
+//!    `min(1/60, step of the main clock)` kept in a cell (see below). The patch points both loads of each function
+//!    at the cell.
+//! 2. **Timers counted in frames of the main clock** (patched by [`tick_scale_patches`]). The frame counter of the main
 //!    clock (record `0xabbef40`, counter `+4`, whole milliseconds `+0`, step in seconds `+0xc`; `sub_02226040` adds 1 to
 //!    it once per update) has 689 mentions in 534 functions: about 216 store it as a stamp, 105 test it for
 //!    equality, 254 load it into a local and 47 subtract it directly; 27 hash it or take a modulo. Most uses mean "this frame" or "last
@@ -35,8 +38,7 @@
 //!    frames (`sub_02788e80`), and cool-downs read from data (`sub_04238850`, `sub_04238a40`, `sub_04611d80`). Above
 //!    60 fps they ran in half the time or less. [`TICK_SITES`] lists the thirteen sites. Each is `sub r32, mem`
 //!    producing the delta in frames; the patch jumps to a stub that scales the delta by the ratio of 60 Hz ticks to
-//!    real frames and returns. The ratio comes from a deficit kept in the padding at `+0x1c` of the main clock record
-//!    (4 bytes nothing else touches, the record is `0x20` long like its neighbours), updated after every main clock
+//!    real frames and returns. The ratio comes from a deficit kept in a cell, updated after every main clock
 //!    update by a wrapper around the call at `0x2226759`: the deficit moves 1/8 of the way each frame towards
 //!    `max(0, 1 - step * 60)`, scaled by 65536. At or below 60 fps it stays 0 and the stubs return the delta
 //!    unchanged. The averaging keeps one slow frame from letting a timer expire early. Sites that compare the delta
@@ -59,12 +61,17 @@
 //! 8. The 1/30 s literal at `0x615b6b4` and 1/60 s at `0x6159e10` are otherwise time of day arithmetic, a frame
 //!    rate normaliser (`sub_04ed92d0`) or a cap (`sub_009e5ce0`) and follow the step: see [`crate::framerate`].
 //!
-//! # The code cave
+//! # The code cave and the cells
 //!
 //! The last page of `.text` is mapped executable and zero past the section's end (`0x5f40a00` to `0x5f41000`). The top
-//! 16 bytes of it hold the floor constant of [`find_dt_floor`], the 1 KiB below that the stubs and the wrapper of
-//! [`find_tick_scale`]. Code in the cave has no unwind information; none of it calls anything that can throw.
-//! Another patch that needs a cave should take space from the bottom of the same page.
+//! [`TICK_SLOT`] bytes of it hold the constants, the wrapper and the stubs of [`tick_scale_patches`]. The last page of
+//! `.data` (`0xabce398` to `0xabcf000`) is mapped read-write and zero: its top [`CELLS`] bytes hold two words the
+//! wrapper writes every frame, the averaged deficit (`u32`, scaled by 65536; 0 means 60 or fewer frames per second)
+//! and the floor of the time step floors (`f32`, starting at 1/60 s, afterwards `max(1/3000, min(1/60, step))` of
+//! the main clock). The floors then keep their old value up to 60 fps (the floor is the frame time, which is at least
+//! 1/60 s) and fall to the real frame time above it, so slow motion that relied on them behaves as at 60 fps.
+//! Code in the cave has no unwind information; none of it calls anything that can throw. Another patch that needs a
+//! cave or a cell should take space from the bottom of the same pages.
 
 use crate::patch::{Finder, Patch, PatchError, Pattern, Probe};
 use crate::widescreen::fnv1a64;
@@ -74,21 +81,19 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKi
 pub const TIMER_UPDATE: u32 = 0x0222_64d0;
 /// Record of the main game clock (`0xabbef40`): `+4` is the frame counter, `+0xc` the step in seconds.
 pub const MAIN_CLOCK: u32 = 0x0abb_ef40;
-/// Where the averaged deficit lives: the unused last dword of the main clock record.
-pub const DEFICIT_OFFSET: u32 = 0x1c;
 const STEP_OFFSET: u32 = 0x0c;
 const FRAME_OFFSET: u32 = 0x04;
 /// 1/60 s as `f32` bits: the literal the floors read.
 pub const ONE_SIXTIETH_BITS: u32 = 0x3c88_8889;
-/// 1/3000 s as `f32` bits: the value that replaces it (the game's own first floor).
-pub const FLOOR_BITS: u32 = 0x39ae_c33e;
+/// 1/3000 s as `f32` bits: the lowest floor the game itself allows its clocks.
+pub const FLOOR_MIN_BITS: u32 = 0x39ae_c33e;
 const REFERENCE_HZ: f32 = 60.0;
 const GAIN: f32 = 0.125;
 const ONE: f32 = 65536.0;
 
-/// Bytes at the top of the page for the floor constant.
-pub const DT_SLOT: u32 = 16;
-/// Bytes below that for the wrapper and the stubs.
+/// Bytes of the last `.data` page that hold the two cells: the deficit (`u32`) and the floor (`f32`).
+pub const CELLS: u32 = 16;
+/// Bytes of the last `.text` page for the constants, the wrapper and the stubs.
 pub const TICK_SLOT: u32 = 0x400;
 /// Floors found: functions that clamp their time step to 1/60 s, each with a compare and a blend value.
 pub const DT_FLOOR_FUNCTIONS: [u32; 4] = [0x00b7_4dd0, 0x0124_1ed0, 0x031e_5bc0, 0x031e_67e0];
@@ -229,21 +234,30 @@ fn not_found(what: impl Into<String>) -> PatchError {
     PatchError::NotFound { name: what.into() }
 }
 
-/// The page after the end of the last executable section, which the loader maps executable and zeroed.
-fn slack_end(finder: &Finder, needed: u32) -> Result<u32, PatchError> {
+/// The end of the page after the last executable (or the largest writable) section: the loader maps it with the
+/// section's protection and zeroed. Fails when something else starts inside it or fewer than `needed` bytes remain.
+fn slack_end(finder: &Finder, code: bool, needed: u32) -> Result<u32, PatchError> {
     let image = finder.image();
-    let text = image
-        .sections
-        .iter()
-        .filter(|s| s.executable())
-        .max_by_key(|s| s.virtual_address)
-        .ok_or_else(|| not_found("executable section"))?;
-    let extent = text.virtual_address + text.virtual_size.max(text.raw_size);
+    let section = if code {
+        image
+            .sections
+            .iter()
+            .filter(|s| s.executable())
+            .max_by_key(|s| s.virtual_address)
+    } else {
+        image
+            .sections
+            .iter()
+            .filter(|s| s.writable() && !s.executable())
+            .max_by_key(|s| s.virtual_size.max(s.raw_size))
+    }
+    .ok_or_else(|| not_found("section for a cave"))?;
+    let extent = section.virtual_address + section.virtual_size.max(section.raw_size);
     let end = (extent + 0xfff) & !0xfff;
     let crowded = image
         .sections
         .iter()
-        .any(|s| s.virtual_address > text.virtual_address && s.virtual_address < end);
+        .any(|s| s.virtual_address > section.virtual_address && s.virtual_address < end);
     if crowded || end - extent < needed {
         return Err(PatchError::TooLong {
             old: (end - extent) as usize,
@@ -251,6 +265,21 @@ fn slack_end(finder: &Finder, needed: u32) -> Result<u32, PatchError> {
         });
     }
     Ok(end)
+}
+
+/// The two cells in the zeroed tail of `.data`: the averaged deficit and the floor of the time step floors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cells {
+    pub deficit: u32,
+    pub floor: u32,
+}
+
+pub fn cells(finder: &Finder) -> Result<Cells, PatchError> {
+    let end = slack_end(finder, false, CELLS)?;
+    Ok(Cells {
+        deficit: end - CELLS,
+        floor: end - CELLS + 4,
+    })
 }
 
 /// A patch that writes `bytes` into slack: it checks that the memory is zero first.
@@ -311,14 +340,13 @@ pub const GAME: Layout<'static> = Layout {
     floors: &DT_FLOOR_FUNCTIONS,
 };
 
-/// The two loads of 1/60 s in each flooring function, pointed at a constant of 1/3000 s.
-pub fn find_dt_floor(finder: &Finder) -> Result<Vec<Patch>, PatchError> {
-    dt_floor_patches(finder, &GAME)
-}
-
-pub fn dt_floor_patches(finder: &Finder, layout: &Layout) -> Result<Vec<Patch>, PatchError> {
-    let end = slack_end(finder, DT_SLOT + TICK_SLOT)?;
-    let constant = end - DT_SLOT;
+/// The patches of the time step floors: the floor cell starts at 1/60 s, and the two loads of 1/60 s in each flooring
+/// function read the cell instead (the wrapper of the main clock update keeps it at `min(1/60, step)`).
+pub fn dt_floor_patches(
+    finder: &Finder,
+    layout: &Layout,
+    cells: &Cells,
+) -> Result<Vec<Patch>, PatchError> {
     let sites = finder.find(&dt_floor_pattern());
     let mut functions: Vec<u32> = sites
         .iter()
@@ -335,16 +363,16 @@ pub fn dt_floor_patches(finder: &Finder, layout: &Layout) -> Result<Vec<Patch>, 
     }
     let mut patches = vec![cave_patch(
         finder,
-        "dt-floor-constant",
-        constant,
-        FLOOR_BITS.to_le_bytes().to_vec(),
+        "dt-floor cell",
+        cells.floor,
+        ONE_SIXTIETH_BITS.to_le_bytes().to_vec(),
     )?];
     for site in sites
         .iter()
         .filter(|s| functions.contains(&s.function.begin))
     {
         let first = site.instructions[0];
-        let displacement = i32::from_le_bytes(rel32(first.rva + u32::from(first.len), constant));
+        let displacement = i32::from_le_bytes(rel32(first.rva + u32::from(first.len), cells.floor));
         patches.push(finder.set_displacement("dt-floor", site, 0, displacement)?);
     }
     if patches.len() != 1 + 2 * layout.floors.len() {
@@ -353,6 +381,18 @@ pub fn dt_floor_patches(finder: &Finder, layout: &Layout) -> Result<Vec<Patch>, 
             count: patches.len() - 1,
         });
     }
+    Ok(patches)
+}
+
+/// Every patch of this module: the wrapper, the stubs and the floors.
+pub fn find_frame_timers(finder: &Finder) -> Result<Vec<Patch>, PatchError> {
+    frame_timer_patches(finder, &GAME)
+}
+
+pub fn frame_timer_patches(finder: &Finder, layout: &Layout) -> Result<Vec<Patch>, PatchError> {
+    let cells = cells(finder)?;
+    let mut patches = tick_scale_patches(finder, layout, &cells)?;
+    patches.extend(dt_floor_patches(finder, layout, &cells)?);
     Ok(patches)
 }
 
@@ -453,10 +493,10 @@ fn stub(code: &mut Code, original: &[u8], first_len: usize, reg: u8, deficit: u3
     code.jump(back);
 }
 
-/// The wrapper of the main clock update: calls it, then moves the deficit a step towards `max(0, 1 - step * 60)`.
-fn wrapper(code: &mut Code, callee: u32, constants: u32, record: u32) {
+/// The wrapper of the main clock update: calls it, then moves the deficit a step towards `max(0, 1 - step * 60)` and
+/// sets the floor cell to `max(1/3000, min(1/60, step))`.
+fn wrapper(code: &mut Code, callee: u32, constants: u32, record: u32, cells: &Cells) {
     let step = record + STEP_OFFSET;
-    let deficit = record + DEFICIT_OFFSET;
     code.put(&[0x48, 0x83, 0xEC, 0x28, 0xE8]);
     code.rip(callee, 0);
     code.put(&[0xC5, 0xFA, 0x10, 0x1D]);
@@ -469,23 +509,33 @@ fn wrapper(code: &mut Code, callee: u32, constants: u32, record: u32) {
     code.put(&[0xC5, 0xD8, 0x57, 0xE4]);
     code.put(&[0xC5, 0xE2, 0x5F, 0xDC]);
     code.put(&[0xC5, 0xDA, 0x2A, 0x25]);
-    code.rip(deficit, 0);
+    code.rip(cells.deficit, 0);
     code.put(&[0xC5, 0xE2, 0x5C, 0xDC]);
     code.put(&[0xC5, 0xE2, 0x59, 0x1D]);
     code.rip(constants + 8, 0);
     code.put(&[0xC5, 0xDA, 0x58, 0xE3]);
     code.put(&[0xC5, 0xFA, 0x2D, 0xD4]);
     code.put(&[0x89, 0x15]);
-    code.rip(deficit, 0);
+    code.rip(cells.deficit, 0);
+    code.put(&[0xC5, 0xFA, 0x10, 0x1D]);
+    code.rip(step, 0);
+    code.put(&[0xC5, 0xE2, 0x5D, 0x1D]);
+    code.rip(constants + 12, 0);
+    code.put(&[0xC5, 0xE2, 0x5F, 0x1D]);
+    code.rip(constants + 16, 0);
+    code.put(&[0xC5, 0xFA, 0x11, 0x1D]);
+    code.rip(cells.floor, 0);
     code.put(&[0x48, 0x83, 0xC4, 0x28, 0xC3]);
 }
 
-/// The constants at the start of the stub area: `60 * 65536`, `65536`, the gain.
-fn constants() -> [u8; 16] {
-    let mut out = [0u8; 16];
+/// The constants at the start of the stub area: `60 * 65536`, `65536`, the gain, 1/60 s, 1/3000 s.
+fn constants() -> [u8; 32] {
+    let mut out = [0u8; 32];
     out[0..4].copy_from_slice(&(REFERENCE_HZ * ONE).to_le_bytes());
     out[4..8].copy_from_slice(&ONE.to_le_bytes());
     out[8..12].copy_from_slice(&GAIN.to_le_bytes());
+    out[12..16].copy_from_slice(&ONE_SIXTIETH_BITS.to_le_bytes());
+    out[16..20].copy_from_slice(&FLOOR_MIN_BITS.to_le_bytes());
     out
 }
 
@@ -589,13 +639,13 @@ pub fn hook_pattern(record: u32) -> Pattern {
 }
 
 /// The wrapper around the main clock update and a stub at each frame delta site.
-pub fn find_tick_scale(finder: &Finder) -> Result<Vec<Patch>, PatchError> {
-    tick_scale_patches(finder, &GAME)
-}
-
-pub fn tick_scale_patches(finder: &Finder, layout: &Layout) -> Result<Vec<Patch>, PatchError> {
-    let end = slack_end(finder, DT_SLOT + TICK_SLOT)?;
-    let area = end - DT_SLOT - TICK_SLOT;
+pub fn tick_scale_patches(
+    finder: &Finder,
+    layout: &Layout,
+    cells: &Cells,
+) -> Result<Vec<Patch>, PatchError> {
+    let end = slack_end(finder, true, TICK_SLOT)?;
+    let area = end - TICK_SLOT;
     let image_base = finder.image().image_base;
 
     let function = finder
@@ -619,11 +669,10 @@ pub fn tick_scale_patches(finder: &Finder, layout: &Layout) -> Result<Vec<Patch>
     }
     let callee = (call.instruction.near_branch_target() - image_base) as u32;
 
-    let deficit = layout.record + DEFICIT_OFFSET;
     let mut code = Code::new(area);
     code.put(&constants());
     let wrapper_at = code.here();
-    wrapper(&mut code, callee, area, layout.record);
+    wrapper(&mut code, callee, area, layout.record, cells);
     let mut patches = Vec::new();
     for site in layout.sites {
         let (reg, first_len) = describe(finder, site)?;
@@ -650,7 +699,7 @@ pub fn tick_scale_patches(finder: &Finder, layout: &Layout) -> Result<Vec<Patch>
             &bytes,
             first_len,
             reg,
-            deficit,
+            cells.deficit,
             site.rva + u32::from(site.len),
         );
         let mut jump = vec![0xE9];
@@ -740,7 +789,7 @@ mod tests {
 
     #[test]
     fn the_stub_scales_whichever_register_holds_the_delta() {
-        let deficit = 0x0abb_ef5c;
+        let deficit = 0x0abc_ff00;
         let back = 0x0100_0500;
         for reg in (0..16u8).filter(|r| *r != 4) {
             let (original, first) = source(reg);
@@ -805,10 +854,14 @@ mod tests {
     }
 
     #[test]
-    fn the_wrapper_calls_the_clock_update_and_stores_the_deficit() {
+    fn the_wrapper_calls_the_clock_update_and_stores_the_deficit_and_the_floor() {
         let record = 0x0abb_ef40;
-        let mut code = Code::new(0x05f4_0c10);
-        wrapper(&mut code, 0x0222_6040, 0x05f4_0c00, record);
+        let cells = Cells {
+            deficit: 0x0abc_ff00,
+            floor: 0x0abc_ff04,
+        };
+        let mut code = Code::new(0x05f4_0c20);
+        wrapper(&mut code, 0x0222_6040, 0x05f4_0c00, record, &cells);
         let instructions = decode(&code.bytes, code.base);
         assert!(instructions.iter().all(|i| !i.is_invalid()));
         assert_eq!(instructions[0].mnemonic(), Mnemonic::Sub);
@@ -826,9 +879,13 @@ mod tests {
                 want(record + STEP_OFFSET),
                 want(0x05f4_0c00),
                 want(0x05f4_0c04),
-                want(record + DEFICIT_OFFSET),
+                want(cells.deficit),
                 want(0x05f4_0c08),
-                want(record + DEFICIT_OFFSET),
+                want(cells.deficit),
+                want(record + STEP_OFFSET),
+                want(0x05f4_0c0c),
+                want(0x05f4_0c10),
+                want(cells.floor),
             ]
         );
         assert_eq!(
@@ -836,6 +893,8 @@ mod tests {
             Mnemonic::Ret
         );
         assert_eq!(constants()[0..4], (60.0f32 * 65536.0).to_le_bytes());
+        assert_eq!(constants()[12..16], ONE_SIXTIETH_BITS.to_le_bytes());
+        assert_eq!(constants()[16..20], FLOOR_MIN_BITS.to_le_bytes());
     }
 
     #[test]

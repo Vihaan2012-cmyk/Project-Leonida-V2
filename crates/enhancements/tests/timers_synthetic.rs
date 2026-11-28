@@ -2,9 +2,7 @@
 #![cfg(windows)]
 #![allow(unsafe_code)]
 
-use enhancements::frame_timers::{
-    self, DEFICIT_OFFSET, DT_SLOT, FLOOR_BITS, Layout, TICK_SLOT, TickSite,
-};
+use enhancements::frame_timers::{self, CELLS, Layout, TICK_SLOT, TickSite};
 use enhancements::patch::{Buffer, CodeMemory, Finder, Mapped, PatchError, apply_all, revert_all};
 use enhancements::widescreen::fnv1a64;
 use pe_image::Image;
@@ -19,7 +17,8 @@ const LITERAL: u32 = DATA;
 const CAP: u32 = DATA + 4;
 const RECORD: u32 = DATA + 0x40;
 const FRAME: u32 = RECORD + 4;
-const DEFICIT: u32 = RECORD + DEFICIT_OFFSET;
+const DEFICIT: u32 = PDATA - CELLS;
+const FLOOR_CELL: u32 = DEFICIT + 4;
 const INPUT: u32 = DATA + 0x80;
 
 const UPDATE: u32 = TEXT;
@@ -291,8 +290,7 @@ fn patched() -> (Module, Vec<enhancements::patch::Applied>, Vec<u8>) {
     let finder = Finder::new(&parsed);
     let list = sites(&bytes);
     let layout = layout(&bytes, &list, &[FLOOR]);
-    let mut patches = frame_timers::dt_floor_patches(&finder, &layout).unwrap();
-    patches.extend(frame_timers::tick_scale_patches(&finder, &layout).unwrap());
+    let patches = frame_timers::frame_timer_patches(&finder, &layout).unwrap();
     // SAFETY: `module` stays mapped for as long as `memory` is used.
     let mut memory = unsafe { Mapped::new(module.base(), module.size()) };
     let applied = apply_all(&mut memory, &patches).unwrap();
@@ -454,7 +452,7 @@ fn a_degenerate_step_does_not_break_the_deficit() {
 }
 
 #[test]
-fn the_step_floor_is_one_three_thousandth_and_the_cap_stays() {
+fn the_floor_follows_the_frame_time_up_to_one_sixtieth_and_never_goes_below_one_three_thousandth() {
     let bytes = image();
     let module = load(
         &bytes,
@@ -467,14 +465,23 @@ fn the_step_floor_is_one_three_thousandth_and_the_cap_stays() {
     .unwrap();
     assert_eq!(floor_of(&module, 1.0 / 120.0), 1.0 / 60.0);
     assert_eq!(floor_of(&module, 0.5), 0.1);
-    let (patched_module, _applied, _) = patched();
-    assert_eq!(floor_of(&patched_module, 1.0 / 120.0), 1.0 / 120.0);
-    assert_eq!(
-        floor_of(&patched_module, 1.0 / 5000.0),
-        f32::from_bits(FLOOR_BITS)
-    );
-    assert_eq!(floor_of(&patched_module, 1.0 / 30.0), 1.0 / 30.0);
-    assert_eq!(floor_of(&patched_module, 0.5), 0.1);
+    let (module, _applied, _) = patched();
+    // Before the first update the cell holds 1/60 s: nothing changes.
+    assert_eq!(floor_of(&module, 1.0 / 120.0), 1.0 / 60.0);
+    call_update(&module, 1.0 / 120.0);
+    assert_eq!(floor_of(&module, 1.0 / 120.0), 1.0 / 120.0);
+    assert_eq!(floor_of(&module, 1.0 / 200.0), 1.0 / 120.0);
+    assert_eq!(floor_of(&module, 1.0 / 30.0), 1.0 / 30.0);
+    assert_eq!(floor_of(&module, 0.5), 0.1);
+    call_update(&module, 1.0 / 30.0);
+    assert_eq!(floor_of(&module, 1.0 / 120.0), 1.0 / 60.0);
+    assert_eq!(floor_of(&module, 1.0 / 30.0), 1.0 / 30.0);
+    call_update(&module, 1.0 / 5000.0);
+    assert_eq!(floor_of(&module, 1.0 / 9000.0), 1.0 / 3000.0);
+    call_update(&module, 0.0);
+    assert_eq!(floor_of(&module, 1.0 / 9000.0), 1.0 / 3000.0);
+    call_update(&module, f32::NAN);
+    assert_eq!(floor_of(&module, 1.0 / 120.0), 1.0 / 60.0);
 }
 
 #[test]
@@ -484,8 +491,7 @@ fn patches_revert_to_the_original_image() {
     let finder = Finder::new(&parsed);
     let list = sites(&bytes);
     let layout = layout(&bytes, &list, &[FLOOR]);
-    let mut patches = frame_timers::dt_floor_patches(&finder, &layout).unwrap();
-    patches.extend(frame_timers::tick_scale_patches(&finder, &layout).unwrap());
+    let patches = frame_timers::frame_timer_patches(&finder, &layout).unwrap();
     let mut memory = Buffer(vec![0; 0x5000]);
     memory.0[TEXT as usize..TEXT as usize + 0x400].copy_from_slice(&bytes[0x400..0x800]);
     memory.0[DATA as usize..DATA as usize + 0x200].copy_from_slice(&bytes[0x800..0xA00]);
@@ -497,26 +503,33 @@ fn patches_revert_to_the_original_image() {
 }
 
 #[test]
-fn the_cave_lives_in_the_slack_after_the_code_and_nothing_else_is_written_there() {
+fn the_cave_and_the_cells_live_in_the_slack_and_nothing_else_is_written_there() {
     let bytes = image();
     let parsed = Image::parse(&bytes).unwrap();
     let finder = Finder::new(&parsed);
     let list = sites(&bytes);
     let layout = layout(&bytes, &list, &[FLOOR]);
-    let floor = frame_timers::dt_floor_patches(&finder, &layout).unwrap();
-    let constant = &floor[0];
-    assert_eq!(constant.rva, DATA - DT_SLOT);
-    assert_eq!(constant.replacement, FLOOR_BITS.to_le_bytes());
-    assert_eq!(constant.original, vec![0; 4]);
-    let tick = frame_timers::tick_scale_patches(&finder, &layout).unwrap();
+    let cells = frame_timers::cells(&finder).unwrap();
+    assert_eq!((cells.deficit, cells.floor), (DEFICIT, FLOOR_CELL));
+    let floor = frame_timers::dt_floor_patches(&finder, &layout, &cells).unwrap();
+    let cell = &floor[0];
+    assert_eq!(cell.rva, FLOOR_CELL);
+    assert_eq!(cell.replacement, 0x3c88_8889u32.to_le_bytes());
+    assert_eq!(cell.original, vec![0; 4]);
+    let tick = frame_timers::tick_scale_patches(&finder, &layout, &cells).unwrap();
     let cave = &tick[0];
-    assert_eq!(cave.rva, DATA - DT_SLOT - TICK_SLOT);
+    assert_eq!(cave.rva, DATA - TICK_SLOT);
     assert!(cave.rva >= SLACK_START);
     assert!(cave.replacement.len() <= TICK_SLOT as usize);
     assert!(cave.original.iter().all(|b| *b == 0));
     for patch in floor.iter().skip(1).chain(tick.iter().skip(1)) {
         assert!(
             patch.rva < SLACK_START || patch.rva >= DATA,
+            "{}",
+            patch.name
+        );
+        assert!(
+            patch.rva + 8 < DEFICIT || patch.rva > PDATA,
             "{}",
             patch.name
         );
@@ -538,7 +551,8 @@ fn a_site_whose_flags_are_read_at_once_or_whose_code_changed_is_refused() {
     let mut list = sites(&bytes);
     let layout_for = |sites: &[TickSite]| {
         let l = layout(&bytes, sites, &[FLOOR]);
-        frame_timers::tick_scale_patches(&finder, &l)
+        let cells = frame_timers::cells(&finder).unwrap();
+        frame_timers::tick_scale_patches(&finder, &l, &cells)
     };
     let bad = TickSite {
         rva: READER_BAD + 6,
@@ -567,14 +581,15 @@ fn the_floor_patch_wants_exactly_the_functions_it_was_told_about() {
     let parsed = Image::parse(&bytes).unwrap();
     let finder = Finder::new(&parsed);
     let list = sites(&bytes);
+    let cells = frame_timers::cells(&finder).unwrap();
     let none = layout(&bytes, &list, &[]);
     assert!(matches!(
-        frame_timers::dt_floor_patches(&finder, &none),
+        frame_timers::dt_floor_patches(&finder, &none, &cells),
         Err(PatchError::Ambiguous { count: 1, .. })
     ));
     let other = layout(&bytes, &list, &[CLOCK]);
     assert!(matches!(
-        frame_timers::dt_floor_patches(&finder, &other),
+        frame_timers::dt_floor_patches(&finder, &other, &cells),
         Err(PatchError::Ambiguous { .. })
     ));
 }
