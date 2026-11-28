@@ -4,6 +4,7 @@
 
 # Leonida's own generated data (never commit)
 /Output/
+/Config/
 *.db
 *.db-journal
 *.db-wal
