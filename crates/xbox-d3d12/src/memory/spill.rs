@@ -7,6 +7,12 @@
 
 use super::*;
 
+/// The memory type a spilled run is imported as: the title's own pages are cached write-back memory, and the GPU
+/// reads and writes them coherently with the CPU's caches.
+const SPILL_MEMORY: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::from_raw(
+    vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw() | vk::MemoryPropertyFlags::HOST_CACHED.as_raw(),
+);
+
 /// The most one `promote_spilled` call mirrors, so the uploads of a frame stay bounded.
 const PROMOTE_PER_CALL: u64 = 256 << 20;
 
@@ -46,7 +52,7 @@ impl AddressSpace {
         len: u64,
     ) -> Result<(vk::DeviceMemory, Option<Mirror>, Grant), MemoryError> {
         // SAFETY: the caller of `map_host` keeps the memory mapped until `unmap`.
-        let (memory, _) = unsafe { self.import_memory(host, len, true)? };
+        let (memory, _) = unsafe { self.import_memory(host, len, true, SPILL_MEMORY)? };
         Ok((memory, None, self.h.budget.record_spill(Class::Mirror, len)))
     }
 
@@ -82,7 +88,8 @@ impl AddressSpace {
             }
         }
         // SAFETY: as the caller promises.
-        let Ok((memory, _)) = (unsafe { self.import_memory(host, PAGE, true) }) else {
+        let Ok((memory, _)) = (unsafe { self.import_memory(host, PAGE, true, SPILL_MEMORY) })
+        else {
             return Ok(false);
         };
         let Ok(probe) = Self::make_window(&self.h, 0, PAGE, false, &self.families) else {
@@ -190,15 +197,13 @@ impl AddressSpace {
     /// memory has been freed; `reclaim` does.
     pub fn promote_spilled(&mut self) -> Result<u64, MemoryError> {
         let mut done = 0;
+        let mut room = self.h.budget.mirror_room();
         for run in self.whole_runs() {
             let spilled = self
                 .memories
                 .get(&run.id)
                 .is_some_and(|m| m.is_spilled() && !m.pinned);
-            if !spilled
-                || done + run.len > PROMOTE_PER_CALL
-                || run.len > self.h.budget.mirror_room()
-            {
+            if !spilled || done + run.len > PROMOTE_PER_CALL || run.len > room {
                 continue;
             }
             let host = self.memories[&run.id].host;
@@ -223,6 +228,7 @@ impl AddressSpace {
             });
             self.sync.dirty.add(run.va, run.va + run.len);
             done += run.len;
+            room -= run.len;
         }
         self.commit()?;
         Ok(done)

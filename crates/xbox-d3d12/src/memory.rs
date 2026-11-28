@@ -24,9 +24,19 @@
 //! window itself, as a direct window does, so the GPU reads and writes the title's own bytes over PCIe and nothing
 //! is copied. The driver's memory requirements for a sparse buffer do not list that memory, but the RTX 4060's
 //! driver (616.64) binds it and reads and writes it correctly (`memory::probe`, run by hand); a driver that does
-//! not is found out at start by a self-test, and `AddressSpace::set_spill` turns the tier off. Without it a run
-//! past the budget is tried in device-local memory at a low priority (the driver then pages it to system memory,
-//! measured to work up to 10 GiB with no refusals on the 4060), and failing that left unbound.
+//! not is found out at start by a self-test, and `AddressSpace::set_spill` (or `LEONIDA_VRAM_SPILL=0`) turns the
+//! tier off. Without it a run past the budget is tried in device-local memory at a low priority and failing that
+//! left unbound.
+//!
+//! Measured on the RTX 4060 (`memory::probe`, 1 GiB blocks of device-local memory bound into a sparse buffer, with
+//! other programs holding about 4 GiB of the card): the driver never refused one up to 10 GiB and the data stayed
+//! correct, but it places each allocation where room is at that moment and moves none later, whatever the
+//! priorities (set at allocation, raised to 1.0 on a late block, or lowered with `vkSetDeviceMemoryPriorityEXT`
+//! on early ones): blocks that did not fit were in system memory from the start, read at 4 to 6 GB/s against 45 to
+//! 55 GB/s for the ones in VRAM. So where memory lands is decided here, by order and by the mirror's share, not left
+//! to the driver. A spilled run reads at the same 5 GB/s.
+//!
+//! Runs below 4 GiB are never spilled: descriptor heaps must be there (`LOW_LIMIT`) and every shader reads them.
 //!
 //! `promote_spilled` mirrors spilled runs again as device-local memory frees, and `spill_range` drops the
 //! device-local copy of runs the layer knows the GPU reads only through other objects (the detiled image of a
@@ -865,6 +875,7 @@ impl AddressSpace {
         va: u64,
         len: u64,
         device_address: bool,
+        preferred: vk::MemoryPropertyFlags,
     ) -> Result<(vk::DeviceMemory, u32), MemoryError> {
         let bits = self.host_type_bits(va)?;
         let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
@@ -872,11 +883,7 @@ impl AddressSpace {
             .host_pointer(va as usize as *mut c_void);
         let mut flags =
             vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-        let kind = self.pick_type(
-            bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE,
-            vk::MemoryPropertyFlags::empty(),
-        );
+        let kind = self.pick_type(bits, preferred, vk::MemoryPropertyFlags::empty());
         let mut info = vk::MemoryAllocateInfo::default()
             .allocation_size(len)
             .memory_type_index(kind)
@@ -899,7 +906,9 @@ impl AddressSpace {
         let (handle, mirror, grant) = match self.backing {
             Backing::Direct => {
                 // SAFETY: the caller of `map_host` keeps the memory mapped until `unmap`.
-                let (memory, bits) = unsafe { self.import_memory(host, len, true)? };
+                let (memory, bits) = unsafe {
+                    self.import_memory(host, len, true, vk::MemoryPropertyFlags::HOST_VISIBLE)?
+                };
                 if bits & self.window.type_bits == 0 {
                     // SAFETY: just made, never bound.
                     unsafe { self.h.device.free_memory(memory, None) };
@@ -912,7 +921,8 @@ impl AddressSpace {
                 (memory, None, None)
             }
             Backing::Mirrored => {
-                let made = if self.spill && len > self.h.budget.mirror_room() {
+                let hot = va + len <= LOW_LIMIT;
+                let made = if self.spill && !hot && len > self.h.budget.mirror_room() {
                     self.import_spilled(host, len)
                 } else {
                     match self.import_mirrored(host, len) {
@@ -981,13 +991,14 @@ impl AddressSpace {
                 None,
             )?;
             let needs = device.get_buffer_memory_requirements(buffer);
-            let (import, bits) = match self.import_memory(va, len, false) {
-                Ok(made) => made,
-                Err(e) => {
-                    device.destroy_buffer(buffer, None);
-                    return Err(e);
-                }
-            };
+            let (import, bits) =
+                match self.import_memory(va, len, false, vk::MemoryPropertyFlags::HOST_VISIBLE) {
+                    Ok(made) => made,
+                    Err(e) => {
+                        device.destroy_buffer(buffer, None);
+                        return Err(e);
+                    }
+                };
             if needs.memory_type_bits & bits == 0 {
                 device.destroy_buffer(buffer, None);
                 device.free_memory(import, None);
@@ -1164,6 +1175,8 @@ mod bench;
 #[cfg(test)]
 mod budget_tests;
 pub mod hooks;
+#[cfg(test)]
+mod probe;
 #[cfg(test)]
 mod spill_tests;
 #[cfg(test)]

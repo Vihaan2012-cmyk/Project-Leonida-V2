@@ -31,6 +31,11 @@ fn spilling(gpu: &TestGpu) -> Option<AddressSpace> {
     Some(space)
 }
 
+/// Memory above 4 GiB, where runs may be spilled; below it they are descriptor heaps and always mirrored.
+fn region(len: u64) -> Region {
+    Region::new_in(len, false, 5 << 30, 1 << 26, 28)
+}
+
 fn mirror_local(h: &Handles) -> u64 {
     h.budget.counters().local[Class::Mirror as usize]
 }
@@ -59,7 +64,7 @@ fn runs_past_the_mirror_limit_go_to_system_memory_and_both_sides_see_each_others
         let h = gpu.handles.clone();
         h.budget.set_mirror_limit(Some(2 * MIB));
         let kernel = Kernel::new(gpu);
-        let regions: Vec<Region> = (0..4).map(|_| Region::new(RUN, false)).collect();
+        let regions: Vec<Region> = (0..4).map(|_| region(RUN)).collect();
         let policies = [
             SyncPolicy::Always,
             SyncPolicy::Marked,
@@ -116,8 +121,8 @@ fn gpu_results_in_spilled_and_mirrored_runs_reach_the_cpu_through_the_layers_own
         let h = gpu.handles.clone();
         h.budget.set_mirror_limit(Some(MIB));
         let kernel = Kernel::new(gpu);
-        let local = Region::new(RUN, true);
-        let spilled = Region::new(RUN, true);
+        let local = Region::new_in(RUN, true, 5 << 30, 1 << 26, 28);
+        let spilled = Region::new_in(RUN, true, 5 << 30, 1 << 26, 28);
         space
             .map_host(local.address, RUN, SyncPolicy::WriteWatch)
             .unwrap();
@@ -153,7 +158,7 @@ fn spilled_runs_are_mirrored_again_when_device_local_memory_frees() {
         let h = gpu.handles.clone();
         h.budget.set_mirror_limit(Some(2 * MIB));
         let kernel = Kernel::new(gpu);
-        let regions: Vec<Region> = (0..4).map(|_| Region::new(RUN, false)).collect();
+        let regions: Vec<Region> = (0..4).map(|_| region(RUN)).collect();
         for region in &regions {
             space
                 .map_host(region.address, RUN, SyncPolicy::Always)
@@ -214,7 +219,7 @@ fn a_mirrored_run_moves_to_system_memory_keeping_what_the_gpu_wrote() {
         };
         let h = gpu.handles.clone();
         let kernel = Kernel::new(gpu);
-        let region = Region::new(RUN, false);
+        let region = self::region(RUN);
         space
             .map_host(region.address, RUN, SyncPolicy::Always)
             .unwrap();
@@ -252,26 +257,51 @@ fn a_mirrored_run_moves_to_system_memory_keeping_what_the_gpu_wrote() {
 #[test]
 fn spilled_runs_keep_working_when_the_window_is_rebuilt() {
     for gpu in &TestGpu::open_all() {
-        let mut space = space(gpu, 1 << 32);
+        let mut space = space(gpu, 1 << 33);
         if space.backing() != Backing::Mirrored || !space.spill_enabled() {
             continue;
         }
         let h = gpu.handles.clone();
         h.budget.set_mirror_limit(Some(0));
         let kernel = Kernel::new(gpu);
-        let region = Region::new(RUN, false);
+        let region = self::region(RUN);
         space
             .map_host(region.address, RUN, SyncPolicy::Marked)
             .unwrap();
         assert_eq!(space.spilled_bytes(), RUN);
         region.write(0, 7);
         let generation = space.generation();
-        space.ensure(0, 3 << 32).unwrap();
+        space.ensure(0, 3 << 33).unwrap();
         assert!(space.generation() > generation, "the window was rebuilt");
         assert_eq!(increment(gpu, &kernel, &mut space, &region), 8);
         space.unmap(region.address, RUN).unwrap();
         space.reclaim();
         kernel.finish(gpu);
+        h.budget.set_mirror_limit(None);
+    }
+}
+
+#[test]
+fn runs_below_4_gib_are_never_spilled() {
+    for gpu in &TestGpu::open_all() {
+        let Some(mut space) = spilling(gpu) else {
+            continue;
+        };
+        let h = gpu.handles.clone();
+        h.budget.set_mirror_limit(Some(0));
+        let low = Region::new(RUN, false);
+        assert!(low.address + RUN <= LOW_LIMIT);
+        let high = region(RUN);
+        space
+            .map_host(low.address, RUN, SyncPolicy::Always)
+            .unwrap();
+        space
+            .map_host(high.address, RUN, SyncPolicy::Always)
+            .unwrap();
+        assert_eq!((mirror_local(&h), mirror_spilled(&h)), (RUN, RUN));
+        space.unmap(low.address, RUN).unwrap();
+        space.unmap(high.address, RUN).unwrap();
+        space.reclaim();
         h.budget.set_mirror_limit(None);
     }
 }
@@ -287,7 +317,7 @@ fn with_the_tier_off_runs_past_the_limit_stay_in_device_local_memory() {
         assert!(!space.spill_enabled());
         let h = gpu.handles.clone();
         h.budget.set_mirror_limit(Some(0));
-        let region = Region::new(RUN, false);
+        let region = self::region(RUN);
         space
             .map_host(region.address, RUN, SyncPolicy::Always)
             .unwrap();
@@ -312,5 +342,92 @@ fn the_budget_says_how_much_of_it_the_mirror_may_take() {
         assert_eq!(budget.mirror_room(), 1000 * MIB, "no more than is free");
         budget.set_mirror_limit(None);
         budget.set_limit(None);
+    }
+}
+
+/// The title's pools are runs of 64 KiB page-file sections placed one after the other: a spilled run over such
+/// views is what the GPU reads in the game.
+#[test]
+fn a_spilled_run_over_many_file_section_views_works() {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFileEx,
+        PAGE_READWRITE, SEC_COMMIT, UnmapViewOfFile,
+    };
+    const VIEWS: u64 = 16;
+    for gpu in &TestGpu::open_all() {
+        let Some(mut space) = spilling(gpu) else {
+            continue;
+        };
+        let h = gpu.handles.clone();
+        h.budget.set_mirror_limit(Some(0));
+        let kernel = Kernel::new(gpu);
+        // SAFETY: sections mapped one after the other at addresses inside the window; every view and handle is
+        // released at the end.
+        unsafe {
+            let mut sections = Vec::new();
+            let mut base = (5u64 << 30) + (1 << 28);
+            let views: Vec<u64> = 'search: loop {
+                let mut mapped: Vec<u64> = Vec::new();
+                for n in 0..VIEWS {
+                    let section = CreateFileMappingW(
+                        INVALID_HANDLE_VALUE,
+                        std::ptr::null(),
+                        PAGE_READWRITE | SEC_COMMIT,
+                        0,
+                        PAGE as u32,
+                        std::ptr::null(),
+                    );
+                    assert!(!section.is_null());
+                    let view = MapViewOfFileEx(
+                        section,
+                        FILE_MAP_ALL_ACCESS,
+                        0,
+                        0,
+                        PAGE as usize,
+                        (base + n * PAGE) as usize as *const c_void,
+                    );
+                    if view.Value.is_null() {
+                        CloseHandle(section);
+                        for (view, section) in mapped.drain(..).zip(sections.drain(..)) {
+                            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                                Value: view as usize as *mut c_void,
+                            });
+                            CloseHandle(section);
+                        }
+                        base += 1 << 28;
+                        continue 'search;
+                    }
+                    sections.push(section);
+                    mapped.push(view.Value as u64);
+                }
+                break mapped;
+            };
+            let start = views[0];
+            space
+                .map_host(start, VIEWS * PAGE, SyncPolicy::Marked)
+                .unwrap();
+            assert_eq!(space.spilled_bytes(), VIEWS * PAGE);
+            for n in 0..VIEWS {
+                *((start + n * PAGE) as *mut u32) = 100 + n as u32;
+            }
+            for n in 0..VIEWS {
+                let at = start + n * PAGE;
+                kernel.run(gpu, &mut space, &[(at, at + 8)], (at, PAGE));
+                assert_eq!(*((at + 8) as *const u32), 101 + n as u32, "view {n}");
+            }
+            space.unmap(start, VIEWS * PAGE).unwrap();
+            space.reclaim();
+            for view in views {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as usize as *mut c_void,
+                });
+            }
+            for section in sections {
+                CloseHandle(section);
+            }
+        }
+        kernel.finish(gpu);
+        h.budget.set_mirror_limit(None);
     }
 }

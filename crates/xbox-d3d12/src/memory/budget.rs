@@ -5,7 +5,8 @@
 //! (`VK_EXT_memory_budget`, or a limit injected with `set_limit`) and what the layer has taken:
 //!
 //! - **Render targets, depth buffers and unordered-access images** (`Class::Target`) are tried in device-local
-//!   memory whatever the budget says, at the highest priority, so the driver pages other memory out for them.
+//!   memory whatever the budget says, at the highest priority. Priority does not make the driver move other memory
+//!   out for them (measured on an RTX 4060, see `memory`): what keeps room for them is the mirror's cap below.
 //! - **Textures** (`Class::Texture`) go to device-local memory while they fit, and to system memory the GPU reads
 //!   over PCIe when they do not or when device-local allocation fails.
 //! - **The mirror of the game's memory** (`Class::Mirror`) is what shaders read the game's memory through. It takes
