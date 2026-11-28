@@ -10,7 +10,7 @@ use windows_sys::Win32::Foundation::{FALSE, HANDLE, INVALID_HANDLE_VALUE, SetLas
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem as fs_api;
 use windows_sys::Win32::Storage::FileSystem::{CREATEFILE2_EXTENDED_PARAMETERS, WIN32_FIND_DATAW};
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
 
 use super::{Refusal, Target, resolve};
 use crate::Shim;
@@ -34,6 +34,7 @@ const MOVEFILE_REPLACE_EXISTING: u32 = 1;
 
 static HIDDEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static DENIED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 const SEEN_LIMIT: usize = 1 << 16;
 
 fn key(path: &Path) -> String {
@@ -140,11 +141,27 @@ fn trace_path(text: &str) {
     }
 }
 
-fn target(text: &str) -> Result<Target, u32> {
+/// Notes a refused name once for the boot trace.
+pub(super) fn note_refusal(refusal: Refusal, text: &str) {
+    let fresh = DENIED
+        .lock()
+        .map(|mut seen| {
+            let seen = seen.get_or_insert_with(HashSet::new);
+            seen.len() < SEEN_LIMIT && seen.insert(text.to_lowercase())
+        })
+        .unwrap_or(false);
+    if fresh {
+        note(format!("file access refused ({refusal:?}): {text}"));
+    }
+}
+
+/// Maps a name the program used. `writes` says whether the call changes anything, which decides the error a
+/// path outside the sandbox is answered with.
+pub(super) fn target(text: &str, writes: bool) -> Result<Target, u32> {
     trace_path(text);
     resolve(text).map_err(|refusal: Refusal| {
-        note(format!("file access refused ({refusal:?}): {text}"));
-        refusal.code()
+        note_refusal(refusal, text);
+        refusal.code_for(writes)
     })
 }
 
@@ -164,7 +181,7 @@ fn read_path(target: &Target, original: &str) -> PathBuf {
 
 /// The host path a read of `text` would open.
 pub fn read_location(text: &str) -> Result<PathBuf, u32> {
-    let target = target(text)?;
+    let target = target(text, false)?;
     Ok(read_path(&target, text))
 }
 
@@ -216,12 +233,12 @@ fn create_file_common(
     disposition: u32,
     flags: u32,
 ) -> Result<Vec<u16>, u32> {
-    let target = target(name)?;
     let backup = flags & FLAG_BACKUP_SEMANTICS != 0;
     let writes = !backup
         && (access & WRITE_ACCESS != 0
             || disposition != OPEN_EXISTING
             || flags & FLAG_DELETE_ON_CLOSE != 0);
+    let target = target(name, writes)?;
     if !writes {
         return Ok(to_wide(&read_path(&target, name)));
     }
@@ -290,7 +307,7 @@ unsafe extern "win64" fn create_file2(
 }
 
 fn attributes_path(text: &str) -> Result<Vec<u16>, u32> {
-    let target = target(text)?;
+    let target = target(text, false)?;
     Ok(to_wide(&read_path(&target, text)))
 }
 
@@ -405,7 +422,7 @@ unsafe fn find_first(
 ) -> HANDLE {
     let text = wide_ptr_to_string(pattern);
     let (folder, mask) = split_pattern(&text);
-    let mapped = match target(folder) {
+    let mapped = match target(folder, false) {
         Ok(mapped) => mapped,
         Err(code) => {
             set_error(code);
@@ -513,7 +530,7 @@ unsafe extern "win64" fn find_close(handle: HANDLE) -> i32 {
 }
 
 fn create_directory(text: &str) -> Result<(), u32> {
-    let target = target(text)?;
+    let target = target(text, true)?;
     if visible(&target, text) {
         return Err(ERROR_ALREADY_EXISTS);
     }
@@ -529,7 +546,7 @@ unsafe extern "win64" fn create_directory_w(name: *const u16, _security: *const 
 }
 
 fn delete_file(text: &str) -> Result<(), u32> {
-    let target = target(text)?;
+    let target = target(text, true)?;
     match &target {
         Target::Layered { base, overlay } => {
             let in_package = base.is_file() && !hidden(base);
@@ -558,7 +575,7 @@ unsafe extern "win64" fn delete_file_w(name: *const u16) -> i32 {
 }
 
 fn remove_directory(text: &str) -> Result<(), u32> {
-    let target = target(text)?;
+    let target = target(text, true)?;
     match &target {
         Target::Layered { base, overlay } => {
             if base.is_dir() && !hidden(base) {
@@ -582,7 +599,7 @@ unsafe extern "win64" fn remove_directory_w(name: *const u16) -> i32 {
 
 unsafe extern "win64" fn set_file_attributes_w(name: *const u16, attributes: u32) -> i32 {
     let text = wide_ptr_to_string(name);
-    let result = target(&text).and_then(|target| {
+    let result = target(&text, true).and_then(|target| {
         if let Target::Layered { base, overlay } = &target
             && !exists(overlay)
         {
@@ -606,8 +623,8 @@ unsafe extern "win64" fn set_file_attributes_w(name: *const u16, attributes: u32
 }
 
 fn move_file(from: &str, to: &str, flags: u32) -> Result<(), u32> {
-    let source = target(from)?;
-    let destination = target(to)?;
+    let source = target(from, true)?;
+    let destination = target(to, true)?;
     if visible(&destination, to) && flags & MOVEFILE_REPLACE_EXISTING == 0 {
         return Err(ERROR_ALREADY_EXISTS);
     }
@@ -649,7 +666,7 @@ unsafe extern "win64" fn get_disk_free_space_ex_w(
     let mut path: Option<PathBuf> = None;
     if !name.is_null() {
         let text = wide_ptr_to_string(name);
-        match target(&text) {
+        match target(&text, false) {
             Ok(target) => {
                 let mut here = read_path(&target, &text);
                 while !here.exists() && here.pop() {}
@@ -665,16 +682,12 @@ unsafe extern "win64" fn get_disk_free_space_ex_w(
 }
 
 fn ucrt(name: &str) -> usize {
-    let library: Vec<u16> = "ucrtbase.dll".encode_utf16().chain([0]).collect();
     let symbol: Vec<u8> = name.bytes().chain([0]).collect();
-    // SAFETY: loads the system's C runtime and asks it for one export.
-    unsafe {
-        let module = LoadLibraryW(library.as_ptr());
-        if module.is_null() {
-            return 0;
-        }
-        GetProcAddress(module, symbol.as_ptr()).map_or(0, |f| f as usize)
-    }
+    let Ok(module) = crate::hostlib::load("ucrtbase.dll", 0) else {
+        return 0;
+    };
+    // SAFETY: asks the system's C runtime, loaded from the system folder, for one export.
+    unsafe { GetProcAddress(module as *mut c_void, symbol.as_ptr()).map_or(0, |f| f as usize) }
 }
 
 type WFopen = unsafe extern "C" fn(*const u16, *const u16) -> *mut c_void;
@@ -693,7 +706,7 @@ fn open_stream(text: &str, mode: &str) -> *mut c_void {
         return std::ptr::null_mut();
     }
     let writes = mode.contains(['w', 'a', '+']);
-    let path = target(text).and_then(|target| {
+    let path = target(text, writes).and_then(|target| {
         if !writes {
             return Ok(read_path(&target, text));
         }
