@@ -457,11 +457,13 @@ fn the_games_graphics_stream_reaches_graphics_pipeline_creation_through_slot_86(
     let Some(h) = harness() else { return };
     let root = empty_root(&h);
     let (vs, ps) = (vec![1u8, 2, 3, 4], vec![9u8, 8, 7]);
-    // not shader containers, so creation is refused as invalid: the stream got past the parser to the builder
+    // not shader containers: the call returns at once with the pipeline object, and the build fails on a worker
     let before = xbox_d3d12::com::notes().len();
-    assert_eq!(
-        create_stream(&h, &games_stream(root, &vs, &ps)),
-        0x8007_0057
+    assert_eq!(create_stream(&h, &games_stream(root, &vs, &ps)), 0);
+    assert!(
+        h.asm
+            .pipeline_service
+            .wait_idle(std::time::Duration::from_secs(60))
     );
     let notes = xbox_d3d12::com::notes();
     assert!(

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use content_filter::{DrawDecision, ResourceId as FilterId};
 
-use super::bridge::{self, BufferRef, Converted, Resolver};
+use super::bridge::{self, BufferRef, Converted, Objects, Resolver};
 use super::hooks;
 use super::indirect::IndirectLayout;
 use super::objects::{pipeline_of, resource_of, root_of, signature_of};
@@ -21,6 +21,7 @@ use super::resapi::image_ref;
 use super::state::Assembly;
 use super::views::identity;
 use crate::com::{self, ComPtr, Kind};
+use crate::compile_queue::DrawPolicy;
 use crate::descriptor::vulkan::ViewInfo;
 use crate::descriptor::{self, gfx10};
 use crate::execute::{
@@ -152,6 +153,40 @@ impl Context<'_> {
     }
 }
 
+/// The objects of a device, which need nothing locked.
+struct Live;
+
+impl Objects for Live {
+    fn pipeline(&self, object: &ComPtr) -> Option<Arc<dyn PendingPipeline>> {
+        // SAFETY: a COM object the title named in a list.
+        unsafe { pipeline_of(object.as_ptr()) }
+    }
+
+    fn command_signature(&self, object: &ComPtr) -> Option<IndirectLayout> {
+        // SAFETY: as `pipeline`.
+        unsafe { signature_of(object.as_ptr()) }
+    }
+
+    fn bundle(&self, object: &ComPtr) -> Option<Arc<CommandStream>> {
+        // SAFETY: as `pipeline`.
+        unsafe { list::closed_stream(object.as_ptr()) }
+    }
+}
+
+impl Objects for Context<'_> {
+    fn pipeline(&self, object: &ComPtr) -> Option<Arc<dyn PendingPipeline>> {
+        Live.pipeline(object)
+    }
+
+    fn command_signature(&self, object: &ComPtr) -> Option<IndirectLayout> {
+        Live.command_signature(object)
+    }
+
+    fn bundle(&self, object: &ComPtr) -> Option<Arc<CommandStream>> {
+        Live.bundle(object)
+    }
+}
+
 impl Resolver for Context<'_> {
     fn buffer(&self, resource: &ComPtr) -> Option<BufferRef> {
         // SAFETY: a COM object the title named in a list.
@@ -183,16 +218,6 @@ impl Resolver for Context<'_> {
         unsafe { root_of(object.as_ptr()) }
     }
 
-    fn pipeline(&self, object: &ComPtr) -> Option<Arc<dyn PendingPipeline>> {
-        // SAFETY: as `buffer`.
-        unsafe { pipeline_of(object.as_ptr()) }
-    }
-
-    fn command_signature(&self, object: &ComPtr) -> Option<IndirectLayout> {
-        // SAFETY: as `buffer`.
-        unsafe { signature_of(object.as_ptr()) }
-    }
-
     fn heap_bases(&self, heaps: &[ComPtr]) -> HeapBases {
         let mut bases = HeapBases::default();
         for heap in heaps {
@@ -217,11 +242,6 @@ impl Resolver for Context<'_> {
 
     fn depth_target(&self, handle: u64) -> Option<TargetView> {
         self.target(handle, true)
-    }
-
-    fn bundle(&self, object: &ComPtr) -> Option<Arc<CommandStream>> {
-        // SAFETY: as `buffer`.
-        unsafe { list::closed_stream(object.as_ptr()) }
     }
 
     fn table_bound(&self, root: &RootSignature, param: u32, handle: u64) {
@@ -462,7 +482,28 @@ impl Assembly {
         }
     }
 
+    /// Under the wait policy, waits for the build of every pipeline the lists draw or dispatch with. It runs before
+    /// anything is locked: the builds put shader code in memory the resource store hands out.
+    fn wait_for_pipelines(&self, lists: &[Arc<CommandStream>]) {
+        if self.pipeline_service.draw_policy() != DrawPolicy::Wait {
+            return;
+        }
+        let mut seen: Vec<Arc<dyn PendingPipeline>> = Vec::new();
+        for list in lists {
+            for pipeline in bridge::used_pipelines(list, &Live) {
+                if !seen
+                    .iter()
+                    .any(|s| std::ptr::addr_eq(Arc::as_ptr(s), Arc::as_ptr(&pipeline)))
+                {
+                    let _ = pipeline.resolve();
+                    seen.push(pipeline);
+                }
+            }
+        }
+    }
+
     pub fn execute(&self, lists: &[Arc<CommandStream>]) -> Result<(), vk::Result> {
+        self.wait_for_pipelines(lists);
         let mut exec = self.exec.lock().unwrap_or_else(PoisonError::into_inner);
         exec.spill.reset();
         let filter = hooks::content_filter();

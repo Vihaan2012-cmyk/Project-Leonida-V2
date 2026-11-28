@@ -82,6 +82,9 @@ pub trait PendingPipeline: Send + Sync {
     fn compute(&self) -> bool;
     /// The built pipeline, by the draw policy: waits for the build or says it is not ready.
     fn resolve(&self) -> Resolved<Arc<Pipeline>>;
+    /// The built pipeline if it is, without waiting whatever the policy; a draw that finds it not ready is counted
+    /// as skipped.
+    fn poll(&self) -> Resolved<Arc<Pipeline>>;
 }
 
 /// A pipeline the title created: its handle and the bind point it is for.
@@ -97,6 +100,10 @@ impl PendingPipeline for Created {
 
     fn resolve(&self) -> Resolved<Arc<Pipeline>> {
         self.handle.resolve()
+    }
+
+    fn poll(&self) -> Resolved<Arc<Pipeline>> {
+        self.handle.resolve_with(DrawPolicy::Skip)
     }
 }
 

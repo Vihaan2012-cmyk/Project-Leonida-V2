@@ -5,8 +5,10 @@
 //! Everything that needs the device's state, such as which texture a COM pointer is or which image a render target
 //! descriptor names, comes through `Resolver`, so the conversion itself runs without a GPU.
 //!
-//! A pipeline the title sets is not asked for until a draw or dispatch uses it: the draw policy then decides
-//! between waiting for its build and dropping the draw, and the first draw that gets it emits `SetPipeline`.
+//! A pipeline the title sets is not asked for until a draw or dispatch uses it, and then without waiting: the
+//! first draw that gets it emits `SetPipeline`, one whose pipeline is not built is dropped. Waiting for builds
+//! (the draw policy) is done by `used_pipelines` and `PendingPipeline::resolve` before the resource store is
+//! locked, because the builds need it.
 
 use std::sync::Arc;
 
@@ -35,21 +37,26 @@ pub struct BufferRef {
     pub size: u64,
 }
 
+/// The objects of the device a stream names that need no resource store, so they can be looked at before it is
+/// locked.
+pub trait Objects {
+    /// The pipeline state object `object`, which may still be building.
+    fn pipeline(&self, object: &ComPtr) -> Option<Arc<dyn PendingPipeline>>;
+    fn command_signature(&self, object: &ComPtr) -> Option<IndirectLayout>;
+    fn bundle(&self, object: &ComPtr) -> Option<Arc<CommandStream>>;
+}
+
 /// What the conversion asks of the device it runs for.
-pub trait Resolver {
+pub trait Resolver: Objects {
     fn buffer(&self, resource: &ComPtr) -> Option<BufferRef>;
     fn image(&self, resource: &ComPtr) -> Option<ImageRef>;
     /// The buffer whose address range holds `address`.
     fn buffer_containing(&self, address: u64) -> Option<BufferRef>;
     fn root_signature(&self, object: &ComPtr) -> Option<Arc<RootSignature>>;
-    /// The pipeline state object `object`, which may still be building.
-    fn pipeline(&self, object: &ComPtr) -> Option<Arc<dyn PendingPipeline>>;
-    fn command_signature(&self, object: &ComPtr) -> Option<IndirectLayout>;
     fn heap_bases(&self, heaps: &[ComPtr]) -> HeapBases;
     /// The render target view the descriptor at this CPU handle names.
     fn color_target(&self, handle: u64) -> Option<TargetView>;
     fn depth_target(&self, handle: u64) -> Option<TargetView>;
-    fn bundle(&self, object: &ComPtr) -> Option<Arc<CommandStream>>;
     /// A descriptor table was bound for `root`'s parameter `param`: the descriptors it can reach need
     /// registering before the draw runs.
     fn table_bound(&self, root: &RootSignature, param: u32, handle: u64) {
@@ -500,6 +507,76 @@ fn convert_into(
     }
 }
 
+/// The pipelines the draws and dispatches of `stream` use, once each, in the order they are first used. A pipeline
+/// that is set and never drawn with is not in the list.
+pub fn used_pipelines(
+    stream: &CommandStream,
+    objects: &dyn Objects,
+) -> Vec<Arc<dyn PendingPipeline>> {
+    let mut used = Vec::new();
+    let mut current: [Option<Arc<dyn PendingPipeline>>; 2] = [None, None];
+    collect_used(stream, objects, &mut current, &mut used, 0);
+    used
+}
+
+fn note_use(
+    current: &[Option<Arc<dyn PendingPipeline>>; 2],
+    used: &mut Vec<Arc<dyn PendingPipeline>>,
+    compute: bool,
+) {
+    if let Some(p) = &current[usize::from(compute)]
+        && !used
+            .iter()
+            .any(|u| std::ptr::addr_eq(Arc::as_ptr(u), Arc::as_ptr(p)))
+    {
+        used.push(p.clone());
+    }
+}
+
+fn collect_used(
+    stream: &CommandStream,
+    objects: &dyn Objects,
+    current: &mut [Option<Arc<dyn PendingPipeline>>; 2],
+    used: &mut Vec<Arc<dyn PendingPipeline>>,
+    depth: u32,
+) {
+    use stream::Command as C;
+    let set = |current: &mut [Option<Arc<dyn PendingPipeline>>; 2], p: Arc<dyn PendingPipeline>| {
+        let at = usize::from(p.compute());
+        current[at] = Some(p);
+    };
+    for command in &stream.commands {
+        match command {
+            C::ClearState { pipeline } => {
+                *current = [None, None];
+                if let Some(p) = pipeline.as_ref().and_then(|p| objects.pipeline(p)) {
+                    set(current, p);
+                }
+            }
+            C::SetPipelineState(Some(pipeline)) => {
+                if let Some(p) = objects.pipeline(pipeline) {
+                    set(current, p);
+                }
+            }
+            C::DrawInstanced { .. } | C::DrawIndexedInstanced { .. } => {
+                note_use(current, used, false)
+            }
+            C::Dispatch { .. } => note_use(current, used, true),
+            C::ExecuteIndirect { signature, .. } => {
+                if let Some(kind) = objects.command_signature(signature).and_then(|l| l.kind) {
+                    note_use(current, used, kind == IndirectKind::Dispatch);
+                }
+            }
+            C::ExecuteBundle(bundle) if depth <= 4 => {
+                if let Some(inner) = objects.bundle(bundle) {
+                    collect_used(&inner, objects, current, used, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn set_pipeline(state: &mut State, pending: Arc<dyn PendingPipeline>) {
     let bound = Some(Bound {
         pending,
@@ -527,7 +604,7 @@ fn pipeline_ready(state: &mut State, out: &mut Converted, compute: bool, r: &dyn
     };
     let built = match &bound.built {
         Some(built) => built.clone(),
-        None => match bound.pending.resolve() {
+        None => match bound.pending.poll() {
             Resolved::Ready(built) => {
                 bound.built = Some(built.clone());
                 built
