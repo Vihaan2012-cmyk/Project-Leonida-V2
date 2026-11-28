@@ -138,6 +138,7 @@ fn run(path: &Path, args: &RunArgs, plan: &RuntimePlan) -> Result<ExitCode> {
     println!("starting {} at {:#x}", path.display(), module.entry());
     // SAFETY: the player asked to run this executable; its imports are bound and its pages protected.
     let code = unsafe { module.call_entry() };
+    shims::d3d12::shutdown();
     if let Some(trace) = binder.trace() {
         trace.write(&boot)?;
     }
