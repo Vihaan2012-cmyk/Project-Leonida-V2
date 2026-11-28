@@ -5,12 +5,13 @@ use std::str::FromStr;
 
 use anyhow::{Result, anyhow, bail};
 use config::{AspectMode, Config, FrameRate, Graphics, Nudity, Upscaler, WindowMode};
+use enhancements::camera_mouse::MouseLookSettings;
 use enhancements::widescreen;
 use shims::audio::OutputMode;
 use shims::gameinput::InputConfig;
 use xbox_d3d12::pacing::FrameLimit;
 
-use super::input;
+use super::{input, mouse};
 use crate::cli::RunArgs;
 
 /// The settings files, read together.
@@ -35,6 +36,8 @@ pub struct RuntimePlan {
     pub frame_generation: bool,
     pub widescreen: widescreen::Config,
     pub input: InputConfig,
+    /// The settings of the direct mouse camera patch; `None` keeps the mouse acting as the right stick.
+    pub mouse_camera: Option<MouseLookSettings>,
     /// Bindings in input.toml that cannot be carried out, each with the reason.
     pub input_skipped: Vec<String>,
     pub block_nudity: bool,
@@ -104,6 +107,10 @@ impl RuntimePlan {
             frame_generation: settings.graphics.frame_generation,
             widescreen: widescreen_config(&settings.graphics),
             input,
+            mouse_camera: settings
+                .input
+                .mouse_camera
+                .then(|| mouse::settings(&settings.input)),
             input_skipped,
             block_nudity: settings.general.content.nudity == Nudity::Block,
             audio: match settings.general.audio.output {
@@ -129,6 +136,7 @@ impl RuntimePlan {
             format!("  widescreen   {}", describe_widescreen(&self.widescreen)),
             format!("  patches      {}", self.describe_patches()),
             format!("  input        {}", self.describe_input()),
+            format!("  mouse camera {}", self.describe_mouse()),
             format!(
                 "  nudity       {}",
                 if self.block_nudity {
@@ -221,6 +229,15 @@ impl RuntimePlan {
             "none".to_string()
         } else {
             names.join(", ")
+        }
+    }
+
+    fn describe_mouse(&self) -> String {
+        match &self.mouse_camera {
+            Some(_) => {
+                "direct, the camera patch is applied when the executable matches".to_string()
+            }
+            None => "off, the mouse acts as the right stick".to_string(),
         }
     }
 
@@ -414,6 +431,36 @@ mod tests {
     }
 
     #[test]
+    fn the_mouse_camera_follows_its_switch_and_the_sensitivities() {
+        let on = plan(&args(), &Settings::default()).unwrap();
+        assert_eq!(on.mouse_camera, Some(MouseLookSettings::default()));
+        assert!(
+            on.summary()
+                .join(
+                    "
+"
+                )
+                .contains("mouse camera direct")
+        );
+        let mut settings = Settings::default();
+        settings.input.mouse_camera = false;
+        let off = plan(&args(), &settings).unwrap();
+        assert_eq!(off.mouse_camera, None);
+        let text = off.summary().join(
+            "
+",
+        );
+        assert!(text.contains("mouse camera off"), "{text}");
+        settings.input.mouse_camera = true;
+        settings.input.mouse_sensitivity = 2.0;
+        settings.input.mouse_sensitivity_y = 0.5;
+        settings.input.mouse_invert_y = true;
+        let tuned = plan(&args(), &settings).unwrap().mouse_camera.unwrap();
+        assert_eq!(tuned.sensitivity, [2.0, 1.0]);
+        assert_eq!(tuned.invert, [false, true]);
+    }
+
+    #[test]
     fn the_output_folder_comes_from_the_command_line_then_the_settings() {
         let mut settings = Settings::default();
         settings.general.output_folder = PathBuf::from("E:\\Out\\Leo");
@@ -442,6 +489,7 @@ mod tests {
             "widescreen",
             "patches",
             "input",
+            "mouse camera",
             "nudity",
             "audio",
             "mods",

@@ -7,9 +7,12 @@
 mod audio;
 mod content;
 mod input;
+mod mouse;
 mod patches;
 mod paths;
 mod plan;
+#[cfg(test)]
+mod synthetic;
 mod upscaler;
 
 use std::path::Path;
@@ -98,8 +101,34 @@ pub fn patch(plan: &RuntimePlan, bytes: &[u8], module: &pe_loader::Module) {
     for name in &outcome.applied {
         println!("patched {name}");
     }
+    for note in &outcome.notes {
+        eprintln!("warning: {note}");
+    }
+    if outcome.mouse_camera {
+        println!("the mouse turns the camera directly");
+    }
     if let Some(warning) = outcome.warning {
         eprintln!("warning: no code patches were applied, the game runs unpatched: {warning}");
+    }
+}
+
+/// Called when the entry point has returned: the mouse goes back to moving the stick, and the cell it filled may go.
+pub fn detach_mouse() {
+    shims::gameinput::direct::detach();
+}
+
+/// What `--dry-run` says about the mouse camera patch for the executable `bytes`: built against it, nothing written.
+pub fn describe_mouse_patch(plan: &RuntimePlan, bytes: &[u8]) -> String {
+    let Some(settings) = &plan.mouse_camera else {
+        return "mouse camera patch: off, the mouse acts as the right stick".to_string();
+    };
+    match mouse::build(settings, bytes, &enhancements::camera_mouse::GAME, &[]) {
+        Ok(built) => format!(
+            "mouse camera patch: will be applied ({} patches, cell at {:#x})",
+            built.patches.len(),
+            built.cell
+        ),
+        Err(reason) => format!("mouse camera patch: would be left out, {reason}"),
     }
 }
 
