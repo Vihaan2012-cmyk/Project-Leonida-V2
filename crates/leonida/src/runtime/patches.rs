@@ -263,12 +263,12 @@ mod tests {
             config: "E:\\Leo\\Config".into(),
             frame_limit: None,
         };
-        let plan = RuntimePlan::from(
-            &args,
-            &super::super::plan::Settings::default(),
-            std::path::Path::new("E:\\Game"),
-        )
-        .unwrap();
+        let settings = super::super::plan::Settings {
+            graphics: <config::Graphics as config::Section>::parse("frame_rate_mode = \"console\"")
+                .unwrap(),
+            ..super::super::plan::Settings::default()
+        };
+        let plan = RuntimePlan::from(&args, &settings, std::path::Path::new("E:\\Game")).unwrap();
         let mut slot = |_| Err("unused".to_string());
         let patches = select(&plan, &[], &memory(), BASE, &mut slot).unwrap();
         assert!(patches.is_empty());
