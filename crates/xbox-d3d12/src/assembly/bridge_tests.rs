@@ -815,3 +815,47 @@ fn only_the_pipelines_draws_and_dispatches_use_are_waited_for_bundles_included()
         Arc::as_ptr(&inner)
     ));
 }
+
+#[test]
+fn a_pipeline_set_again_and_drawn_again_is_listed_once_and_one_drawn_later_is_listed_after_it() {
+    let mut fake = Fake::default();
+    let (a, b) = (Unbuilt::new(false, false), Unbuilt::new(false, false));
+    let (a_object, b_object) = (
+        pipeline_object(&mut fake, &a),
+        pipeline_object(&mut fake, &b),
+    );
+    let list = stream(vec![
+        stream::Command::SetPipelineState(Some(a_object.clone())),
+        draw(),
+        stream::Command::SetPipelineState(Some(b_object)),
+        draw(),
+        draw(),
+        stream::Command::SetPipelineState(Some(a_object)),
+        draw(),
+    ]);
+    let used = used_pipelines(&list, &fake);
+    assert_eq!(used.len(), 2);
+    assert!(std::ptr::addr_eq(Arc::as_ptr(&used[0]), Arc::as_ptr(&a)));
+    assert!(std::ptr::addr_eq(Arc::as_ptr(&used[1]), Arc::as_ptr(&b)));
+}
+
+#[test]
+fn converting_into_the_vectors_of_an_earlier_frame_gives_the_same_commands() {
+    let fake = Fake::default();
+    let list = stream(vec![
+        stream::Command::SetPrimitiveTopology(4),
+        stream::Command::SetStencilRef(2),
+        stream::Command::SetBlendFactor(None),
+    ]);
+    let first = convert(&list, &fake);
+    let big = stream(vec![stream::Command::SetPrimitiveTopology(5); 50]);
+    let used = convert(&big, &fake);
+    assert_eq!(used.commands.len(), 50);
+    let again = convert_reusing(&list, &fake, used);
+    assert_eq!(
+        format!("{:?}", again.commands),
+        format!("{:?}", first.commands)
+    );
+    assert!(again.commands.capacity() >= 50, "the capacity is kept");
+    assert!(again.writes.is_empty());
+}
