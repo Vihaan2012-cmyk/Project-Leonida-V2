@@ -12,9 +12,17 @@ use super::{EmitError, Emitter, ITERATION_LIMIT, ok};
 
 pub(super) struct Flow {
     reached: Vec<Word>,
-    /// Per loop head: whether a block in its loop branched back to it this time round.
+    /// Per block some later block branches back to: whether one did so this time round.
     again: HashMap<usize, Word>,
-    loops: Vec<(usize, usize)>,
+    loops: Vec<Loop>,
+}
+
+/// A span of blocks that runs again while a branch goes back into it.
+struct Loop {
+    head: usize,
+    end: usize,
+    /// The blocks inside whose back branches belong to this loop and not to one nested in it.
+    targets: Vec<usize>,
 }
 
 fn targets(terminator: &Terminator) -> Vec<usize> {
@@ -25,34 +33,78 @@ fn targets(terminator: &Terminator) -> Vec<usize> {
     }
 }
 
-/// The loops: each spans from a block some later block branches back to, through the last such block.
-/// `None` when two loops share blocks without one lying inside the other.
-fn loops(function: &Function) -> Option<Vec<(usize, usize)>> {
+/// The loops: each spans from a block some later block branches back to, through the last such block. Loops
+/// that only partly overlap are joined into one, which runs again from whichever block was branched back to;
+/// the flag says whether any were.
+fn loops(function: &Function) -> (Vec<Loop>, bool) {
+    let mut back = Vec::new();
     let mut ends: BTreeMap<usize, usize> = BTreeMap::new();
     for (id, block) in function.blocks.iter().enumerate() {
         for target in targets(&block.terminator) {
             if target <= id {
+                back.push((target, id));
                 let end = ends.entry(target).or_insert(id);
                 *end = (*end).max(id);
             }
         }
     }
-    let loops: Vec<(usize, usize)> = ends.into_iter().collect();
-    for (i, outer) in loops.iter().enumerate() {
-        for inner in &loops[i + 1..] {
-            if inner.0 <= outer.1 && inner.1 > outer.1 {
-                return None;
+    let mut spans: Vec<(usize, usize)> = ends.into_iter().collect();
+    let mut joined = false;
+    while let Some((outer, inner)) = partial_overlap(&spans) {
+        spans[outer].1 = spans[inner].1;
+        spans.remove(inner);
+        joined = true;
+    }
+    let mut loops: Vec<Loop> = spans
+        .into_iter()
+        .map(|(head, end)| Loop {
+            head,
+            end,
+            targets: Vec::new(),
+        })
+        .collect();
+    for (target, source) in back {
+        let innermost = loops
+            .iter_mut()
+            .filter(|l| l.head <= target && source <= l.end)
+            .min_by_key(|l| l.end - l.head)
+            .expect("a back branch lies in the span of its target");
+        if !innermost.targets.contains(&target) {
+            innermost.targets.push(target);
+        }
+    }
+    (loops, joined)
+}
+
+/// Two spans (by index) where the second starts inside the first and ends after it.
+fn partial_overlap(spans: &[(usize, usize)]) -> Option<(usize, usize)> {
+    for (i, outer) in spans.iter().enumerate() {
+        for (j, inner) in spans.iter().enumerate() {
+            if outer.0 < inner.0 && inner.0 <= outer.1 && inner.1 > outer.1 {
+                return Some((i, j));
             }
         }
     }
-    Some(loops)
+    None
 }
 
+/// Programs with overlapping loops this small build faster in the driver as a loop over a switch of their blocks;
+/// from this many blocks the guarded form is the faster one (the large ray-tracing resolve programs take about a
+/// quarter of the time).
+const JOIN_FROM_BLOCKS: usize = 600;
+
 pub(super) fn flow(b: &mut Builder, function: &Function, ptr_bool: Word) -> Option<Flow> {
-    let loops = loops(function)?;
+    let (loops, joined) = loops(function);
+    if joined && function.blocks.len() < JOIN_FROM_BLOCKS {
+        return None;
+    }
     let mut flag = || b.variable(ptr_bool, None, StorageClass::Function, None);
     let reached = function.blocks.iter().map(|_| flag()).collect();
-    let again = loops.iter().map(|(head, _)| (*head, flag())).collect();
+    let again = loops
+        .iter()
+        .flat_map(|l| l.targets.iter().copied())
+        .map(|target| (target, flag()))
+        .collect();
     Some(Flow {
         reached,
         again,
@@ -89,11 +141,11 @@ impl Emitter {
             let found = flow
                 .loops
                 .iter()
-                .find(|span| span.0 == at && Some(**span) != inside);
+                .find(|l| l.head == at && Some((l.head, l.end)) != inside);
             match found {
-                Some(&(head, end)) => {
-                    self.loop_span(function, flow, iterations, head, end)?;
-                    at = end + 1;
+                Some(found) => {
+                    self.loop_span(function, flow, iterations, found)?;
+                    at = found.end + 1;
                 }
                 None => {
                     self.guarded_block(function, flow, at)?;
@@ -148,13 +200,14 @@ impl Emitter {
         function: &Function,
         flow: &Flow,
         iterations: Word,
-        head: usize,
-        end: usize,
+        found: &Loop,
     ) -> Result<(), EmitError> {
+        let (head, end) = (found.head, found.end);
         let (u32_, bool_) = (self.t.u32_, self.t.bool_);
         let no = self.boolc(false);
-        let again = flow.again[&head];
-        self.store(again, no)?;
+        for target in &found.targets {
+            self.store(flow.again[target], no)?;
+        }
         let (header, body, next, merge) = (self.b.id(), self.b.id(), self.b.id(), self.b.id());
         ok(self.b.branch(header))?;
         self.begin(header)?;
@@ -164,11 +217,23 @@ impl Emitter {
         self.span(function, flow, iterations, head..end + 1, Some((head, end)))?;
         ok(self.b.branch(next))?;
         self.begin(next)?;
-        let go = ok(self.b.load(bool_, None, again, None, []))?;
-        for (offset, flag) in flow.reached[head..=end].iter().enumerate() {
-            self.store(*flag, if offset == 0 { go } else { no })?;
+        let mut go = no;
+        let mut restart = HashMap::new();
+        for target in &found.targets {
+            let flag = ok(self.b.load(bool_, None, flow.again[target], None, []))?;
+            restart.insert(*target, flag);
+            go = if go == no {
+                flag
+            } else {
+                ok(self.b.logical_or(bool_, None, go, flag))?
+            };
         }
-        self.store(again, no)?;
+        for (block, flag) in flow.reached[head..=end].iter().enumerate() {
+            self.store(*flag, restart.get(&(head + block)).copied().unwrap_or(no))?;
+        }
+        for target in &found.targets {
+            self.store(flow.again[target], no)?;
+        }
         let count = self.load(iterations)?;
         let one = self.u32c(1);
         let count = ok(self.b.i_add(u32_, None, count, one))?;
@@ -178,5 +243,76 @@ impl Emitter {
         let repeat = ok(self.b.logical_and(bool_, None, go, room))?;
         ok(self.b.branch_conditional(repeat, header, merge, []))?;
         self.begin(merge)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shader_ir::Block;
+
+    fn function(terminators: Vec<Terminator>) -> Function {
+        Function {
+            wave64: false,
+            blocks: terminators
+                .into_iter()
+                .enumerate()
+                .map(|(pc, terminator)| Block {
+                    pc,
+                    stmts: Vec::new(),
+                    terminator,
+                })
+                .collect(),
+            temps: 1,
+            ordered: false,
+            upper_lanes: false,
+        }
+    }
+
+    fn shape(loops: &[Loop]) -> Vec<(usize, usize, Vec<usize>)> {
+        loops
+            .iter()
+            .map(|l| (l.head, l.end, l.targets.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn two_branches_back_to_one_block_make_one_loop() {
+        let function = function(vec![
+            Terminator::Jump(1),
+            Terminator::Jump(2),
+            Terminator::Branch(0, 1, 3),
+            Terminator::Branch(0, 1, 4),
+            Terminator::End,
+        ]);
+        assert_eq!(shape(&loops(&function).0), vec![(1, 3, vec![1])]);
+    }
+
+    #[test]
+    fn partly_overlapping_loops_become_one_that_restarts_at_either_target() {
+        let function = function(vec![
+            Terminator::Jump(1),
+            Terminator::Jump(2),
+            Terminator::Branch(0, 1, 3),
+            Terminator::Jump(4),
+            Terminator::Branch(0, 2, 5),
+            Terminator::End,
+        ]);
+        assert_eq!(shape(&loops(&function).0), vec![(1, 4, vec![1, 2])]);
+    }
+
+    #[test]
+    fn an_inner_loop_keeps_its_own_targets() {
+        let function = function(vec![
+            Terminator::Jump(1),
+            Terminator::Jump(2),
+            Terminator::Branch(0, 2, 3),
+            Terminator::Branch(0, 1, 4),
+            Terminator::End,
+        ]);
+        assert_eq!(
+            shape(&loops(&function).0),
+            vec![(1, 3, vec![1]), (2, 2, vec![2])]
+        );
     }
 }
