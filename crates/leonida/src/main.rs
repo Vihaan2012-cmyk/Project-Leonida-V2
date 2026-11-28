@@ -12,10 +12,12 @@ mod cmd_report;
 mod cmd_run;
 mod cmd_shaders;
 mod cmd_systems;
+mod cmd_triage;
 mod cmd_verify;
 mod game;
 mod pipeline_work;
 mod runtime;
+mod triage_signature;
 
 use std::process::ExitCode;
 
