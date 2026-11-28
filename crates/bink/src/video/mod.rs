@@ -1,12 +1,14 @@
 //! Bink 2 video: frame header, slices and macroblocks.
 
 mod block;
+mod deblock;
 mod dsp;
 mod inter;
 #[cfg(test)]
 mod inter_tests;
 mod motion;
 mod pred;
+mod smooth;
 #[cfg(test)]
 mod testutil;
 
@@ -17,6 +19,7 @@ use crate::tables;
 use block::{
     Codes, read_acs, read_cbp_chroma, read_cbp_luma, read_dc_diffs, read_flags, read_quant,
 };
+use deblock::{Meta, info_word};
 use inter::{BlockKind, TypeLru};
 use motion::MvLine;
 use pred::{ChromaDc, DcRange, LumaDc, QuantLine};
@@ -53,6 +56,31 @@ struct Row {
     top: bool,
     wide: bool,
     alpha: bool,
+}
+
+/// Where the information words of one plane of one macroblock go.
+struct Rec<'a> {
+    meta: &'a mut Meta,
+    plane: usize,
+    bx: usize,
+    by: usize,
+}
+
+impl<'a> Rec<'a> {
+    fn new(meta: &'a mut Meta, plane: usize, bx: usize, by: usize) -> Self {
+        Self {
+            meta,
+            plane,
+            bx,
+            by,
+        }
+    }
+
+    /// Records the block at (`x`, `y`) of the macroblock, which is `per_mb` blocks wide.
+    fn set(&mut self, x: usize, y: usize, info: u16, per_mb: usize) {
+        self.meta
+            .set(self.plane, self.bx * per_mb + x, self.by * per_mb + y, info);
+    }
 }
 
 struct SliceState {
@@ -178,12 +206,12 @@ impl VideoDecoder {
             return Err(Error::Unsupported('?'));
         }
         let mut frame = self.blank(index);
+        let (mut row_flags, mut column_flags) = (Vec::new(), Vec::new());
         if flags & 0x10000 != 0 {
-            let mut scratch = Vec::new();
             if flags & 0x8000 == 0 {
                 read_flags(
                     &mut reader,
-                    &mut scratch,
+                    &mut row_flags,
                     true,
                     (self.height as usize).div_ceil(16) * 2 - 1,
                 );
@@ -192,12 +220,17 @@ impl VideoDecoder {
             if flags & 0x4000 == 0 {
                 read_flags(
                     &mut reader,
-                    &mut scratch,
+                    &mut column_flags,
                     true,
                     (self.width as usize).div_ceil(32) * 4 - 1,
                 );
             }
         }
+        let mut meta = Meta::new(
+            frame.planes[0].stride,
+            frame.planes[0].data.len() / frame.planes[0].stride,
+            self.alpha,
+        );
         let skip_alpha = self.alpha && flags & 0x8_0000 != 0;
         if skip_alpha {
             frame.planes[3].data.fill((flags >> 24) as u8);
@@ -220,6 +253,7 @@ impl VideoDecoder {
                     &mut r,
                     &mut state,
                     &mut frame,
+                    &mut meta,
                     flags,
                     by,
                     by == first,
@@ -236,6 +270,18 @@ impl VideoDecoder {
             }
             first = end;
         }
+        deblock::apply(
+            &mut frame,
+            &meta,
+            &deblock::Params {
+                threshold: ((flags & 0xff) << 3) as i16,
+                vertical: flags & 0x4000 == 0,
+                horizontal: flags & 0x8000 == 0,
+                columns: &column_flags,
+                rows: &row_flags,
+                height16: (self.height as usize + 15) & !15,
+            },
+        );
         Ok(frame)
     }
 
@@ -245,6 +291,7 @@ impl VideoDecoder {
         r: &mut BitReader,
         st: &mut SliceState,
         frame: &mut Frame,
+        meta: &mut Meta,
         flags: u32,
         by: usize,
         top: bool,
@@ -272,9 +319,9 @@ impl VideoDecoder {
             };
             match (kind, reference) {
                 (BlockKind::Intra, _) => {
-                    self.intra_mb(r, st, frame, &row, bx, reference.is_some())?
+                    self.intra_mb(r, st, frame, meta, &row, bx, reference.is_some())?
                 }
-                (kind, Some(refr)) => self.inter_mb(r, st, frame, refr, &row, bx, kind)?,
+                (kind, Some(refr)) => self.inter_mb(r, st, frame, meta, refr, &row, bx, kind)?,
                 (_, None) => return None,
             }
         }
@@ -293,6 +340,7 @@ impl VideoDecoder {
         r: &mut BitReader,
         st: &mut SliceState,
         frame: &mut Frame,
+        meta: &mut Meta,
         row: &Row,
         bx: usize,
         inter_frame: bool,
@@ -322,6 +370,7 @@ impl VideoDecoder {
             &range,
             &mut frame.planes[0],
             at,
+            &mut Rec::new(meta, 0, bx, by),
         )?;
         for p in [2usize, 1] {
             let (dc, cbp) = if p == 2 {
@@ -331,7 +380,19 @@ impl VideoDecoder {
             };
             let plane = &mut frame.planes[p];
             let at = by * 16 * plane.stride + bx * 16;
-            self.intra_chroma(r, dc, cbp, q, bx, top, left, &range, plane, at)?;
+            self.intra_chroma(
+                r,
+                dc,
+                cbp,
+                q,
+                bx,
+                top,
+                left,
+                &range,
+                plane,
+                at,
+                &mut Rec::new(meta, p, bx, by),
+            )?;
         }
         if row.alpha {
             let at = luma_at(&frame.planes[3]);
@@ -347,6 +408,7 @@ impl VideoDecoder {
                 &range,
                 &mut frame.planes[3],
                 at,
+                &mut Rec::new(meta, 3, bx, by),
             )?;
         }
         Some(())
@@ -366,23 +428,24 @@ impl VideoDecoder {
         range: &DcRange,
         plane: &mut Plane,
         at: usize,
+        rec: &mut Rec,
     ) -> Option<()> {
         let cbp = read_cbp_luma(r, *cbp_state, wide);
         *cbp_state = cbp;
         let d: [i32; 16] = read_dc_diffs(r, q);
         let dcs = dc.predict_intra(bx, &d, top, left, range);
         let mut blocks = [[0i32; 64]; 16];
+        let mut counts = [0u32; 16];
         for quad in 0..4 {
-            if !read_acs(
+            let got = read_acs(
                 r,
                 &self.codes,
                 cbp >> (4 * quad),
                 &tables::QUANT_INTRA_LUMA,
                 q,
                 &mut blocks[quad * 4..quad * 4 + 4],
-            ) {
-                return None;
-            }
+            )?;
+            counts[quad * 4..quad * 4 + 4].copy_from_slice(&got);
         }
         let stride = plane.stride;
         for (k, block) in blocks.iter_mut().enumerate() {
@@ -391,6 +454,12 @@ impl VideoDecoder {
             let (jx, jy) = ((k % 4) % 2, (k % 4) / 2);
             let off = at + (qy * 16 + jy * 8) * stride + qx * 16 + jx * 8;
             dsp::put_block(block, &mut plane.data[off..], stride);
+            rec.set(
+                qx * 2 + jx,
+                qy * 2 + jy,
+                info_word(true, counts[k], dcs[k]),
+                4,
+            );
         }
         Some(())
     }
@@ -408,27 +477,27 @@ impl VideoDecoder {
         range: &DcRange,
         plane: &mut Plane,
         at: usize,
+        rec: &mut Rec,
     ) -> Option<()> {
         let cbp = read_cbp_chroma(r, *cbp_state);
         *cbp_state = cbp;
         let d: [i32; 4] = read_dc_diffs(r, q);
         let dcs = dc.predict_intra(bx, &d, top, left, range);
         let mut blocks = [[0i32; 64]; 4];
-        if !read_acs(
+        let counts = read_acs(
             r,
             &self.codes,
             cbp,
             &tables::QUANT_INTRA_CHROMA,
             q,
             &mut blocks,
-        ) {
-            return None;
-        }
+        )?;
         let stride = plane.stride;
         for (k, block) in blocks.iter_mut().enumerate() {
             block[0] = dcs[k] * 8 + 32;
             let off = at + (k / 2) * 8 * stride + (k % 2) * 8;
             dsp::put_block(block, &mut plane.data[off..], stride);
+            rec.set(k % 2, k / 2, info_word(true, counts[k], dcs[k]), 2);
         }
         Some(())
     }

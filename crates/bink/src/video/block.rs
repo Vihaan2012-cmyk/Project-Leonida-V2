@@ -221,7 +221,8 @@ pub fn read_cbp_chroma(r: &mut BitReader, previous: u32) -> u32 {
 }
 
 /// Reads the coefficients of up to four blocks. `cbp` has one bit per block in its low bits; a non-zero high half
-/// selects the second code table.
+/// selects the second code table. Returns how many coefficients each block carried (the deblocking filters pick
+/// their strength by it), or `None` when the data is damaged.
 pub fn read_acs(
     r: &mut BitReader,
     codes: &Codes,
@@ -229,7 +230,7 @@ pub fn read_acs(
     quant: &[[u16; 64]; 4],
     q: i32,
     blocks: &mut [[i32; 64]],
-) -> bool {
+) -> Option<[u32; 4]> {
     let book = if cbp >> 16 != 0 {
         &codes.ac1
     } else {
@@ -237,6 +238,7 @@ pub fn read_acs(
     };
     let matrix = &quant[(q & 3) as usize];
     let shift = q >> 2;
+    let mut counts = [0u32; 4];
     for (n, block) in blocks.iter_mut().enumerate() {
         if (cbp >> n) & 1 == 0 {
             continue;
@@ -247,9 +249,7 @@ pub fn read_acs(
             if escape > 0 {
                 escape -= 1;
             } else {
-                let Some(symbol) = book.read(r) else {
-                    return false;
-                };
+                let symbol = book.read(r)?;
                 let run = if symbol == 11 {
                     r.read(6) as usize
                 } else {
@@ -264,10 +264,11 @@ pub fn read_acs(
             let level = read_level(r);
             let pos = usize::from(tables::ZIGZAG[index]);
             block[pos] = (((level * i32::from(matrix[pos])) << shift) + 0x40) >> 7;
+            counts[n] += 1;
             index += 1;
         }
     }
-    !r.overrun()
+    (!r.overrun()).then_some(counts)
 }
 
 #[cfg(test)]
@@ -351,14 +352,8 @@ mod tests {
         let data = pack(&[(0b000, 3), (0, 1), (0, 1), (0b10, 2)]);
         let mut r = BitReader::new(&data);
         let mut block = [[0i32; 64]];
-        assert!(read_acs(
-            &mut r,
-            &codes,
-            1,
-            &tables::QUANT_INTRA_LUMA,
-            0,
-            &mut block
-        ));
+        let counts = read_acs(&mut r, &codes, 1, &tables::QUANT_INTRA_LUMA, 0, &mut block);
+        assert_eq!(counts, Some([1, 0, 0, 0]));
         let expect = ((i32::from(tables::QUANT_INTRA_LUMA[0][1])) + 0x40) >> 7;
         assert_eq!(block[0][1], expect);
         assert_eq!(block[0].iter().filter(|&&v| v != 0).count(), 1);

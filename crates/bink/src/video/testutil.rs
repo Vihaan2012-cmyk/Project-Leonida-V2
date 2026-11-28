@@ -111,7 +111,7 @@ pub fn frame(dec: &VideoDecoder, f: impl Fn(usize, usize, usize) -> u8) -> Frame
 /// A frame payload for a picture one macroblock tall: the frame flags, the offset of the empty second slice and
 /// the macroblock bits.
 pub fn payload(mbs: &Bits) -> Vec<u8> {
-    payload_with_flags(0x2000, mbs)
+    payload_with_flags(0xE000, mbs)
 }
 
 pub fn payload_with_flags(flags: u32, mbs: &Bits) -> Vec<u8> {
