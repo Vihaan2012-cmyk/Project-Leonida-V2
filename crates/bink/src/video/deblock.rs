@@ -20,6 +20,20 @@
 //!   frame of the game's movies sets it.
 //! * Every edge filter moves up to two samples on each side of the edge: with `d = q0 - p0` the outer samples
 //!   change by `(d + 4) >> 3` and the inner ones by `(d + 2) >> 2`, towards each other.
+//!
+//! Further facts read from the library:
+//! * The class of a block is counted where the coefficients are read (RVA 0x150f0): fewer than 8 coefficients
+//!   raise it by one, fewer than 4 by one more, none by a third; the class sits in bits 13 and 14 of the block's
+//!   information word beside the DC value (13 bits) and the intra bit (15). Blocks of inter macroblocks keep an
+//!   all-zero word (RVA 0x17f00 clears them), so next to an intra block only the intra side of the edge moves.
+//! * Chroma blocks are 8x8 as well, so a chroma edge stands for 16 luma samples: its edge flag is the one of the
+//!   luma line at twice the position, and every chroma block boundary is a motion quarter boundary.
+//! * The edge flag lists are read per luma line of 8 samples (index 0 is the border and never set); a set flag
+//!   leaves that line alone.
+//! * Block rows past the picture (macroblock rows that hold only 16 rows of picture) are not filtered, and the
+//!   smoothing of the last picture row looks at the row below it as parsed.
+//! * Slice boundaries need no care: the library defers the edges across a boundary when slices are decoded by
+//!   different threads and ends with the same picture.
 
 use super::motion::Mvs;
 use super::smooth;
