@@ -157,12 +157,15 @@ struct Report {
     narrow_by_stage: [usize; 3],
     approximate: BTreeMap<&'static str, [usize; 3]>,
     approximate_shaders: [usize; 3],
+    hazard_examples: BTreeMap<&'static str, Vec<String>>,
     patterns: BTreeMap<Pattern, [usize; 3]>,
+    wide_ops: BTreeMap<String, ([usize; 3], String)>,
     instructions: usize,
     unsupported: usize,
     missing: BTreeMap<String, (usize, usize, String, String)>,
     lift_errors: BTreeMap<String, usize>,
     examples: bool,
+    lanes_only: bool,
 }
 
 impl Report {
@@ -183,7 +186,7 @@ impl Report {
         self.wave64 += usize::from(wave64);
         let coverage = shader_ir::coverage(code, wave64);
         if wave64 {
-            self.count_narrow(stage, code);
+            self.count_narrow(name, stage, code);
         }
         self.instructions += coverage.instructions;
         self.unsupported += coverage.unsupported.len();
@@ -203,7 +206,7 @@ impl Report {
                 entry.3 = text.clone();
             }
         }
-        if coverage.unsupported.is_empty() && coverage.invalid_words == 0 {
+        if coverage.unsupported.is_empty() && coverage.invalid_words == 0 && !self.lanes_only {
             self.complete += 1;
             match shader_ir::lift(code, wave64) {
                 Ok(function) if function.verify().is_ok() => {
@@ -223,7 +226,7 @@ impl Report {
         Some(())
     }
 
-    fn count_narrow(&mut self, stage: Option<Stage>, code: &[u8]) {
+    fn count_narrow(&mut self, name: &str, stage: Option<Stage>, code: &[u8]) {
         let slot = match stage {
             Some(Stage::Pixel) => 0,
             Some(Stage::Vertex) => 1,
@@ -235,9 +238,20 @@ impl Report {
         self.approximate_shaders[slot] += usize::from(!hazards.is_empty());
         for hazard in hazards {
             self.approximate.entry(hazard.describe()).or_default()[slot] += 1;
+            let examples = self.hazard_examples.entry(hazard.describe()).or_default();
+            if examples.len() < if self.examples { 12 } else { 3 } {
+                examples.push(name.to_string());
+            }
         }
         for pattern in shader_ir::lane_patterns(code) {
             self.patterns.entry(pattern).or_default()[slot] += 1;
+        }
+        for op in shader_ir::wide_scalar_ops(code) {
+            let entry = self.wide_ops.entry(op).or_default();
+            entry.0[slot] += 1;
+            if entry.1.is_empty() {
+                entry.1 = name.to_string();
+            }
         }
     }
 
@@ -254,7 +268,10 @@ impl Report {
             return;
         };
         if wave64 {
-            self.count_narrow(Some(Stage::Vertex), code);
+            self.count_narrow("(first half)", Some(Stage::Vertex), code);
+        }
+        if self.lanes_only {
+            return;
         }
         let result = shader_ir::lift(code, wave64)
             .map_err(|e| e.to_string())
@@ -314,7 +331,14 @@ impl Report {
             "64-lane graphics programs, which run 32 lanes wide (pixel / vertex including merged first halves / geometry): {np} / {nv} / {ng}; of which name lanes 32-63 by number: {ap} / {av} / {ag}"
         );
         for (reason, [p, v, g]) in &self.approximate {
-            println!("  {p} / {v} / {g} {reason}");
+            let examples = self
+                .hazard_examples
+                .get(reason)
+                .map(|names| names.join(", "));
+            println!(
+                "  {p} / {v} / {g} {reason}  e.g. {}",
+                examples.unwrap_or_default()
+            );
         }
         println!("lane-mask patterns in those programs (pixel / vertex / geometry):");
         for (pattern, [p, v, g]) in &self.patterns {
@@ -324,6 +348,12 @@ impl Report {
                 "empty upper half is enough"
             };
             println!("  {p} / {v} / {g} {} [{kind}]", pattern.describe());
+        }
+        if self.examples {
+            println!("64-bit scalar instructions in those programs (pixel / vertex / geometry):");
+            for (op, ([p, v, g], example)) in &self.wide_ops {
+                println!("  {p} / {v} / {g} {op}  e.g. {example}");
+            }
         }
         let mut missing: Vec<_> = self.missing.iter().collect();
         missing.sort_by(|a, b| (b.1.0, b.1.1).cmp(&(a.1.0, a.1.1)).then(a.0.cmp(b.0)));
@@ -344,6 +374,7 @@ pub fn report_command(args: &ReportArgs) -> Result<ExitCode> {
     with_archive(args.game.as_ref(), |archive| {
         let mut report = Report {
             examples: args.examples,
+            lanes_only: args.lanes_only,
             ..Report::default()
         };
         carve(archive, |shader| {
