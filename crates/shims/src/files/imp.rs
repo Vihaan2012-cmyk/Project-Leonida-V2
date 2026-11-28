@@ -3,14 +3,24 @@ use std::ffi::c_void;
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{FALSE, HANDLE, INVALID_HANDLE_VALUE, SetLastError, TRUE};
+use windows_sys::Win32::Globalization::{CP_ACP, WideCharToMultiByte};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem as fs_api;
-use windows_sys::Win32::Storage::FileSystem::{CREATEFILE2_EXTENDED_PARAMETERS, WIN32_FIND_DATAW};
+use windows_sys::Win32::Storage::FileSystem::{
+    CREATEFILE2_EXTENDED_PARAMETERS, WIN32_FIND_DATAA, WIN32_FIND_DATAW,
+};
 use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+
+#[path = "crt.rs"]
+mod crt;
+#[path = "extra.rs"]
+mod extra;
+#[path = "registry.rs"]
+mod registry;
 
 use super::{Refusal, Target, resolve};
 use crate::Shim;
@@ -31,6 +41,7 @@ const WRITE_ACCESS: u32 =
 const FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
 const FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const MOVEFILE_REPLACE_EXISTING: u32 = 1;
+const MOVEFILE_DELAY_UNTIL_REBOOT: u32 = 4;
 
 static HIDDEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
@@ -143,15 +154,20 @@ fn trace_path(text: &str) {
 
 /// Notes a refused name once for the boot trace.
 pub(super) fn note_refusal(refusal: Refusal, text: &str) {
+    note_once(text, format!("file access refused ({refusal:?}): {text}"));
+}
+
+/// Adds `line` to the boot trace unless a line was already added for `key`.
+pub(super) fn note_once(key: &str, line: String) {
     let fresh = DENIED
         .lock()
         .map(|mut seen| {
             let seen = seen.get_or_insert_with(HashSet::new);
-            seen.len() < SEEN_LIMIT && seen.insert(text.to_lowercase())
+            seen.len() < SEEN_LIMIT && seen.insert(key.to_lowercase())
         })
         .unwrap_or(false);
     if fresh {
-        note(format!("file access refused ({refusal:?}): {text}"));
+        note(line);
     }
 }
 
@@ -360,6 +376,7 @@ unsafe extern "win64" fn get_file_attributes_ex_a(
 struct Listing {
     entries: Vec<WIN32_FIND_DATAW>,
     next: usize,
+    narrow: bool,
 }
 
 static LISTINGS: Mutex<Option<HashMap<usize, Listing>>> = Mutex::new(None);
@@ -412,16 +429,62 @@ fn split_pattern(text: &str) -> (&str, &str) {
     }
 }
 
+/// Writes a listing entry to the program's find record, in the 8-bit form when the program asked for one.
+unsafe fn store_entry(data: *mut c_void, entry: &WIN32_FIND_DATAW, narrow: bool) {
+    if narrow {
+        // SAFETY: an all-zero record is valid.
+        let mut out: WIN32_FIND_DATAA = unsafe { std::mem::zeroed() };
+        out.dwFileAttributes = entry.dwFileAttributes;
+        out.ftCreationTime = entry.ftCreationTime;
+        out.ftLastAccessTime = entry.ftLastAccessTime;
+        out.ftLastWriteTime = entry.ftLastWriteTime;
+        out.nFileSizeHigh = entry.nFileSizeHigh;
+        out.nFileSizeLow = entry.nFileSizeLow;
+        out.dwReserved0 = entry.dwReserved0;
+        out.dwReserved1 = entry.dwReserved1;
+        narrow_name(&entry.cFileName, &mut out.cFileName);
+        narrow_name(&entry.cAlternateFileName, &mut out.cAlternateFileName);
+        // SAFETY: `data` is the program's `WIN32_FIND_DATAA`.
+        unsafe { *data.cast::<WIN32_FIND_DATAA>() = out };
+    } else {
+        // SAFETY: `data` is the program's `WIN32_FIND_DATAW`.
+        unsafe { *data.cast::<WIN32_FIND_DATAW>() = *entry };
+    }
+}
+
+/// A file name in the system's 8-bit code page, `?` where it has no letter for a character.
+fn narrow_name(name: &[u16], out: &mut [i8]) {
+    let end = name.iter().position(|c| *c == 0).unwrap_or(name.len());
+    // SAFETY: converts `end` characters into a buffer whose size is given.
+    let written = unsafe {
+        WideCharToMultiByte(
+            CP_ACP,
+            0,
+            name.as_ptr(),
+            end as i32,
+            out.as_mut_ptr().cast(),
+            out.len() as i32 - 1,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        )
+    };
+    out[written.max(0) as usize] = 0;
+}
+
 unsafe fn find_first(
-    pattern: *const u16,
+    text: &str,
     level: i32,
     data: *mut c_void,
     operation: i32,
     filter: *const c_void,
     flags: u32,
+    narrow: bool,
 ) -> HANDLE {
-    let text = wide_ptr_to_string(pattern);
-    let (folder, mask) = split_pattern(&text);
+    let (folder, mask) = split_pattern(text);
+    if mask == ".." || mask.contains(':') {
+        set_error(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
     let mapped = match target(folder, false) {
         Ok(mapped) => mapped,
         Err(code) => {
@@ -432,8 +495,15 @@ unsafe fn find_first(
     let (base, overlay) = match &mapped {
         Target::Layered { base, overlay } => (Some(base.clone()), Some(overlay.clone())),
         Target::Direct { path, .. } => (None, Some(path.clone())),
+        Target::Passthrough if narrow => {
+            let name: Vec<u8> = text.bytes().chain([0]).collect();
+            // SAFETY: a terminated pattern; the other arguments are the program's.
+            return unsafe {
+                fs_api::FindFirstFileExA(name.as_ptr(), level, data, operation, filter, flags)
+            };
+        }
         Target::Passthrough => {
-            let wide = to_wide(Path::new(&text));
+            let wide = to_wide(Path::new(text));
             // SAFETY: a terminated pattern; the other arguments are the program's.
             return unsafe {
                 fs_api::FindFirstFileExW(wide.as_ptr(), level, data, operation, filter, flags)
@@ -464,20 +534,35 @@ unsafe fn find_first(
         set_error(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
     }
-    // SAFETY: `data` is the program's `WIN32_FIND_DATAW`.
-    unsafe { *data.cast::<WIN32_FIND_DATAW>() = entries[0] };
+    // SAFETY: `data` is the program's find record.
+    unsafe { store_entry(data, &entries[0], narrow) };
     let handle = NEXT_LISTING.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut listings) = LISTINGS.lock() {
-        listings
-            .get_or_insert_with(HashMap::new)
-            .insert(handle, Listing { entries, next: 1 });
+        listings.get_or_insert_with(HashMap::new).insert(
+            handle,
+            Listing {
+                entries,
+                next: 1,
+                narrow,
+            },
+        );
     }
     handle as HANDLE
 }
 
 unsafe extern "win64" fn find_first_file_w(pattern: *const u16, data: *mut c_void) -> HANDLE {
     // SAFETY: forwarded as given.
-    unsafe { find_first(pattern, 0, data, 0, std::ptr::null(), 0) }
+    unsafe {
+        find_first(
+            &wide_ptr_to_string(pattern),
+            0,
+            data,
+            0,
+            std::ptr::null(),
+            0,
+            false,
+        )
+    }
 }
 
 unsafe extern "win64" fn find_first_file_ex_w(
@@ -489,30 +574,47 @@ unsafe extern "win64" fn find_first_file_ex_w(
     flags: u32,
 ) -> HANDLE {
     // SAFETY: forwarded as given.
-    unsafe { find_first(pattern, level, data, operation, filter, flags) }
+    unsafe {
+        find_first(
+            &wide_ptr_to_string(pattern),
+            level,
+            data,
+            operation,
+            filter,
+            flags,
+            false,
+        )
+    }
 }
 
-unsafe extern "win64" fn find_next_file_w(handle: HANDLE, data: *mut c_void) -> i32 {
+unsafe fn find_next(handle: HANDLE, data: *mut c_void, narrow: bool) -> i32 {
     let ours = LISTINGS.lock().ok().and_then(|mut listings| {
         let listing = listings.as_mut()?.get_mut(&(handle as usize))?;
         Some(match listing.entries.get(listing.next) {
             Some(entry) => {
                 listing.next += 1;
-                Some(*entry)
+                Some((*entry, listing.narrow))
             }
             None => None,
         })
     });
     match ours {
-        Some(Some(entry)) => {
-            // SAFETY: `data` is the program's `WIN32_FIND_DATAW`.
-            unsafe { *data.cast::<WIN32_FIND_DATAW>() = entry };
+        Some(Some((entry, was_narrow))) => {
+            // SAFETY: `data` is the program's find record, in the form its listing was opened with.
+            unsafe { store_entry(data, &entry, was_narrow) };
             TRUE
         }
         Some(None) => fail_bool(ERROR_NO_MORE_FILES),
+        // SAFETY: a host handle from `FindFirstFileExA`.
+        None if narrow => unsafe { fs_api::FindNextFileA(handle, data.cast()) },
         // SAFETY: a host handle from `FindFirstFileExW`.
         None => unsafe { fs_api::FindNextFileW(handle, data.cast()) },
     }
+}
+
+unsafe extern "win64" fn find_next_file_w(handle: HANDLE, data: *mut c_void) -> i32 {
+    // SAFETY: forwarded as given.
+    unsafe { find_next(handle, data, false) }
 }
 
 unsafe extern "win64" fn find_close(handle: HANDLE) -> i32 {
@@ -623,6 +725,9 @@ unsafe extern "win64" fn set_file_attributes_w(name: *const u16, attributes: u32
 }
 
 fn move_file(from: &str, to: &str, flags: u32) -> Result<(), u32> {
+    if flags & MOVEFILE_DELAY_UNTIL_REBOOT != 0 {
+        return Err(ERROR_ACCESS_DENIED);
+    }
     let source = target(from, true)?;
     let destination = target(to, true)?;
     if visible(&destination, to) && flags & MOVEFILE_REPLACE_EXISTING == 0 {
@@ -690,39 +795,8 @@ fn ucrt(name: &str) -> usize {
     unsafe { GetProcAddress(module as *mut c_void, symbol.as_ptr()).map_or(0, |f| f as usize) }
 }
 
-type WFopen = unsafe extern "C" fn(*const u16, *const u16) -> *mut c_void;
-type WStat = unsafe extern "C" fn(*const u16, *mut c_void) -> i32;
-
-fn crt_function(slot: &'static OnceLock<usize>, name: &str) -> usize {
-    *slot.get_or_init(|| ucrt(name))
-}
-
-static WFOPEN: OnceLock<usize> = OnceLock::new();
-static WSTAT: OnceLock<usize> = OnceLock::new();
-
 fn open_stream(text: &str, mode: &str) -> *mut c_void {
-    let function = crt_function(&WFOPEN, "_wfopen");
-    if function == 0 {
-        return std::ptr::null_mut();
-    }
-    let writes = mode.contains(['w', 'a', '+']);
-    let path = target(text, writes).and_then(|target| {
-        if !writes {
-            return Ok(read_path(&target, text));
-        }
-        write_path(
-            &target,
-            text,
-            mode.contains(['a', '+']) && !mode.contains('w'),
-        )
-    });
-    let Ok(path) = path else {
-        return std::ptr::null_mut();
-    };
-    let wide = to_wide(&path);
-    let mode: Vec<u16> = mode.encode_utf16().chain([0]).collect();
-    // SAFETY: `function` is `_wfopen`; both strings are terminated.
-    unsafe { std::mem::transmute::<usize, WFopen>(function)(wide.as_ptr(), mode.as_ptr()) }
+    crt::open_stream_shared(text, mode, None)
 }
 
 unsafe extern "win64" fn wfopen(name: *const u16, mode: *const u16) -> *mut c_void {
@@ -733,22 +807,13 @@ unsafe extern "win64" fn fopen(name: *const u8, mode: *const u8) -> *mut c_void 
     open_stream(&narrow_ptr_to_string(name), &narrow_ptr_to_string(mode))
 }
 
-unsafe extern "win64" fn wstat64(name: *const u16, buffer: *mut c_void) -> i32 {
-    let function = crt_function(&WSTAT, "_wstat64");
-    let text = wide_ptr_to_string(name);
-    match attributes_path(&text) {
-        // SAFETY: `function` is `_wstat64`; the path is terminated and `buffer` is the program's.
-        Ok(path) if function != 0 => unsafe {
-            std::mem::transmute::<usize, WStat>(function)(path.as_ptr(), buffer)
-        },
-        _ => -1,
-    }
-}
-
 unsafe extern "win64" fn remove(name: *const u8) -> i32 {
     match delete_file(&narrow_ptr_to_string(name)) {
         Ok(()) => 0,
-        Err(_) => -1,
+        Err(code) => {
+            crt::set_errno(code);
+            -1
+        }
     }
 }
 
@@ -816,37 +881,30 @@ pub fn shims() -> Vec<Shim> {
             });
         }
     }
-    for (dll, name, address) in [
-        (
-            "api-ms-win-crt-stdio-l1-1-0.dll",
-            "_wfopen",
-            wfopen as *const () as usize,
-        ),
-        (
-            "api-ms-win-crt-stdio-l1-1-0.dll",
-            "fopen",
-            fopen as *const () as usize,
-        ),
-        (
-            "api-ms-win-crt-filesystem-l1-1-0.dll",
-            "_wstat64",
-            wstat64 as *const () as usize,
-        ),
-        (
-            "api-ms-win-crt-filesystem-l1-1-0.dll",
-            "remove",
-            remove as *const () as usize,
-        ),
-        ("ucrtbase.dll", "_wfopen", wfopen as *const () as usize),
-        ("ucrtbase.dll", "fopen", fopen as *const () as usize),
-        ("ucrtbase.dll", "_wstat64", wstat64 as *const () as usize),
-        ("ucrtbase.dll", "remove", remove as *const () as usize),
-    ] {
-        shims.push(Shim { dll, name, address });
+    shims.extend(extra::shims());
+    shims.extend(registry::shims());
+    shims.extend(crt::cpp_shims());
+    let streams: [(&str, usize); 3] = [
+        ("_wfopen", wfopen as *const () as usize),
+        ("fopen", fopen as *const () as usize),
+        ("remove", remove as *const () as usize),
+    ];
+    for (name, address) in streams.iter() {
+        for dll in crt::CRT_SETS {
+            shims.push(Shim {
+                dll,
+                name,
+                address: *address,
+            });
+        }
     }
+    shims.extend(crt::shims());
     shims
 }
 
+#[cfg(test)]
+#[path = "sandbox_tests.rs"]
+mod sandbox_tests;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
