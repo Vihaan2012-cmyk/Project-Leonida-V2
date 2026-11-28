@@ -4,6 +4,7 @@
 pub mod camera;
 pub mod clock_floor;
 pub mod diagnostics;
+pub mod frame_timers;
 pub mod framerate;
 pub mod patch;
 pub mod widescreen;

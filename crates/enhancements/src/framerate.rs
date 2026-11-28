@@ -83,7 +83,8 @@
 //!   none is patched. [`Entry`] records them as data.
 //!
 //! The frame counter is used mostly to mean "updated this or last frame" (83 functions subtract it and compare with 1,
-//! 2 or 3), which does not depend on the rate. A few use it as time: see [`FRAME_COUNTER_TIMERS`].
+//! 2 or 3), which does not depend on the rate. A few use it as time, and a few functions floor their time step at
+//! 1/60 s: both are patched, see [`crate::frame_timers`] ([`FRAME_TIMERS`]).
 
 use crate::patch::{Finder, Patch, PatchError, Pattern, Site};
 use iced_x86::{Mnemonic, OpKind, Register};
@@ -186,6 +187,36 @@ pub const CLOCK_FLOOR: Entry = Entry {
     find: Some(crate::clock_floor::find),
 };
 
+pub const FRAME_TIMERS: Entry = Entry {
+    id: "frame-timers",
+    summary: "Keep logic that floors its time step at 1/60 s or counts frames at the 60 per second rate above 60 fps",
+    proof: Proof::Unproven,
+    activation: Activation::WithCustomLimit,
+    evidence: &[
+        Evidence {
+            rva: 0x0222_6759,
+            what: "call in sub_022264d0 that updates the main clock; wrapped to average the frame rate and set the floor",
+        },
+        Evidence {
+            rva: 0x0222_6040,
+            what: "sub_02226040 adds 1 to the frame counter at record +4 and stores the step at +0xc",
+        },
+        Evidence {
+            rva: 0x00b7_4dd0,
+            what: "entity time step floored at 1/60 s (loads at 0xb74df6 and 0xb74e03); three more floors in sub_01241ed0, sub_031e5bc0, sub_031e67e0",
+        },
+        Evidence {
+            rva: 0x031b_248f,
+            what: "one of thirteen frame - stamp deltas that the patch scales (see frame_timers::TICK_SITES)",
+        },
+        Evidence {
+            rva: 0x0615_9e10,
+            what: "the 1/60 s literal the eight floor loads read",
+        },
+    ],
+    find: Some(crate::frame_timers::find_frame_timers),
+};
+
 pub const FRAME_EVENT_INTERVAL: Entry = Entry {
     id: "frame-event-interval",
     summary: "The interval the title registers for the frame events, 8333 to 66667 microseconds",
@@ -248,7 +279,7 @@ pub const GAME_LIMITER: Entry = Entry {
 
 pub const FRAME_COUNTER_TIMERS: Entry = Entry {
     id: "frame-counter-timers",
-    summary: "Timers that count frames of the main clock (0xabbef44) instead of time: too fast above 30 or 60 fps",
+    summary: "Other uses of the frame counter (0xabbef44) that count frames: work spreading and budgets, no patch",
     proof: Proof::Unproven,
     activation: Activation::DataOnly,
     evidence: &[
@@ -311,9 +342,10 @@ pub const FIXED_STEP_CONSTANTS: Entry = Entry {
 };
 
 /// Every entry, patches first.
-pub const ENTRIES: [&Entry; 7] = [
+pub const ENTRIES: [&Entry; 8] = [
     &STEP_FLOOR,
     &CLOCK_FLOOR,
+    &FRAME_TIMERS,
     &FRAME_EVENT_INTERVAL,
     &CEILING,
     &GAME_LIMITER,
