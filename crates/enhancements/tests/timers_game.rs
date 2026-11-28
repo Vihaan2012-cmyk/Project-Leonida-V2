@@ -186,3 +186,32 @@ fn the_time_step_floors_are_where_the_notes_say() {
         assert!(seen.contains(&rva), "{rva:#x}");
     }
 }
+
+/// Decodes every function several times: slow in a debug build, so run with `--release -- --ignored`.
+#[test]
+#[ignore]
+fn the_whole_selection_for_a_custom_limit_does_not_overlap() {
+    let Some(bytes) = executable() else {
+        return;
+    };
+    let image = Image::parse(&bytes).unwrap();
+    let finder = Finder::new(&image);
+    let patches = enhancements::framerate::select(&finder, true, &[]).unwrap();
+    assert_eq!(
+        patches.len(),
+        1 + 2 + 2 + TICK_SITES.len() + 1 + 2 * DT_FLOOR_FUNCTIONS.len()
+    );
+    let mut ranges: Vec<(u32, u32, &str)> = patches
+        .iter()
+        .map(|p| (p.rva, p.rva + p.original.len() as u32, p.name.as_str()))
+        .collect();
+    ranges.sort_unstable();
+    for pair in ranges.windows(2) {
+        assert!(
+            pair[0].1 <= pair[1].0,
+            "{} overlaps {}",
+            pair[0].2,
+            pair[1].2
+        );
+    }
+}
