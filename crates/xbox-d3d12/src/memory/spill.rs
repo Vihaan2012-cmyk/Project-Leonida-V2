@@ -192,19 +192,30 @@ impl AddressSpace {
             .collect()
     }
 
-    /// Mirrors spilled runs again, lowest address first, while the budget has room for them, and returns the bytes
-    /// done. The copies to device-local memory are made by the next `record_uploads`. Call it when device-local
-    /// memory has been freed; `reclaim` does.
+    /// Mirrors spilled runs again, those the resource layer called hot first and then lowest address first, while
+    /// the budget has room for them, and returns the bytes done. The copies to device-local memory are made by the
+    /// next `record_uploads`. Call it when device-local memory has been freed; `reclaim` does.
     pub fn promote_spilled(&mut self) -> Result<u64, MemoryError> {
         let mut done = 0;
         let mut room = self.h.budget.mirror_room();
-        for run in self.whole_runs() {
-            let spilled = self
-                .memories
-                .get(&run.id)
-                .is_some_and(|m| m.is_spilled() && !m.pinned);
-            if !spilled || done + run.len > PROMOTE_PER_CALL || run.len > room {
+        self.promote_more = false;
+        let mut waiting: Vec<Whole> = self
+            .whole_runs()
+            .into_iter()
+            .filter(|r| {
+                self.memories
+                    .get(&r.id)
+                    .is_some_and(|m| m.is_spilled() && !m.pinned)
+            })
+            .collect();
+        waiting.sort_by_key(|r| (!self.temp.is_hot(r.va, r.va + r.len), r.va));
+        for run in waiting {
+            if run.len > room {
                 continue;
+            }
+            if done + run.len > PROMOTE_PER_CALL {
+                self.promote_more = true;
+                break;
             }
             let host = self.memories[&run.id].host;
             let (handle, mirror, grant) = match self.import_mirrored(host, run.len) {
@@ -229,49 +240,6 @@ impl AddressSpace {
             self.sync.dirty.add(run.va, run.va + run.len);
             done += run.len;
             room -= run.len;
-        }
-        self.commit()?;
-        Ok(done)
-    }
-
-    /// Moves the runs lying wholly inside `va..va + len` out of device-local memory into system memory, bound
-    /// straight into the window. For memory the GPU reads only through other objects: a texture's detiled image
-    /// is made from the host bytes, so the window's copy of the texture's memory only takes device-local memory
-    /// and upload bandwidth. What the GPU wrote into them is copied back first; no commands that use the window
-    /// may be in flight. Returns the bytes moved.
-    pub fn spill_range(&mut self, va: u64, len: u64) -> Result<u64, MemoryError> {
-        if !self.spill {
-            return Ok(0);
-        }
-        let end = va + len;
-        let runs: Vec<Whole> = self
-            .whole_runs()
-            .into_iter()
-            .filter(|r| r.va >= va && r.va + r.len <= end)
-            .filter(|r| self.memories.get(&r.id).is_some_and(|m| !m.is_spilled()))
-            .collect();
-        let mut done = 0;
-        for run in runs {
-            self.read_back(run.va, run.len)?;
-            let host = self.memories[&run.id].host;
-            let (handle, _, grant) = self.import_spilled(host, run.len)?;
-            let memory = self.memories.get_mut(&run.id).expect("found above");
-            self.retired_memory
-                .push(std::mem::replace(&mut memory.handle, handle));
-            self.retired_grants.extend(memory.grant.replace(grant));
-            memory.pinned = true;
-            if let Some(mirror) = memory.mirror.take() {
-                self.retired_buffers.push(mirror.buffer);
-                self.retired_memory.push(mirror.import);
-            }
-            self.pending.push(Bind {
-                offset: run.va - self.window.base,
-                size: run.len,
-                memory: handle,
-                memory_offset: 0,
-            });
-            self.sync.forget(run.va, run.va + run.len);
-            done += run.len;
         }
         self.commit()?;
         Ok(done)

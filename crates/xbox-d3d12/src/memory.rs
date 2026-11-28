@@ -50,12 +50,14 @@ use ash::ext::external_memory_host;
 use ash::vk;
 
 mod budget;
+mod cold;
 mod dirty;
 mod spill;
 mod sync;
 mod transfer;
 
 pub use budget::{Budget, Class, Counters, Grant, MemoryExtensions, Placement, Request};
+pub use cold::{Split, WindowClasses};
 use dirty::Tiles;
 pub use sync::HostAccess;
 pub use transfer::{TimelineWait, TransferQueue, pick_transfer_family};
@@ -367,6 +369,10 @@ pub struct AddressSpace {
     spill: bool,
     lenient: bool,
     reclaims: u32,
+    /// `promote_spilled` stopped at its per-call limit with runs still waiting: the next `reclaim` goes on.
+    promote_more: bool,
+    /// What is known of how the GPU uses the game's memory: see `cold`.
+    temp: cold::Temperature,
     generation: u64,
     transfer: Option<transfer::Transfer>,
     /// The families the window and the copy buffers are shared by: more than one when a transfer queue of another
@@ -462,6 +468,8 @@ impl AddressSpace {
             spill: false,
             lenient: false,
             reclaims: 0,
+            promote_more: false,
+            temp: cold::Temperature::default(),
             generation: 0,
             transfer: None,
             families,
@@ -1044,6 +1052,7 @@ impl AddressSpace {
     fn unmap_range(&mut self, va: u64, len: u64) {
         self.forget_deferred(va, len);
         self.sync.forget(va, va + len);
+        self.temp.forget(va, va + len);
         for cut in self.extents.remove(va, len) {
             self.pending.push(Bind {
                 offset: cut.va - self.window.base,
@@ -1135,7 +1144,7 @@ impl AddressSpace {
             self.h.budget.release(&grant);
         }
         self.reclaims = self.reclaims.wrapping_add(1);
-        let now = freed || self.reclaims.is_multiple_of(64);
+        let now = freed || self.promote_more || self.reclaims.is_multiple_of(64);
         if !self.deferred.is_empty() && now {
             let _ = self.retry_deferred();
         }
@@ -1174,6 +1183,8 @@ impl Drop for AddressSpace {
 mod bench;
 #[cfg(test)]
 mod budget_tests;
+#[cfg(test)]
+mod cold_tests;
 pub mod hooks;
 #[cfg(test)]
 mod probe;
