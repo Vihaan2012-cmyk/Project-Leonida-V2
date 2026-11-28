@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ash::vk;
 use shader_translate::FloatMode;
@@ -25,6 +25,7 @@ use crate::heap::console::{ConsolePlacement, HeapAllocator, NoAllocator};
 use crate::heap::{HeapPlacement, Placed, ResourcesLow};
 use crate::memory::{self, AddressSpace, Config, MemoryError, SyncPolicy};
 use crate::pacing::{FrameLimit, Pacer};
+use crate::pipeline::shaders::ShaderSource;
 use crate::pipeline::{DirectTranslation, PipelineCache, PipelineEnv, PipelineError};
 use crate::present::vulkan::OffscreenTarget;
 use crate::present::{
@@ -137,11 +138,38 @@ impl AssemblyConfig {
     }
 }
 
+/// Where the time of `Assembly::execute` went, summed over the submissions since the last `take`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ExecTimings {
+    pub submissions: u32,
+    /// Waiting for pipeline builds and finding the textures the title wrote.
+    pub prepare: Duration,
+    /// Command streams to replay commands, through the resolver.
+    pub convert: Duration,
+    pub bindless: Duration,
+    /// Merging the ranges the GPU writes and gathering the address space's dirty memory into uploads.
+    pub memory: Duration,
+    /// The replay of the commands into the command buffer, uploads and downloads included.
+    pub record: Duration,
+    /// Ending the command buffer, submitting it and waiting for the GPU.
+    pub submit_wait: Duration,
+    /// Releasing detiled memory and reclaiming after the GPU is done.
+    pub finish: Duration,
+    pub total: Duration,
+}
+
+impl ExecTimings {
+    pub fn take(&mut self) -> ExecTimings {
+        std::mem::take(self)
+    }
+}
+
 /// What one submission works with at a time.
 pub struct ExecState {
     pub pool: vk::CommandPool,
     pub fence: vk::Fence,
     pub spill: SpillRing,
+    pub timings: ExecTimings,
 }
 
 pub struct Assembly {
@@ -218,6 +246,20 @@ impl Assembly {
         config: &AssemblyConfig,
         wrap: impl FnOnce(Arc<PipelineEnv>) -> SharedBuilder,
     ) -> Result<Arc<Assembly>, AssemblyError> {
+        Self::build_with_source(
+            config,
+            Arc::new(DirectTranslation::new(FloatMode::default())),
+            wrap,
+        )
+    }
+
+    /// As `build_with`, with the shader translation `source` instead of the direct one: tests and benchmarks that
+    /// bring their own shaders.
+    pub fn build_with_source(
+        config: &AssemblyConfig,
+        source: Arc<dyn ShaderSource>,
+        wrap: impl FnOnce(Arc<PipelineEnv>) -> SharedBuilder,
+    ) -> Result<Arc<Assembly>, AssemblyError> {
         let gpu = Arc::new(Gpu::create(&config.gpu)?);
         gpu.handles.budget.set_note(com::note);
         gpu.handles.budget.announce();
@@ -234,7 +276,7 @@ impl Assembly {
             gpu.ctx.clone(),
             bindless.layout,
             cache,
-            Arc::new(DirectTranslation::new(FloatMode::default())),
+            source,
             code.clone(),
         )?;
         pipelines.note = Arc::new(|text| com::note_once(text.to_string()));
@@ -296,6 +338,7 @@ impl Assembly {
                 )?,
                 fence: device.create_fence(&vk::FenceCreateInfo::default(), None)?,
                 spill: SpillRing::new(&resources),
+                timings: ExecTimings::default(),
             }
         };
         Ok(Arc::new(Assembly {
