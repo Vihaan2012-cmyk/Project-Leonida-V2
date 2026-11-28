@@ -550,7 +550,7 @@ fn the_c_runtime_streams_follow_the_same_rules() {
         assert!(fopen(a(&new_file).as_ptr(), a("wb").as_ptr()).is_null());
         assert_eq!(errno(), 13);
         assert!(!Path::new(&new_file).exists());
-        let mut stream = 1usize as *mut c_void;
+        let mut stream = std::ptr::dangling_mut::<c_void>();
         assert_eq!(
             wfopen_s(&mut stream, w(&secret_file).as_ptr(), w("r").as_ptr()),
             2
