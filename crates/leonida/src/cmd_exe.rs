@@ -98,7 +98,16 @@ pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
         ExeCommand::Imports { dll } => imports(&image, dll.as_deref()),
         ExeCommand::Network => network(&image),
         ExeCommand::Functions { top } => functions(&image, *top),
-        ExeCommand::Disasm { address, limit } => disasm(&image, address, *limit)?,
+        ExeCommand::Disasm {
+            address,
+            limit,
+            end,
+        } => disasm(&image, address, *limit, end.as_deref())?,
+        ExeCommand::Dump {
+            address,
+            len,
+            width,
+        } => dump(&image, address, *len, *width)?,
         ExeCommand::Analyze { out, threads } => analyze(&image, out, *threads)?,
         ExeCommand::Strings { find, min, limit } => strings(&image, find.as_deref(), *min, *limit),
         ExeCommand::Xrefs {
@@ -334,12 +343,26 @@ fn parse_address(image: &Image<'_>, text: &str) -> Result<u32> {
     u32::try_from(rva).map_err(|_| anyhow!("address outside the image"))
 }
 
-fn disasm(image: &Image<'_>, address: &str, limit: usize) -> Result<()> {
+fn dump(image: &Image<'_>, address: &str, len: usize, width: usize) -> Result<()> {
+    let rva = parse_address(image, address)?;
+    let bytes = image
+        .read(rva, len)
+        .ok_or_else(|| anyhow!("0x{rva:x}+{len} is not backed by file data"))?;
+    for (n, line) in bytes.chunks(width.max(1)).enumerate() {
+        let hex: Vec<String> = line.iter().map(|b| format!("{b:02x}")).collect();
+        println!("{:08x}  {}", rva as usize + n * width.max(1), hex.join(" "));
+    }
+    Ok(())
+}
+
+fn disasm(image: &Image<'_>, address: &str, limit: usize, end: Option<&str>) -> Result<()> {
+    let range_end = end;
     let rva = parse_address(image, address)?;
     let function = image.function_containing(rva);
-    let (start, end) = match function {
-        Some(f) => (f.begin, f.end),
-        None => (rva, rva.saturating_add(0x100)),
+    let (start, end) = match (end, function) {
+        (Some(end), _) => (rva, parse_address(image, end)?),
+        (None, Some(f)) => (f.begin, f.end),
+        (None, None) => (rva, rva.saturating_add(0x100)),
     };
     let bytes = image
         .bytes_at(start)
@@ -347,13 +370,14 @@ fn disasm(image: &Image<'_>, address: &str, limit: usize) -> Result<()> {
     let length = ((end - start) as usize).min(bytes.len());
     let names = import_names(image);
     let starts: HashSet<u32> = image.functions().iter().map(|f| f.begin).collect();
-    match function {
+    match function.filter(|_| range_end.is_none()) {
         Some(f) => println!(
             "; function 0x{:08x}..0x{:08x} ({} bytes)",
             f.begin,
             f.end,
             f.end - f.begin
         ),
+        None if range_end.is_some() => println!("; range 0x{start:08x}..0x{end:08x}"),
         None => println!("; no exception-table entry covers 0x{rva:x}; showing 256 bytes"),
     }
     let base = image.image_base;
