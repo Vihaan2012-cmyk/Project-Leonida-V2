@@ -163,7 +163,55 @@ fn facts(code: u32, address: usize, context: &CONTEXT, fault: Option<(bool, usiz
             .unwrap_or_default(),
         code_at: read_memory(address, 16).unwrap_or_default(),
         fault,
+        pointed: dump_registers(&registers(context), read_prefix),
     }
+}
+
+/// The first `length` bytes at `address` that can be read, or fewer (down to 8) when the region ends sooner.
+fn read_prefix(address: usize, length: usize) -> Option<Vec<u8>> {
+    [length, length / 2, length / 4, 8]
+        .into_iter()
+        .filter(|n| *n >= 8 && *n <= length)
+        .find_map(|n| read_memory(address, n))
+}
+
+/// The registers that hold addresses of readable memory: 64 bytes at each, and 32 at each pointer found in the
+/// first 64 bytes (at most eight a register), so an object's data pointer shows its contents without a debugger.
+/// Equal addresses are shown once. `read` gives up to the length asked from an address, or nothing.
+pub fn dump_registers(
+    registers: &[(&'static str, u64)],
+    read: impl Fn(usize, usize) -> Option<Vec<u8>>,
+) -> Vec<(String, u64, Vec<u8>)> {
+    const LOWEST: u64 = 0x1_0000;
+    let mut out: Vec<(String, u64, Vec<u8>)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for &(name, value) in registers {
+        if name == "eflags" || value < LOWEST || !seen.insert(value) {
+            continue;
+        }
+        let Some(bytes) = read(value as usize, 64) else {
+            continue;
+        };
+        let words: Vec<u64> = bytes
+            .chunks_exact(8)
+            .map(|w| u64::from_le_bytes(w.try_into().unwrap_or([0; 8])))
+            .collect();
+        out.push((name.to_string(), value, bytes));
+        let mut followed = 0;
+        for (k, word) in words.into_iter().enumerate() {
+            if followed == 8 {
+                break;
+            }
+            if word < LOWEST || !seen.insert(word) {
+                continue;
+            }
+            if let Some(inner) = read(word as usize, 32) {
+                out.push((format!("{name}+{:#x}", k * 8), word, inner));
+                followed += 1;
+            }
+        }
+    }
+    out
 }
 
 /// The text of a report for `facts` with the explainer's lines.
@@ -196,6 +244,13 @@ pub fn format_report(facts: &CrashFacts, headline: &str, explanation: &[String])
         .collect();
     for row in regs.chunks(4) {
         let _ = writeln!(text, "  {}", row.join(" "));
+    }
+    for (name, address, bytes) in &facts.pointed {
+        let _ = writeln!(text, "memory at {name} = {address:#x}:");
+        for (row, chunk) in bytes.chunks(16).enumerate() {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+            let _ = writeln!(text, "  {:04x}: {}", row * 16, hex.join(" "));
+        }
     }
     let _ = writeln!(text, "stack:");
     for (depth, frame) in facts.frames.iter().enumerate() {
@@ -397,4 +452,85 @@ pub fn install() {
         atexit(at_exit);
     }
     INSTALLED.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake(memory: &'static [(usize, [u8; 64])]) -> impl Fn(usize, usize) -> Option<Vec<u8>> {
+        move |address, length| {
+            memory
+                .iter()
+                .find(|(base, _)| *base == address)
+                .map(|(_, bytes)| bytes[..length.min(64)].to_vec())
+        }
+    }
+
+    #[test]
+    fn registers_that_point_at_memory_are_dumped_with_the_pointers_inside() {
+        let mut object = [0u8; 64];
+        object[8..16].copy_from_slice(&0x50000u64.to_le_bytes());
+        object[16..24].copy_from_slice(&0x70u64.to_le_bytes());
+        let mut data = [0u8; 64];
+        data[..4].copy_from_slice(&[0xE7, 0xDC, 0x0D, 0x00]);
+        let memory: &'static [(usize, [u8; 64])] =
+            Box::leak(vec![(0x40000usize, object), (0x50000, data)].into_boxed_slice());
+        let regs = [
+            ("rax", 0u64),
+            ("rcx", 0x40000),
+            ("rdx", 0x40000),
+            ("rbx", 0x9999_9999),
+            ("eflags", 0x40000),
+        ];
+        let dumps = dump_registers(&regs, fake(memory));
+        assert_eq!(
+            dumps.len(),
+            2,
+            "rax is null, rdx repeats rcx, rbx is unreadable, eflags is no address"
+        );
+        assert_eq!(dumps[0].0, "rcx");
+        assert_eq!(dumps[0].2.len(), 64);
+        assert_eq!(dumps[1].0, "rcx+0x8");
+        assert_eq!(dumps[1].1, 0x50000);
+        assert_eq!(dumps[1].2.len(), 32);
+        assert_eq!(&dumps[1].2[..4], &[0xE7, 0xDC, 0x0D, 0x00]);
+    }
+
+    #[test]
+    fn real_memory_is_read_only_where_it_is_readable() {
+        let value = Box::new([0xABu8; 64]);
+        let at = value.as_ptr() as usize;
+        assert_eq!(read_prefix(at, 16), Some(value[..16].to_vec()));
+        assert!(read_prefix(0x10, 64).is_none());
+        let regs = [("rcx", at as u64), ("rdx", 0x20)];
+        let dumps = dump_registers(&regs, read_prefix);
+        assert_eq!(dumps.len(), 1);
+        assert_eq!(dumps[0].0, "rcx");
+    }
+
+    #[test]
+    fn the_report_prints_the_dumped_bytes() {
+        let facts = CrashFacts {
+            code: 0x8000_0003,
+            address: 0x1000,
+            rva: None,
+            function_rva: None,
+            registers: vec![("rcx", 0x4000)],
+            frames: vec![],
+            image_base: 0,
+            image_size: 0,
+            code_before: vec![],
+            code_at: vec![],
+            fault: None,
+            pointed: vec![("rcx".into(), 0x4000, (0..20).collect())],
+        };
+        let text = format_report(&facts, "test", &[]);
+        assert!(text.contains("memory at rcx = 0x4000:"), "{text}");
+        assert!(
+            text.contains("  0000: 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f"),
+            "{text}"
+        );
+        assert!(text.contains("  0010: 10 11 12 13"), "{text}");
+    }
 }
