@@ -5,7 +5,7 @@ mod lift;
 mod unseen;
 mod verify;
 
-pub use halves::{Hazard, upper_lane_hazards};
+pub use halves::{Hazard, Pattern, lane_patterns, upper_lane_hazards};
 pub use interp::{BLOCK_LIMIT, EXPORT_WORDS, Machine, RunError, export_slot, run};
 pub use ir::{
     ATTRIBUTES, AtomicOp, Bin, Block, BlockId, Cmp, Expr, Function, Image, ImageDim, ImageOp, Reg,
