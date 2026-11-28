@@ -127,6 +127,20 @@ unsafe extern "win64" fn a_reset(this: *mut c_void) -> u32 {
     S_OK
 }
 
+/// Slot 9, called as `(allocator, callback, context)` at rva 0x1884fe: the title hands the console allocator a
+/// function (0x555df10) that gives it memory for command buffer chunks from the title's own pools. This layer
+/// records into its own memory, so the callback is kept by nobody and never called.
+unsafe extern "win64" fn a_set_memory_callback_x(
+    _this: *mut c_void,
+    _callback: *const c_void,
+    _context: *mut c_void,
+) -> u32 {
+    com::note_once(
+        "ID3D12CommandAllocator slot 9 (the title's chunk memory callback) is accepted; this layer uses its own memory",
+    );
+    S_OK
+}
+
 fn allocator_vtable(core: &DeviceCore) -> *const usize {
     core.cached_vtable(
         Kind::CommandAllocator,
@@ -137,6 +151,7 @@ fn allocator_vtable(core: &DeviceCore) -> *const usize {
             (2, release as *const () as usize),
             (7, a_get_device as *const () as usize),
             (8, a_reset as *const () as usize),
+            (9, a_set_memory_callback_x as *const () as usize),
         ],
     )
 }
@@ -394,6 +409,18 @@ unsafe extern "win64" fn l_close(this: *mut c_void) -> u32 {
     drop(s);
     list.release_allocator();
     error.unwrap_or(S_OK)
+}
+
+/// Slot 139, called as `(list, allocator, 0, 0)` at rva 0x2474cce when the title takes a list from its pool and
+/// checks the result with a breakpoint: the console's `Reset` with one more argument, which every call passes as 0.
+unsafe extern "win64" fn l_reset_x(
+    this: *mut c_void,
+    allocator: *mut c_void,
+    pso: *mut c_void,
+    _flags: u64,
+) -> u32 {
+    // SAFETY: the same list, allocator and pipeline `Reset` takes.
+    unsafe { l_reset(this, allocator, pso) }
 }
 
 unsafe extern "win64" fn l_reset(
@@ -1349,6 +1376,7 @@ fn list_vtable(core: &DeviceCore) -> *const usize {
         (131, f!(l_unmeasured_131)),
         (132, f!(l_unmeasured_132)),
         (141, f!(l_set_scratch_buffer)),
+        (139, f!(l_reset_x)),
         (142, f!(l_ignored_142)),
         (146, f!(l_barrier)),
         (148, f!(l_allocate_upload)),

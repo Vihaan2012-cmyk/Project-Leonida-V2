@@ -209,3 +209,5 @@ ID3D12PipelineState 7 GetDevice pc
 ID3D12PipelineState 8 GetCachedBlob pc
 ID3D12PipelineState 11 GetScratchBlobX measured
 ID3D12RootSignature 7 GetDevice pc
+ID3D12GraphicsCommandList 139 ResetX measured (called as (allocator, 0, 0) at rva 0x02474cce when a list leaves the title's pool; the result is checked with a breakpoint)
+ID3D12CommandAllocator 9 SetMemoryCallbackX measured (called as (callback 0x555df10, context) at rva 0x001884fe; the console allocator gets chunk memory from the title through it)
