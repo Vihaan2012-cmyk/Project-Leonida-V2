@@ -24,11 +24,14 @@ pub mod dlssg;
 pub mod fallback;
 pub mod ffi;
 pub mod locate;
+pub(crate) mod lock;
 pub mod modes;
 pub mod ngx;
 mod upscaler;
 pub mod vk;
 
+#[cfg(test)]
+mod lock_tests;
 #[cfg(test)]
 mod tests;
 
