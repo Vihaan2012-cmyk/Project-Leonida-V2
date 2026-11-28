@@ -323,6 +323,11 @@ impl Context<'_> {
     }
 }
 
+/// How many emptied replay command vectors are kept for the next submission.
+const MAX_SPARE: usize = 8;
+/// Vectors that grew past this many commands are freed instead of kept.
+const MAX_SPARE_COMMANDS: usize = 1 << 19;
+
 /// Commands in the first command buffer of a long list; each one after it takes twice as many.
 pub(super) const FIRST_CHUNK: usize = 1024;
 
@@ -639,9 +644,10 @@ impl Assembly {
             filter,
             tables: RefCell::default(),
         };
+        let mut spare = std::mem::take(&mut exec.spare);
         let converted: Vec<Converted> = lists
             .iter()
-            .map(|list| bridge::convert(list, &context))
+            .map(|list| bridge::convert_reusing(list, &context, spare.pop().unwrap_or_default()))
             .collect();
         drop(context);
         let convert = lap(&mut mark);
@@ -708,16 +714,31 @@ impl Assembly {
         let record = recording
             .elapsed()
             .saturating_sub(submission.end + submission.submit);
+        if let Err(e) = sent {
+            drop(space);
+            drop(resources);
+            for note in report {
+                com::note_once(note);
+            }
+            return Err(e);
+        }
+        for mut list in converted {
+            list.commands.clear();
+            list.writes.clear();
+            if list.commands.capacity() <= MAX_SPARE_COMMANDS {
+                spare.push(list);
+            }
+        }
+        spare.truncate(MAX_SPARE);
+        exec.spare = spare;
+        let mut mark = Instant::now();
+        submission.wait(fence)?;
+        let gpu = lap(&mut mark);
         drop(space);
         drop(resources);
         for note in report {
             com::note_once(note);
         }
-        sent?;
-        drop(converted);
-        let mut mark = Instant::now();
-        submission.wait(fence)?;
-        let gpu = lap(&mut mark);
         let (ended, submitted) = (submission.end, submission.submit);
         drop(submission);
         {

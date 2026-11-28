@@ -180,10 +180,20 @@ fn layout_state(layout: u32) -> u32 {
 }
 
 pub fn convert(stream: &CommandStream, resolver: &dyn Resolver) -> Converted {
-    let mut out = Converted {
-        commands: Vec::with_capacity(stream.commands.len()),
-        writes: Vec::new(),
-    };
+    convert_reusing(stream, resolver, Converted::default())
+}
+
+/// As `convert`, into the vectors of `spare`, which keep their capacity from the last frame: a frame's commands
+/// are some megabytes, and a fresh block of that size costs a page fault per page.
+pub fn convert_reusing(
+    stream: &CommandStream,
+    resolver: &dyn Resolver,
+    spare: Converted,
+) -> Converted {
+    let mut out = spare;
+    out.commands.clear();
+    out.writes.clear();
+    out.commands.reserve(stream.commands.len());
     let mut state = State::default();
     convert_into(stream, resolver, &mut state, &mut out, 0);
     out
@@ -530,36 +540,43 @@ pub fn used_pipelines(
     objects: &dyn Objects,
 ) -> Vec<Arc<dyn PendingPipeline>> {
     let mut used = Vec::new();
-    let mut current: [Option<Arc<dyn PendingPipeline>>; 2] = [None, None];
+    let mut current: [Option<Noted>; 2] = [None, None];
     collect_used(stream, objects, &mut current, &mut used, 0);
     used
 }
 
+/// A pipeline that is set, and whether the list used it already.
+type Noted = (Arc<dyn PendingPipeline>, bool);
+
 fn note_use(
-    current: &[Option<Arc<dyn PendingPipeline>>; 2],
+    current: &mut [Option<Noted>; 2],
     used: &mut Vec<Arc<dyn PendingPipeline>>,
     compute: bool,
 ) {
-    if let Some(p) = &current[usize::from(compute)]
-        && !used
+    if let Some((p, noted)) = &mut current[usize::from(compute)]
+        && !*noted
+    {
+        *noted = true;
+        if !used
             .iter()
             .any(|u| std::ptr::addr_eq(Arc::as_ptr(u), Arc::as_ptr(p)))
-    {
-        used.push(p.clone());
+        {
+            used.push(p.clone());
+        }
     }
 }
 
 fn collect_used(
     stream: &CommandStream,
     objects: &dyn Objects,
-    current: &mut [Option<Arc<dyn PendingPipeline>>; 2],
+    current: &mut [Option<Noted>; 2],
     used: &mut Vec<Arc<dyn PendingPipeline>>,
     depth: u32,
 ) {
     use stream::Command as C;
-    let set = |current: &mut [Option<Arc<dyn PendingPipeline>>; 2], p: Arc<dyn PendingPipeline>| {
+    let set = |current: &mut [Option<Noted>; 2], p: Arc<dyn PendingPipeline>| {
         let at = usize::from(p.compute());
-        current[at] = Some(p);
+        current[at] = Some((p, false));
     };
     for command in &stream.commands {
         match command {
@@ -618,6 +635,9 @@ fn pipeline_ready(state: &mut State, out: &mut Converted, compute: bool, r: &dyn
     let Some(bound) = slot else {
         return true;
     };
+    if bound.emitted {
+        return true;
+    }
     let built = match &bound.built {
         Some(built) => built.clone(),
         None => match bound.pending.poll() {
@@ -634,10 +654,8 @@ fn pipeline_ready(state: &mut State, out: &mut Converted, compute: bool, r: &dyn
             }
         },
     };
-    if !bound.emitted {
-        bound.emitted = true;
-        out.commands.push(Command::SetPipeline(built));
-    }
+    bound.emitted = true;
+    out.commands.push(Command::SetPipeline(built));
     true
 }
 
