@@ -11,8 +11,11 @@
 //! - `XMemAllocatePhysicalPages(flags, &count, pages)`, `XMemMapPhysicalPages(address, count, pages)` (a null
 //!   `pages` unmaps), `XMemMapPhysicalPagesScatter(addresses, count, pages)` and
 //!   `XMemFreePhysicalPages(count, pages)`: Windows' AWE functions without the process handle. Each physical
-//!   page is a 64 KiB section of the page file, since AWE needs a privilege ordinary users lack; its number is
-//!   an index into our own table.
+//!   page is a 64 KiB section of the page file, since AWE needs a privilege ordinary users lack. The entry
+//!   that names it carries the page number in bits 4 and up, as the title reads it: it keeps `entry >> 4` in
+//!   its own 21-bit tables and rebuilds `(stored << 4) & 0x1fffff0` to map the page again, so an entry with
+//!   anything in the low nibble, such as a plain counter, comes back as the first of its sixteen. An entry
+//!   that names no page (0) maps nothing.
 //!   `write_physical_page` is how DirectStorage reads land in those pages. The page-table entry of such a
 //!   request is taken as a page number from `XMemAllocatePhysicalPages`, or as the address of a mapped view of
 //!   a page; whether the title stores one or the other (or a console physical address) is not measured.
@@ -77,6 +80,21 @@ mod imp {
 
     const TRUE: i32 = 1;
     const FALSE: i32 = 0;
+
+    /// A physical page entry names its page in bits 4 and up; the low four bits are not part of the identity.
+    /// The title keeps only `(entry >> 4)` in its own tables (21-bit fields; the code at 0x1e6c110, 0x55aa6a0 and
+    /// 0xf2c470) and rebuilds `(stored << 4) & 0x1fffff0` when it maps the page again, so entries that differ
+    /// only in the low nibble come back as one page.
+    pub(crate) const ENTRY_SHIFT: u32 = 4;
+
+    pub(crate) fn entry_of(page: usize) -> usize {
+        page << ENTRY_SHIFT
+    }
+
+    /// The page number an entry names; 0 when it names none.
+    pub(crate) fn page_of(entry: usize) -> usize {
+        entry >> ENTRY_SHIFT
+    }
     const E_FAIL: i32 = 0x8000_4005u32 as i32;
     const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
     const MEM_TOP_DOWN: u32 = 0x10_0000;
@@ -621,7 +639,7 @@ mod imp {
             }
             state.pages.push(Some(section as usize));
             // SAFETY: `pages` has room for `wanted` numbers.
-            unsafe { *pages.add(made) = state.pages.len() };
+            unsafe { *pages.add(made) = entry_of(state.pages.len()) };
             made += 1;
         }
         // SAFETY: as the caller promises.
@@ -645,13 +663,17 @@ mod imp {
         }
     }
 
-    fn map_one(at: usize, page: Option<usize>) -> bool {
+    fn map_one(at: usize, entry: Option<usize>) -> bool {
         if let Ok(mut state) = STATE.lock() {
             unmap(&mut state, at);
         }
-        let Some(page) = page else {
+        let Some(entry) = entry else {
             return true;
         };
+        let page = page_of(entry);
+        if page == 0 {
+            return true;
+        }
         if !carve(at, PAGE) {
             note(format!(
                 "XMemMapPhysicalPages at {at:#x}: not inside a reservation it made"
@@ -686,8 +708,27 @@ mod imp {
             return false;
         }
         state.placeholders.remove(&at);
+        let other = state
+            .views
+            .iter()
+            .find(|(_, mapped)| **mapped == page)
+            .map(|(&va, _)| va);
         state.views.insert(at, page);
+        if let Some(other) = other {
+            note_aliased(page, at, other);
+        }
         true
+    }
+
+    /// Notes (a few times) that a physical page now has views at two addresses. The title does this for a moment
+    /// while a freed page's unmap is queued; a pair that stays is two addresses showing one memory.
+    fn note_aliased(page: usize, at: usize, other: usize) {
+        static NOTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if NOTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+            note(format!(
+                "physical page {page} is mapped at {at:#x} while it is still mapped at {other:#x}"
+            ));
+        }
     }
 
     /// Maps (or, with null `pages`, unmaps) a page at each address, and tells the hooks about the ones in
@@ -729,7 +770,7 @@ mod imp {
             let page = (!pages.is_null()).then(|| unsafe { *pages.add(k) });
             let done = map_one(at, page);
             ok &= done;
-            if done && page.is_some() && tracked[k] {
+            if done && page.is_some_and(|entry| page_of(entry) != 0) && tracked[k] {
                 mapped.push(at as u64);
             }
         }
@@ -794,7 +835,7 @@ mod imp {
             // SAFETY: as the caller promises.
             let freed: HashSet<usize> = unsafe { std::slice::from_raw_parts(pages, count) }
                 .iter()
-                .copied()
+                .map(|&entry| page_of(entry))
                 .collect();
             let mapped: Vec<u64> = STATE.lock().map_or_else(
                 |_| Vec::new(),
@@ -823,7 +864,7 @@ mod imp {
         };
         for k in 0..count {
             // SAFETY: as the caller promises.
-            let page = unsafe { *pages.add(k) };
+            let page = page_of(unsafe { *pages.add(k) });
             if let Some(slot) = page.checked_sub(1).and_then(|i| state.pages.get_mut(i))
                 && let Some(section) = slot.take()
             {
@@ -834,18 +875,21 @@ mod imp {
         TRUE
     }
 
-    /// The page a DirectStorage page-table entry names: a page number `XMemAllocatePhysicalPages` returned, or
-    /// the 64 KiB-aligned address of a view of one. The two cannot be told apart only for the value 0x10000,
-    /// which would need 65,536 live pages; the number wins.
+    /// The page a DirectStorage page-table entry names: the address of a mapped view of a page, else an entry
+    /// `XMemAllocatePhysicalPages` returned (the page number in bits 4 and up). A view address is looked up first:
+    /// views sit at 64 KiB boundaries, and so do the entries of every sixteenth page.
     fn page_of_entry(state: &State, entry: u64) -> Option<usize> {
-        if let Ok(number) = usize::try_from(entry)
-            && number >= 1
-            && matches!(state.pages.get(number - 1), Some(Some(_)))
+        let entry = usize::try_from(entry).ok()?;
+        if entry.is_multiple_of(PAGE)
+            && let Some(&page) = state.views.get(&entry)
         {
-            return Some(number);
+            return Some(page);
         }
-        let at = usize::try_from(entry).ok().filter(|at| at % PAGE == 0)?;
-        state.views.get(&at).copied()
+        let number = page_of(entry);
+        (entry & ((1 << ENTRY_SHIFT) - 1) == 0
+            && number >= 1
+            && matches!(state.pages.get(number - 1), Some(Some(_))))
+        .then_some(number)
     }
 
     /// Writes `data` at `offset` into the physical page `entry` names (see `page_of_entry`), for DirectStorage
