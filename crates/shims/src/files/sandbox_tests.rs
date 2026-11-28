@@ -976,3 +976,19 @@ fn turning_the_sandbox_off_restores_the_old_reach() {
     // SAFETY: a key just opened.
     unsafe { close_key(key) };
 }
+
+/// The C runtime gives the game Leonida's path as its own; opening it reads the game's executable instead, and
+/// writing it stays refused.
+#[test]
+fn leonidas_own_path_reads_the_games_executable() {
+    let b = boxed();
+    let game = b.package.join("game.exe");
+    std::fs::write(&game, b"MZ game").expect("game");
+    crate::loader::set_main_path(game.clone());
+    let own = std::env::current_exe().expect("own path");
+    let target = crate::files::resolve(&own.to_string_lossy()).expect("mapped");
+    match target {
+        crate::files::Target::Layered { base, .. } => assert_eq!(base, game),
+        other => panic!("{other:?}"),
+    }
+}

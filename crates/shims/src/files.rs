@@ -90,8 +90,21 @@ pub fn set_redirect(redirect: Option<Redirect>) {
     }
 }
 
+/// Whether `path` names Leonida's own executable, which the C runtime reports as the program's path.
+fn names_leonida(path: &str) -> bool {
+    let plain = |text: &str| text.replace('/', "\\").to_lowercase();
+    std::env::current_exe().is_ok_and(|own| plain(path) == plain(&own.to_string_lossy()))
+}
+
 /// Maps a path the game names.
 pub fn resolve(path: &str) -> Result<Target, Refusal> {
+    // The game asks for its own program file by the path the C runtime gave it, which is Leonida's: it means the
+    // game's executable, read as data.
+    if names_leonida(path)
+        && let Some(game) = crate::loader::main_path()
+    {
+        return resolve(&game.to_string_lossy());
+    }
     let Ok(roots) = ROOTS.read() else {
         return Ok(Target::Passthrough);
     };
