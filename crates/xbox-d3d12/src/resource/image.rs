@@ -8,7 +8,7 @@ use ash::vk;
 
 use super::desc::{Dimension, ResourceDesc};
 use crate::descriptor::format::{Format, Kind};
-use crate::memory::Handles;
+use crate::memory::{Class, Grant, Handles, Placement, Request};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImageError {
@@ -27,6 +27,8 @@ pub enum ImageError {
 pub struct GpuImage {
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,
+    /// How the memory was granted: device-local, or spilled to system memory the GPU reads over PCIe.
+    pub grant: Grant,
     pub format: vk::Format,
     pub extent: [u32; 3],
     pub mips: u32,
@@ -145,41 +147,41 @@ impl GpuImage {
                 .map_err(|_| ImageError::Unsupported(format))?;
             let image = h.device.create_image(&create, None)?;
             let needs = h.device.get_image_memory_requirements(image);
-            let types = h.instance.get_physical_device_memory_properties(h.physical);
-            let kind = (0..types.memory_type_count)
-                .filter(|i| needs.memory_type_bits & (1 << i) != 0)
-                .find(|i| {
-                    types.memory_types[*i as usize]
-                        .property_flags
-                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-                })
-                .or_else(|| {
-                    (0..types.memory_type_count).find(|i| needs.memory_type_bits & (1 << i) != 0)
-                });
-            let Some(kind) = kind else {
-                h.device.destroy_image(image, None);
-                return Err(ImageError::NoMemory);
+            let class = if desc.has_flag(super::desc::ALLOW_RENDER_TARGET)
+                || desc.has_flag(super::desc::ALLOW_DEPTH_STENCIL)
+                || desc.has_flag(super::desc::ALLOW_UNORDERED_ACCESS)
+                || info.kind != Kind::Color
+            {
+                Class::Target
+            } else {
+                Class::Texture
             };
-            let memory = match h.device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(needs.size)
-                    .memory_type_index(kind),
-                None,
+            let grant = match h.budget.allocate(
+                &h.device,
+                &Request {
+                    size: needs.size,
+                    type_bits: needs.memory_type_bits,
+                    class,
+                    device_address: false,
+                },
             ) {
-                Ok(memory) => memory,
+                Ok(grant) => grant,
                 Err(e) => {
                     h.device.destroy_image(image, None);
                     return Err(e.into());
                 }
             };
+            let memory = grant.memory;
             if let Err(e) = h.device.bind_image_memory(image, memory, 0) {
                 h.device.destroy_image(image, None);
                 h.device.free_memory(memory, None);
+                h.budget.release(&grant);
                 return Err(e.into());
             }
             let made = GpuImage {
                 image,
                 memory,
+                grant,
                 format,
                 extent,
                 mips: desc.mips(),
@@ -411,5 +413,11 @@ impl GpuImage {
             h.device.destroy_image(self.image, None);
             h.device.free_memory(self.memory, None);
         }
+        h.budget.release(&self.grant);
+    }
+
+    /// Whether the image lives in device-local memory.
+    pub fn device_local(&self) -> bool {
+        self.grant.placement == Placement::DeviceLocal
     }
 }

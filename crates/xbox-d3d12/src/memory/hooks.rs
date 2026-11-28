@@ -93,11 +93,11 @@ impl AddressSpaceHooks {
 
 impl GpuMemoryHooks for AddressSpaceHooks {
     fn mapped(&self, va: u64, len: u64, policy: SyncPolicy) -> Result<(), MemoryError> {
-        self.space().map_host(va, len, policy)
+        self.space().lenient(|s| s.map_host(va, len, policy))
     }
 
     fn pages_mapped(&self, va: u64, count: u64, policy: SyncPolicy) -> Result<(), MemoryError> {
-        self.space().map_pages(va, count, policy)
+        self.space().lenient(|s| s.map_pages(va, count, policy))
     }
 
     fn pages_mapped_scatter(
@@ -105,7 +105,8 @@ impl GpuMemoryHooks for AddressSpaceHooks {
         addresses: &[u64],
         policy: SyncPolicy,
     ) -> Result<(), MemoryError> {
-        self.space().map_pages_scatter(addresses, policy)
+        self.space()
+            .lenient(|s| s.map_pages_scatter(addresses, policy))
     }
 
     fn unmapped(&self, va: u64, len: u64) -> Result<(), MemoryError> {

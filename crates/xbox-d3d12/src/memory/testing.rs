@@ -62,10 +62,26 @@ impl TestGpu {
                 let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
                     .buffer_device_address(true)
                     .timeline_semaphore(timeline);
+                let extra = MemoryExtensions::available(&instance, physical);
+                let mut priority =
+                    vk::PhysicalDeviceMemoryPriorityFeaturesEXT::default().memory_priority(true);
+                let mut pageable =
+                    vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT::default()
+                        .pageable_device_local_memory(true);
                 let mut features = vk::PhysicalDeviceFeatures2::default()
                     .features(base)
                     .push_next(&mut v12);
-                let extensions = DEVICE_EXTENSIONS.map(CStr::as_ptr);
+                if extra.priority {
+                    features = features.push_next(&mut priority);
+                }
+                if extra.pageable {
+                    features = features.push_next(&mut pageable);
+                }
+                let extensions: Vec<*const std::ffi::c_char> = DEVICE_EXTENSIONS
+                    .into_iter()
+                    .chain(extra.names())
+                    .map(CStr::as_ptr)
+                    .collect();
                 let Ok(device) = instance.create_device(
                     physical,
                     &vk::DeviceCreateInfo::default()
@@ -101,6 +117,7 @@ impl TestGpu {
                         queue,
                         queue_family: family as u32,
                         queue_lock: lock,
+                        budget: Budget::new(&instance, physical, extra),
                     },
                     family: family as u32,
                 });

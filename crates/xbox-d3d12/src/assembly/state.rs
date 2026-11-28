@@ -219,6 +219,8 @@ impl Assembly {
         wrap: impl FnOnce(Arc<PipelineEnv>) -> SharedBuilder,
     ) -> Result<Arc<Assembly>, AssemblyError> {
         let gpu = Arc::new(Gpu::create(&config.gpu)?);
+        gpu.handles.budget.set_note(com::note);
+        gpu.handles.budget.announce();
         let space = Arc::new(Mutex::new(open_address_space(&gpu)?));
         if config.memory_hooks {
             memory::hooks::install_address_space(space.clone());
