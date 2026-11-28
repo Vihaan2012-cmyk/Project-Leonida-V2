@@ -12,7 +12,12 @@
 //!   decoder (unless the frame is queued), `BinkSetWillLoop` wraps. A decoder error ends the movie: the frame
 //!   counter jumps to the last frame and a trace note says why.
 //! - Frames go into the game's own mapped textures in the layout [`layout`] documents.
-//! - Audio goes to voices on the shared mixer ([`sound`]), one per selected track, paced by the frames played.
+//! - Audio goes to voices on the shared mixer ([`sound`]), one per selected track: each decoded frame's samples are
+//!   queued when the frame is played (the first frame brings 0.76 s, so the queue stays ahead of the device).
+//!   The movie's clock follows the audio: [`player`] reads how long the first voice has played (a source-frame count
+//!   in the mixer, rebased at every seek) when each frame is installed, and moves the wall-based clock by the
+//!   smoothed difference, so picture and sound stay together through device clock drift. A stalled or absent
+//!   device (the voice plays nothing) hands the clock back to the wall.
 //!
 //! # What the executable does with Bink (RVAs of game build 1.0.2.1, read statically)
 //!
@@ -54,9 +59,19 @@
 //!   not a padded one.
 //! - Whether a movie has alpha: taken from bit `0x00100000` of the header word at `+0x24`.
 //! - How many frame buffer sets Bink itself reports: three here (the game's fence array holds three).
-//! - The game's own sound system (`BinkSetSoundSystem`: a `BINKSND` of 0x1c0 bytes filled by `01a9b300`, with ready,
-//!   lock, unlock, pause, on/off and close functions at `+0x170..+0x1b0`) is measured but not driven: audio goes to
-//!   the shared mixer instead.
+//! - The game's own sound system is measured but not driven. `0442fce0` (from `015e3c10`) calls
+//!   `BinkSetSoundSystem(05f172c0, 0)`; `05f172c0` returns `01a9b300`, the game's `BINKSNDOPEN`
+//!   `(snd, rate, channels, flags, bink) -> bool`. It zeroes a 0x1c0-byte `BINKSND`, stores rate (`+0x34`), channels
+//!   (`+0x38`) and the movie (`+0x74`), sets the ready function `020eeb40` (`+0x170`: room for a segment in the
+//!   voice's queue), `0442e820` (`+0x178`), the submit function `00b98f70` (`+0x180`: sends a finished segment of the
+//!   ring at `+0xa4` to the voice through `04e64f00`), `0442e850`/`0442e860` (`+0x198`/`+0x1a0`), the close function
+//!   `019031b0` (`+0x1a8`) and no-ops (`00004380`) elsewhere. It makes the ring (eight segments of 0.125 s of 16-bit samples,
+//!   `01a9b4a0`) and a 0x60-byte streaming voice object in the game's own audio layer (`04f97130`,
+//!   `04ee9870`, `04ee9ae0`), and files the sound in a table of up to eight (`01a9b570`). So in the real engine the
+//!   decoded samples reach the game's audio layer (its XAudio2 source voices), mixed under the groups `Bink.Quiet`,
+//!   `Bink.Normal` and `Bink.Loud` (`05e15400`, from `02425c90`); the voice is named `bink_%u` (`0086a0c0`). The
+//!   per-track volume the game sets with `BinkSetVolume` (`018bea90`) is applied to the mixer voice here instead.
+//!   Nothing else of Bink's sound API is imported (no `BinkOpenTrack`, `BinkSetPan`, `BinkGetTrackData`).
 //! - The plane order and audio contract of the decoder behind [`MovieDecoder`] are assumed (Y, Cr, Cb, alpha; the
 //!   audio of the frame just decoded).
 //! - The decode thread calls the game's read callback from a thread the game did not start.
