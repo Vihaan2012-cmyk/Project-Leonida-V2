@@ -209,20 +209,22 @@ fn a_footprint_upload_names_the_subresource_pitch_and_block_rows() {
     };
     let copy = |src_box: Option<Box3>| {
         convert(
-            &stream(vec![stream::Command::CopyTextureRegion {
-                dst: CopyLocation::Subresource {
-                    resource: texture.clone(),
-                    index: 7,
+            &stream(vec![stream::Command::CopyTextureRegion(Box::new(
+                stream::TextureCopy {
+                    dst: CopyLocation::Subresource {
+                        resource: texture.clone(),
+                        index: 7,
+                    },
+                    x: 4,
+                    y: 8,
+                    z: 0,
+                    src: CopyLocation::Placed {
+                        resource: upload.clone(),
+                        footprint,
+                    },
+                    src_box,
                 },
-                x: 4,
-                y: 8,
-                z: 0,
-                src: CopyLocation::Placed {
-                    resource: upload.clone(),
-                    footprint,
-                },
-                src_box,
-            }]),
+            ))]),
             &fake,
         )
     };
@@ -271,27 +273,29 @@ fn reading_a_texture_back_records_the_range_the_gpu_writes() {
         },
     );
     let done = convert(
-        &stream(vec![stream::Command::CopyTextureRegion {
-            dst: CopyLocation::Placed {
-                resource: readback.clone(),
-                footprint: Footprint {
-                    offset: 0x100,
-                    format: 28,
-                    width: 64,
-                    height: 32,
-                    depth: 1,
-                    row_pitch: 256,
+        &stream(vec![stream::Command::CopyTextureRegion(Box::new(
+            stream::TextureCopy {
+                dst: CopyLocation::Placed {
+                    resource: readback.clone(),
+                    footprint: Footprint {
+                        offset: 0x100,
+                        format: 28,
+                        width: 64,
+                        height: 32,
+                        depth: 1,
+                        row_pitch: 256,
+                    },
                 },
+                x: 0,
+                y: 0,
+                z: 0,
+                src: CopyLocation::Subresource {
+                    resource: texture.clone(),
+                    index: 0,
+                },
+                src_box: None,
             },
-            x: 0,
-            y: 0,
-            z: 0,
-            src: CopyLocation::Subresource {
-                resource: texture.clone(),
-                index: 0,
-            },
-            src_box: None,
-        }]),
+        ))]),
         &fake,
     );
     assert_eq!(done.writes, vec![(0x40_0100, 32 * 256)]);
@@ -561,14 +565,11 @@ fn copying_a_whole_texture_copies_every_mip_and_layer() {
         &fake,
     );
     assert_eq!(done.commands.len(), 6);
-    let Command::CopyImage {
-        region, src_sub, ..
-    } = &done.commands[1]
-    else {
+    let Command::CopyImage(copy) = &done.commands[1] else {
         panic!();
     };
-    assert_eq!(*src_sub, Subresource { mip: 1, layer: 0 });
-    assert_eq!(region.size, [32, 16, 1]);
+    assert_eq!(copy.src_sub, Subresource { mip: 1, layer: 0 });
+    assert_eq!(copy.region.size, [32, 16, 1]);
 }
 
 #[test]

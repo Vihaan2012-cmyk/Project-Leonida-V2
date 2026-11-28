@@ -659,14 +659,15 @@ fn recorded_structs_are_decoded_from_their_console_layouts() {
         other => panic!("{other:?}"),
     }
     match &commands[1] {
-        Command::CopyTextureRegion {
-            dst,
-            x,
-            y,
-            z,
-            src,
-            src_box,
-        } => {
+        Command::CopyTextureRegion(copy) => {
+            let xbox_d3d12::stream::TextureCopy {
+                dst,
+                x,
+                y,
+                z,
+                src,
+                src_box,
+            } = &**copy;
             assert!(matches!(dst, CopyLocation::Subresource { index: 5, .. }));
             assert_eq!((*x, *y, *z), (1, 2, 3));
             assert!(src_box.is_none());

@@ -521,14 +521,15 @@ impl<'a> Replayer<'a> {
                 };
                 self.report.copies += 1;
             }
-            Command::CopyImage {
-                dst,
-                dst_sub,
-                at,
-                src,
-                src_sub,
-                region,
-            } => {
+            Command::CopyImage(copy) => {
+                let ImageCopy {
+                    dst,
+                    dst_sub,
+                    at,
+                    src,
+                    src_sub,
+                    region,
+                } = &**copy;
                 self.end_rendering();
                 let copy = vk::ImageCopy::default()
                     .src_subresource(layers_of(src, *src_sub))
@@ -549,12 +550,13 @@ impl<'a> Replayer<'a> {
                 };
                 self.report.copies += 1;
             }
-            Command::ResolveImage {
-                dst,
-                dst_sub,
-                src,
-                src_sub,
-            } => {
+            Command::ResolveImage(resolve) => {
+                let ImageResolve {
+                    dst,
+                    dst_sub,
+                    src,
+                    src_sub,
+                } = &**resolve;
                 self.end_rendering();
                 let resolve = vk::ImageResolve::default()
                     .src_subresource(layers_of(src, *src_sub))

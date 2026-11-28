@@ -63,13 +63,13 @@ pub type Rects = SmallVec<[Rect; 1]>;
 pub type Viewports = SmallVec<[Viewport; 2]>;
 
 /// Root constants of one call: up to 16 dwords stay inline, the limit is 64.
-pub type RootValues = SmallVec<[u32; 16]>;
+pub type RootValues = SmallVec<[u32; 8]>;
 
 /// The vertex buffers of one call: a draw reads a few streams, the limit is 16.
-pub type VertexViews = SmallVec<[VertexBufferView; 4]>;
+pub type VertexViews = SmallVec<[VertexBufferView; 2]>;
 
 /// The render target handles of one call, at most 8.
-pub type TargetHandles = SmallVec<[u64; 8]>;
+pub type TargetHandles = SmallVec<[u64; 4]>;
 
 /// A `D3D12_RESOURCE_BARRIER`.
 #[derive(Clone, Debug)]
@@ -160,6 +160,17 @@ pub enum RootView {
     UnorderedAccess,
 }
 
+/// The arguments of `CopyTextureRegion`, boxed in the command because they are twice the size of any other.
+#[derive(Clone, Debug)]
+pub struct TextureCopy {
+    pub dst: CopyLocation,
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+    pub src: CopyLocation,
+    pub src_box: Option<Box3>,
+}
+
 /// One recorded call, in the order it was made.
 #[derive(Clone, Debug)]
 pub enum Command {
@@ -193,14 +204,7 @@ pub enum Command {
         src_offset: u64,
         bytes: u64,
     },
-    CopyTextureRegion {
-        dst: CopyLocation,
-        x: u32,
-        y: u32,
-        z: u32,
-        src: CopyLocation,
-        src_box: Option<Box3>,
-    },
+    CopyTextureRegion(Box<TextureCopy>),
     CopyResource {
         dst: ComPtr,
         src: ComPtr,

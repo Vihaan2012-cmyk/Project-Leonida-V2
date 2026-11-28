@@ -429,15 +429,17 @@ impl Assembly {
                         };
                         filter.on_upload(FilterId(u64::from(d.id)), *dst_offset, data);
                     }
-                    stream::Command::CopyTextureRegion {
-                        dst: stream::CopyLocation::Subresource { resource: dst, .. },
-                        src:
+                    stream::Command::CopyTextureRegion(copy) => {
+                        let (
+                            stream::CopyLocation::Subresource { resource: dst, .. },
                             stream::CopyLocation::Placed {
                                 resource: src,
                                 footprint,
                             },
-                        ..
-                    } => {
+                        ) = (&copy.dst, &copy.src)
+                        else {
+                            continue;
+                        };
                         // SAFETY: COM objects the title named.
                         let (d, s) =
                             unsafe { (resource_of(dst.as_ptr()), resource_of(src.as_ptr())) };
