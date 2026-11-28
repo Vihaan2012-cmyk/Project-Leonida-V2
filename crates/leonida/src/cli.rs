@@ -240,6 +240,10 @@ pub struct ExeArgs {
     /// The game folder. Searched for when omitted.
     #[arg(long, global = true)]
     pub game: Option<PathBuf>,
+    /// Analyse another image of the game folder instead of the executable: the one whose file name starts with this
+    /// text (case-insensitive), e.g. `bink`. Read as data only.
+    #[arg(long, global = true)]
+    pub image: Option<String>,
     #[command(subcommand)]
     pub command: ExeCommand,
 }

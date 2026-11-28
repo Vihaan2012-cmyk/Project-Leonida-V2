@@ -31,9 +31,39 @@ pub(crate) fn executable(game: &Path) -> Result<PathBuf> {
     Ok(game.join(name))
 }
 
+/// The one file of the game folder whose name starts with `prefix`, compared without regard to case.
+fn image_by_prefix(game: &Path, prefix: &str) -> Result<PathBuf> {
+    let prefix = prefix.to_ascii_lowercase();
+    let mut found: Vec<PathBuf> = std::fs::read_dir(game)
+        .with_context(|| format!("listing {}", game.display()))?
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with(&prefix)
+        })
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect();
+    found.sort();
+    match found.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => bail!("no file in the game folder starts with {prefix:?}"),
+        many => bail!(
+            "{} files start with {prefix:?}; use a longer prefix",
+            many.len()
+        ),
+    }
+}
+
 pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
     let game = resolve_game(args.game.as_ref(), &Manifest::builtin())?;
-    let path = executable(&game)?;
+    let path = match &args.image {
+        Some(prefix) => image_by_prefix(&game, prefix)?,
+        None => executable(&game)?,
+    };
     let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     let bytes = map_file(&file).context("mapping the executable")?;
     let image = Image::parse(&bytes)?;
