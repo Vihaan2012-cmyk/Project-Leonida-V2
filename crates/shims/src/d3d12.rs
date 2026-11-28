@@ -9,8 +9,11 @@
 
 use std::ffi::c_void;
 
-use config::{AspectMode, WindowMode};
-use xbox_d3d12::assembly::{self, AssemblyConfig, InputEvent, Output, WindowOptionsConfig};
+use config::{AspectMode, PipelineNotReady, WindowMode};
+use xbox_d3d12::assembly::{
+    self, AssemblyConfig, InputEvent, Output, PipelinesSeen, WindowOptionsConfig,
+};
+use xbox_d3d12::compile_queue::DrawPolicy;
 use xbox_d3d12::present::ScaleMode;
 
 use crate::gameinput::config::MouseButton;
@@ -70,7 +73,26 @@ pub fn assembly_config() -> AssemblyConfig {
         AspectMode::Stretch => ScaleMode::Stretch,
         AspectMode::Letterbox | AspectMode::Native => ScaleMode::Fit,
     };
+    config.draw_policy = match graphics.pipeline_not_ready {
+        PipelineNotReady::Wait => DrawPolicy::Wait,
+        PipelineNotReady::Skip => DrawPolicy::Skip,
+    };
+    let output = crate::loader::output_dir();
     config
+        .pipeline_cache
+        .get_or_insert_with(|| output.join("game-pipelines.cache"));
+    if config.pipelines_seen.is_none() {
+        config.pipelines_seen = Some(PipelinesSeen::beside(output.join("pipelines-seen")));
+    }
+    config
+}
+
+/// Stops recording the pipelines the game creates and writes the pipeline cache, so the next start finds them
+/// built. Safe to call more than once; the game may exit without releasing its device.
+pub fn shutdown() {
+    if let Some(assembly) = assembly::current() {
+        assembly.pipeline_service.shutdown();
+    }
 }
 
 /// Builds the assembled device (and with it the address space the `XMem*` shims report to) before the game
