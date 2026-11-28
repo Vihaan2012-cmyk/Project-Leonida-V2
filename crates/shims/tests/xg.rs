@@ -206,10 +206,33 @@ mod exports {
         unsafe { std::mem::transmute_copy(&address) }
     }
 
-    /// Width, height, mips, array, format, samples (2), usage, bind, cpu, misc, esram (2), swizzle, pitch.
-    fn desc(width: u32, height: u32, mips: u32, format: u32, bind: u32, swizzle: u32) -> [u32; 15] {
+    /// The console's `D3D12_RESOURCE_DESC` as the builder at rva 0x4ecc940 fills it: dimension (3 = 2D), padding,
+    /// alignment, width (64-bit), height, depth or array and mips (16-bit each), format, sample count and
+    /// quality, the swizzle field and the D3D12 flags (`d3d12_flags`: 1 render target).
+    fn desc(
+        width: u32,
+        height: u32,
+        mips: u32,
+        format: u32,
+        d3d12_flags: u32,
+        swizzle: u32,
+    ) -> [u32; 15] {
         [
-            width, height, mips, 1, format, 1, 0, 0, bind, 0, 0, 0, 0, swizzle, 0,
+            3,
+            0,
+            0,
+            0,
+            width,
+            0,
+            height,
+            1 | (mips << 16),
+            format,
+            1,
+            0,
+            swizzle,
+            d3d12_flags,
+            0,
+            0,
         ]
     }
 
@@ -290,7 +313,7 @@ mod exports {
         // SAFETY: valid pointers.
         assert_eq!(unsafe { suggest(&d, 0, &mut mode) }, 0);
         assert_eq!(mode, 4);
-        let d = desc(1920, 1080, 1, 28, 0x20, 0);
+        let d = desc(1920, 1080, 1, 28, 1, 0);
         // SAFETY: as above.
         assert_eq!(unsafe { suggest(&d, 0, &mut mode) }, 0);
         assert_eq!(mode, 22);

@@ -14,8 +14,12 @@
 //!   pointer to a large structure), 8 (six arguments, in a loop over subresources) and 10 (seven arguments).
 //!   No site reads a return value from slots 2, 8 or 10.
 //!
-//! Unmeasured, and so marked with a trace note when reached: the description's field order (the public
-//! 2D description's is used), the numbering of swizzle modes (AMD's address library numbering is used), the
+//! The description is a `D3D12_RESOURCE_DESC`, measured in the builder at rva 0x4ecc940: dimension (3 for 2D,
+//! 4 for 3D) at +0, width (64-bit) at +0x10, height at +0x18, depth or array size (16-bit) at +0x1c, mips (16-bit)
+//! at +0x1e, format at +0x20, sample count at +0x24, the swizzle mode (`0x100 | mode`, the field
+//! `XGSuggestSwizzleMode` is pointed at) at +0x2c and the D3D12 resource flags at +0x30.
+//!
+//! Unmeasured, and so marked with a trace note when reached: the numbering of swizzle modes (AMD's address library numbering is used), the
 //! resource layout structure slot 2 fills (the public one's leading plane is written) and what slots 8 and 10
 //! do (they answer `E_NOTIMPL` and write nothing).
 
@@ -507,28 +511,30 @@ mod imp {
 
     const SLOTS: usize = 32;
     const MAX_MIPS: usize = 15;
-    const MISC_CUBE: u32 = 0x4;
 
-    /// The description as the public 2D description orders it. Unmeasured: see the module note.
+    /// The console's `D3D12_RESOURCE_DESC`, with the swizzle mode where the PC's has its layout.
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
     pub struct TextureDesc {
-        pub width: u32,
+        pub dimension: u32,
+        pub _pad: u32,
+        pub alignment: u64,
+        pub width: u64,
         pub height: u32,
-        pub mip_levels: u32,
-        pub array_size: u32,
+        pub depth_or_array: u16,
+        pub mip_levels: u16,
         pub format: u32,
         pub sample_count: u32,
         pub sample_quality: u32,
-        pub usage: u32,
-        pub bind_flags: u32,
-        pub cpu_access: u32,
-        pub misc_flags: u32,
-        pub esram_offset: u32,
-        pub esram_usage: u32,
         pub swizzle: u32,
-        pub pitch: u32,
+        pub flags: u32,
     }
+
+    /// `D3D12_RESOURCE_DIMENSION_TEXTURE3D`.
+    const DIMENSION_3D: u32 = 4;
+    const FLAG_RENDER_TARGET: u32 = 0x1;
+    const FLAG_DEPTH_STENCIL: u32 = 0x2;
+    const FLAG_UNORDERED_ACCESS: u32 = 0x4;
 
     impl TextureDesc {
         /// A swizzle field the caller wrote itself carries bit 8 (`0x100 | mode`); anything else is open.
@@ -536,15 +542,34 @@ mod imp {
             (self.swizzle & 0x100 != 0).then_some(SwizzleMode(self.swizzle & 0xFF))
         }
 
+        /// The D3D12 flags as the bind flags the swizzle rule takes.
+        fn bind_flags(&self) -> u32 {
+            let mut bind = 0;
+            if self.flags & FLAG_RENDER_TARGET != 0 {
+                bind |= layout::BIND_RENDER_TARGET;
+            }
+            if self.flags & FLAG_DEPTH_STENCIL != 0 {
+                bind |= layout::BIND_DEPTH_STENCIL;
+            }
+            if self.flags & FLAG_UNORDERED_ACCESS != 0 {
+                bind |= layout::BIND_UNORDERED_ACCESS;
+            }
+            bind
+        }
+
         fn spec(&self, swizzle: SwizzleMode) -> TextureSpec {
             TextureSpec {
-                dimension: Dimension::D2,
-                width: self.width,
+                dimension: if self.dimension == DIMENSION_3D {
+                    Dimension::D3
+                } else {
+                    Dimension::D2
+                },
+                width: u32::try_from(self.width).unwrap_or(u32::MAX),
                 height: self.height,
-                depth: self.array_size.max(1),
-                mips: self.mip_levels,
+                depth: u32::from(self.depth_or_array.max(1)),
+                mips: u32::from(self.mip_levels),
                 format: self.format,
-                cube: self.misc_flags & MISC_CUBE != 0,
+                cube: false,
                 swizzle,
             }
         }
@@ -760,7 +785,7 @@ mod imp {
             return E_NOTIMPL;
         }
         let swizzle = desc.explicit_mode().unwrap_or_else(|| {
-            layout::suggest_swizzle_mode(&desc.spec(SwizzleMode::SW_4KB_S), desc.bind_flags)
+            layout::suggest_swizzle_mode(&desc.spec(SwizzleMode::SW_4KB_S), desc.bind_flags())
         });
         match layout::compute(&desc.spec(swizzle)) {
             Ok(layout) => {
@@ -797,7 +822,7 @@ mod imp {
             return E_INVALIDARG;
         }
         // SAFETY: `mode` is writable.
-        unsafe { *mode = layout::suggest_swizzle_mode(&spec, desc.bind_flags).0 };
+        unsafe { *mode = layout::suggest_swizzle_mode(&spec, desc.bind_flags()).0 };
         note_once(
             &SUGGEST_NOTE,
             "xg_xs: XGSuggestSwizzleMode chose by its own rule (the console's is unmeasured)",
