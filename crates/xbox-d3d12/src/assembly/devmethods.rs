@@ -49,6 +49,19 @@ fn pipeline_hresult(what: &str, error: PipelineError) -> u32 {
 
 // Resources
 
+/// Where the title's allocation chain puts a committed resource, as the console runtime's `XMemAlloc` gets it:
+/// `None` when no hook is set or the chain only reached the default allocator (then the device allocates).
+fn title_placement(desc: &crate::resource::desc::ResourceDesc) -> Option<Placement> {
+    let info = desc.allocation_info().ok()?;
+    let allocator = super::heap_allocator()?;
+    let hooked = allocator.allocate(info.size, crate::heap::console::RESOURCE_ATTRIBUTES)?;
+    com::note(format!(
+        "a committed resource of {:#x} bytes was placed by the title's allocator at {:#x}",
+        info.size, hooked.address
+    ));
+    Some(Placement::Placed(hooked.address))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_resource(
     this: *mut c_void,
@@ -68,6 +81,10 @@ fn create_resource(
     let Some(desc) = (unsafe { read_resource_desc(desc) }) else {
         com::note_once("a resource description with an unknown dimension was refused");
         return E_INVALIDARG;
+    };
+    let placement = match placement {
+        Placement::Committed(HeapKind::Default) => title_placement(&desc).unwrap_or(placement),
+        other => other,
     };
     match asm.create_resource(placement, &desc, state) {
         Ok(id) => {
