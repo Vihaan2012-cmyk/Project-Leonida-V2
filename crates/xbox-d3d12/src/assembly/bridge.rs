@@ -4,11 +4,16 @@
 //!
 //! Everything that needs the device's state, such as which texture a COM pointer is or which image a render target
 //! descriptor names, comes through `Resolver`, so the conversion itself runs without a GPU.
+//!
+//! A pipeline the title sets is not asked for until a draw or dispatch uses it: the draw policy then decides
+//! between waiting for its build and dropping the draw, and the first draw that gets it emits `SetPipeline`.
 
 use std::sync::Arc;
 
 use super::indirect::IndirectLayout;
+use super::pipelines::PendingPipeline;
 use crate::com::ComPtr;
+use crate::compile_queue::Resolved;
 use crate::execute::barrier::{
     DEPTH_READ, DEPTH_WRITE, NON_PIXEL_SHADER_RESOURCE, PIXEL_SHADER_RESOURCE, RENDER_TARGET,
     UNORDERED_ACCESS,
@@ -37,7 +42,8 @@ pub trait Resolver {
     /// The buffer whose address range holds `address`.
     fn buffer_containing(&self, address: u64) -> Option<BufferRef>;
     fn root_signature(&self, object: &ComPtr) -> Option<Arc<RootSignature>>;
-    fn pipeline(&self, object: &ComPtr) -> Option<Arc<Pipeline>>;
+    /// The pipeline state object `object`, which may still be building.
+    fn pipeline(&self, object: &ComPtr) -> Option<Arc<dyn PendingPipeline>>;
     fn command_signature(&self, object: &ComPtr) -> Option<IndirectLayout>;
     fn heap_bases(&self, heaps: &[ComPtr]) -> HeapBases;
     /// The render target view the descriptor at this CPU handle names.
@@ -67,8 +73,17 @@ pub struct Converted {
     pub writes: Vec<(u64, u64)>,
 }
 
+/// A pipeline set and not yet used, or used and kept.
+struct Bound {
+    pending: Arc<dyn PendingPipeline>,
+    built: Option<Arc<Pipeline>>,
+    emitted: bool,
+}
+
 #[derive(Default)]
 struct State {
+    graphics_pipeline: Option<Bound>,
+    compute_pipeline: Option<Bound>,
     graphics_root: Option<Arc<RootSignature>>,
     compute_root: Option<Arc<RootSignature>>,
     vertex: Vec<Option<VertexBufferView>>,
@@ -170,12 +185,12 @@ fn convert_into(
             C::ClearState { pipeline } => {
                 *state = State::default();
                 if let Some(p) = pipeline.as_ref().and_then(|p| r.pipeline(p)) {
-                    out.commands.push(Command::SetPipeline(p));
+                    set_pipeline(state, p);
                 }
             }
             C::SetPipelineState(pipeline) => match pipeline {
                 Some(p) => match r.pipeline(p) {
-                    Some(p) => out.commands.push(Command::SetPipeline(p)),
+                    Some(p) => set_pipeline(state, p),
                     None => r.note("SetPipelineState named an object that is not a pipeline state"),
                 },
                 None => r.note("SetPipelineState(null) was recorded and ignored"),
@@ -186,7 +201,7 @@ fn convert_into(
                 start_vertex,
                 start_instance,
             } => {
-                if !skipped(state, r) {
+                if !skipped(state, r) && pipeline_ready(state, out, false, r) {
                     out.commands.push(Command::Draw {
                         vertices: *vertex_count,
                         instances: *instance_count,
@@ -202,7 +217,7 @@ fn convert_into(
                 base_vertex,
                 start_instance,
             } => {
-                if !skipped(state, r) {
+                if !skipped(state, r) && pipeline_ready(state, out, false, r) {
                     out.commands.push(Command::DrawIndexed {
                         indices: *index_count,
                         instances: *instance_count,
@@ -212,7 +227,11 @@ fn convert_into(
                     });
                 }
             }
-            C::Dispatch { x, y, z, .. } => out.commands.push(Command::Dispatch([*x, *y, *z])),
+            C::Dispatch { x, y, z, .. } => {
+                if pipeline_ready(state, out, true, r) {
+                    out.commands.push(Command::Dispatch([*x, *y, *z]));
+                }
+            }
             C::CopyBufferRegion {
                 dst,
                 dst_offset,
@@ -450,7 +469,11 @@ fn convert_into(
                     .as_ref()
                     .and_then(|c| r.buffer(c))
                     .map(|c| c.address + count_offset);
-                if kind != IndirectKind::Dispatch && skipped(state, r) {
+                let compute = kind == IndirectKind::Dispatch;
+                if !compute && skipped(state, r) {
+                    continue;
+                }
+                if !pipeline_ready(state, out, compute, r) {
                     continue;
                 }
                 out.commands.push(Command::ExecuteIndirect {
@@ -475,6 +498,54 @@ fn convert_into(
             }
         }
     }
+}
+
+fn set_pipeline(state: &mut State, pending: Arc<dyn PendingPipeline>) {
+    let bound = Some(Bound {
+        pending,
+        built: None,
+        emitted: false,
+    });
+    if bound.as_ref().is_some_and(|b| b.pending.compute()) {
+        state.compute_pipeline = bound;
+    } else {
+        state.graphics_pipeline = bound;
+    }
+}
+
+/// Gets the pipeline of the draw or dispatch about to be recorded, by the draw policy, and emits `SetPipeline` for
+/// it the first time. False when the draw is dropped because the pipeline is not built or failed to build. With no
+/// pipeline set in the list the draw goes through, as the title recorded it.
+fn pipeline_ready(state: &mut State, out: &mut Converted, compute: bool, r: &dyn Resolver) -> bool {
+    let slot = if compute {
+        &mut state.compute_pipeline
+    } else {
+        &mut state.graphics_pipeline
+    };
+    let Some(bound) = slot else {
+        return true;
+    };
+    let built = match &bound.built {
+        Some(built) => built.clone(),
+        None => match bound.pending.resolve() {
+            Resolved::Ready(built) => {
+                bound.built = Some(built.clone());
+                built
+            }
+            Resolved::NotReady => return false,
+            Resolved::Failed(why) => {
+                r.note(&format!(
+                    "a pipeline that failed to build was used; its draws are dropped: {why}"
+                ));
+                return false;
+            }
+        },
+    };
+    if !bound.emitted {
+        bound.emitted = true;
+        out.commands.push(Command::SetPipeline(built));
+    }
+    true
 }
 
 /// Whether the draw about to be recorded reads a buffer the content filter hides.

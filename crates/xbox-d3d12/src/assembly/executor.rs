@@ -16,6 +16,7 @@ use super::bridge::{self, BufferRef, Converted, Resolver};
 use super::hooks;
 use super::indirect::IndirectLayout;
 use super::objects::{pipeline_of, resource_of, root_of, signature_of};
+use super::pipelines::PendingPipeline;
 use super::resapi::image_ref;
 use super::state::Assembly;
 use super::views::identity;
@@ -29,7 +30,6 @@ use crate::execute::{
 use crate::heap;
 use crate::list;
 use crate::memory::Backing;
-use crate::pipeline::Pipeline;
 use crate::queue::{Executor, QueueInfo, TileCall};
 use crate::resource::{Origin, Resources};
 use crate::root::{HeapBases, ParameterKind, RangeType, RootSignature};
@@ -183,7 +183,7 @@ impl Resolver for Context<'_> {
         unsafe { root_of(object.as_ptr()) }
     }
 
-    fn pipeline(&self, object: &ComPtr) -> Option<Arc<Pipeline>> {
+    fn pipeline(&self, object: &ComPtr) -> Option<Arc<dyn PendingPipeline>> {
         // SAFETY: as `buffer`.
         unsafe { pipeline_of(object.as_ptr()) }
     }

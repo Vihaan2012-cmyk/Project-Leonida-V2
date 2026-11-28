@@ -163,6 +163,12 @@ pub struct Device {
     pub core: Arc<DeviceCore>,
 }
 
+impl Drop for Device {
+    fn drop(&mut self) {
+        crate::assembly::state::device_released(&self.core);
+    }
+}
+
 /// The shared state of a device, for the methods of other steps.
 ///
 /// # Safety
