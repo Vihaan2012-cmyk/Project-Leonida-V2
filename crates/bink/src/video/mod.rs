@@ -1,4 +1,11 @@
 //! Bink 2 video: frame header, slices and macroblocks.
+//!
+//! Frame flags (the first word of a frame) as the game's Bink library reads them: the low byte times eight is the
+//! smoothing threshold of flat intra blocks, 0x2000 selects the recency-coded block types, 0x4000 and 0x8000 switch
+//! vertical and horizontal edge filtering off (and with it the edge flag lists), 0x10000 announces those lists,
+//! 0x20000 lets a motion source sit closer to the picture's far edge, 0x40000 selects the wider coded-block
+//! patterns and DC range (and replaces the filters of the residue itself, which no game movie uses), and 0x80000
+//! fills the alpha plane with the top byte. Decoded frames are filtered in `deblock`.
 
 mod block;
 mod deblock;

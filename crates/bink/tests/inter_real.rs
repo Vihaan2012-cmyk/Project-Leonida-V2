@@ -83,9 +83,9 @@ fn every_frame_of_small_movies_decodes_and_neighbours_stay_close() {
     }
 }
 
-/// Decodes whole 2560x1440 movies, so run it with `--release`. Each movie has a later keyframe: the intra picture
-/// and the frame the inter chain predicted just before it describe nearly the same moment, so their distance
-/// shows how far the chain has wandered.
+/// Decodes whole 2560x1440 movies, so run it with `--release`. Streams 17 and 18 end in a cut to black, so their
+/// last keyframe is a different picture from the frame before it and only shows that the chain is stable up to
+/// there; stream 22 cuts between scenes at its keyframes.
 #[test]
 #[ignore = "decodes about 3300 frames of 2560x1440; run with --release"]
 fn a_keyframe_after_a_long_inter_chain_matches_the_chain_before_it() {
@@ -100,14 +100,35 @@ fn a_keyframe_after_a_long_inter_chain_matches_the_chain_before_it() {
             println!(
                 "  keyframe {key} is {v:.2} dB from the frame before, against {before:.2} dB for the 20 pairs earlier"
             );
-            // Stream 22 cuts between scenes at its keyframes, so only the two movies that hold on one picture are held to
-            // a floor.
             if index != 22 {
                 assert!(
                     v > 28.0,
                     "stream {index}: the keyframe at {key} is only {v:.2} dB from the chain"
                 );
             }
+        }
+    }
+}
+
+/// Cutscene movies with a keyframe every 150 frames: the keyframe is coded without the chain, so its distance to
+/// the inter frame before it measures how far the decoded chain has wandered from the encoder's, and it has to stay
+/// within a few dB of what neighbouring inter frames agree on. The block filters and the exact motion compensation
+/// arithmetic are what keep it there.
+#[test]
+#[ignore = "decodes about 1500 frames of 1280x720; run with --release"]
+fn regular_keyframes_stay_close_to_the_chain_before_them() {
+    let Some(movies) = Movies::open() else { return };
+    for (index, floor) in [(99, 40.0), (98, 27.0), (211, 24.0)] {
+        let c = decode_all(&movies, index);
+        println!(
+            "stream {index}: {} frames, mean adjacent psnr {:.2}",
+            c.frames, c.mean
+        );
+        for &(key, v, before) in &c.at_keys {
+            println!(
+                "  keyframe {key} is {v:.2} dB from the frame before, against {before:.2} dB for the pairs before"
+            );
+            assert!(v > floor, "stream {index}: keyframe {key} only {v:.2} dB");
         }
     }
 }

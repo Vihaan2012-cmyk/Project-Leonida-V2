@@ -150,9 +150,7 @@ mod tests {
         let mut by_column = [[0i16; 8]; 8];
         for col in 0..8 {
             let out = line(std::array::from_fn(|r| c[r * 8 + col] as i16));
-            for x in 0..8 {
-                by_column[col][x] = out[x];
-            }
+            by_column[col] = out;
         }
         for x in 0..8 {
             let out = line(std::array::from_fn(|col| by_column[col][x]));
