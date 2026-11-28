@@ -146,6 +146,14 @@ fn run(path: &Path, args: &RunArgs, plan: &RuntimePlan) -> Result<ExitCode> {
             Ok(applied) => println!("trace: {} fast-fail sites made visible", applied.len()),
             Err(error) => eprintln!("warning: fast-fail sites stay hidden from the trace: {error}"),
         }
+        let breaks = enhancements::diagnostics::break_sites_from_env();
+        if !breaks.is_empty() {
+            let patches = enhancements::diagnostics::break_patches(&memory, &breaks);
+            match enhancements::patch::apply_all(&mut memory, &patches) {
+                Ok(applied) => println!("trace: {} breakpoints set", applied.len()),
+                Err(error) => eprintln!("warning: breakpoints not set: {error}"),
+            }
+        }
         let folder = boot.clone();
         std::thread::spawn(move || {
             loop {

@@ -165,6 +165,40 @@ pub fn fastfail_patches(memory: &dyn CodeMemory, sites: &[u32]) -> Vec<Patch> {
         .collect()
 }
 
+/// The image offsets in `LEONIDA_BREAK_AT` (comma separated, `0x` hex or decimal), for `break_patches`.
+pub fn break_sites_from_env() -> Vec<u32> {
+    std::env::var("LEONIDA_BREAK_AT")
+        .map(|text| parse_sites(&text))
+        .unwrap_or_default()
+}
+
+pub fn parse_sites(text: &str) -> Vec<u32> {
+    text.split(',')
+        .map(str::trim)
+        .filter_map(|site| match site.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => site.parse().ok(),
+        })
+        .collect()
+}
+
+/// One `int3` over the first byte of the instruction at each site, so the crash handler records the registers
+/// and stack the first time execution gets there. For finding where a value goes wrong; the run stops there.
+pub fn break_patches(memory: &dyn CodeMemory, sites: &[u32]) -> Vec<Patch> {
+    sites
+        .iter()
+        .filter_map(|rva| {
+            let original = memory.read(*rva, 1).ok()?;
+            Some(Patch {
+                name: format!("breakpoint at {rva:#x}"),
+                rva: *rva,
+                original,
+                replacement: vec![0xCC],
+            })
+        })
+        .collect()
+}
+
 /// Patches the fast-fail sites that hold `int 29h` and gives the explainer to the crash handler.
 pub fn enable(memory: &mut dyn CodeMemory, sites: &[u32]) -> Result<Vec<Applied>, PatchError> {
     shims::trace::set_explainer(explain);
@@ -382,5 +416,19 @@ mod tests {
     #[test]
     fn the_heap_check_is_in_the_table() {
         assert!(CHECKS.iter().any(|c| c.rva == 0x01cf_336c));
+    }
+}
+
+#[cfg(test)]
+mod break_tests {
+    use super::*;
+
+    #[test]
+    fn break_sites_parse_hex_and_decimal_and_skip_junk() {
+        assert_eq!(
+            parse_sites("0x1d65c45, 16, nope,0x10"),
+            vec![0x1d6_5c45, 16, 0x10]
+        );
+        assert!(parse_sites("").is_empty());
     }
 }
