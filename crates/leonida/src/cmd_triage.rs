@@ -13,7 +13,9 @@ use exe_analysis::triage::{
 use game_package::map_file;
 use pe_image::Image;
 
-use crate::triage_signature::{write_library_comparison, write_signature};
+use crate::triage_signature::{
+    References, index_names, write_debug_directory, write_library_comparison, write_signature,
+};
 
 const NAMES_PER_LINE: usize = 104;
 const EXPORTS_SHOWN: usize = 400;
@@ -68,9 +70,36 @@ pub fn system_folder() -> PathBuf {
     PathBuf::from(root).join("System32")
 }
 
-pub fn triage_command(game: &Path, system: Option<&Path>) -> Result<ExitCode> {
+/// Folders searched for other copies of the game's libraries when none is given.
+fn default_search_roots() -> Vec<PathBuf> {
+    [
+        "C:\\Program Files",
+        "C:\\Program Files (x86)",
+        "C:\\Windows\\WinSxS",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
+pub fn triage_command(game: &Path, system: Option<&Path>, search: &[PathBuf]) -> Result<ExitCode> {
     let system = system.map_or_else(system_folder, Path::to_path_buf);
     let images = find_images(game);
+    let wanted = images
+        .iter()
+        .filter_map(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .collect();
+    let roots = if search.is_empty() {
+        default_search_roots()
+    } else {
+        search.to_vec()
+    };
+    let refs = References {
+        found: index_names(&roots, &wanted),
+        system,
+    };
+    let system = &refs.system;
     let stdout = io::stdout();
     let mut out = stdout.lock();
     writeln!(
@@ -79,6 +108,15 @@ pub fn triage_command(game: &Path, system: Option<&Path>) -> Result<ExitCode> {
         images.len(),
         game.display(),
         system.display()
+    )?;
+    writeln!(
+        out,
+        "Folders searched for other copies of each library: {}\n",
+        roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
     )?;
     let mut summary = Vec::new();
     for path in &images {
@@ -103,7 +141,7 @@ pub fn triage_command(game: &Path, system: Option<&Path>) -> Result<ExitCode> {
             &name,
             &image,
             &triage,
-            &system,
+            &refs,
         )?;
         summary.push((relative.display().to_string(), triage.indicators.len()));
     }
@@ -172,8 +210,9 @@ pub(crate) fn write_image(
     name: &str,
     image: &Image<'_>,
     t: &Triage,
-    system: &Path,
+    refs: &References,
 ) -> io::Result<()> {
+    let system = refs.system.as_path();
     writeln!(
         out,
         "================================================================"
@@ -306,8 +345,9 @@ pub(crate) fn write_image(
             )?;
         }
     }
+    write_debug_directory(out, image)?;
     write_strings(out, t)?;
-    write_signature(out, image, Some(system), name)?;
+    write_signature(out, image, refs, name)?;
     let reference = system.join(name);
     if !system.as_os_str().is_empty()
         && name.to_ascii_lowercase().ends_with(".dll")

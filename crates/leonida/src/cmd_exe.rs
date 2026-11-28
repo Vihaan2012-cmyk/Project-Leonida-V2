@@ -60,8 +60,8 @@ fn image_by_prefix(game: &Path, prefix: &str) -> Result<PathBuf> {
 
 pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
     let game = resolve_game(args.game.as_ref(), &Manifest::builtin())?;
-    if let ExeCommand::Triage { system } = &args.command {
-        return crate::cmd_triage::triage_command(&game, system.as_deref());
+    if let ExeCommand::Triage { system, search } = &args.command {
+        return crate::cmd_triage::triage_command(&game, system.as_deref(), search);
     }
     let path = match &args.image {
         Some(prefix) => image_by_prefix(&game, prefix)?,
