@@ -427,6 +427,11 @@ pub fn humanize(name: &str) -> String {
 
 const LABELS: &[(&str, &str, &str)] = &[
     (
+        "input.mouse_camera",
+        "Turn the camera directly",
+        "On: the mouse turns the camera through a code patch. Off: the mouse acts as the right stick.",
+    ),
+    (
         "input.mouse_sensitivity",
         "Sensitivity",
         "How fast the mouse turns the camera, 0.05 to 10.",
@@ -592,6 +597,7 @@ mod tests {
         let page = controls();
         let ids: Vec<&str> = page.fields().map(|field| field.id.as_str()).collect();
         for expected in [
+            "input.mouse_camera",
             "input.mouse_sensitivity",
             "input.mouse_invert_y",
             "input.gamepad_look_sensitivity",
@@ -604,6 +610,16 @@ mod tests {
             .find(|field| field.id == "input.mouse_sensitivity")
             .unwrap();
         assert_eq!(sensitivity.kind, Kind::Number);
+        let camera = page
+            .fields()
+            .find(|field| field.id == "input.mouse_camera")
+            .unwrap();
+        assert_eq!(camera.kind, Kind::flag());
+        assert_eq!(camera.label, "Turn the camera directly");
+        assert!(
+            page.columns[0].iter().position(|f| f.id == camera.id)
+                < page.columns[0].iter().position(|f| f.id == sensitivity.id)
+        );
         assert_eq!(humanize("take_cover"), "Take cover");
     }
 

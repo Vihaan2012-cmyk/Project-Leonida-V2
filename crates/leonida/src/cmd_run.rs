@@ -41,6 +41,7 @@ pub fn run_command(args: &RunArgs) -> Result<ExitCode> {
     runtime::print_plan(&plan);
     let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     let bytes = map_file(&file).context("mapping the file")?;
+    println!("{}", runtime::describe_mouse_patch(&plan, &bytes));
     let image = Image::parse(&bytes)?;
     let binder = Binder::new(&[]);
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
@@ -138,6 +139,7 @@ fn run(path: &Path, args: &RunArgs, plan: &RuntimePlan) -> Result<ExitCode> {
     println!("starting {} at {:#x}", path.display(), module.entry());
     // SAFETY: the player asked to run this executable; its imports are bound and its pages protected.
     let code = unsafe { module.call_entry() };
+    runtime::detach_mouse();
     shims::d3d12::shutdown();
     if let Some(trace) = binder.trace() {
         trace.write(&boot)?;

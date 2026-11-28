@@ -327,6 +327,8 @@ impl Default for MouseWheel {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Input {
+    /// Turns the camera directly with the mouse through a code patch; false keeps the mouse acting as the right stick.
+    pub mouse_camera: bool,
     pub mouse_sensitivity: f32,
     /// Multiplies `mouse_sensitivity` for sideways movement.
     pub mouse_sensitivity_x: f32,
@@ -350,6 +352,7 @@ pub struct Input {
 impl Default for Input {
     fn default() -> Self {
         Self {
+            mouse_camera: true,
             mouse_sensitivity: 1.0,
             mouse_sensitivity_x: 1.0,
             mouse_sensitivity_y: 1.0,
@@ -484,6 +487,10 @@ fn documented_defaults() -> String {
     format!(
         "\
 # Leonida input settings. Delete this file (or run `leonida config reset`) to get it back with the defaults.
+
+# true turns the camera directly with the mouse (a code patch in the game, nothing is sent through the stick);
+# false keeps the mouse acting as the right stick. mouse_smoothing only applies when this is false.
+mouse_camera = true
 
 # How fast the mouse turns the camera. 0.05 to 10.0, 1.0 is the game's own speed. The two axis values
 # multiply it for sideways and up-and-down movement.
@@ -644,6 +651,37 @@ mod keyboard_mouse_tests {
         assert_eq!(input.mouse_wheel.up, "");
         assert_eq!(input.mouse_wheel.down, "jump");
         assert_eq!(input.keys(Action::Fire), ["Mouse4"]);
+    }
+
+    #[test]
+    fn the_mouse_turns_the_camera_directly_unless_switched_off() {
+        assert!(Input::default().mouse_camera);
+        assert!(Input::parse("").unwrap().mouse_camera);
+        assert!(
+            !Input::parse(
+                "mouse_camera = false
+"
+            )
+            .unwrap()
+            .mouse_camera
+        );
+        let error = Input::parse(
+            "mouse_camera = 1
+",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("mouse_camera"), "{error}");
+        let text = documented_defaults();
+        assert!(
+            text.contains(
+                "
+mouse_camera = true
+"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("acting as the right stick"));
     }
 
     #[test]
