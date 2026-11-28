@@ -23,6 +23,8 @@ mod lanes;
 mod model;
 #[cfg(test)]
 mod real_tests;
+#[cfg(test)]
+mod survey_tests;
 mod tables;
 #[cfg(test)]
 mod testenc;
