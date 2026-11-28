@@ -1,8 +1,10 @@
 //! Authenticode checks for `leonida exe triage`: does the signed digest match the file, and where does the file
 //! differ from a signed original. Only hashes, offsets and counts are reported.
 
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use game_package::map_file;
 use pe_image::Image;
@@ -97,7 +99,7 @@ fn range(label: &str, start: usize, end: usize) -> Region {
 }
 
 /// Ways the file could have been hashed other than the documented one, each with the digest it gives.
-fn experiments(image: &Image<'_>) -> Vec<(&'static str, [u8; 32])> {
+fn experiments(image: &Image<'_>) -> Vec<(String, [u8; 32])> {
     let standard = Convention {
         skip_checksum: true,
         skip_certificate_entry: true,
@@ -118,52 +120,148 @@ fn experiments(image: &Image<'_>) -> Vec<(&'static str, [u8; 32])> {
         .map(|s| s.raw_offset as usize)
         .min();
     let mut out = vec![
-        ("documented ranges", with(&|_| {})),
+        ("documented ranges".to_string(), with(&|_| {})),
         (
-            "checksum field included",
+            "checksum field included".to_string(),
             with(&|h| h.skip_checksum = false),
         ),
         (
-            "certificate directory entry included",
+            "certificate directory entry included".to_string(),
             with(&|h| h.skip_certificate_entry = false),
         ),
         (
-            "checksum and certificate entry both included",
+            "checksum and certificate entry both included".to_string(),
             with(&|h| {
                 h.skip_checksum = false;
                 h.skip_certificate_entry = false;
             }),
         ),
-        ("sections in table order", with(&|h| h.table_order = true)),
         (
-            "data after the last section left out",
+            "sections in table order".to_string(),
+            with(&|h| h.table_order = true),
+        ),
+        (
+            "data after the last section left out".to_string(),
             with(&|h| h.trailing = Trailing::None),
         ),
         (
-            "data after the last section runs through the certificate",
+            "data after the last section runs through the certificate".to_string(),
             with(&|h| h.trailing = Trailing::ThroughEndOfFile),
         ),
     ];
     if let Some(first) = first_raw {
         out.push((
-            "headers end at the first section's file offset",
+            "headers end at the first section's file offset".to_string(),
             with(&|h| h.header_end = Some(first)),
         ));
     }
     if bytes.len() <= EXPERIMENT_LIMIT {
-        let mut copy = bytes.to_vec();
-        let timestamp = image.checksum_offset() - 80;
-        if let Some(field) = copy.get_mut(timestamp..timestamp + 4) {
-            field.fill(0);
+        let timestamp_at = image.checksum_offset() - 80;
+        let mut candidates = vec![0u32];
+        for entry in debug_entries(image) {
+            if !candidates.contains(&entry.timestamp) && entry.timestamp != image.timestamp {
+                candidates.push(entry.timestamp);
+            }
         }
-        if let Ok(patched) = Image::parse(&copy) {
-            out.push((
-                "header timestamp zeroed",
-                sha256(&copy, &regions_for(&patched, &standard)),
-            ));
+        for value in candidates {
+            let mut copy = bytes.to_vec();
+            if let Some(field) = copy.get_mut(timestamp_at..timestamp_at + 4) {
+                field.copy_from_slice(&value.to_le_bytes());
+            }
+            if let Ok(patched) = Image::parse(&copy) {
+                out.push((
+                    format!("header time stamp replaced by 0x{value:08x}"),
+                    sha256(&copy, &regions_for(&patched, &standard)),
+                ));
+            }
         }
     }
     out
+}
+
+pub struct DebugEntry {
+    pub kind: u32,
+    pub timestamp: u32,
+    pub size: u32,
+    pub pointer: u32,
+}
+
+pub fn debug_entries(image: &Image<'_>) -> Vec<DebugEntry> {
+    let Some((rva, size)) = image.directory(6) else {
+        return Vec::new();
+    };
+    (0..(size / 28).min(32))
+        .filter_map(|index| {
+            let raw = image.read(rva + 28 * index, 28)?;
+            let field =
+                |at: usize| u32::from_le_bytes(raw[at..at + 4].try_into().unwrap_or([0; 4]));
+            Some(DebugEntry {
+                timestamp: field(4),
+                kind: field(12),
+                size: field(16),
+                pointer: field(24),
+            })
+        })
+        .collect()
+}
+
+fn debug_kind(kind: u32) -> &'static str {
+    match kind {
+        1 => "COFF",
+        2 => "CodeView",
+        3 => "FPO",
+        4 => "MISC",
+        9 => "BORLAND",
+        10 => "RESERVED10",
+        11 => "CLSID",
+        12 => "VC_FEATURE",
+        13 => "POGO",
+        14 => "ILTCG",
+        15 => "MPX",
+        16 => "REPRO",
+        20 => "EX_DLLCHARACTERISTICS",
+        _ => "other",
+    }
+}
+
+pub fn write_debug_directory(out: &mut dyn Write, image: &Image<'_>) -> io::Result<()> {
+    let entries = debug_entries(image);
+    if entries.is_empty() {
+        return writeln!(out, "debug directory: none");
+    }
+    writeln!(
+        out,
+        "debug directory ({} entries, header time stamp 0x{:08x}):",
+        entries.len(),
+        image.timestamp
+    )?;
+    for e in &entries {
+        let mut extra = String::new();
+        if e.kind == 2 {
+            let at = e.pointer as usize;
+            if let Some(raw) = image.bytes().get(at..at + (e.size as usize).min(512))
+                && raw.get(..4) == Some(b"RSDS")
+                && raw.len() > 24
+            {
+                let age = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
+                let path = raw[24..].split(|b| *b == 0).next().unwrap_or(&[]);
+                extra = format!(" age {age} pdb {}", String::from_utf8_lossy(path));
+            }
+        }
+        writeln!(
+            out,
+            "  {:<22} time stamp 0x{:08x}{} size {}{extra}",
+            debug_kind(e.kind),
+            e.timestamp,
+            if e.timestamp == image.timestamp {
+                " (= header)"
+            } else {
+                " (differs from header)"
+            },
+            e.size
+        )?;
+    }
+    Ok(())
 }
 
 /// Which header field a file offset in the first `size_of_headers` bytes belongs to.
@@ -231,7 +329,7 @@ fn difference(a: &[u8], b: &[u8]) -> Difference {
 pub fn write_signature(
     out: &mut dyn Write,
     image: &Image<'_>,
-    system: Option<&Path>,
+    refs: &References,
     name: &str,
 ) -> io::Result<()> {
     let bytes = image.bytes();
@@ -264,6 +362,11 @@ pub fn write_signature(
         "  names in the signature: {}",
         signature.names.join("; ")
     )?;
+    writeln!(
+        out,
+        "  signing times in the signature: {}",
+        signature.signing_times.join("; ")
+    )?;
     let regions = authenticode::regions(image);
     let computed_digest = sha256(bytes, &regions);
     match &signature.algorithm {
@@ -282,7 +385,7 @@ pub fn write_signature(
                 }
             )?;
             if !matches {
-                write_mismatch_analysis(out, image, &signature.digest, system, name)?;
+                write_mismatch_analysis(out, image, &signature.digest, refs, name)?;
             }
         }
         other => writeln!(
@@ -294,13 +397,101 @@ pub fn write_signature(
     Ok(())
 }
 
+/// How the signature's per-page hashes compare with the file: pages checked, and the file offsets that differ.
+fn page_check(image: &Image<'_>, stored: &authenticode::PageHashes) -> Option<(usize, Vec<u32>)> {
+    if stored.algorithm != DigestAlgorithm::Sha256 {
+        return None;
+    }
+    let ours = authenticode::page_hashes(image);
+    let mut bad = Vec::new();
+    for (offset, hash) in &ours {
+        match stored.entries.iter().find(|(o, _)| o == offset) {
+            Some((_, wanted)) if wanted.as_slice() == hash.as_slice() => {}
+            _ => bad.push(*offset),
+        }
+    }
+    Some((ours.len(), bad))
+}
+
+fn write_page_hashes(
+    out: &mut dyn Write,
+    image: &Image<'_>,
+    refs: &References,
+    name: &str,
+) -> io::Result<()> {
+    let Some(signature) = signature(image) else {
+        return Ok(());
+    };
+    let Some(stored) = &signature.page_hashes else {
+        return writeln!(out, "  page hashes: the signature carries none");
+    };
+    writeln!(
+        out,
+        "  page hashes: {} stored entries ({:?})",
+        stored.entries.len(),
+        stored.algorithm
+    )?;
+    match page_check(image, stored) {
+        None => writeln!(out, "    not recomputed (not SHA-256)")?,
+        Some((total, bad)) => {
+            writeln!(
+                out,
+                "    {} of {total} pages differ from the stored page hashes",
+                bad.len()
+            )?;
+            let mut named = Vec::new();
+            for offset in bad.iter().take(60) {
+                let place = image
+                    .sections
+                    .iter()
+                    .find(|s| *offset >= s.raw_offset && *offset < s.raw_offset + s.raw_size)
+                    .map_or(
+                        if *offset == 0 {
+                            "headers".to_string()
+                        } else {
+                            "after sections".to_string()
+                        },
+                        |s| s.name.clone(),
+                    );
+                named.push(format!("0x{offset:x} ({place})"));
+            }
+            writeln!(
+                out,
+                "    differing pages: {}{}",
+                named.join(", "),
+                if bad.len() > 60 { ", ..." } else { "" }
+            )?;
+        }
+    }
+    let reference = refs.system.join(name);
+    if let Ok(map) = File::open(&reference).and_then(|f| map_file(&f))
+        && let Ok(other) = Image::parse(&map)
+        && let Some(sig) = signature_of(&other)
+        && let Some(stored) = &sig.page_hashes
+        && let Some((total, bad)) = page_check(&other, stored)
+    {
+        writeln!(
+            out,
+            "    method check on {}: {} of {total} pages differ from its own stored page hashes",
+            reference.display(),
+            bad.len()
+        )?;
+    }
+    Ok(())
+}
+
+fn signature_of(image: &Image<'_>) -> Option<authenticode::Signature> {
+    signature(image)
+}
+
 fn write_mismatch_analysis(
     out: &mut dyn Write,
     image: &Image<'_>,
     signed: &[u8],
-    system: Option<&Path>,
+    refs: &References,
     name: &str,
 ) -> io::Result<()> {
+    write_page_hashes(out, image, refs, name)?;
     writeln!(out, "  hashed ranges:")?;
     for region in authenticode::regions(image) {
         writeln!(
@@ -328,22 +519,140 @@ fn write_mismatch_analysis(
             }
         )?;
     }
-    let Some(system) = system else { return Ok(()) };
+    let system = &refs.system;
     let reference = system.join(name);
-    let Ok(file) = std::fs::File::open(&reference) else {
-        return writeln!(out, "  no {name} in {} to compare with", system.display());
-    };
-    let Ok(map) = map_file(&file) else {
+    match File::open(&reference).and_then(|f| map_file(&f)) {
+        Err(_) => writeln!(out, "  no {name} in {} to compare with", system.display())?,
+        Ok(map) => match Image::parse(&map) {
+            Ok(other) => write_reference_diff(out, image, &other, signed, &reference)?,
+            Err(_) => writeln!(
+                out,
+                "  the copy in {} is not a 64-bit PE image",
+                system.display()
+            )?,
+        },
+    }
+    write_other_copies(out, image, signed, refs, name, &reference)
+}
+
+fn write_other_copies(
+    out: &mut dyn Write,
+    image: &Image<'_>,
+    signed: &[u8],
+    refs: &References,
+    name: &str,
+    system_copy: &Path,
+) -> io::Result<()> {
+    let Some(paths) = refs.found.get(&name.to_ascii_lowercase()) else {
         return Ok(());
     };
-    let Ok(other) = Image::parse(&map) else {
-        return writeln!(
+    let mut listed = Vec::new();
+    let mut identical = 0;
+    for path in paths {
+        if path.as_path() == system_copy {
+            continue;
+        }
+        let Ok(map) = File::open(path).and_then(|f| map_file(&f)) else {
+            continue;
+        };
+        if map[..] == *image.bytes() {
+            identical += 1;
+            continue;
+        }
+        let Ok(other) = Image::parse(&map) else {
+            continue;
+        };
+        let their = signature(&other);
+        let same_digest = their.as_ref().is_some_and(|s| s.digest == signed);
+        let verifies = their
+            .as_ref()
+            .is_some_and(|s| s.digest == sha256(other.bytes(), &authenticode::regions(&other)));
+        listed.push((
+            same_digest,
+            path.clone(),
+            other.bytes().len(),
+            other.timestamp,
+            verifies,
+        ));
+    }
+    listed.sort_by_key(|l| (!l.0, l.1.clone()));
+    writeln!(
+        out,
+        "  other copies of {name} on this PC: {} different, {identical} byte-identical to this one",
+        listed.len()
+    )?;
+    for (same_digest, path, size, timestamp, verifies) in listed.iter().take(30) {
+        writeln!(
             out,
-            "  the copy in {} is not a 64-bit PE image",
-            system.display()
-        );
-    };
-    write_reference_diff(out, image, &other, signed, &reference)
+            "    {} ({size} bytes, time stamp 0x{timestamp:08x} {}): {}; own signature {}",
+            path.display(),
+            crate::cmd_triage::utc(*timestamp),
+            if *same_digest {
+                "SAME SIGNED DIGEST AS OURS"
+            } else {
+                "other signed digest"
+            },
+            if *verifies {
+                "verifies"
+            } else {
+                "does not verify"
+            },
+        )?;
+        if (*same_digest || *timestamp == image.timestamp)
+            && let Ok(map) = File::open(path).and_then(|f| map_file(&f))
+            && let Ok(other) = Image::parse(&map)
+        {
+            write_reference_diff(out, image, &other, signed, path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Other places that hold a library of the same name, found by walking some folders.
+pub struct References {
+    pub system: PathBuf,
+    pub found: HashMap<String, Vec<PathBuf>>,
+}
+
+/// Every file under `roots` (at most 14 folders down) whose lowercase name is in `wanted`.
+pub fn index_names(roots: &[PathBuf], wanted: &HashSet<String>) -> HashMap<String, Vec<PathBuf>> {
+    fn visit(
+        dir: &Path,
+        depth: usize,
+        wanted: &HashSet<String>,
+        out: &mut HashMap<String, Vec<PathBuf>>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                if depth > 0 {
+                    visit(&entry.path(), depth - 1, wanted, out);
+                }
+            } else {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                if wanted.contains(&name) {
+                    out.entry(name).or_default().push(entry.path());
+                }
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    for root in roots {
+        visit(root, 14, wanted, &mut out);
+    }
+    for list in out.values_mut() {
+        list.sort();
+        list.dedup();
+    }
+    out
 }
 
 fn write_reference_diff(

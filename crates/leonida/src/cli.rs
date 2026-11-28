@@ -351,6 +351,10 @@ pub enum ExeCommand {
         /// Folder with the Windows copies of the runtime libraries to compare with. Defaults to System32.
         #[arg(long)]
         system: Option<PathBuf>,
+        /// Folders to search for other copies of each library, to find the signed original of a file whose
+        /// signature does not match. May be given more than once; defaults to Program Files and WinSxS.
+        #[arg(long)]
+        search: Vec<PathBuf>,
     },
     /// Readable text in the executable's data sections.
     Strings {
