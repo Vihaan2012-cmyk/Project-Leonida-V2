@@ -314,6 +314,14 @@ impl Context<'_> {
     }
 }
 
+/// The time since `*mark`, which moves to now.
+fn lap(mark: &mut Instant) -> Duration {
+    let now = Instant::now();
+    let spent = now.duration_since(*mark);
+    *mark = now;
+    spent
+}
+
 /// Merges address ranges that touch or overlap.
 fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     ranges.retain(|r| r.1 > 0);
@@ -336,6 +344,18 @@ impl Assembly {
         fence: vk::Fence,
         record: impl FnOnce(vk::CommandBuffer) -> R,
     ) -> Result<R, vk::Result> {
+        self.run_commands_timed(pool, fence, record)
+            .map(|(value, _)| value)
+    }
+
+    /// As `run_commands`, also returning the time spent in `record` and the time spent ending, submitting and
+    /// waiting.
+    fn run_commands_timed<R>(
+        &self,
+        pool: vk::CommandPool,
+        fence: vk::Fence,
+        record: impl FnOnce(vk::CommandBuffer) -> R,
+    ) -> Result<(R, [Duration; 2]), vk::Result> {
         let d = &self.gpu.ctx.device;
         // SAFETY: the command buffer comes from a pool of this device, is recorded once, submitted once and freed
         // after the fence says the GPU is done.
@@ -351,7 +371,10 @@ impl Assembly {
                     &vk::CommandBufferBeginInfo::default()
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )?;
+                let started = Instant::now();
                 let value = record(cb);
+                let recorded = started.elapsed();
+                let started = Instant::now();
                 d.end_command_buffer(cb)?;
                 let buffers = [cb];
                 let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
@@ -366,7 +389,7 @@ impl Assembly {
                 }
                 d.wait_for_fences(&[fence], true, u64::MAX)?;
                 d.reset_fences(&[fence])?;
-                Ok(value)
+                Ok((value, [recorded, started.elapsed()]))
             })();
             d.free_command_buffers(pool, &[cb]);
             result
@@ -509,6 +532,7 @@ impl Assembly {
     }
 
     pub fn execute(&self, lists: &[Arc<CommandStream>]) -> Result<(), vk::Result> {
+        let begun = Instant::now();
         self.wait_for_pipelines(lists);
         let mut exec = self.exec.lock().unwrap_or_else(PoisonError::into_inner);
         exec.spill.reset();
@@ -519,6 +543,8 @@ impl Assembly {
         if let Some(filter) = &filter {
             self.filter_uploads(filter, &resources, lists);
         }
+        let mut mark = Instant::now();
+        let prepare = mark.duration_since(begun);
         let context = Context {
             asm: self,
             resources: &resources,
@@ -529,11 +555,13 @@ impl Assembly {
             .map(|list| bridge::convert(list, &context))
             .collect();
         drop(context);
+        let convert = lap(&mut mark);
         {
             let mut descriptors = self.descriptors();
             self.bindless
                 .update(&mut descriptors, &resources, &self.views)?;
         }
+        let bindless = lap(&mut mark);
         let writes = merge_ranges(
             converted
                 .iter()
@@ -553,8 +581,9 @@ impl Assembly {
             buffer: space.buffer(),
             device_address: space.heap_base(),
         };
+        let memory = lap(&mut mark);
         let mut report = Vec::new();
-        let result = self.run_commands(pool, fence, |cb| {
+        let result = self.run_commands_timed(pool, fence, |cb| {
             space.record_uploads(cb);
             for list in &converted {
                 let env = ReplayEnv {
@@ -579,7 +608,8 @@ impl Assembly {
         for note in report {
             com::note_once(note);
         }
-        result?;
+        let (_, [record, submit_wait]) = result?;
+        mark = Instant::now();
         {
             let resources = self.resources();
             resources.release_detiled();
@@ -587,6 +617,17 @@ impl Assembly {
         }
         self.gpu.handles.budget.tick();
         drop(converted);
+        let finish = lap(&mut mark);
+        let t = &mut exec.timings;
+        t.submissions += 1;
+        t.prepare += prepare;
+        t.convert += convert;
+        t.bindless += bindless;
+        t.memory += memory;
+        t.record += record;
+        t.submit_wait += submit_wait;
+        t.finish += finish;
+        t.total += begun.elapsed();
         Ok(())
     }
 }
