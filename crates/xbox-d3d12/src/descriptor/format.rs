@@ -62,6 +62,10 @@ pub mod dxgi {
     pub const R8G8_SNORM: u32 = 51;
     pub const R8G8_SINT: u32 = 52;
     pub const R16_TYPELESS: u32 = 53;
+    /// The console's 16-bit depth with an 8-bit stencil, and its two planes as views.
+    pub const D16_UNORM_S8_UINT: u32 = 118;
+    pub const R16_UNORM_X8_TYPELESS: u32 = 119;
+    pub const X16_TYPELESS_G8_UINT: u32 = 120;
     pub const R16_FLOAT: u32 = 54;
     pub const D16_UNORM: u32 = 55;
     pub const R16_UNORM: u32 = 56;
@@ -381,6 +385,29 @@ pub static FORMATS: &[Format] = &[
     typeless(dxgi::R16_TYPELESS, R16_FLOAT),
     R16_FLOAT,
     special(dxgi::D16_UNORM, 7, V::D16_UNORM, 2, Kind::Depth),
+    // PC GPUs rarely have a 16-bit depth with stencil; the 24-bit one holds every value of it (and falls back to
+    // 32-bit float depth where there is no 24-bit one).
+    special(
+        dxgi::D16_UNORM_S8_UINT,
+        7,
+        V::D24_UNORM_S8_UINT,
+        4,
+        Kind::DepthStencil,
+    ),
+    special(
+        dxgi::R16_UNORM_X8_TYPELESS,
+        7,
+        V::D24_UNORM_S8_UINT,
+        4,
+        Kind::DepthPlane,
+    ),
+    special(
+        dxgi::X16_TYPELESS_G8_UINT,
+        5,
+        V::D24_UNORM_S8_UINT,
+        4,
+        Kind::StencilPlane,
+    ),
     color(dxgi::R16_UNORM, 7, R, V::R16_UNORM, 2),
     color(dxgi::R16_UINT, 11, R, V::R16_UINT, 2),
     color(dxgi::R16_SNORM, 8, R, V::R16_SNORM, 2),

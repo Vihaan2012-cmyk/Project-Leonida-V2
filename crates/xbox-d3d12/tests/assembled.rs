@@ -1005,3 +1005,11 @@ fn a_typeless_16_bit_texture_is_made_with_the_uses_the_gpu_allows() {
     let texture = h.committed(1, &texture_desc(64, 64, 53, 0x1 | 0x4), 0);
     assert!(!texture.is_null());
 }
+
+/// The console's 16-bit depth with stencil (DXGI 118) is a depth-stencil target the title makes.
+#[test]
+fn a_16_bit_depth_with_stencil_texture_is_made() {
+    let Some(h) = harness() else { return };
+    let depth = h.committed(1, &texture_desc(64, 64, 118, 0x2), 0);
+    assert!(!depth.is_null());
+}
