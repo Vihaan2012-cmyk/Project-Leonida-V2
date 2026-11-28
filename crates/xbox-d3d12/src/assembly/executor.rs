@@ -1,9 +1,10 @@
 //! `Executor`: closed command lists replayed on the Vulkan queue.
 //!
 //! One `ExecuteCommandLists` call is one submission: every list is converted to replay commands (`bridge`), the
-//! descriptors they can reach are registered and the bindless set brought up to date, one command buffer is
-//! recorded (host memory copied into a mirrored window first, what the GPU wrote copied back after) and the call
-//! returns when the GPU has finished. Submissions run one at a time.
+//! descriptors they can reach are registered and the bindless set brought up to date, the lists are recorded (host
+//! memory copied into a mirrored window first, what the GPU wrote copied back after) and the call returns when the
+//! GPU has finished. A long list goes into several command buffers, each submitted as it is finished so the GPU
+//! works while the rest is recorded. Submissions run one at a time.
 
 use std::cell::RefCell;
 use std::ffi::c_void;
