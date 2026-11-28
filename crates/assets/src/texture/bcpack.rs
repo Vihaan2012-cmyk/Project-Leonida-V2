@@ -9,6 +9,11 @@
 
 use thiserror::Error;
 
+mod bc6h;
+#[cfg(test)]
+mod bc6h_real_tests;
+#[cfg(test)]
+mod bc6h_tests;
 mod bc7;
 #[cfg(test)]
 mod bc7_tests;
@@ -264,6 +269,7 @@ pub fn decode_with(
         BcPackCodec::Bc3 => blocks::bc3,
         BcPackCodec::Bc4 => blocks::bc4,
         BcPackCodec::Bc5 => blocks::bc5,
+        BcPackCodec::Bc6h if bc6h::has_history() => bc6h::bc6h,
         BcPackCodec::Bc7 => bc7::bc7,
         _ => return Err(BcPackError::Unsupported { codec }),
     };
@@ -333,12 +339,12 @@ mod tests {
 
     #[test]
     fn codecs_without_a_block_stage_stay_unsupported() {
-        for codec in [BcPackCodec::Bc2, BcPackCodec::Bc6h] {
-            assert_eq!(
-                decode(codec, &[0; 64], 4096),
-                Err(BcPackError::Unsupported { codec })
-            );
-        }
+        assert_eq!(
+            decode(BcPackCodec::Bc2, &[0; 64], 4096),
+            Err(BcPackError::Unsupported {
+                codec: BcPackCodec::Bc2
+            })
+        );
         assert!(matches!(
             decode(BcPackCodec::Bc1, &[0; 64], 100),
             Err(BcPackError::BadSize { .. })
