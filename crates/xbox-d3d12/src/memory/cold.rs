@@ -169,22 +169,23 @@ impl AddressSpace {
         for (a, b) in t.hot.pieces(va, hi) {
             fresh.remove(a, b);
         }
-        let mut added = Vec::new();
         for (a, b) in fresh.take() {
             if !covers(&t.cold, a, b) {
                 t.cold.add(a, b);
                 t.due = true;
-                added.push((a, b));
             }
-        }
-        for (a, b) in added {
-            self.reset_watch(a, b);
         }
     }
 
-    /// Starts the write watch afresh over `lo..hi`, so what it reports from now on is what the title writes after
-    /// the detile that made the range cold. A mirrored range keeps what the watch had seen as dirty for the upload.
-    fn reset_watch(&mut self, lo: u64, hi: u64) {
+    /// Call it just before reading the bytes `va..va + len` an image is made from: what `take_cold_writes` reports
+    /// from then on is what the title writes after the read. A mirrored range keeps what the write watch had seen
+    /// as dirty for the next upload.
+    pub fn rebase_writes(&mut self, va: u64, len: u64) {
+        if self.backing != Backing::Mirrored || len == 0 {
+            return;
+        }
+        let (lo, hi) = (va, va + len);
+        self.temp.written.remove(lo, hi);
         let mut seen = Vec::new();
         for (start, extent, from, to) in self.extents.overlapping(lo, hi) {
             let Some(memory) = self.memories.get(&extent.memory) else {

@@ -143,6 +143,13 @@ impl ResourceDesc {
         self.flags & flag != 0
     }
 
+    /// A texture only sampled: nothing renders to it or writes it from a shader, so its game memory is read only
+    /// once, to make its image.
+    pub fn detiles_for_sampling(&self) -> bool {
+        !self.is_buffer()
+            && !self.has_flag(ALLOW_RENDER_TARGET | ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS)
+    }
+
     pub fn depth(&self) -> u32 {
         if self.dimension == Dimension::Texture3D {
             self.depth_or_array_size.max(1)

@@ -256,8 +256,13 @@ fn the_cpus_writes_to_cold_memory_are_reported_whether_or_not_it_was_released() 
         let at = region.address;
         space.map_host(at, RUN, SyncPolicy::WriteWatch).unwrap();
         kernel.run(gpu, &mut space, &[], (at, 4));
+        region.touch(6 * PAGE, 1);
+        space.rebase_writes(at + 4 * PAGE, 8 * PAGE);
         space.mark_cold(at + 4 * PAGE, 8 * PAGE);
-        assert!(space.take_cold_writes().is_empty());
+        assert!(
+            space.take_cold_writes().is_empty(),
+            "the write before the read is not news"
+        );
 
         // The host's own write (a streaming read landing in the pages) is named by its caller.
         space.mark_dirty(at + 6 * PAGE, 4096);
