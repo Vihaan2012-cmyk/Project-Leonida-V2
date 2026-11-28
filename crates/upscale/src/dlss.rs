@@ -20,6 +20,7 @@
 //! (see [`ffi::slots`]). The declarations in [`ffi`] are our own, written from NVIDIA's public SDK headers
 //! (<https://github.com/NVIDIA/DLSS>, NVIDIA RTX SDK licence): no NVIDIA file is copied or distributed.
 
+pub mod dlssg;
 pub mod fallback;
 pub mod ffi;
 pub mod locate;
