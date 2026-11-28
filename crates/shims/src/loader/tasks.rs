@@ -1015,6 +1015,21 @@ pub(super) unsafe fn one_shot_result(
     unsafe { get_result(block, label_id(label), size, buffer, std::ptr::null_mut()) }
 }
 
+/// The result of a [`begin_one_shot`] call into `buffer`, with the count of bytes written.
+///
+/// # Safety
+/// As for [`get_result`].
+pub(super) unsafe fn one_shot_result_used(
+    block: *mut AsyncBlock,
+    label: &'static str,
+    size: usize,
+    buffer: *mut c_void,
+    used: *mut usize,
+) -> i32 {
+    // SAFETY: as the caller promises.
+    unsafe { get_result(block, label_id(label), size, buffer, used) }
+}
+
 // ---- The methods of XThreadingImpl ----
 
 type This = *mut c_void;

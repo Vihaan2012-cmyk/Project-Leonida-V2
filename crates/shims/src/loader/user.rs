@@ -1,4 +1,5 @@
-//! `XUserImpl`: one local user, always signed in, with every privilege, and no way to prove who they are.
+//! `XUserImpl`: one local user, always signed in, with the local privileges and none that needs the Xbox network,
+//! and no way to prove who they are.
 //!
 //! The user has a fixed non-zero user id and local id, is an adult and not a guest. Its gamertag is
 //! `LEONIDA_GAMERTAG` (up to 15 printable ASCII characters) or `Player`. Every handle is its own allocation,
@@ -37,7 +38,7 @@ pub(super) fn new_handle() -> usize {
     handle
 }
 
-fn valid(handle: usize) -> bool {
+pub(super) fn valid(handle: usize) -> bool {
     HANDLES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -227,21 +228,32 @@ unsafe extern "win64" fn get_age_group(_: This, user: usize, out: *mut u32) -> i
     unsafe { put(user, out, 3u32) }
 }
 
-/// Everything is allowed offline; what needs a network fails there.
+/// The privileges the Xbox network grants: CrossPlay, Clubs, Sessions, Broadcast, MultiplayerParties,
+/// CloudManageSession, CloudJoinSession, SocialNetworkSharing, UserGeneratedContent, Communications, Multiplayer
+/// and AddFriends. The title asks for fifteen (table at RVA 0x654fc34); the other three, ManageProfilePrivacy,
+/// GameDvr and CloudSavedGames, concern what stays on the machine.
+const NETWORK_PRIVILEGES: [u32; 12] = [185, 188, 189, 190, 203, 207, 208, 220, 247, 252, 254, 255];
+
+/// `XUserPrivilegeDenyReason::Unknown`: the reason a console gives when it cannot ask Xbox services.
+const DENIED_UNKNOWN: u32 = 4;
+
+/// A user with no Xbox network holds no network privilege and is not told why beyond "unknown"; the others are
+/// held. Nothing here grants a licence or an entitlement.
 unsafe extern "win64" fn check_privilege(
     _: This,
     user: usize,
     _options: u32,
-    _privilege: u32,
+    privilege: u32,
     has: *mut u8,
     reason: *mut u32,
 ) -> i32 {
+    let allowed = !NETWORK_PRIVILEGES.contains(&privilege);
     if !reason.is_null() {
         // SAFETY: writable, checked.
-        unsafe { *reason = 0 };
+        unsafe { *reason = if allowed { 0 } else { DENIED_UNKNOWN } };
     }
     // SAFETY: the program's pointer.
-    unsafe { put(user, has, 1u8) }
+    unsafe { put(user, has, u8::from(allowed)) }
 }
 
 unsafe extern "win64" fn resolve_privilege_async(

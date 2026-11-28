@@ -246,7 +246,8 @@ unsafe extern "win64" fn game_restart_on_crash(
 
 // ---- XGameRuntimeFeatureImpl ----
 
-/// The class each `XGameRuntimeFeature` value goes through; networking is unavailable offline.
+/// The class each `XGameRuntimeFeature` value goes through. A console reports every feature present, networking
+/// included: being offline shows in the connectivity hint, not here.
 const FEATURES: [Option<&str>; 22] = [
     Some("XAccessibilityImpl"),
     Some("XAppCaptureImpl"),
@@ -258,7 +259,7 @@ const FEATURES: [Option<&str>; 22] = [
     Some("XGameSaveImpl"),
     Some("XGameUiImpl"),
     Some("XLauncherImpl"),
-    None,
+    Some("XNetworkingImpl"),
     Some("XPackageImpl"),
     Some("XPersistentLocalStorageImpl"),
     Some("XAccessibilityImpl"),

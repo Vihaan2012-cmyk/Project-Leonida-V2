@@ -226,6 +226,7 @@ fn impls() -> &'static [ClassImpl] {
     static IMPLS: OnceLock<Vec<ClassImpl>> = OnceLock::new();
     IMPLS.get_or_init(|| {
         let mut all = super::system::impls();
+        all.extend(super::capture::impls());
         all.extend(super::package::impls());
         all.extend(super::devices::impls());
         all.extend(super::save::impls());
@@ -233,6 +234,31 @@ fn impls() -> &'static [ClassImpl] {
         all.extend(super::user::impls());
         all
     })
+}
+
+/// The named methods of a served class that nothing implements: a call lands on the trap and fails.
+pub fn unimplemented_methods(class: &str) -> Vec<String> {
+    let registry = registry();
+    let mut missing = Vec::new();
+    for imp in impls().iter().filter(|i| i.class == class) {
+        let Some(root) = registry.interfaces.iter().position(|i| i.name == imp.root) else {
+            continue;
+        };
+        let slots = registry.slots(root);
+        for (i, name) in slots.iter().enumerate() {
+            let Some(name) = name else { continue };
+            let by_slot = format!("@{}", 3 + i);
+            let first = slots.iter().position(|s| *s == Some(*name)) == Some(i);
+            let found = imp
+                .methods
+                .iter()
+                .any(|m| m.name == by_slot || (first && m.name == *name));
+            if !found {
+                missing.push(name.to_string());
+            }
+        }
+    }
+    missing
 }
 
 /// Whether `QueryApiImpl` serves the class.

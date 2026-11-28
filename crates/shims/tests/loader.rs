@@ -328,12 +328,18 @@ fn every_served_class_answers_query_api_impl() {
         "XGameUiImpl",
         "XGameStreamingImpl",
         "XNetworkingImpl",
+        "XAppCaptureImpl",
+        "XGameInviteImpl",
     ] {
         let first = object(class);
         let second = object(class);
         assert_eq!(first, second, "{class} is one object");
     }
-    for class in ["XAppCaptureImpl", "XGameInviteImpl", "XGameProtocolImpl"] {
+    for class in [
+        "XGameProtocolImpl",
+        "XGameActivationImpl",
+        "XAppCaptureMetadataImpl",
+    ] {
         let mut out = 1usize;
         let hr = shims::loader::query_api(&class_id(class), &class_id(class), &mut out);
         assert_eq!(hr, NOT_PROVIDED, "{class}");
@@ -617,10 +623,10 @@ fn system_game_and_feature_classes_answer_from_the_package_config() {
         assert_eq!(available(feature, 7), 1, "XGameSave");
         assert_eq!(
             available(feature, 10),
-            0,
-            "XNetworking is not available offline"
+            1,
+            "XNetworking is present, as on a console that is offline"
         );
-        assert_eq!(available(feature, 1), 0, "XAppCapture is not served");
+        assert_eq!(available(feature, 1), 1, "XAppCapture");
         assert_eq!(available(feature, 99), 0);
 
         let info: unsafe extern "win64" fn(usize, *mut [u8; 144]) -> *mut [u8; 144] =

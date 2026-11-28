@@ -1,17 +1,19 @@
 //! The smaller runtime classes: `XDisplayImpl`, `XLauncherImpl`, `XAccessibilityImpl`, `XUserDeviceImpl`,
-//! `XGameUiImpl`, `XGameStreamingImpl` and `XNetworkingImpl`.
+//! `XGameUiImpl`, `XGameInviteImpl`, `XGameStreamingImpl` and `XNetworkingImpl`.
 //!
 //! Only the argument counts of the executable's calls were measured; the parameter lists follow the GDK
 //! reference. Nothing here reaches a network: the networking class answers as a console with no connection.
 
+use std::collections::HashSet;
 use std::ffi::c_void;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::com::{ClassImpl, c_str, method};
 use super::tasks::{self, AsyncBlock};
-use super::user::new_handle;
+use super::user::{new_handle, valid};
 use super::{
-    E_FAIL, E_INVALIDARG, E_NOTIMPL, E_POINTER, HR_NETWORK_UNREACHABLE, HR_NOT_FOUND, S_OK,
+    E_ABORT, E_FAIL, E_INVALIDARG, E_NOTIMPL, E_POINTER, HR_NETWORK_UNREACHABLE, HR_NOT_FOUND, S_OK,
 };
 use crate::trace::note;
 
@@ -61,16 +63,36 @@ unsafe extern "win64" fn launch_uri(_: This, _user: usize, uri: *const u8) -> i3
     E_FAIL
 }
 
+/// Timeout deferrals the program holds. A console grants every request and never times the title out, so each is a
+/// fresh handle that stays valid until it is closed.
+static DEFERRALS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
 unsafe extern "win64" fn acquire_timeout_deferral(_: This, handle: *mut usize) -> i32 {
-    if !handle.is_null() {
-        // SAFETY: writable, checked.
-        unsafe { *handle = 0 };
+    if handle.is_null() {
+        return E_POINTER;
     }
-    E_FAIL
+    let made = Box::into_raw(Box::new(0u64)) as usize;
+    DEFERRALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .insert(made);
+    // SAFETY: writable, checked.
+    unsafe { *handle = made };
+    S_OK
 }
 
-unsafe extern "win64" fn close_timeout_deferral(_: This, _handle: usize) -> i32 {
-    E_FAIL
+/// Closes a deferral once; a handle that was never handed out is ignored.
+unsafe extern "win64" fn close_timeout_deferral(_: This, handle: usize) {
+    let known = DEFERRALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .remove(&handle);
+    if known {
+        // SAFETY: the box `acquire_timeout_deferral` made, closed once.
+        drop(unsafe { Box::from_raw(handle as *mut u64) });
+    }
 }
 
 // ---- XAccessibilityImpl ----
@@ -89,8 +111,9 @@ unsafe extern "win64" fn high_contrast_mode(_: This, mode: *mut u32) -> i32 {
     S_OK
 }
 
-/// No voice is installed: the callback runs zero times.
-unsafe extern "win64" fn enumerate_voices(_: This, _callback: usize, _context: usize) -> i32 {
+/// `XSpeechSynthesizerEnumerateInstalledVoices(context, callback)`: no voice is installed, so the callback runs
+/// zero times.
+unsafe extern "win64" fn enumerate_voices(_: This, _context: usize, _callback: usize) -> i32 {
     S_OK
 }
 
@@ -162,7 +185,8 @@ unsafe extern "win64" fn find_user_for_device(
     S_OK
 }
 
-/// A registration is kept under a token and never fires: the association and the audio endpoint never change.
+/// A registration is kept under a token and never fires: the association and the audio endpoint never change, and
+/// nobody invites a player who is offline.
 unsafe extern "win64" fn device_register(
     _: This,
     _queue: usize,
@@ -335,6 +359,132 @@ unsafe extern "win64" fn error_dialog_result(_: This, block: *mut AsyncBlock) ->
 
 unsafe extern "win64" fn notification_hint(_: This, _position: u32) -> i32 {
     S_OK
+}
+
+/// `XGameUiShowPlayerProfileCardAsync(block, user, targetXuid)`: the card is shown and dismissed at once.
+unsafe extern "win64" fn profile_card_async(
+    _: This,
+    block: *mut AsyncBlock,
+    user: usize,
+    target: u64,
+) -> i32 {
+    if block.is_null() {
+        return E_POINTER;
+    }
+    if !valid(user) {
+        return E_INVALIDARG;
+    }
+    note(format!(
+        "game profile card for {target:#x} dismissed at once"
+    ));
+    // SAFETY: the program's block.
+    unsafe {
+        tasks::begin_one_shot(block, "XGameUiShowPlayerProfileCardAsync", || {
+            (S_OK, Vec::new())
+        })
+    }
+}
+
+unsafe extern "win64" fn profile_card_result(_: This, block: *mut AsyncBlock) -> i32 {
+    // SAFETY: the program's block.
+    unsafe {
+        tasks::one_shot_result(
+            block,
+            "XGameUiShowPlayerProfileCardAsync",
+            0,
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+const TEXT_ENTRY: &str = "XGameUiShowTextEntryAsync";
+
+/// `XGameUiShowTextEntryAsync(block, title, description, defaultText, inputScope, maxLength)`: nobody can type
+/// offline, so the dialog is accepted with the text it was offered (cut to `maxLength` characters). With nothing
+/// offered it is cancelled, which the program reads as the user backing out (`E_ABORT`).
+unsafe extern "win64" fn text_entry_async(
+    _: This,
+    block: *mut AsyncBlock,
+    title: *const u8,
+    _description: *const u8,
+    default_text: *const u8,
+    _input_scope: u32,
+    max_length: u32,
+) -> i32 {
+    if block.is_null() {
+        return E_POINTER;
+    }
+    if max_length == 0 {
+        return E_INVALIDARG;
+    }
+    // SAFETY: strings or null.
+    let (title, offered) = unsafe { (c_str(title), c_str(default_text)) };
+    let text: String = offered
+        .unwrap_or_default()
+        .chars()
+        .take(max_length as usize)
+        .collect();
+    note(format!(
+        "game text entry \"{}\" answered with {}",
+        title.unwrap_or_default(),
+        if text.is_empty() {
+            "a cancel".to_string()
+        } else {
+            format!("its default {text:?}")
+        }
+    ));
+    // SAFETY: the program's block.
+    unsafe {
+        tasks::begin_one_shot(block, TEXT_ENTRY, move || {
+            if text.is_empty() {
+                return (E_ABORT, Vec::new());
+            }
+            let mut bytes = text.into_bytes();
+            bytes.push(0);
+            (S_OK, bytes)
+        })
+    }
+}
+
+unsafe extern "win64" fn text_entry_result_size(
+    _: This,
+    block: *mut AsyncBlock,
+    size: *mut u32,
+) -> i32 {
+    if size.is_null() {
+        return E_POINTER;
+    }
+    let mut bytes = 0usize;
+    // SAFETY: the program's block; `bytes` is writable.
+    let status = unsafe { tasks::get_result_size(block, &mut bytes) };
+    // SAFETY: writable, checked.
+    unsafe { *size = bytes as u32 };
+    status
+}
+
+unsafe extern "win64" fn text_entry_result(
+    _: This,
+    block: *mut AsyncBlock,
+    size: u32,
+    buffer: *mut u8,
+    used: *mut u32,
+) -> i32 {
+    let mut written = 0usize;
+    // SAFETY: the program's block and a buffer of `size` bytes.
+    let status = unsafe {
+        tasks::one_shot_result_used(
+            block,
+            TEXT_ENTRY,
+            size as usize,
+            buffer as *mut c_void,
+            &mut written,
+        )
+    };
+    if !used.is_null() {
+        // SAFETY: writable, checked.
+        unsafe { *used = written as u32 };
+    }
+    status
 }
 
 // ---- XGameStreamingImpl ----
@@ -670,8 +820,24 @@ pub(super) fn impls() -> Vec<ClassImpl> {
                 method!("XGameUiShowErrorDialogAsync", error_dialog_async),
                 method!("XGameUiShowErrorDialogResult", error_dialog_result),
                 method!("XGameUiSetNotificationPositionHint", notification_hint),
+                method!("XGameUiShowPlayerProfileCardAsync", profile_card_async),
+                method!("XGameUiShowPlayerProfileCardResult", profile_card_result),
+                method!("XGameUiShowTextEntryAsync", text_entry_async),
+                method!("XGameUiShowTextEntryResultSize", text_entry_result_size),
+                method!("XGameUiShowTextEntryResult", text_entry_result),
             ],
             failure: E_FAIL,
+        },
+        ClassImpl {
+            class: "XGameInviteImpl",
+            root: "IXGameInviteImpl",
+            methods: vec![
+                method!("XGameInviteRegisterForEvent", device_register),
+                method!("XGameInviteUnregisterForEvent", device_unregister),
+                method!("XGameInviteRegisterForPendingEvent", device_register),
+                method!("XGameInviteUnregisterForPendingEvent", device_unregister),
+            ],
+            failure: HR_NOT_FOUND,
         },
         ClassImpl {
             class: "XGameStreamingImpl",

@@ -10,6 +10,8 @@ use std::sync::Mutex;
 use crate::Shim;
 
 #[cfg(windows)]
+mod capture;
+#[cfg(windows)]
 mod com;
 #[cfg(windows)]
 mod devices;
@@ -192,6 +194,12 @@ pub fn shims() -> Vec<Shim> {
     {
         Vec::new()
     }
+}
+
+/// The methods of a served runtime class that have no implementation and fail when called.
+#[cfg(windows)]
+pub fn unimplemented_methods(class: &str) -> Vec<String> {
+    com::unimplemented_methods(class)
 }
 
 /// Serves `QueryApiImpl`, for tests and for callers that hold no module handle.
