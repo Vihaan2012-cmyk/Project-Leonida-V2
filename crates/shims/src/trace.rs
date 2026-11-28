@@ -218,6 +218,9 @@ pub struct CrashFacts {
     pub code_at: Vec<u8>,
     /// For an access violation: whether it wrote (else read or executed) and the address it touched.
     pub fault: Option<(bool, usize)>,
+    /// Memory the registers point at: the register (or `reg+offset` for a pointer found in its bytes), the
+    /// address and the bytes read, 64 for a register and 32 for a pointer inside one.
+    pub pointed: Vec<(String, u64, Vec<u8>)>,
 }
 
 impl CrashFacts {
