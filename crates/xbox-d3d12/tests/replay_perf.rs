@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use shader_container::testutil;
 use shader_translate::FloatMode;
+use smallvec::smallvec;
 use xbox_d3d12::execute::barrier::{
     COPY_SOURCE, NON_PIXEL_SHADER_RESOURCE, PIXEL_SHADER_RESOURCE, RENDER_TARGET,
 };
@@ -767,16 +768,16 @@ fn game_frame(world: &World, shape: Shape) -> Vec<Command> {
         out.push(Command::Barriers(transitions));
         let t = &ts[pass % ts.len()];
         out.push(Command::SetRenderTargets {
-            colors: vec![t.target],
+            colors: smallvec![t.target],
             depth: None,
         });
         out.push(Command::ClearRenderTarget {
             view: t.target,
             color: [0.0; 4],
-            rects: Vec::new(),
+            rects: Default::default(),
         });
-        out.push(Command::SetViewports(vec![viewport()]));
-        out.push(Command::SetScissors(vec![xbox_d3d12::execute::Rect {
+        out.push(Command::SetViewports(smallvec![viewport()]));
+        out.push(Command::SetScissors(smallvec![xbox_d3d12::execute::Rect {
             left: 0,
             top: 0,
             right: SIZE as i32,
@@ -801,7 +802,7 @@ fn game_frame(world: &World, shape: Shape) -> Vec<Command> {
                     bind: BindPoint::Graphics,
                     param: 0,
                     first: 0,
-                    values: vec![rng.next(1000), rng.next(1000), 3, 4],
+                    values: smallvec![rng.next(1000), rng.next(1000), 3, 4],
                 });
             }
             if d % 4 == 0 {
@@ -826,7 +827,7 @@ fn game_frame(world: &World, shape: Shape) -> Vec<Command> {
                 let mesh = u64::from(rng.next(64)) * 256;
                 out.push(Command::SetVertexBuffers {
                     start: 0,
-                    views: vec![
+                    views: smallvec![
                         VertexBufferView {
                             va: VERTEX_AT + mesh,
                             size: 1024,
@@ -873,7 +874,7 @@ fn game_frame(world: &World, shape: Shape) -> Vec<Command> {
                     bind: BindPoint::Compute,
                     param: 0,
                     first: 0,
-                    values: vec![g, 2],
+                    values: smallvec![g, 2],
                 });
                 out.push(Command::SetRootView {
                     bind: BindPoint::Compute,
@@ -972,7 +973,7 @@ fn replaying_a_game_frame_costs_microseconds_per_draw() {
         },
         Command::SetPipeline(world.graphics[0].clone()),
         Command::SetRenderTargets {
-            colors: vec![world.targets[0].target],
+            colors: smallvec![world.targets[0].target],
             depth: None,
         },
         Command::SetIndexBuffer(Some(IndexBufferView {
@@ -982,7 +983,7 @@ fn replaying_a_game_frame_costs_microseconds_per_draw() {
         })),
         Command::SetVertexBuffers {
             start: 0,
-            views: vec![
+            views: smallvec![
                 VertexBufferView {
                     va: VERTEX_AT,
                     size: 1024,
@@ -1169,8 +1170,8 @@ const READBACK: u64 = 0x60000;
 const OUT_A: u64 = 0x61000;
 const OUT_B: u64 = 0x62000;
 
-fn views(va: u64) -> Vec<VertexBufferView> {
-    vec![
+fn views(va: u64) -> xbox_d3d12::execute::VertexViews {
+    smallvec![
         VertexBufferView {
             va,
             size: 1024,
@@ -1199,10 +1200,10 @@ fn draw_setup(world: &World) -> Vec<Command> {
         },
         Command::SetPipeline(world.graphics[0].clone()),
         Command::SetRenderTargets {
-            colors: vec![world.targets[0].target],
+            colors: smallvec![world.targets[0].target],
             depth: None,
         },
-        Command::SetViewports(vec![viewport()]),
+        Command::SetViewports(smallvec![viewport()]),
         Command::SetTopology(4),
         Command::SetVertexBuffers {
             start: 0,
@@ -1217,7 +1218,7 @@ fn draw_setup(world: &World) -> Vec<Command> {
             bind: BindPoint::Graphics,
             param: 0,
             first: 0,
-            values: vec![1, 2, 3, 4],
+            values: smallvec![1, 2, 3, 4],
         },
     ]
 }
@@ -1331,7 +1332,7 @@ fn every_state_that_changes_is_recorded_again() {
                 bind: BindPoint::Graphics,
                 param: 0,
                 first: 2,
-                values: vec![9],
+                values: smallvec![9],
             },
             |s| s.push_calls,
         ),
@@ -1357,7 +1358,7 @@ fn every_state_that_changes_is_recorded_again() {
             "second vertex buffer",
             Command::SetVertexBuffers {
                 start: 1,
-                views: vec![second_slot],
+                views: smallvec![second_slot],
             },
             |s| s.vertex_binds,
         ),
@@ -1365,7 +1366,7 @@ fn every_state_that_changes_is_recorded_again() {
             "vertex stride",
             Command::SetVertexBuffers {
                 start: 0,
-                views: vec![VertexBufferView {
+                views: smallvec![VertexBufferView {
                     va: VERTEX_AT,
                     size: 1024,
                     stride: 48,
@@ -1394,7 +1395,7 @@ fn every_state_that_changes_is_recorded_again() {
         ("topology", Command::SetTopology(5), |s| s.topology_sets),
         (
             "viewport",
-            Command::SetViewports(vec![Viewport {
+            Command::SetViewports(smallvec![Viewport {
                 width: 32.0,
                 ..viewport()
             }]),
@@ -1402,7 +1403,7 @@ fn every_state_that_changes_is_recorded_again() {
         ),
         (
             "scissor",
-            Command::SetScissors(vec![xbox_d3d12::execute::Rect {
+            Command::SetScissors(smallvec![xbox_d3d12::execute::Rect {
                 left: 0,
                 top: 0,
                 right: 8,
@@ -1419,7 +1420,7 @@ fn every_state_that_changes_is_recorded_again() {
         (
             "render targets",
             Command::SetRenderTargets {
-                colors: vec![world.targets[1].target],
+                colors: smallvec![world.targets[1].target],
                 depth: None,
             },
             |s| s.rendering_scopes,
@@ -1449,7 +1450,7 @@ fn a_pipeline_that_comes_back_binds_again_and_only_changed_push_words_are_pushed
             bind: BindPoint::Graphics,
             param: 0,
             first: 3,
-            values: vec![77],
+            values: smallvec![77],
         },
         indexed(),
     ]);
@@ -1475,7 +1476,7 @@ fn a_dispatch_between_draws_does_not_leave_its_push_constants_for_the_next_draw_
             bind: BindPoint::Compute,
             param: 0,
             first: 0,
-            values: vec![40, 2],
+            values: smallvec![40, 2],
         },
         Command::SetRootView {
             bind: BindPoint::Compute,
@@ -1504,7 +1505,7 @@ fn clears_after_the_targets_become_load_operations_and_stay_ordered_before_other
     let clear = |color| Command::ClearRenderTarget {
         view: world.targets[0].target,
         color,
-        rects: Vec::new(),
+        rects: Default::default(),
     };
     let mut commands = draw_setup(&world);
     commands.push(clear([1.0, 0.0, 0.0, 1.0]));
@@ -1564,7 +1565,7 @@ fn barriers_of_consecutive_commands_are_one_call_unless_they_touch_one_image_or_
             bind: BindPoint::Graphics,
             param: 0,
             first: 0,
-            values: vec![1],
+            values: smallvec![1],
         },
         transition(1, 0, RENDER_TARGET),
     ];
@@ -1579,7 +1580,7 @@ fn barriers_of_consecutive_commands_are_one_call_unless_they_touch_one_image_or_
     let split = vec![
         transition(0, 0, RENDER_TARGET),
         Command::SetRenderTargets {
-            colors: vec![world.targets[0].target],
+            colors: smallvec![world.targets[0].target],
             depth: None,
         },
         draw(),
@@ -1638,7 +1639,7 @@ fn writer_list(world: &World, index: u32, value: u32) -> Vec<Command> {
             bind: BindPoint::Compute,
             param: 0,
             first: 0,
-            values: vec![value, 0],
+            values: smallvec![value, 0],
         },
         Command::SetRootView {
             bind: BindPoint::Compute,

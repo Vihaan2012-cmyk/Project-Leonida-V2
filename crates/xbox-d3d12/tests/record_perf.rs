@@ -281,7 +281,11 @@ fn record_frame(frame: &Frame, shape: Shape) {
                         1 => (0x80, 4),
                         _ => (4, 0x800),
                     };
-                    transition(frame.buffers[(pass + k) % frame.buffers.len()], before, after)
+                    transition(
+                        frame.buffers[(pass + k) % frame.buffers.len()],
+                        before,
+                        after,
+                    )
                 })
                 .collect();
             barrier(list, transitions.len() as u32, transitions.as_ptr());
@@ -343,6 +347,7 @@ fn record_frame(frame: &Frame, shape: Shape) {
 }
 
 struct Stub {
+    filtering: bool,
     image: ImageRef,
     target: TargetView,
 }
@@ -397,8 +402,9 @@ impl Resolver for Stub {
     fn note(&self, _text: &str) {}
 }
 
-fn stub() -> Stub {
+fn stub(filtering: bool) -> Stub {
     Stub {
+        filtering,
         image: ImageRef {
             image: vk::Image::null(),
             format: vk::Format::R8G8B8A8_UNORM,
@@ -421,6 +427,10 @@ fn median(times: &mut [Duration]) -> Duration {
     times[times.len() / 2]
 }
 
+fn min(times: &[Duration]) -> Duration {
+    *times.iter().min().unwrap()
+}
+
 fn allocations() -> u64 {
     ALLOCS.load(Ordering::Relaxed)
 }
@@ -430,12 +440,18 @@ fn allocations() -> u64 {
 fn recording_and_converting_a_game_frame_costs_microseconds_per_draw() {
     let Some(h) = harness() else { return };
     let frame = h.frame();
+    println!("--- no content filter");
+    measure(&frame, &stub(false));
+    println!("--- content filter that hides nothing");
+    measure(&frame, &stub(true));
+}
+
+fn measure(frame: &Frame, resolver: &Stub) {
     let shape = Shape {
         passes: 40,
         draws_per_pass: 250,
     };
     let draws = (shape.passes * shape.draws_per_pass) as f64;
-    let resolver = stub();
     let (mut record, mut convert, mut free_stream, mut free_converted) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut counts = [0u64; 4];
@@ -448,14 +464,14 @@ fn recording_and_converting_a_game_frame_costs_microseconds_per_draw() {
         for round in 0..60 {
             let a0 = allocations();
             let t0 = Instant::now();
-            record_frame(&frame, shape);
+            record_frame(frame, shape);
             assert_eq!(close(frame.list), 0);
             let t1 = t0.elapsed();
             let a1 = allocations();
             let stream = xbox_d3d12::list::closed_stream(frame.list).expect("a closed list");
             commands = stream.commands.len();
             let t = Instant::now();
-            let converted = bridge::convert(&stream, &resolver);
+            let converted = bridge::convert(&stream, resolver);
             let t2 = t.elapsed();
             let a2 = allocations();
             converted_commands = converted.commands.len();
@@ -478,6 +494,13 @@ fn recording_and_converting_a_game_frame_costs_microseconds_per_draw() {
         }
     }
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    println!(
+        "minimum of each step: record {:.3} ms, convert {:.3} ms, free replay commands {:.3} ms, Reset + free stream {:.3} ms",
+        ms(min(&record)),
+        ms(min(&convert)),
+        ms(min(&free_converted)),
+        ms(min(&free_stream))
+    );
     let (r, c, fc, fs) = (
         median(&mut record),
         median(&mut convert),

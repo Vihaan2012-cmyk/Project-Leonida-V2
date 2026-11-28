@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use ash::vk;
+use smallvec::SmallVec;
 
 use crate::pipeline::Pipeline;
 use crate::root::{HeapBases, RootSignature};
@@ -73,6 +74,21 @@ pub struct VertexBufferView {
     pub size: u32,
     pub stride: u32,
 }
+
+/// Rectangles, almost always none or one.
+pub type Rects = SmallVec<[Rect; 1]>;
+
+/// The viewports of one call: a pass sets one.
+pub type Viewports = SmallVec<[Viewport; 2]>;
+
+/// Root constants of one call: up to 16 dwords stay inline, the limit is 64.
+pub type RootValues = SmallVec<[u32; 16]>;
+
+/// The vertex buffers of one call: a draw reads a few streams, the limit is 16.
+pub type VertexViews = SmallVec<[VertexBufferView; 4]>;
+
+/// The colour targets of one pass.
+pub type ColorTargets = SmallVec<[TargetView; 2]>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexBufferView {
@@ -155,7 +171,7 @@ pub enum Command {
         bind: BindPoint,
         param: u32,
         first: u32,
-        values: Vec<u32>,
+        values: RootValues,
     },
     SetRootView {
         bind: BindPoint,
@@ -170,31 +186,31 @@ pub enum Command {
     },
     /// `SetDescriptorHeaps`: the 32-bit bases a root signature that indexes its heaps directly receives.
     SetDescriptorHeaps(HeapBases),
-    SetViewports(Vec<Viewport>),
-    SetScissors(Vec<Rect>),
+    SetViewports(Viewports),
+    SetScissors(Rects),
     SetBlendFactor([f32; 4]),
     SetStencilRef(u32),
     /// `IASetPrimitiveTopology`, a `D3D_PRIMITIVE_TOPOLOGY` value.
     SetTopology(u32),
     SetVertexBuffers {
         start: u32,
-        views: Vec<VertexBufferView>,
+        views: VertexViews,
     },
     SetIndexBuffer(Option<IndexBufferView>),
     SetRenderTargets {
-        colors: Vec<TargetView>,
+        colors: ColorTargets,
         depth: Option<TargetView>,
     },
     ClearRenderTarget {
         view: TargetView,
         color: [f32; 4],
-        rects: Vec<Rect>,
+        rects: Rects,
     },
     ClearDepthStencil {
         view: TargetView,
         depth: Option<f32>,
         stencil: Option<u8>,
-        rects: Vec<Rect>,
+        rects: Rects,
     },
     /// `ClearUnorderedAccessView*` on a buffer: `value` fills it as 32-bit words.
     FillBuffer {
