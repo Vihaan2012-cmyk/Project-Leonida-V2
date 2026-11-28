@@ -13,6 +13,8 @@ use pe_loader::ImportRef;
 #[cfg(windows)]
 mod crash;
 #[cfg(windows)]
+mod memmap;
+#[cfg(windows)]
 pub mod probes;
 #[cfg(windows)]
 mod screen;
@@ -522,6 +524,7 @@ pub fn watch_crashes(folder: PathBuf, base: usize, size: usize) {
         if first {
             crash::install();
             screen::schedule(dumps.clone());
+            memmap::schedule(dumps.clone());
             threads::schedule(dumps);
         }
     }

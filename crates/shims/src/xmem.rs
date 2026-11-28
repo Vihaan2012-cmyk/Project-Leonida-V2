@@ -159,6 +159,7 @@ mod imp {
     pub extern "win64" fn alloc_default(size: usize, attributes: u64) -> *mut c_void {
         let address = allocate(size, attributes);
         title_hooks::note_default_allocation(address as usize, size);
+        note_large("XMemAllocDefault", address as usize, size, attributes, 0);
         address
     }
 
@@ -401,6 +402,38 @@ mod imp {
     }
 
     pub extern "win64" fn virtual_alloc(
+        address: *mut c_void,
+        size: usize,
+        allocation_type: u32,
+        attributes: u64,
+        protect: u32,
+    ) -> *mut c_void {
+        let made = virtual_alloc_inner(address, size, allocation_type, attributes, protect);
+        note_large(
+            "XMemVirtualAlloc",
+            made as usize,
+            size,
+            attributes,
+            allocation_type,
+        );
+        made
+    }
+
+    /// Notes an allocation of at least 64 MiB with who asked for it, so a memory report can be matched to the title's
+    /// own pools.
+    fn note_large(call: &str, address: usize, size: usize, attributes: u64, allocation_type: u32) {
+        if size < 64 << 20 {
+            return;
+        }
+        let caller = crate::trace::calling_site()
+            .map_or_else(|| "?".to_string(), |offset| format!("{offset:#x}"));
+        note(format!(
+            "{call}: {:.3} GiB at {address:#x}, attributes {attributes:#x}, type {allocation_type:#x}, from image offset {caller}",
+            size as f64 / (1u64 << 30) as f64
+        ));
+    }
+
+    fn virtual_alloc_inner(
         address: *mut c_void,
         size: usize,
         allocation_type: u32,

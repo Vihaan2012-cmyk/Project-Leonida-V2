@@ -35,6 +35,69 @@ fn heap() -> *mut c_void {
     }
 }
 
+/// Blocks at least this large are remembered with the stack that asked for them, for the memory report.
+const LARGE: usize = 256 << 20;
+
+struct Large {
+    address: usize,
+    size: usize,
+    stack: std::backtrace::Backtrace,
+}
+
+static LARGE_BLOCKS: std::sync::Mutex<Vec<Large>> = std::sync::Mutex::new(Vec::new());
+
+thread_local! {
+    static RECORDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn remember(address: *mut u8, size: usize) {
+    if address.is_null() || size < LARGE || RECORDING.with(|r| r.replace(true)) {
+        return;
+    }
+    let stack = std::backtrace::Backtrace::force_capture();
+    if let Ok(mut blocks) = LARGE_BLOCKS.lock() {
+        blocks.push(Large {
+            address: address as usize,
+            size,
+            stack,
+        });
+    }
+    RECORDING.with(|r| r.set(false));
+}
+
+fn forget(address: *mut u8, size: usize) {
+    if size < LARGE || RECORDING.with(|r| r.replace(true)) {
+        return;
+    }
+    if let Ok(mut blocks) = LARGE_BLOCKS.lock() {
+        blocks.retain(|b| b.address != address as usize);
+    }
+    RECORDING.with(|r| r.set(false));
+}
+
+/// The live blocks of at least 256 MiB Leonida's own code holds, each with the stack that made it.
+pub fn large_blocks() -> String {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    if RECORDING.with(|r| r.replace(true)) {
+        return text;
+    }
+    if let Ok(blocks) = LARGE_BLOCKS.lock() {
+        for block in blocks.iter() {
+            let _ = writeln!(
+                text,
+                "block {:#x}: {:.3} GiB, made by
+{}",
+                block.address,
+                block.size as f64 / (1u64 << 30) as f64,
+                block.stack
+            );
+        }
+    }
+    RECORDING.with(|r| r.set(false));
+    text
+}
+
 /// The global allocator over the private heap.
 pub struct PrivateHeap;
 
@@ -57,26 +120,31 @@ impl PrivateHeap {
 // SAFETY: every block comes from one heap and goes back to it, aligned as asked.
 unsafe impl GlobalAlloc for PrivateHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if layout.align() <= NATURAL {
+        let made = if layout.align() <= NATURAL {
             // SAFETY: a heap of ours.
             unsafe { HeapAlloc(heap(), 0, layout.size()) as *mut u8 }
         } else {
             // SAFETY: as above.
             unsafe { Self::aligned(layout, 0) }
-        }
+        };
+        remember(made, layout.size());
+        made
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if layout.align() <= NATURAL {
+        let made = if layout.align() <= NATURAL {
             // SAFETY: a heap of ours.
             unsafe { HeapAlloc(heap(), HEAP_ZERO_MEMORY, layout.size()) as *mut u8 }
         } else {
             // SAFETY: as above.
             unsafe { Self::aligned(layout, HEAP_ZERO_MEMORY) }
-        }
+        };
+        remember(made, layout.size());
+        made
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        forget(ptr, layout.size());
         let block = if layout.align() <= NATURAL {
             ptr as *mut c_void
         } else {
@@ -92,8 +160,11 @@ unsafe impl GlobalAlloc for PrivateHeap {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if layout.align() <= NATURAL {
+            forget(ptr, layout.size());
             // SAFETY: a block of this heap, kept at the natural alignment.
-            unsafe { HeapReAlloc(heap(), 0, ptr as *mut c_void, new_size) as *mut u8 }
+            let made = unsafe { HeapReAlloc(heap(), 0, ptr as *mut c_void, new_size) as *mut u8 };
+            remember(made, new_size);
+            made
         } else {
             // SAFETY: the layout is valid; copied then freed as the default does.
             unsafe {

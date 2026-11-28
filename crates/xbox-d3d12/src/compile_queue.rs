@@ -226,12 +226,16 @@ pub struct Config {
     pub memory_budget: Option<u64>,
 }
 
+/// The most workers the queue starts by default. NVIDIA's shader compiler keeps a working area of 1 to 2 GiB on every
+/// thread it compiles on: a boot with 8 workers had 19 GiB of driver memory 45 seconds in, one with 3 about half.
+pub const MOST_WORKERS: usize = 3;
+
 impl Default for Config {
-    /// Leaves two processors to the game's own threads, and at least one worker.
+    /// Leaves two processors to the game's own threads, at least one worker and at most `MOST_WORKERS`.
     fn default() -> Config {
         let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
         Config {
-            workers: cpus.saturating_sub(2).clamp(1, 8),
+            workers: cpus.saturating_sub(2).clamp(1, MOST_WORKERS),
             worker_init: None,
             persist: None,
             memory_budget: None,

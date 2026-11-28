@@ -119,7 +119,10 @@ pub fn start(
         seen: seen.map(|s| (s.path.clone(), s.bytecode.clone())),
         ..Default::default()
     };
-    if let Some(workers) = workers {
+    let from_env = std::env::var("LEONIDA_PIPELINE_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    if let Some(workers) = from_env.or(workers) {
         config.workers = workers.max(1);
     }
     PipelineService::start(config, move || Ok(DeviceBuilder(builder)))
