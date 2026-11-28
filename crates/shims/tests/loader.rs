@@ -382,16 +382,16 @@ fn derived_interfaces_answer_with_the_same_object_and_a_second_family_is_its_own
 #[test]
 fn an_unimplemented_slot_notes_the_call_and_fails() {
     let package = object("XPackageImpl");
-    // SAFETY: slot 12 is XPackageFindChunkAvailability, which nothing implements.
+    // SAFETY: slot 30 is XPackageGetWriteStats, which nothing implements.
     let hr = unsafe {
-        let call: unsafe extern "win64" fn(usize) -> i32 = slot(package, 12);
+        let call: unsafe extern "win64" fn(usize) -> i32 = slot(package, 30);
         call(package)
     };
     assert_eq!(hr, 0x8000_4001_u32 as i32);
     assert!(
         shims::trace::notes()
             .iter()
-            .any(|n| n.contains("XPackageImpl slot 12 (XPackageFindChunkAvailability)"))
+            .any(|n| n.contains("XPackageImpl slot 30 (XPackageGetWriteStats)"))
     );
 }
 
