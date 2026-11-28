@@ -87,6 +87,47 @@ pub fn sha256(bytes: &[u8], regions: &[Region]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+const PAGE: usize = 4096;
+
+/// The SHA-256 page hashes of `image` as a signature stores them: one for the headers (without the checksum and
+/// certificate-entry fields, zero-padded to a page), one for each 4096-byte page of every section's file data in
+/// table order (the last page of a section zero-padded), and a closing entry at the end of the last section with
+/// an all-zero digest.
+pub fn page_hashes(image: &Image<'_>) -> Vec<(u32, [u8; 32])> {
+    let bytes = image.bytes();
+    let zeros = [0u8; PAGE];
+    let checksum_at = image.checksum_offset();
+    let entry_at = image.directory_entry_offset(DIRECTORY_SECURITY);
+    let headers = (image.headers_size as usize).min(bytes.len());
+    let mut hasher = Sha256::new();
+    let part = |from: usize, to: usize, hasher: &mut Sha256| {
+        if let Some(slice) = bytes.get(from..to.max(from)) {
+            hasher.update(slice);
+        }
+    };
+    part(0, checksum_at, &mut hasher);
+    part(checksum_at + 4, entry_at, &mut hasher);
+    part(entry_at + 8, headers, &mut hasher);
+    hasher.update(&zeros[..PAGE.saturating_sub(headers)]);
+    let mut out = vec![(0u32, hasher.finalize().into())];
+    let mut end = headers;
+    for section in &image.sections {
+        let (start, size) = (section.raw_offset as usize, section.raw_size as usize);
+        for page in (0..size).step_by(PAGE) {
+            let len = PAGE.min(size - page);
+            let mut hasher = Sha256::new();
+            if let Some(slice) = bytes.get(start + page..start + page + len) {
+                hasher.update(slice);
+            }
+            hasher.update(&zeros[..PAGE - len]);
+            out.push(((start + page) as u32, hasher.finalize().into()));
+        }
+        end = end.max(start + size);
+    }
+    out.push((end as u32, [0; 32]));
+    out
+}
+
 /// The PE checksum (the algorithm of `CheckSumMappedFile`) with the file's own checksum field counted as zero.
 pub fn checksum(bytes: &[u8], checksum_offset: usize) -> u32 {
     let mut sum: u64 = 0;
@@ -141,6 +182,16 @@ pub struct Signature {
     pub digest: Vec<u8>,
     /// Common names and organisations in the signature's certificates, in order, without repeats.
     pub names: Vec<String>,
+    /// Per-page hashes of the signed image (file offset and digest), when the signature carries them.
+    pub page_hashes: Option<PageHashes>,
+    /// Times the signature and its time stamp were made, as `YYYY-MM-DD HH:MM:SS`.
+    pub signing_times: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageHashes {
+    pub algorithm: DigestAlgorithm,
+    pub entries: Vec<(u32, Vec<u8>)>,
 }
 
 struct Tlv<'a> {
@@ -259,6 +310,76 @@ fn certificate_names(blob: &[u8]) -> Vec<String> {
     names
 }
 
+const OID_PAGE_HASH_V1: [u8; 12] = [
+    0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x03, 0x01,
+];
+const OID_PAGE_HASH_V2: [u8; 12] = [
+    0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x03, 0x02,
+];
+const OID_SIGNING_TIME: [u8; 11] = [
+    0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x05,
+];
+
+fn find_page_hashes(blob: &[u8]) -> Option<PageHashes> {
+    for (oid, algorithm, width) in [
+        (OID_PAGE_HASH_V2, DigestAlgorithm::Sha256, 32),
+        (OID_PAGE_HASH_V1, DigestAlgorithm::Sha1, 20),
+    ] {
+        let Some(at) = blob.windows(oid.len()).position(|w| w == oid) else {
+            continue;
+        };
+        let set = tlv(&blob[at + oid.len()..])?;
+        let octets = tlv(set.content)?;
+        if octets.tag != 0x04 {
+            continue;
+        }
+        let entries = octets
+            .content
+            .chunks_exact(4 + width)
+            .map(|c| {
+                (
+                    u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                    c[4..].to_vec(),
+                )
+            })
+            .collect();
+        return Some(PageHashes { algorithm, entries });
+    }
+    None
+}
+
+fn find_signing_times(blob: &[u8]) -> Vec<String> {
+    let mut times = Vec::new();
+    let mut from = 0;
+    while let Some(found) = blob[from..]
+        .windows(OID_SIGNING_TIME.len())
+        .position(|w| w == OID_SIGNING_TIME)
+    {
+        let start = from + found + OID_SIGNING_TIME.len();
+        from = start;
+        let Some(set) = tlv(&blob[start..]) else {
+            continue;
+        };
+        let Some(time) = tlv(set.content) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(time.content);
+        if time.tag == 0x17 && text.len() >= 12 {
+            let century = if &text[..2] < "50" { "20" } else { "19" };
+            times.push(format!(
+                "{century}{}-{}-{} {}:{}:{}",
+                &text[0..2],
+                &text[2..4],
+                &text[4..6],
+                &text[6..8],
+                &text[8..10],
+                &text[10..12]
+            ));
+        }
+    }
+    times
+}
+
 /// The signature in the certificate table, if there is one.
 pub fn signature(image: &Image<'_>) -> Option<Signature> {
     let (offset, size) = certificate_table(image)?;
@@ -275,6 +396,8 @@ pub fn signature(image: &Image<'_>) -> Option<Signature> {
         algorithm: found.as_ref().map(|f| f.0.clone()),
         digest: found.map(|f| f.1).unwrap_or_default(),
         names: certificate_names(blob),
+        page_hashes: find_page_hashes(blob),
+        signing_times: find_signing_times(blob),
     })
 }
 
@@ -467,6 +590,52 @@ mod tests {
         let mut odd = bytes.clone();
         odd.push(0x80);
         assert_eq!(checksum(&odd, 4), folded + 0x80 + 13);
+    }
+
+    #[test]
+    fn page_hashes_cover_headers_and_each_section_page() {
+        let bytes = signed_image(None, b"");
+        let image = Image::parse(&bytes).unwrap();
+        let pages = page_hashes(&image);
+        assert_eq!(
+            pages.iter().map(|p| p.0).collect::<Vec<_>>(),
+            vec![0, 0x400, 0x600]
+        );
+        assert_eq!(pages[2].1, [0; 32]);
+        let mut padded = bytes[0x400..0x600].to_vec();
+        padded.resize(4096, 0);
+        assert_eq!(pages[1].1.as_slice(), Sha256::digest(&padded).as_slice());
+        let mut changed = bytes.clone();
+        put32(&mut changed, image.checksum_offset(), 7);
+        let again = page_hashes(&Image::parse(&changed).unwrap());
+        assert_eq!(again, pages);
+        changed[0x401] ^= 1;
+        let again = page_hashes(&Image::parse(&changed).unwrap());
+        assert_eq!(
+            (again[0].1 == pages[0].1, again[1].1 == pages[1].1),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn stored_page_hashes_and_signing_time_are_read() {
+        let mut blob = Vec::new();
+        blob.extend([
+            0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 2, 3, 2,
+        ]);
+        let mut entries = 0u32.to_le_bytes().to_vec();
+        entries.extend([0xAB; 32]);
+        blob.extend(der(0x31, &der(0x04, &entries)));
+        blob.extend([0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 1, 9, 5]);
+        blob.extend(der(0x31, &der(0x17, b"240131235959Z")));
+        let hashes = find_page_hashes(&blob).unwrap();
+        assert_eq!(hashes.algorithm, DigestAlgorithm::Sha256);
+        assert_eq!(hashes.entries, vec![(0, vec![0xAB; 32])]);
+        assert_eq!(
+            find_signing_times(&blob),
+            vec!["2024-01-31 23:59:59".to_string()]
+        );
+        assert!(find_page_hashes(&[1, 2, 3]).is_none());
     }
 
     #[test]
