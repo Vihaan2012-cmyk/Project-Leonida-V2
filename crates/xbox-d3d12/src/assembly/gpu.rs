@@ -40,6 +40,9 @@ pub struct GpuConfig {
     /// Pretend the GPU has this many MiB of device-local memory for the layer's own allocations
     /// (`LEONIDA_VRAM_LIMIT_MB`), to see how the title behaves with less.
     pub vram_limit_mib: Option<u64>,
+    /// How many MiB of device-local memory the mirror of the game's memory may take (`LEONIDA_VRAM_MIRROR_MB`)
+    /// before the rest of the game's memory is read from system memory; by default a share of the budget.
+    pub vram_mirror_mib: Option<u64>,
 }
 
 impl GpuConfig {
@@ -49,6 +52,9 @@ impl GpuConfig {
             gpu: std::env::var("LEONIDA_GPU").ok().map(|n| n.to_lowercase()),
             validation: std::env::var_os("LEONIDA_VALIDATION").is_some(),
             vram_limit_mib: std::env::var("LEONIDA_VRAM_LIMIT_MB")
+                .ok()
+                .and_then(|v| v.trim().parse().ok()),
+            vram_mirror_mib: std::env::var("LEONIDA_VRAM_MIRROR_MB")
                 .ok()
                 .and_then(|v| v.trim().parse().ok()),
         }
@@ -511,6 +517,9 @@ impl Gpu {
             let budget = memory::Budget::new(&instance, physical, memory_extensions);
             if let Some(mib) = config.vram_limit_mib {
                 budget.set_limit(Some(mib << 20));
+            }
+            if let Some(mib) = config.vram_mirror_mib {
+                budget.set_mirror_limit(Some(mib << 20));
             }
             let handles = Handles {
                 instance,
