@@ -374,7 +374,7 @@ mod tests {
             let mut table = ((cert.len() + 8) as u32).to_le_bytes().to_vec();
             table.extend([0, 2, 2, 0]);
             table.extend(cert);
-            while table.len() % 8 != 0 {
+            while !table.len().is_multiple_of(8) {
                 table.push(0);
             }
             put32(
