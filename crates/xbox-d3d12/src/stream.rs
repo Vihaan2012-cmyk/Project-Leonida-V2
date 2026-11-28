@@ -5,6 +5,8 @@
 //! `Reset` of its list. Descriptor handles stay raw numbers: the CPU handle of a heap entry is the host
 //! address of its bytes, the GPU handle the console GPU address (`heap.rs`).
 
+use smallvec::SmallVec;
+
 use crate::com::ComPtr;
 
 #[repr(C)]
@@ -53,6 +55,21 @@ pub struct IndexBufferView {
     pub size: u32,
     pub format: u32,
 }
+
+/// Rectangles, almost always none or one.
+pub type Rects = SmallVec<[Rect; 1]>;
+
+/// The viewports of one call: a pass sets one.
+pub type Viewports = SmallVec<[Viewport; 2]>;
+
+/// Root constants of one call: up to 16 dwords stay inline, the limit is 64.
+pub type RootValues = SmallVec<[u32; 16]>;
+
+/// The vertex buffers of one call: a draw reads a few streams, the limit is 16.
+pub type VertexViews = SmallVec<[VertexBufferView; 4]>;
+
+/// The render target handles of one call, at most 8.
+pub type TargetHandles = SmallVec<[u64; 8]>;
 
 /// A `D3D12_RESOURCE_BARRIER`.
 #[derive(Clone, Debug)]
@@ -196,14 +213,14 @@ pub enum Command {
         format: u32,
     },
     SetPrimitiveTopology(u32),
-    SetViewports(Vec<Viewport>),
-    SetScissorRects(Vec<Rect>),
+    SetViewports(Viewports),
+    SetScissorRects(Rects),
     SetBlendFactor(Option<[f32; 4]>),
     SetStencilRef(u32),
     SetPipelineState(Option<ComPtr>),
     ResourceBarrier(Vec<Barrier>),
     EnhancedBarrier(Vec<BarrierGroup>),
-    SetDescriptorHeaps(Vec<ComPtr>),
+    SetDescriptorHeaps(SmallVec<[ComPtr; 2]>),
     SetRootSignature {
         compute: bool,
         signature: Option<ComPtr>,
@@ -217,7 +234,7 @@ pub enum Command {
         compute: bool,
         index: u32,
         dest_offset: u32,
-        values: Vec<u32>,
+        values: RootValues,
     },
     SetRootView {
         compute: bool,
@@ -228,7 +245,7 @@ pub enum Command {
     SetIndexBuffer(Option<IndexBufferView>),
     SetVertexBuffers {
         start: u32,
-        views: Vec<VertexBufferView>,
+        views: VertexViews,
     },
     /// `D3D12_STREAM_OUTPUT_BUFFER_VIEW`: location, size, filled-size location.
     SetStreamOutputTargets {
@@ -238,7 +255,7 @@ pub enum Command {
     /// With `single_range`, `rtvs` holds the first handle and the count says how many follow at the
     /// descriptor increment.
     SetRenderTargets {
-        rtvs: Vec<u64>,
+        rtvs: TargetHandles,
         single_range: bool,
         count: u32,
         dsv: Option<u64>,
@@ -248,30 +265,30 @@ pub enum Command {
         flags: u32,
         depth: f32,
         stencil: u8,
-        rects: Vec<Rect>,
+        rects: Rects,
     },
     ClearRenderTargetView {
         rtv: u64,
         color: [f32; 4],
-        rects: Vec<Rect>,
+        rects: Rects,
     },
     ClearUnorderedAccessViewUint {
         gpu: u64,
         cpu: u64,
         resource: ComPtr,
         values: [u32; 4],
-        rects: Vec<Rect>,
+        rects: Rects,
     },
     ClearUnorderedAccessViewFloat {
         gpu: u64,
         cpu: u64,
         resource: ComPtr,
         values: [f32; 4],
-        rects: Vec<Rect>,
+        rects: Rects,
     },
     DiscardResource {
         resource: ComPtr,
-        rects: Vec<Rect>,
+        rects: Rects,
         first_subresource: u32,
         subresources: u32,
     },
@@ -287,7 +304,7 @@ pub enum Command {
     /// Console slot 59: a GPU event marker, `begin` the leading byte argument and `data` the blob.
     GpuEvent {
         begin: bool,
-        data: Vec<u8>,
+        data: SmallVec<[u8; 32]>,
     },
     /// Console slot 141: `(2, GPU address, size, n)` binds the compute scratch buffer.
     SetScratchBuffer {

@@ -260,6 +260,10 @@ impl Resolver for Context<'_> {
         }
     }
 
+    fn filters_draws(&self) -> bool {
+        self.filter.is_some()
+    }
+
     fn skip_draw(&self, buffers: &[u64]) -> bool {
         self.filter
             .as_ref()

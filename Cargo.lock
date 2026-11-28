@@ -3350,6 +3350,7 @@ dependencies = [
  "shader-container",
  "shader-ir",
  "shader-translate",
+ "smallvec",
  "thiserror 2.0.21",
  "upscale",
  "windows-sys 0.61.2",

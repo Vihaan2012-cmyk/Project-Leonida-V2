@@ -10,6 +10,8 @@
 
 use std::sync::Arc;
 
+use smallvec::SmallVec;
+
 use super::indirect::IndirectLayout;
 use super::pipelines::PendingPipeline;
 use crate::com::ComPtr;
@@ -20,7 +22,7 @@ use crate::execute::barrier::{
 };
 use crate::execute::{
     Barrier, BindPoint, BufferFootprint, Command, ImageRef, IndexBufferView, IndirectKind, Rect,
-    Resource, Subresource, TargetView, TexelBox, VertexBufferView, Viewport,
+    Rects, Resource, Subresource, TargetView, TexelBox, VertexBufferView, VertexViews, Viewport,
 };
 use crate::heap;
 use crate::pipeline::Pipeline;
@@ -54,6 +56,10 @@ pub trait Resolver {
     /// registering before the draw runs.
     fn table_bound(&self, root: &RootSignature, param: u32, handle: u64) {
         let _ = (root, param, handle);
+    }
+    /// Whether `skip_draw` can ever say yes: draws skip the address gathering when it cannot.
+    fn filters_draws(&self) -> bool {
+        true
     }
     /// Whether a draw reading these buffer addresses is dropped (the content filter).
     fn skip_draw(&self, buffers: &[u64]) -> bool {
@@ -129,7 +135,7 @@ fn texel_box(b: &stream::Box3) -> TexelBox {
     }
 }
 
-fn rects(list: &[stream::Rect]) -> Vec<Rect> {
+fn rects(list: &[stream::Rect]) -> Rects {
     list.iter()
         .map(|r| Rect {
             left: r.left,
@@ -166,7 +172,10 @@ fn layout_state(layout: u32) -> u32 {
 }
 
 pub fn convert(stream: &CommandStream, resolver: &dyn Resolver) -> Converted {
-    let mut out = Converted::default();
+    let mut out = Converted {
+        commands: Vec::with_capacity(stream.commands.len()),
+        writes: Vec::new(),
+    };
     let mut state = State::default();
     convert_into(stream, resolver, &mut state, &mut out, 0);
     out
@@ -367,7 +376,7 @@ fn convert_into(
                 out.commands.push(Command::SetIndexBuffer(state.index));
             }
             C::SetVertexBuffers { start, views } => {
-                let views: Vec<VertexBufferView> = views
+                let views: VertexViews = views
                     .iter()
                     .map(|v| VertexBufferView {
                         va: v.location,
@@ -397,14 +406,14 @@ fn convert_into(
                 dsv,
             } => {
                 let step = u64::from(heap::increment_size(heap::TYPE_RTV));
-                let handles: Vec<u64> = if *single_range {
+                let handles: SmallVec<[u64; 8]> = if *single_range {
                     rtvs.first()
                         .map(|first| (0..u64::from(*count)).map(|k| first + k * step).collect())
                         .unwrap_or_default()
                 } else {
                     rtvs.clone()
                 };
-                let colors: Vec<TargetView> =
+                let colors: SmallVec<[TargetView; 2]> =
                     handles.iter().filter_map(|h| r.color_target(*h)).collect();
                 if colors.len() != handles.len() {
                     r.note("a render target view names no texture; it is left out");
@@ -550,7 +559,10 @@ fn pipeline_ready(state: &mut State, out: &mut Converted, compute: bool, r: &dyn
 
 /// Whether the draw about to be recorded reads a buffer the content filter hides.
 fn skipped(state: &State, r: &dyn Resolver) -> bool {
-    let mut addresses: Vec<u64> = state.vertex.iter().flatten().map(|v| v.va).collect();
+    if !r.filters_draws() {
+        return false;
+    }
+    let mut addresses: SmallVec<[u64; 17]> = state.vertex.iter().flatten().map(|v| v.va).collect();
     if let Some(index) = state.index {
         addresses.push(index.va);
     }

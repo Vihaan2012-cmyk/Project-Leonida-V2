@@ -13,6 +13,8 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use smallvec::{SmallVec, smallvec};
+
 use crate::com::{
     self, ComPtr, E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_POINTER, Guid, Kind, S_OK, add_ref, iid,
     release, state,
@@ -20,7 +22,8 @@ use crate::com::{
 use crate::device::DeviceCore;
 use crate::stream::{
     Barrier, BarrierGroup, Box3, BufferBarrier, Command, CommandStream, CopyLocation, Footprint,
-    GlobalBarrier, IndexBufferView, Rect, RootView, TextureBarrier, VertexBufferView, Viewport,
+    GlobalBarrier, IndexBufferView, Rect, Rects, RootView, TextureBarrier, VertexBufferView,
+    Viewport,
 };
 
 pub const LIST_TYPE_DIRECT: u32 = 0;
@@ -143,6 +146,8 @@ fn allocator_vtable(core: &DeviceCore) -> *const usize {
 #[derive(Default)]
 struct ListState {
     open: bool,
+    /// How many commands the list held when it was last closed: the next recording starts with room for them.
+    expected: usize,
     commands: Vec<Command>,
     uploads: Vec<Box<[u8]>>,
     error: Option<u32>,
@@ -330,9 +335,9 @@ unsafe fn com_ref(p: *mut c_void) -> Option<ComPtr> {
     unsafe { ComPtr::add_ref(p) }
 }
 
-unsafe fn rect_vec(p: *const Rect, n: u32) -> Vec<Rect> {
+unsafe fn rect_vec(p: *const Rect, n: u32) -> Rects {
     // SAFETY: as the caller promises.
-    unsafe { slice(p, n) }.to_vec()
+    SmallVec::from_slice(unsafe { slice(p, n) })
 }
 
 unsafe extern "win64" fn l_query_interface(
@@ -378,6 +383,7 @@ unsafe extern "win64" fn l_close(this: *mut c_void) -> u32 {
         return E_FAIL;
     }
     s.open = false;
+    s.expected = s.commands.len();
     let stream = CommandStream {
         list_type: list.list_type,
         commands: std::mem::take(&mut s.commands),
@@ -410,6 +416,8 @@ unsafe extern "win64" fn l_reset(
         }
         *s = ListState {
             open: true,
+            commands: Vec::with_capacity(s.expected),
+            expected: s.expected,
             ..Default::default()
         };
     }
@@ -609,7 +617,10 @@ unsafe extern "win64" fn l_set_topology(this: *mut c_void, topology: u32) {
 
 unsafe extern "win64" fn l_set_viewports(this: *mut c_void, n: u32, p: *const Viewport) {
     // SAFETY: `n` viewports.
-    push(this, Command::SetViewports(unsafe { slice(p, n) }.to_vec()));
+    push(
+        this,
+        Command::SetViewports(SmallVec::from_slice(unsafe { slice(p, n) })),
+    );
 }
 
 unsafe extern "win64" fn l_set_scissors(this: *mut c_void, n: u32, p: *const Rect) {
@@ -725,7 +736,7 @@ macro_rules! root_methods {
                     compute: $compute,
                     index,
                     dest_offset: offset,
-                    values: vec![value],
+                    values: smallvec![value],
                 },
             );
         }
@@ -738,7 +749,7 @@ macro_rules! root_methods {
             offset: u32,
         ) {
             // SAFETY: `count` dwords.
-            let values = unsafe { slice(data, count) }.to_vec();
+            let values = SmallVec::from_slice(unsafe { slice(data, count) });
             push(
                 this,
                 Command::SetRootConstants {
@@ -809,7 +820,7 @@ unsafe extern "win64" fn l_set_vertex_buffers(
     views: *const VertexBufferView,
 ) {
     // SAFETY: `n` views.
-    let views = unsafe { slice(views, n) }.to_vec();
+    let views = SmallVec::from_slice(unsafe { slice(views, n) });
     push(this, Command::SetVertexBuffers { start, views });
 }
 
@@ -834,7 +845,12 @@ unsafe extern "win64" fn l_set_render_targets(
     let single = single_range != 0;
     let take = if single { n.min(1) } else { n };
     // SAFETY: `take` handles, then an optional depth handle.
-    let (rtvs, dsv) = unsafe { (slice(rtvs, take).to_vec(), dsv.as_ref().copied()) };
+    let (rtvs, dsv) = unsafe {
+        (
+            SmallVec::from_slice(slice(rtvs, take)),
+            dsv.as_ref().copied(),
+        )
+    };
     push(
         this,
         Command::SetRenderTargets {
@@ -949,7 +965,7 @@ unsafe extern "win64" fn l_discard_resource(
             return;
         };
         let (rects, first, count) = if region.is_null() {
-            (Vec::new(), 0, 0)
+            (Rects::new(), 0, 0)
         } else {
             let n = *(region as *const u32);
             let p = *(region.add(8) as *const *const Rect);
@@ -975,7 +991,7 @@ unsafe extern "win64" fn l_discard_resource(
 unsafe extern "win64" fn l_gpu_event(this: *mut c_void, begin: u8, data: *const u8, size: u32) {
     let size = size.min(1 << 16);
     // SAFETY: `size` readable bytes, as the measured callers pass.
-    let data = unsafe { slice(data, size) }.to_vec();
+    let data = SmallVec::from_slice(unsafe { slice(data, size) });
     push(
         this,
         Command::GpuEvent {

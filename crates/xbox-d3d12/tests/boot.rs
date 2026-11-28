@@ -427,7 +427,7 @@ fn a_list_records_through_the_console_slots_and_the_queue_hands_it_to_the_execut
         } => {
             assert!(*compute);
             assert_eq!(*index, 3);
-            assert_eq!(values, &[7, 8, 9]);
+            assert_eq!(values.as_slice(), [7, 8, 9]);
         }
         other => panic!("{other:?}"),
     }
@@ -442,7 +442,9 @@ fn a_list_records_through_the_console_slots_and_the_queue_hands_it_to_the_execut
         Command::EnhancedBarrier(groups) => assert_eq!(groups.len(), 1),
         other => panic!("{other:?}"),
     }
-    assert!(matches!(&commands[5], Command::GpuEvent { begin: true, data } if data == b"label"));
+    assert!(
+        matches!(&commands[5], Command::GpuEvent { begin: true, data } if data.as_slice() == b"label")
+    );
     assert_eq!(commands.len(), 6);
     assert_eq!(streams[0].uploads.len(), 1);
 }

@@ -4,6 +4,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use ash::vk;
+use smallvec::smallvec;
 
 use super::bridge::*;
 use super::indirect::IndirectLayout;
@@ -363,7 +364,7 @@ fn a_draw_that_reads_a_hidden_buffer_is_dropped_and_a_dispatch_is_not() {
         stream(vec![
             stream::Command::SetVertexBuffers {
                 start: 0,
-                views: vec![VertexBufferView {
+                views: smallvec![VertexBufferView {
                     location: vertex,
                     size: 64,
                     stride: 16,
@@ -432,7 +433,7 @@ fn root_state_follows_the_bind_point_and_tables_are_announced() {
                 compute: false,
                 index: 1,
                 dest_offset: 3,
-                values: vec![9, 8],
+                values: smallvec![9, 8],
             },
             stream::Command::SetRootView {
                 compute: true,
@@ -471,7 +472,7 @@ fn a_single_range_of_render_targets_steps_by_the_descriptor_size() {
     }
     let done = convert(
         &stream(vec![stream::Command::SetRenderTargets {
-            rtvs: vec![0x1000],
+            rtvs: smallvec![0x1000],
             single_range: true,
             count: 3,
             dsv: None,
@@ -486,7 +487,7 @@ fn a_single_range_of_render_targets_steps_by_the_descriptor_size() {
     assert!(fake.notes.borrow().is_empty());
     let missing = convert(
         &stream(vec![stream::Command::SetRenderTargets {
-            rtvs: vec![0x1000, 0x9999],
+            rtvs: smallvec![0x1000, 0x9999],
             single_range: false,
             count: 2,
             dsv: None,
@@ -519,14 +520,14 @@ fn clearing_an_unordered_access_view_fills_a_buffer_or_clears_a_texture() {
                 cpu: 0,
                 resource: buffer.clone(),
                 values: [7, 0, 0, 0],
-                rects: Vec::new(),
+                rects: Default::default(),
             },
             stream::Command::ClearUnorderedAccessViewFloat {
                 gpu: 0,
                 cpu: 0,
                 resource: texture.clone(),
                 values: [1.0, 0.5, 0.0, 1.0],
-                rects: Vec::new(),
+                rects: Default::default(),
             },
         ]),
         &fake,
@@ -576,7 +577,7 @@ fn heaps_and_unknown_calls_are_resolved_or_noted() {
     let fake = Fake::default();
     let done = convert(
         &stream(vec![
-            stream::Command::SetDescriptorHeaps(vec![heap.clone()]),
+            stream::Command::SetDescriptorHeaps(smallvec![heap.clone()]),
             stream::Command::SetPipelineState(Some(heap.clone())),
             stream::Command::Unrecorded {
                 slot: 71,

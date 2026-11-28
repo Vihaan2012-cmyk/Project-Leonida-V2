@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use ash::vk;
 use shader_container::testutil;
 use shader_translate::FloatMode;
+use smallvec::smallvec;
 use xbox_d3d12::execute::{
     self, Arena, BindPoint, Command, ImageRef, ReplayEnv, SpillAllocator, TargetView, VkContext,
     barrier,
@@ -784,13 +785,13 @@ fn draw_triangle(setup: &Setup, vertex: u8, pixel: u8) -> Option<(Arc<Pipeline>,
         },
         Command::SetPipeline(pipeline.clone()),
         Command::SetRenderTargets {
-            colors: vec![target],
+            colors: smallvec![target],
             depth: None,
         },
         Command::ClearRenderTarget {
             view: target,
             color: [0.0; 4],
-            rects: Vec::new(),
+            rects: Default::default(),
         },
         Command::SetTopology(4),
         Command::Draw {
@@ -924,7 +925,7 @@ fn root_constants_an_indirect_dispatch_fills_and_copies_run_in_order() {
             bind: BindPoint::Compute,
             param: 0,
             first: 0,
-            values: vec![40, 2],
+            values: smallvec![40, 2],
         },
         Command::SetRootView {
             bind: BindPoint::Compute,
@@ -1013,7 +1014,7 @@ fn a_root_argument_that_spills_reaches_the_shader_through_the_pointer_in_s0() {
             bind: BindPoint::Compute,
             param: 0,
             first: 0,
-            values: vec![77],
+            values: smallvec![77],
         },
         Command::SetRootView {
             bind: BindPoint::Compute,

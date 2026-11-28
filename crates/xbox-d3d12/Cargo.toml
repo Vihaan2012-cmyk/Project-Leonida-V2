@@ -9,6 +9,7 @@ rust-version.workspace = true
 ash.workspace = true
 content-filter.workspace = true
 sha2.workspace = true
+smallvec.workspace = true
 shader-container.workspace = true
 shader-ir.workspace = true
 shader-translate.workspace = true
