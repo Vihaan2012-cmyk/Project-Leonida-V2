@@ -15,7 +15,9 @@ mod seen;
 mod service;
 
 pub use dir::DirBytecode;
-pub use seen::{BytecodeStore, MemoryBytecode, Pso, PsoKey, SeenEntry, SeenError, SeenLog};
+pub use seen::{
+    BytecodeStore, MemoryBytecode, Pso, PsoKey, SeenEntry, SeenError, SeenLog, read_entries,
+};
 pub use service::{
     PipelineBuilder, PipelineHandle, PipelineService, Resolved, ServiceConfig, ServiceStats,
 };
