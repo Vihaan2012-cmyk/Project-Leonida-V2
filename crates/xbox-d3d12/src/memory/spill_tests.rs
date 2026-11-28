@@ -314,3 +314,90 @@ fn the_budget_says_how_much_of_it_the_mirror_may_take() {
         budget.set_limit(None);
     }
 }
+
+/// The title's pools are runs of 64 KiB page-file sections placed one after the other: a spilled run over such
+/// views is what the GPU reads in the game.
+#[test]
+fn a_spilled_run_over_many_file_section_views_works() {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFileEx,
+        PAGE_READWRITE, SEC_COMMIT, UnmapViewOfFile,
+    };
+    const VIEWS: u64 = 16;
+    for gpu in &TestGpu::open_all() {
+        let Some(mut space) = spilling(gpu) else {
+            continue;
+        };
+        let h = gpu.handles.clone();
+        h.budget.set_mirror_limit(Some(0));
+        let kernel = Kernel::new(gpu);
+        // SAFETY: sections mapped one after the other at addresses inside the window; every view and handle is
+        // released at the end.
+        unsafe {
+            let mut sections = Vec::new();
+            let mut base = (6u64 << 29) + (1 << 28);
+            let views: Vec<u64> = 'search: loop {
+                let mut mapped: Vec<u64> = Vec::new();
+                for n in 0..VIEWS {
+                    let section = CreateFileMappingW(
+                        INVALID_HANDLE_VALUE,
+                        std::ptr::null(),
+                        PAGE_READWRITE | SEC_COMMIT,
+                        0,
+                        PAGE as u32,
+                        std::ptr::null(),
+                    );
+                    assert!(!section.is_null());
+                    let view = MapViewOfFileEx(
+                        section,
+                        FILE_MAP_ALL_ACCESS,
+                        0,
+                        0,
+                        PAGE as usize,
+                        (base + n * PAGE) as usize as *const c_void,
+                    );
+                    if view.Value.is_null() {
+                        CloseHandle(section);
+                        for (view, section) in mapped.drain(..).zip(sections.drain(..)) {
+                            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                                Value: view as usize as *mut c_void,
+                            });
+                            CloseHandle(section);
+                        }
+                        base += 1 << 28;
+                        continue 'search;
+                    }
+                    sections.push(section);
+                    mapped.push(view.Value as u64);
+                }
+                break mapped;
+            };
+            let start = views[0];
+            space
+                .map_host(start, VIEWS * PAGE, SyncPolicy::Marked)
+                .unwrap();
+            assert_eq!(space.spilled_bytes(), VIEWS * PAGE);
+            for n in 0..VIEWS {
+                *((start + n * PAGE) as *mut u32) = 100 + n as u32;
+            }
+            for n in 0..VIEWS {
+                let at = start + n * PAGE;
+                kernel.run(gpu, &mut space, &[(at, at + 8)], (at, PAGE));
+                assert_eq!(*((at + 8) as *const u32), 101 + n as u32, "view {n}");
+            }
+            space.unmap(start, VIEWS * PAGE).unwrap();
+            space.reclaim();
+            for view in views {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as usize as *mut c_void,
+                });
+            }
+            for section in sections {
+                CloseHandle(section);
+            }
+        }
+        kernel.finish(gpu);
+        h.budget.set_mirror_limit(None);
+    }
+}
