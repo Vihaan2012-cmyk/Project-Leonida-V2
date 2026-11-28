@@ -969,6 +969,9 @@ fn sample_flags(count: u32) -> vk::SampleCountFlags {
 }
 
 #[cfg(test)]
+mod offline_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
