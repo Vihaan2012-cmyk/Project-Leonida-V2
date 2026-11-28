@@ -63,6 +63,9 @@ pub fn sites_from_env() -> Vec<u32> {
 /// # Safety
 /// `address` must be a byte of mapped code that no thread is executing mid-instruction in a way the write breaks.
 unsafe fn poke(address: usize, byte: u8) -> bool {
+    // Two threads changing the same page's protection at once could leave it read-only under the other's write.
+    static POKING: Mutex<()> = Mutex::new(());
+    let _held = POKING.lock().unwrap_or_else(|e| e.into_inner());
     let mut old = 0u32;
     // SAFETY: as the caller promises; the protection is put back after.
     unsafe {
@@ -271,9 +274,11 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         .map(|steps| dump_at(&registers(context), steps))
         .unwrap_or_default();
     note(format!(
-        "reached {} (time {count}) on thread {thread}: rax={:#x} {} {} {} {}, [rsp]={}{dump}",
+        "reached {} (time {count}) on thread {thread}: rax={:#x} rsi={:#x} rdi={:#x} {} {} {} {}, [rsp]={}{dump}",
         image_offset(at),
         context.Rax,
+        context.Rsi,
+        context.Rdi,
         register("rcx", context.Rcx),
         register("rdx", context.Rdx),
         register("r8", context.R8),
