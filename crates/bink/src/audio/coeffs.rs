@@ -103,13 +103,13 @@ pub fn read_channel(r: &mut BitReader, layout: &Layout, out: &mut [f32]) -> Resu
         let width = r.read(4);
         let mut signs = r.clone();
         signs.seek(r.pos() + (end - i) * width as usize);
-        for k in i..end {
+        for (k, slot) in out.iter_mut().enumerate().take(end).skip(i) {
             while band < bands && layout.bands[band] <= k {
                 q = quant[band];
                 band += 1;
             }
             let magnitude = if width == 0 { 0 } else { r.read(width) };
-            out[k] = if magnitude == 0 {
+            *slot = if magnitude == 0 {
                 0.0
             } else if signs.read_bool() {
                 -q * magnitude as f32
@@ -142,7 +142,7 @@ pub(crate) mod tests {
     impl BitWriter {
         pub fn put(&mut self, value: u32, n: u32) {
             for b in 0..n {
-                if self.bits % 8 == 0 {
+                if self.bits.is_multiple_of(8) {
                     self.bytes.push(0);
                 }
                 if (value >> b) & 1 != 0 {
@@ -163,7 +163,7 @@ pub(crate) mod tests {
         }
 
         pub fn align32(&mut self) {
-            while self.bits % 32 != 0 {
+            while !self.bits.is_multiple_of(32) {
                 self.put(0, 1);
             }
         }
