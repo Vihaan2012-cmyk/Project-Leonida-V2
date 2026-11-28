@@ -53,6 +53,28 @@ pub fn load_settings(dir: &Path, write_missing: bool) -> Result<Settings> {
     read().with_context(|| format!("reading the settings in {}", dir.display()))
 }
 
+/// Closes the ways a library could be picked up from the game folder or the current folder: from here on a library
+/// load that names no folder searches Windows's system folder and Leonida's own folder only.
+#[cfg(windows)]
+pub fn protect_library_search() {
+    if let Err(code) = shims::hostlib::confine_search_path() {
+        eprintln!(
+            "warning: could not limit where libraries are searched for (error {code}); Windows libraries are still loaded from the system folder by full path"
+        );
+    }
+}
+
+/// Makes sure every Windows library the imports name is in the Windows system folder and loads from there, never
+/// from the game folder. Gives how many there are, or the message to show when one is missing.
+#[cfg(windows)]
+pub fn check_system_libraries<'a>(
+    dlls: impl IntoIterator<Item = &'a str>,
+) -> Result<usize, shims::hostlib::SystemLibraryError> {
+    let needed = shims::system_libraries(dlls);
+    shims::hostlib::require(needed.iter().map(String::as_str))?;
+    Ok(needed.len())
+}
+
 /// Prints the plan.
 pub fn print_plan(plan: &RuntimePlan) {
     for line in plan.summary() {
@@ -158,6 +180,46 @@ mod tests {
                 .unwrap()
                 .count(),
             7
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_libraries_are_checked_in_the_system_folder_and_never_the_games() {
+        assert_eq!(
+            check_system_libraries(["KERNEL32.dll", "kernel32.dll", "ucrtbase.dll", "XMem.dll"])
+                .unwrap(),
+            2,
+            "repeats and console libraries are not counted"
+        );
+        let needed = shims::system_libraries([
+            "MSVCP140.dll",
+            "VCRUNTIME140_1.dll",
+            "concrt140.dll",
+            "XCurl.dll",
+            "libHttpClient.GDK.dll",
+            "WS2_32.dll",
+            "ADVAPI32.dll",
+        ]);
+        assert_eq!(
+            needed,
+            ["msvcp140.dll", "vcruntime140_1.dll", "advapi32.dll"]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_c_runtime_stops_with_the_redistributable_message() {
+        let error = check_system_libraries(["MSVCP140_leonida_absent.dll"]).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("msvcp140_leonida_absent.dll"), "{text}");
+        assert!(
+            text.contains("Microsoft Visual C++ Redistributable"),
+            "{text}"
+        );
+        assert!(
+            text.contains("never loads the copy in the game folder"),
+            "{text}"
         );
     }
 

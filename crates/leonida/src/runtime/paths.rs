@@ -75,11 +75,22 @@ pub fn configure(plan: &RuntimePlan) -> Result<Vec<String>> {
     std::fs::create_dir_all(&plan.output_dir)
         .with_context(|| format!("creating {}", plan.output_dir.display()))?;
     shims::loader::configure(Some(plan.game_dir.clone()), plan.output_dir.clone());
-    if !shims::files::configure(plan.game_dir.clone(), plan.output_dir.clone()) {
+    let configured = if plan.sandbox_files {
+        shims::files::configure_sandboxed(
+            plan.game_dir.clone(),
+            plan.output_dir.clone(),
+            vec![plan.mods_dir.clone(), plan.fixes_dir.clone()],
+        )
+    } else {
+        shims::files::configure(plan.game_dir.clone(), plan.output_dir.clone())
+    };
+    if !configured {
         bail!(
-            "the game folder {} and the output folder {} must both be on a drive with a letter",
+            "the game folder {}, the output folder {}, the mods folder {} and the fixes folder {} must all be on a drive with a letter",
             plan.game_dir.display(),
-            plan.output_dir.display()
+            plan.output_dir.display(),
+            plan.mods_dir.display(),
+            plan.fixes_dir.display()
         );
     }
     let (overlay, notes) = load_overlay(plan, &game_version()?)?;

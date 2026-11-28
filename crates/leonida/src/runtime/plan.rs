@@ -46,6 +46,8 @@ pub struct RuntimePlan {
     pub block_nudity: bool,
     pub blocklist: PathBuf,
     pub audio: OutputMode,
+    /// Whether the game is limited to its own folder, `Output/` and the mods and fixes folders (`files.sandbox`).
+    pub sandbox_files: bool,
     pub language: String,
     pub trace: bool,
 }
@@ -121,6 +123,7 @@ impl RuntimePlan {
                 config::AudioOutput::Auto => OutputMode::Auto,
                 config::AudioOutput::Off => OutputMode::Off,
             },
+            sandbox_files: settings.general.files.sandbox,
             language: settings.general.language.clone(),
             trace: args.trace,
         })
@@ -157,6 +160,7 @@ impl RuntimePlan {
                 }
             ),
         ];
+        lines.push(format!("  files        {}", self.describe_files()));
         let mods = if self.mod_load_order.is_empty() {
             "none".to_string()
         } else {
@@ -167,6 +171,20 @@ impl RuntimePlan {
             self.mods_dir.display()
         ));
         lines
+    }
+
+    fn describe_files(&self) -> String {
+        if self.sandbox_files {
+            format!(
+                "sandboxed: the game folder, {} and {} read only, {} read and write, no other path",
+                self.mods_dir.display(),
+                self.fixes_dir.display(),
+                self.output_dir.display()
+            )
+        } else {
+            "sandbox off (files.sandbox = false): the game can reach every file on this PC"
+                .to_string()
+        }
     }
 
     fn describe_upscaler(&self) -> String {
@@ -464,6 +482,34 @@ frame_generation_method = \"dlss\"",
     }
 
     #[test]
+    fn the_file_sandbox_is_on_by_default_and_the_summary_says_which() {
+        let on = plan(&args(), &Settings::default()).unwrap();
+        assert!(on.sandbox_files);
+        let text = on.summary().join("\n");
+        let line = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("files"))
+            .expect("a files line");
+        assert!(line.contains("sandboxed"), "{line}");
+        assert!(line.contains("Mods"), "{line}");
+        assert!(line.contains("Fixes"), "{line}");
+        assert!(
+            line.contains(&on.output_dir.display().to_string()),
+            "{line}"
+        );
+        let mut settings = Settings::default();
+        settings.general.files.sandbox = false;
+        let off = plan(&args(), &settings).unwrap();
+        assert!(!off.sandbox_files);
+        let text = off.summary().join("\n");
+        assert!(
+            text.contains("sandbox off (files.sandbox = false)"),
+            "{text}"
+        );
+        assert!(!text.contains("sandboxed"), "{text}");
+    }
+
+    #[test]
     fn the_mouse_camera_follows_its_switch_and_the_sensitivities() {
         let on = plan(&args(), &Settings::default()).unwrap();
         assert_eq!(on.mouse_camera, Some(MouseLookSettings::default()));
@@ -525,6 +571,7 @@ frame_generation_method = \"dlss\"",
             "mouse camera",
             "nudity",
             "audio",
+            "files",
             "mods",
         ] {
             assert!(
