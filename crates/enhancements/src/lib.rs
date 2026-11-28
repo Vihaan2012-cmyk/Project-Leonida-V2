@@ -6,5 +6,6 @@ pub mod clock_floor;
 pub mod diagnostics;
 pub mod frame_timers;
 pub mod framerate;
+pub mod game_limiter;
 pub mod patch;
 pub mod widescreen;
