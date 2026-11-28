@@ -1,4 +1,4 @@
-use super::testutil::{Bits, decoder, frame, payload, sample};
+use super::testutil::{Bits, decoder, frame, payload, payload_with_flags, sample};
 use super::{BlockKind, Frame, TypeLru};
 use crate::bits::BitReader;
 use crate::error::Error;
@@ -344,4 +344,35 @@ fn the_recency_list_moves_the_chosen_type_up() {
     assert_eq!(lru.read(&mut r), BlockKind::Residue);
     assert_eq!(lru.read(&mut r), BlockKind::Skip);
     assert_eq!(lru.read(&mut r), BlockKind::Intra);
+}
+
+#[test]
+fn edge_flag_lists_follow_the_picture_size() {
+    // 48x32: three row flags (height to 16) and seven column flags (width to a whole macroblock), each list
+    // behind its leading false flag, here spelled out bit by bit.
+    let dec = decoder(48, 32);
+    let reference = frame(&dec, texture);
+    let mut b = Bits::default();
+    b.put(0, 1).put(0b101, 3);
+    b.put(0, 1).put(0b0110101, 7);
+    kind(&mut b, SKIP);
+    b.put(0b10, 2);
+    let out = dec
+        .decode(1, &payload_with_flags(0x12000, &b), false, Some(&reference))
+        .unwrap();
+    assert_eq!(out.planes[0].data, reference.planes[0].data);
+}
+
+#[test]
+fn a_slice_that_ends_early_is_rejected() {
+    let dec = decoder(W, H);
+    let reference = frame(&dec, texture);
+    let mut b = Bits::default();
+    kind(&mut b, SKIP);
+    b.put(0b10, 2);
+    b.put(0, 32).put(0, 32); // two more words the slice does not account for
+    assert!(matches!(
+        dec.decode(1, &payload(&b), false, Some(&reference)),
+        Err(Error::Frame { .. })
+    ));
 }

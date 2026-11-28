@@ -113,7 +113,7 @@ fn clip(v: i32) -> i32 {
 /// Half-sample position of the six-tap luma filter between `s[1]` and `s[2]` of `s[0..6]`.
 #[inline]
 fn luma_tap(s: [i32; 6]) -> i32 {
-    clip((((s[2] + s[3]) * 19 >> 1) - (s[1] + s[4]) * 2 + ((s[0] + s[5]) >> 1) + 8) >> 4)
+    clip(((((s[2] + s[3]) * 19) >> 1) - (s[1] + s[4]) * 2 + ((s[0] + s[5]) >> 1) + 8) >> 4)
 }
 
 /// Quarter-sample position of the two-tap chroma filter.
@@ -145,13 +145,14 @@ pub fn luma_block(dst: &mut Plane, src: &Plane, bx: usize, by: usize, mv: [i32; 
         }
     }
     for j in 0..16 {
-        for i in 0..16 {
+        let out = &mut dst.data[(by + j) * dst.stride + bx..][..16];
+        for (i, o) in out.iter_mut().enumerate() {
             let v = if fy {
                 luma_tap(std::array::from_fn(|k| tmp[j + k][i]))
             } else {
                 tmp[j + 2][i]
             };
-            dst.data[(by + j) * dst.stride + bx + i] = v as u8;
+            *o = v as u8;
         }
     }
 }
@@ -169,9 +170,9 @@ pub fn chroma_block(dst: &mut Plane, src: &Plane, bx: usize, by: usize, mv: [i32
         }
     }
     for j in 0..8 {
-        for i in 0..8 {
-            dst.data[(by + j) * dst.stride + bx + i] =
-                chroma_tap(tmp[j][i], tmp[j + 1][i], fy) as u8;
+        let out = &mut dst.data[(by + j) * dst.stride + bx..][..8];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = chroma_tap(tmp[j][i], tmp[j + 1][i], fy) as u8;
         }
     }
 }
