@@ -28,8 +28,15 @@ pub(super) fn pool_paths() -> Vec<PathBuf> {
     out
 }
 
-/// `(codec, decoded size)` of every chunk, from the pool's entry table alone.
-pub(super) fn chunk_table(path: &Path) -> Option<Vec<(u8, u64)>> {
+pub(super) struct Entry {
+    pub codec: u8,
+    pub size: u64,
+    pub src: u64,
+    pub packed: u64,
+}
+
+/// Every chunk of a pool, from its entry table alone.
+pub(super) fn chunk_entries(path: &Path) -> Option<Vec<Entry>> {
     let mut f = std::fs::File::open(path).ok()?;
     let mut head = [0u8; 24];
     f.read_exact(&mut head).ok()?;
@@ -46,7 +53,13 @@ pub(super) fn chunk_table(path: &Path) -> Option<Vec<(u8, u64)>> {
             .map(|i| {
                 let (v, n) = (entry(i), entry(i + 1));
                 let size = (((n >> 30) & 0x3F_FFFF) - ((v >> 30) & 0x3F_FFFF)) * 4096;
-                (((v >> 26) & 15) as u8, size)
+                let (src, end) = ((v & 0x3FF_FFFF) * 256, (n & 0x3FF_FFFF) * 256);
+                Entry {
+                    codec: ((v >> 26) & 15) as u8,
+                    size,
+                    src,
+                    packed: (end - src).saturating_sub(v >> 52),
+                }
             })
             .collect(),
     )
@@ -56,11 +69,11 @@ pub(super) fn chunk_table(path: &Path) -> Option<Vec<(u8, u64)>> {
 fn bcpack_chunks_per_codec_across_the_game() {
     let mut total: BTreeMap<u8, (usize, u64)> = BTreeMap::new();
     for path in pool_paths() {
-        let Some(chunks) = chunk_table(&path) else {
+        let Some(chunks) = chunk_entries(&path) else {
             continue;
         };
         let mut here: BTreeMap<u8, usize> = BTreeMap::new();
-        for (codec, size) in chunks {
+        for Entry { codec, size, .. } in chunks {
             let t = total.entry(codec).or_default();
             t.0 += 1;
             t.1 += size;
@@ -81,4 +94,13 @@ fn bcpack_chunks_per_codec_across_the_game() {
             *bytes as f64 / 1e6
         );
     }
+}
+
+/// The packed bytes of one chunk.
+pub(super) fn read_chunk(path: &Path, e: &Entry) -> Option<Vec<u8>> {
+    let mut f = std::fs::File::open(path).ok()?;
+    f.seek(SeekFrom::Start(e.src)).ok()?;
+    let mut raw = vec![0u8; e.packed as usize];
+    f.read_exact(&mut raw).ok()?;
+    Some(raw)
 }
