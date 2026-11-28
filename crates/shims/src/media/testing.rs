@@ -219,9 +219,12 @@ pub enum SinkEvent {
     Pause(bool),
 }
 
-/// Records what the player sends to the audio engine.
+/// Records what the player sends to the audio engine; `.1` is the position it reports.
 #[derive(Clone, Default)]
-pub struct RecordingSink(pub Arc<Mutex<Vec<SinkEvent>>>);
+pub struct RecordingSink(
+    pub Arc<Mutex<Vec<SinkEvent>>>,
+    pub Arc<Mutex<Option<Duration>>>,
+);
 
 impl super::sound::AudioSink for RecordingSink {
     fn push(&mut self, track: usize, rate: u32, channels: u8, samples: Vec<f32>) {
@@ -240,6 +243,9 @@ impl super::sound::AudioSink for RecordingSink {
     }
     fn pause(&mut self, paused: bool) {
         self.0.lock().unwrap().push(SinkEvent::Pause(paused));
+    }
+    fn position(&self) -> Option<Duration> {
+        *self.1.lock().unwrap()
     }
 }
 
