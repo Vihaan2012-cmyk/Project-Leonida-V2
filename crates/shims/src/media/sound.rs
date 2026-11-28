@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::audio::{Buffer, Looping, SharedMixer, VoiceId, VoiceParams, with_engine};
 
@@ -12,12 +13,19 @@ pub trait AudioSink: Send {
     fn flush(&mut self);
     fn set_gain(&mut self, track: usize, gain: f32);
     fn pause(&mut self, paused: bool);
+    /// How long the audio of the lowest-numbered track has played since the last flush; `None` while nothing has been
+    /// pushed. It stands still when the device does not consume or the voice has run dry.
+    fn position(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// Plays on the shared audio engine's mixer; its voices are removed when it is dropped.
 pub struct EngineSink {
     mixer: SharedMixer,
     voices: BTreeMap<usize, (VoiceId, VoiceParams)>,
+    /// Source frames each voice had played when the sink was last flushed.
+    bases: BTreeMap<usize, f64>,
     gains: BTreeMap<usize, f32>,
     paused: bool,
 }
@@ -31,6 +39,7 @@ impl EngineSink {
         EngineSink {
             mixer,
             voices: BTreeMap::new(),
+            bases: BTreeMap::new(),
             gains: BTreeMap::new(),
             paused: false,
         }
@@ -72,10 +81,21 @@ impl AudioSink for EngineSink {
 
     fn flush(&mut self) {
         if let Ok(mut mixer) = self.mixer.lock() {
-            for (voice, _) in self.voices.values() {
+            for (track, (voice, _)) in &self.voices {
                 mixer.flush(*voice);
+                self.bases
+                    .insert(*track, mixer.voice_played(*voice).unwrap_or(0.0));
             }
         }
+    }
+
+    fn position(&self) -> Option<Duration> {
+        let (track, (voice, params)) = self.voices.iter().next()?;
+        let played = self.mixer.lock().ok()?.voice_played(*voice)?;
+        let base = self.bases.get(track).copied().unwrap_or(0.0);
+        Some(Duration::from_secs_f64(
+            (played - base).max(0.0) / f64::from(params.rate.max(1)),
+        ))
     }
 
     fn set_gain(&mut self, track: usize, gain: f32) {
@@ -162,5 +182,29 @@ mod tests {
         assert!((render(&m, 1)[0] - 0.4).abs() < 1e-6);
         sink.set_gain(0, 0.25);
         assert!((render(&m, 1)[0] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_position_is_what_the_mixer_has_played_since_the_last_flush() {
+        let m = mixer();
+        let mut sink = EngineSink::on(m.clone());
+        assert_eq!(sink.position(), None);
+        sink.push(1, 48000, 2, vec![0.1; 2 * 4800]);
+        sink.push(0, 48000, 2, vec![0.1; 2 * 4800]);
+        assert_eq!(sink.position(), Some(Duration::ZERO));
+        render(&m, 2400);
+        assert_eq!(
+            sink.position(),
+            Some(Duration::from_millis(50)),
+            "the lowest track is the clock"
+        );
+        sink.flush();
+        assert_eq!(sink.position(), Some(Duration::ZERO));
+        sink.push(0, 48000, 2, vec![0.1; 2 * 4800]);
+        render(&m, 480);
+        assert_eq!(sink.position(), Some(Duration::from_millis(10)));
+        sink.pause(true);
+        render(&m, 480);
+        assert_eq!(sink.position(), Some(Duration::from_millis(10)), "paused");
     }
 }
