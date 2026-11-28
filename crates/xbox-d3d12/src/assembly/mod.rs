@@ -60,7 +60,7 @@ pub use crate::pacing::FrameLimit as Limit;
 
 const DXGI_ERROR_UNSUPPORTED: u32 = 0x887A_0004;
 
-static LIMIT: Mutex<FrameLimit> = Mutex::new(FrameLimit::Console);
+static LIMIT: Mutex<FrameLimit> = Mutex::new(FrameLimit::Uncapped);
 static ALLOCATOR: RwLock<Option<Arc<dyn HeapAllocator>>> = RwLock::new(None);
 
 /// The frame rate policy. Call it before the device exists; a device that exists applies it at once.

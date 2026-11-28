@@ -295,8 +295,16 @@ mod tests {
     }
 
     #[test]
-    fn the_defaults_are_the_consoles_and_change_nothing_in_the_game() {
+    fn the_defaults_run_uncapped_with_the_frame_rate_patches() {
         let plan = plan(&args(), &Settings::default()).unwrap();
+        assert_eq!(plan.frame_limit, FrameLimit::Uncapped);
+        assert!(plan.custom_limit);
+        assert_eq!(plan.describe_patches(), "framerate");
+    }
+
+    #[test]
+    fn the_consoles_pacing_changes_nothing_in_the_game() {
+        let plan = plan(&args(), &graphics("frame_rate_mode = \"console\"")).unwrap();
         assert_eq!(plan.frame_limit, FrameLimit::Console);
         assert!(!plan.custom_limit);
         assert_eq!(plan.upscaler, Upscaler::Off);
