@@ -759,3 +759,149 @@ fn the_feature_and_crash_callback_slots_the_title_calls_at_start_succeed() {
         );
     }
 }
+
+fn heap_of(h: &Harness, heap_type: u32) -> (Ptr, u64) {
+    let mut heap = std::ptr::null_mut();
+    let desc = [heap_type, 8, 1, 1];
+    // SAFETY: device slot 14, heap slot 9.
+    unsafe {
+        let create_heap: unsafe extern "win64" fn(Ptr, *const u32, *const u8, *mut Ptr) -> u32 =
+            slot(h.device, 14);
+        assert_eq!(
+            create_heap(
+                h.device,
+                desc.as_ptr(),
+                guid(&iid::DESCRIPTOR_HEAP).as_ptr(),
+                &mut heap
+            ),
+            0
+        );
+        let start: unsafe extern "win64" fn(Ptr) -> u64 = slot(heap, 9);
+        (heap, start(heap))
+    }
+}
+
+#[test]
+fn a_sampler_made_through_slot_61_is_written_and_registered() {
+    let Some(h) = harness() else { return };
+    let (_heap, cpu) = heap_of(&h, 1);
+    let mut desc = [0u8; 0x54];
+    let mut put = |at: usize, v: u32| desc[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    put(4, 1);
+    put(8, 1);
+    put(0x10, 1);
+    put(0x14, 1);
+    put(0x18, 2);
+    put(0x1C, 2);
+    put(0x20, 2);
+    put(0x28, 15.0f32.to_bits());
+    let before = h.asm.descriptors().registry.sampler_count();
+    // SAFETY: device slot 61, `(desc, handle)`; the handle is a sampler heap slot.
+    let words = unsafe {
+        let create: unsafe extern "win64" fn(Ptr, *const u8, u64) = slot(h.device, 61);
+        create(h.device, desc.as_ptr(), cpu);
+        std::slice::from_raw_parts(cpu as usize as *const u32, 4).to_vec()
+    };
+    // Clamp codes 2 in X, Y and Z, a bilinear magnification, minimisation and a linear mip filter.
+    assert_eq!(words[0] & 0x1FF, 0b010_010_010);
+    assert_eq!((words[2] >> 20) & 3, 1);
+    assert_eq!((words[2] >> 22) & 3, 1);
+    assert_eq!((words[2] >> 26) & 3, 2);
+    assert_eq!(words[1] >> 12, 0xF00);
+    assert!(h.asm.descriptors().registry.sampler_count() > before);
+}
+
+#[test]
+fn views_made_from_an_address_through_slots_70_and_71_describe_that_memory() {
+    let Some(h) = harness() else { return };
+    let (_heap, cpu) = heap_of(&h, 0);
+    let resource = buffer_desc(0x4000, 4);
+    let address = 0x2_0000_1000u64;
+    let mut view = [0u8; 0x38];
+    view[4..8].copy_from_slice(&1u32.to_le_bytes());
+    view[8..12].copy_from_slice(&0x1688u32.to_le_bytes());
+    view[0x18..0x1C].copy_from_slice(&0x400u32.to_le_bytes());
+    view[0x1C..0x20].copy_from_slice(&16u32.to_le_bytes());
+    view[0x28..0x30].copy_from_slice(&address.to_le_bytes());
+    // SAFETY: device slots 70 and 71 with `(resource desc, view desc, handle)`; the handles are heap slots.
+    let (srv, uav) = unsafe {
+        let make: unsafe extern "win64" fn(Ptr, *const u8, *const u8, u64) = slot(h.device, 70);
+        make(h.device, resource.as_ptr(), view.as_ptr(), cpu);
+        let srv = std::slice::from_raw_parts(cpu as usize as *const u32, 4).to_vec();
+        let make: unsafe extern "win64" fn(Ptr, *const u8, *const u8, u64) = slot(h.device, 71);
+        let mut uav_desc = [0u8; 0x38];
+        uav_desc[4..8].copy_from_slice(&1u32.to_le_bytes());
+        uav_desc[0x10..0x14].copy_from_slice(&0x400u32.to_le_bytes());
+        uav_desc[0x14..0x18].copy_from_slice(&16u32.to_le_bytes());
+        uav_desc[0x28..0x30].copy_from_slice(&address.to_le_bytes());
+        make(h.device, resource.as_ptr(), uav_desc.as_ptr(), cpu + 32);
+        (
+            srv,
+            std::slice::from_raw_parts((cpu + 32) as usize as *const u32, 4).to_vec(),
+        )
+    };
+    for words in [&srv, &uav] {
+        let base = u64::from(words[0]) | (u64::from(words[1] & 0xFFFF) << 32);
+        assert_eq!(base, address, "{words:x?}");
+    }
+}
+
+#[test]
+fn the_allocation_info_state_object_range_and_crash_slots_answer() {
+    let Some(h) = harness() else { return };
+    let descs = [buffer_desc(0x10000, 0), texture_desc(64, 64, 28, 0)].concat();
+    let mut info = [0u64; 6];
+    let mut total = [0u64; 2];
+    let mut plain = [0u64; 2];
+    // SAFETY: device slots 25, 108, 74, 101, 119 and 132 with the shapes the executable calls.
+    unsafe {
+        let one: unsafe extern "win64" fn(*mut u64, Ptr, u32, u32, *const u8) -> *mut u64 =
+            slot(h.device, 25);
+        one(plain.as_mut_ptr(), h.device, 1, 2, descs.as_ptr());
+        let two: unsafe extern "win64" fn(
+            *mut u64,
+            Ptr,
+            u32,
+            u32,
+            *const u8,
+            *mut u64,
+        ) -> *mut u64 = slot(h.device, 108);
+        let back = two(
+            total.as_mut_ptr(),
+            h.device,
+            1,
+            2,
+            descs.as_ptr(),
+            info.as_mut_ptr(),
+        );
+        assert_eq!(back, total.as_mut_ptr());
+        assert_eq!(total, plain);
+        assert_eq!(info[0], 0);
+        assert_eq!(info[2], 0x10000);
+        assert_eq!(info[3], info[3].next_multiple_of(info[4]));
+        assert_eq!(info[3] + info[5], total[0]);
+
+        let mut handle = 0u64;
+        let range: unsafe extern "win64" fn(Ptr, u64, u32, *mut u64) -> u32 = slot(h.device, 74);
+        assert_eq!(range(h.device, 0x4_0000_0000, 16, &mut handle), 0);
+        assert_eq!(handle, 1);
+
+        let mut state = 7usize as Ptr;
+        let create: unsafe extern "win64" fn(Ptr, *const u8, *const u8, *mut Ptr) -> u32 =
+            slot(h.device, 101);
+        let desc = [0u8; 24];
+        let result = create(
+            h.device,
+            desc.as_ptr(),
+            guid(&iid::RESOURCE).as_ptr(),
+            &mut state,
+        );
+        assert_eq!(result, 0x887A_0004);
+        assert!(state.is_null());
+
+        let crash: unsafe extern "win64" fn(Ptr, usize, usize, usize) -> u32 = slot(h.device, 132);
+        assert_eq!(crash(h.device, 3, 0, 0), 0);
+        let append: unsafe extern "win64" fn(Ptr, usize, usize, usize) -> u32 = slot(h.device, 119);
+        assert_eq!(append(h.device, 0, 0x80, 0), 0);
+    }
+}

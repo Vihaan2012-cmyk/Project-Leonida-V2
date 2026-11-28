@@ -143,3 +143,80 @@ pub fn sampler(desc: &SamplerDesc, borders: &mut BorderTable) -> Sampler {
     }
     s
 }
+
+/// The console's own sampler description, as the title's sampler builder (rva 0x012b96b0) fills it for
+/// `CreateSamplerX` (device slot 61): 0x54 bytes of u32 and f32 fields at the offsets `assembly::rawdesc` reads.
+/// Measured: which field sits where. Not measured: the meaning of the filter codes (the title writes 1, 2 or 3 for
+/// each of magnification and minimisation) and of the compare field's upper bits; they are read as below.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConsoleSampler {
+    /// Magnification and minimisation: 1 bilinear, 3 anisotropic bilinear, anything else point.
+    pub mag: u32,
+    pub min: u32,
+    /// Mip filter: 0 point, 1 or more linear.
+    pub mip: u32,
+    /// The anisotropy table's value: a ratio of 1, 2, 4, 8 or 16 (0 or 3 are read as log2 codes).
+    pub aniso: u32,
+    /// `SQ_TEX_CLAMP` codes for U, V and W.
+    pub clamp: [u32; 3],
+    pub min_lod: f32,
+    pub max_lod: f32,
+    pub lod_bias: f32,
+    /// Low three bits `SQ_TEX_DEPTH_COMPARE`; bit 4 marks a comparison that is NEVER.
+    pub compare: u32,
+    pub border_color: [f32; 4],
+}
+
+pub fn from_console(c: &ConsoleSampler, borders: &mut BorderTable) -> Sampler {
+    let pick = |code: u32| match code {
+        3 => Filter::AnisoBilinear,
+        1 => Filter::Bilinear,
+        _ => Filter::Point,
+    };
+    let aniso = c.mag == 3 || c.min == 3;
+    let ratio = match c.aniso {
+        0 => 1,
+        3 => 8,
+        v if v <= 4 => v,
+        v => v.min(16),
+    };
+    let address = |code: u32| AddressMode::from_bits(code);
+    let mut s = Sampler {
+        address_u: address(c.clamp[0]),
+        address_v: address(c.clamp[1]),
+        address_w: address(c.clamp[2]),
+        mag: pick(c.mag),
+        min: pick(c.min),
+        mip: if c.mip >= 1 {
+            MipFilter::Linear
+        } else {
+            MipFilter::Point
+        },
+        max_anisotropy: if aniso {
+            ratio.next_power_of_two().min(16)
+        } else {
+            1
+        },
+        min_lod: c.min_lod,
+        max_lod: c.max_lod,
+        lod_bias: c.lod_bias,
+        compare: Compare::from_bits(c.compare),
+        compare_never: c.compare & 0x10 != 0 && c.compare & 7 == 0,
+        ..Sampler::default()
+    };
+    let uses_border = [c.clamp[0], c.clamp[1], c.clamp[2]]
+        .iter()
+        .any(|m| matches!(m, 4..=7));
+    if uses_border {
+        match c.border_color {
+            [0.0, 0.0, 0.0, 0.0] => s.border = Border::TransparentBlack,
+            [0.0, 0.0, 0.0, 1.0] => s.border = Border::OpaqueBlack,
+            [1.0, 1.0, 1.0, 1.0] => s.border = Border::OpaqueWhite,
+            custom => {
+                s.border = Border::Table;
+                s.border_index = borders.index_of(custom) & 0xFFF;
+            }
+        }
+    }
+    s
+}

@@ -140,3 +140,44 @@ fn minimum_and_maximum_filters_and_integer_borders() {
     assert_eq!(max.reduction, Reduction::Maximum);
     assert!(max.integer_border);
 }
+
+#[test]
+fn a_console_sampler_keeps_its_clamp_codes_filters_and_border() {
+    let console = ConsoleSampler {
+        mag: 1,
+        min: 3,
+        mip: 1,
+        aniso: 4,
+        clamp: [2, 6, 0],
+        min_lod: 0.0,
+        max_lod: 15.0,
+        lod_bias: 0.5,
+        compare: 3,
+        border_color: [0.0, 0.0, 0.0, 1.0],
+    };
+    let s = from_console(&console, &mut BorderTable::default());
+    assert_eq!(s.address_u, AddressMode::ClampLastTexel);
+    assert_eq!(s.address_v, AddressMode::ClampBorder);
+    assert_eq!(s.address_w, AddressMode::Wrap);
+    assert_eq!((s.mag, s.min), (Filter::Bilinear, Filter::AnisoBilinear));
+    assert_eq!(s.mip, MipFilter::Linear);
+    assert_eq!(s.max_anisotropy, 4);
+    assert_eq!(s.compare, Compare::LessEqual);
+    assert_eq!(s.border, Border::OpaqueBlack);
+    let point = from_console(
+        &ConsoleSampler {
+            mag: 2,
+            min: 2,
+            mip: 0,
+            aniso: 8,
+            clamp: [0; 3],
+            compare: 0,
+            ..console
+        },
+        &mut BorderTable::default(),
+    );
+    assert_eq!((point.mag, point.min), (Filter::Point, Filter::Point));
+    assert_eq!(point.mip, MipFilter::Point);
+    assert_eq!(point.max_anisotropy, 1);
+    assert!(!point.compare_never);
+}

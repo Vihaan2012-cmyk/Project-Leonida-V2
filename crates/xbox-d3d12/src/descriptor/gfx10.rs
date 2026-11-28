@@ -239,7 +239,7 @@ pub enum AddressMode {
 }
 
 impl AddressMode {
-    fn from_bits(bits: u32) -> AddressMode {
+    pub(crate) fn from_bits(bits: u32) -> AddressMode {
         [
             AddressMode::Wrap,
             AddressMode::Mirror,
@@ -311,7 +311,7 @@ pub enum Compare {
 }
 
 impl Compare {
-    fn from_bits(bits: u32) -> Compare {
+    pub(crate) fn from_bits(bits: u32) -> Compare {
         [
             Compare::Never,
             Compare::Less,
