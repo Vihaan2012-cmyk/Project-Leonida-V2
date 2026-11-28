@@ -11,6 +11,7 @@
 //! element). Lanes 11-14 carry the four index rows as zigzag deltas, two pixels per even/odd bit pair, with the
 //! parity swapped on the last row.
 
+use super::bc6h_history::{ENDPOINTS, INDICES};
 use super::blocks::{interleave4, unzig};
 use super::bptc::ANCHOR2;
 use super::lanes::LaneSymbols;
@@ -277,14 +278,14 @@ pub(super) fn pack(m: usize, part: usize, field: &[[u32; 4]; 3], ix: &[u32; 16])
 }
 
 #[inline(always)]
-fn interleave(a: u8, b: u8, bits: u32) -> u32 {
+pub(super) fn interleave(a: u8, b: u8, bits: u32) -> u32 {
     (0..bits).fold(0, |acc, k| {
         acc | u32::from(a >> k & 1) << (2 * k) | u32::from(b >> k & 1) << (2 * k + 1)
     })
 }
 
 #[inline(always)]
-fn unzig_wide(v: u32) -> i32 {
+pub(super) fn unzig_wide(v: u32) -> i32 {
     (v >> 1) as i32 ^ -((v & 1) as i32)
 }
 
@@ -302,8 +303,8 @@ const fn parity_table(shift: usize) -> [u8; 256] {
     t
 }
 
-static EVEN: [u8; 256] = parity_table(0);
-static ODD: [u8; 256] = parity_table(1);
+pub(super) static EVEN: [u8; 256] = parity_table(0);
+pub(super) static ODD: [u8; 256] = parity_table(1);
 
 fn missing(block: usize, distance: usize) -> BcPackError {
     BcPackError::History {
@@ -314,16 +315,12 @@ fn missing(block: usize, distance: usize) -> BcPackError {
     }
 }
 
-/// The built-in history of BC6H: nothing is recovered yet.
 fn builtin() -> &'static History {
     static HISTORY: OnceLock<History> = OnceLock::new();
-    HISTORY.get_or_init(History::empty)
-}
-
-/// Whether any built-in history entry is recovered; without one no real chunk can be decoded.
-pub fn has_history() -> bool {
-    let h = builtin();
-    h.endpoints.iter().any(|e| *e != Entry::Unknown)
+    HISTORY.get_or_init(|| History {
+        endpoints: ENDPOINTS.to_vec(),
+        indices: INDICES.to_vec(),
+    })
 }
 
 pub fn bc6h(

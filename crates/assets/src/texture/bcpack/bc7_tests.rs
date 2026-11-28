@@ -659,7 +659,6 @@ fn unequal_shared_p_bits_are_reported() {
 }
 
 #[test]
-fn bc7_is_a_supported_codec_and_bc6h_is_not() {
+fn bc7_is_a_supported_codec() {
     assert!(super::is_supported(BcPackCodec::Bc7));
-    assert!(!super::is_supported(BcPackCodec::Bc6h));
 }

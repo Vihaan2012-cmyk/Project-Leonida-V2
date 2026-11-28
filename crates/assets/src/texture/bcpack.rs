@@ -5,11 +5,17 @@
 //! history entry, and index codebooks. [`decode`] runs both. Codecs whose block stage is not covered by the
 //! measured facts return [`BcPackError::Unsupported`] so the caller keeps its placeholder; a chunk that needs a
 //! built-in history entry that is only provisional, or not recovered, returns [`BcPackError::History`]. All BC7
-//! history entries are provisional.
+//! and BC6H history entries are provisional (BC6H's are fitted from retail chunks); BC2 never occurs in the game and
+//! has no block stage.
 
 use thiserror::Error;
 
 mod bc6h;
+#[cfg(test)]
+mod bc6h_fit;
+#[cfg(test)]
+mod bc6h_harness;
+mod bc6h_history;
 #[cfg(test)]
 mod bc6h_real_tests;
 #[cfg(test)]
@@ -241,6 +247,7 @@ pub fn is_supported(codec: BcPackCodec) -> bool {
             | BcPackCodec::Bc3
             | BcPackCodec::Bc4
             | BcPackCodec::Bc5
+            | BcPackCodec::Bc6h
             | BcPackCodec::Bc7
     )
 }
@@ -270,7 +277,7 @@ pub fn decode_with(
         BcPackCodec::Bc3 => blocks::bc3,
         BcPackCodec::Bc4 => blocks::bc4,
         BcPackCodec::Bc5 => blocks::bc5,
-        BcPackCodec::Bc6h if bc6h::has_history() => bc6h::bc6h,
+        BcPackCodec::Bc6h => bc6h::bc6h,
         BcPackCodec::Bc7 => bc7::bc7,
         _ => return Err(BcPackError::Unsupported { codec }),
     };
