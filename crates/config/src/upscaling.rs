@@ -21,7 +21,9 @@ impl Section for Upscaling {
 # Leonida upscaler files. Delete this file (or run `leonida config reset`) to get it back with the defaults.
 
 # DLSS needs NVIDIA's own nvngx_dlss.dll, which Leonida does not include: point this at your copy, and set
-# upscaler = \"dlss\" in graphics.toml. Without it, a DLSS choice falls back to the temporal upscaler.
+# upscaler = \"dlss\" in graphics.toml. Without this line Leonida looks in NVIDIA's NGX folders and next to
+# leonida.exe. When no copy is found, or the GPU is not an NVIDIA RTX, a DLSS choice falls back to the temporal
+# upscaler; `leonida config dlss` says which.
 # dlss_path = \"C:/Games/DLSS/nvngx_dlss.dll\"
 "
         .to_string()

@@ -1,8 +1,9 @@
 //! Optional NVIDIA DLSS super resolution through NGX, the runtime that comes with NVIDIA's driver. Nothing of
 //! NVIDIA's is linked, bundled or shipped.
 //!
-//! The player supplies NVIDIA's files: the driver installs the NGX loader (`nvngx.dll`), and the player points the
-//! configuration at a DLSS library (`nvngx_dlss.dll`) they obtained from NVIDIA. DLSS only works on NVIDIA GPUs with
+//! The player supplies NVIDIA's files: the driver installs the NGX loader (`nvngx.dll`), and the player puts a DLSS
+//! library (`nvngx_dlss.dll`) they obtained from NVIDIA where [`locate::locate`] looks (the `dlss_path` setting,
+//! NVIDIA's NGX folders, next to the executable). DLSS only works on NVIDIA GPUs with
 //! tensor cores (GeForce RTX); anywhere else, or when NGX fails, [`create_with_fallback`] hands back FSR 1 or the
 //! temporal upscaler together with a message saying why.
 //!

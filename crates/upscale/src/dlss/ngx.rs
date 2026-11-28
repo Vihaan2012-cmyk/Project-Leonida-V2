@@ -612,6 +612,18 @@ impl Ngx {
             .app_data_path
             .clone()
             .unwrap_or_else(std::env::temp_dir);
+        std::fs::create_dir_all(&data_path)
+            .and_then(|()| {
+                let probe = data_path.join(".leonida-ngx-write-test");
+                std::fs::write(&probe, b"")?;
+                std::fs::remove_file(probe)
+            })
+            .map_err(|error| {
+                NgxError::Other(format!(
+                    "NGX needs a writable folder for its logs and caches, and {} is not: {error}",
+                    data_path.display()
+                ))
+            })?;
         let data_path_wide = wide(&data_path);
         let mut wide_paths = vec![data_path_wide];
         let mut path_array: Vec<*const u16> = Vec::new();
@@ -640,6 +652,7 @@ impl Ngx {
         let gdpa = Some(vk.get_device_proc_addr);
         let info: *const ffi::FeatureCommonInfo = &*feature_info;
         let app_id = options.application_id;
+        let mut live = live_instances();
         // SAFETY: every pointer argument refers to a buffer that lives in `wide_paths` or `feature_info`, both alive
         // for the call; the Vulkan handles belong to the caller's live device.
         let result = unsafe {
@@ -715,13 +728,16 @@ impl Ngx {
             }
         };
         check(result.0, result.1)?;
+        live.live += 1;
+        live.peak = live.peak.max(live.live);
         let capabilities = match Parameters::capabilities(&api) {
             Ok(capabilities) => capabilities,
             Err(error) => {
-                shutdown(&api, vk.device);
+                release(&api, vk.device, &mut live);
                 return Err(error);
             }
         };
+        drop(live);
         Ok(Ngx {
             api,
             device: vk.device,
@@ -860,10 +876,28 @@ impl Ngx {
     }
 }
 
-/// Shuts NGX down. The driver's `Shutdown1(device)` crashes where the argument-less `Shutdown` works, so the latter is
-/// preferred.
-fn shutdown(api: &Api, device: vk::Device) {
-    // SAFETY: NGX was initialised on `device` and is shut down once per initialisation.
+struct Live {
+    live: u32,
+    /// The most initialisations that were live at once.
+    peak: u32,
+}
+
+/// How many initialisations of NGX are live in this process. The lock keeps one thread's shutdown away from
+/// another's initialisation.
+fn live_instances() -> std::sync::MutexGuard<'static, Live> {
+    static LIVE: std::sync::Mutex<Live> = std::sync::Mutex::new(Live { live: 0, peak: 0 });
+    LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Ends one initialisation. The driver's `Shutdown` is global and crashes when it runs after the device of another
+/// initialisation was destroyed (and `Shutdown1(device)` crashes too), so NGX is shut down only when it only ever had
+/// one initialisation; otherwise it stays initialised until the process ends.
+fn release(api: &Api, device: vk::Device, live: &mut Live) {
+    live.live = live.live.saturating_sub(1);
+    if live.live > 0 || live.peak > 1 {
+        return;
+    }
+    // SAFETY: NGX was initialised and this was its only initialisation, so nothing uses it any more.
     unsafe {
         if let Some(shutdown) = api.shutdown {
             shutdown();
@@ -871,6 +905,16 @@ fn shutdown(api: &Api, device: vk::Device) {
             shutdown1(device);
         }
     }
+}
+
+/// Whether NGX was left initialised because several initialisations overlapped (see [`release`]): the devices it was
+/// given must then never be destroyed, or NGX touches them when the process ends.
+pub fn left_initialised() -> bool {
+    live_instances().peak > 1
+}
+
+fn shutdown(api: &Api, device: vk::Device) {
+    release(api, device, &mut live_instances());
 }
 
 impl Drop for Ngx {

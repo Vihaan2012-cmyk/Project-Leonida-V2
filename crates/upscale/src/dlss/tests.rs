@@ -366,6 +366,12 @@ fn the_real_factory_falls_back_when_no_library_is_found() {
     assert!(notice.contains("nvngx_dlss.dll was not found"), "{notice}");
 }
 
+/// NGX is process-wide and crashes when several threads use it at once, so the tests that run it take turns.
+fn ngx_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Whether this machine has NGX at all; the GPU tests skip when it does not.
 fn ngx_present() -> bool {
     match ngx::Api::open(None) {
@@ -398,6 +404,7 @@ fn ngx_names_the_vulkan_extensions_it_needs() {
 
 #[test]
 fn ngx_initialises_on_the_nvidia_gpu_and_reports_availability() {
+    let _turn = ngx_turn();
     if !ngx_present() {
         return;
     }
@@ -492,6 +499,7 @@ fn library_config() -> DlssConfig {
 #[test]
 #[ignore = "needs an NVIDIA GPU and nvngx_dlss.dll (set LEONIDA_DLSS_DLL)"]
 fn dlss_upscales_a_smooth_synthetic_frame_close_to_the_bilinear_upscale() {
+    let _turn = ngx_turn();
     let mut dlss = DlssUpscaler::new(&library_config()).expect("DLSS starts");
     eprintln!("GPU: {}", dlss.device_name());
     let output = [1280, 720];
@@ -664,4 +672,27 @@ mod locating {
         assert_eq!(super::super::locate::find_in(&root, 4), Some(library));
         assert_eq!(super::super::locate::find_in(&root, 2), None);
     }
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU and nvngx_dlss.dll (set LEONIDA_DLSS_DLL)"]
+fn several_dlss_instances_live_together_and_drop_in_any_order() {
+    let _turn = ngx_turn();
+    let config = library_config();
+    let flags = DlssOptions::default().feature_flags();
+    let mut first = DlssUpscaler::new(&config).expect("first");
+    let mut second = DlssUpscaler::new(&config).expect("second");
+    first
+        .prepare_feature([640, 360], [1280, 720], flags)
+        .unwrap();
+    second
+        .prepare_feature([960, 540], [1920, 1080], flags)
+        .unwrap();
+    drop(first);
+    let mut third = DlssUpscaler::new(&config).expect("third");
+    third
+        .prepare_feature([640, 360], [1280, 720], flags)
+        .unwrap();
+    drop(second);
+    drop(third);
 }
