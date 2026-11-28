@@ -71,8 +71,9 @@ fn decode_all(movies: &Movies, index: usize) -> Chain {
 #[test]
 fn every_frame_of_small_movies_decodes_and_neighbours_stay_close() {
     let Some(movies) = Movies::open() else { return };
-    // A 15-frame KB2j movie, a 150-frame 512x512 KB2n movie and a 198-frame mostly still 1080p one.
-    for index in [29, 24, 4] {
+    // A 15-frame KB2j movie, a 150-frame 512x512 KB2n movie, a 198-frame mostly still 1080p one and a 150-frame
+    // 720x1280 one (whose width is not a whole number of macroblocks).
+    for index in [29, 24, 4, 156] {
         let c = decode_all(&movies, index);
         println!(
             "stream {index}: {} frames, keys {:?}, mean adjacent psnr {:.2}, minimum {:.2}",
@@ -86,20 +87,27 @@ fn every_frame_of_small_movies_decodes_and_neighbours_stay_close() {
 /// and the frame the inter chain predicted just before it describe nearly the same moment, so their distance
 /// shows how far the chain has wandered.
 #[test]
-#[ignore = "decodes about 1100 frames of 2560x1440; run with --release"]
+#[ignore = "decodes about 3300 frames of 2560x1440; run with --release"]
 fn a_keyframe_after_a_long_inter_chain_matches_the_chain_before_it() {
     let Some(movies) = Movies::open() else { return };
-    for index in [17, 18] {
+    for index in [17, 18, 22] {
         let c = decode_all(&movies, index);
-        let (key, v, before) = c.at_keys[0];
         println!(
-            "stream {index}: {} frames, mean adjacent psnr {:.2}; keyframe {key} is {v:.2} dB from the frame before, \
-             against {before:.2} dB for the 20 pairs earlier",
+            "stream {index}: {} frames, mean adjacent psnr {:.2}",
             c.frames, c.mean
         );
-        assert!(
-            v > 28.0,
-            "stream {index}: the keyframe at {key} is only {v:.2} dB from the chain"
-        );
+        for &(key, v, before) in &c.at_keys {
+            println!(
+                "  keyframe {key} is {v:.2} dB from the frame before, against {before:.2} dB for the 20 pairs earlier"
+            );
+            // Stream 22 cuts between scenes at its keyframes, so only the two movies that hold on one picture are held to
+            // a floor.
+            if index != 22 {
+                assert!(
+                    v > 28.0,
+                    "stream {index}: the keyframe at {key} is only {v:.2} dB from the chain"
+                );
+            }
+        }
     }
 }
