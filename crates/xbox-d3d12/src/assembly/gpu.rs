@@ -4,7 +4,8 @@
 //! addresses, 64-bit shader integers and timeline semaphores for replay and pipelines; sparse binding with residency
 //! and `VK_EXT_external_memory_host` for the memory part (`memory::Support::check` decides); the swap chain and
 //! surface extensions for presentation; and descriptor indexing for the bindless image set. Fragment barycentrics,
-//! mesh shaders, pixel interlock and 64-bit image atomics are enabled when the GPU has them.
+//! mesh shaders, pixel interlock and 64-bit image atomics are enabled when the GPU has them, and so are the memory
+//! budget, memory priority and pageable device-local memory extensions the device-local budget uses.
 
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, c_char};
