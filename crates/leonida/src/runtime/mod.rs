@@ -12,6 +12,8 @@ mod patches;
 mod paths;
 mod plan;
 #[cfg(test)]
+mod real_tests;
+#[cfg(test)]
 mod synthetic;
 mod upscaler;
 
