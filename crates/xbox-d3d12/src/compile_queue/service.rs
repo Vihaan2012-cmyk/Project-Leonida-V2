@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -94,6 +94,8 @@ pub struct ServiceStats {
     /// Draws that found their pipeline not ready: those that waited, those skipped, and the time waiting.
     pub draws_waited: u64,
     pub draws_skipped: u64,
+    /// Draws dropped because their pipeline failed to build.
+    pub draws_failed: u64,
     pub wait_micros: u64,
     pub recorded: u64,
     pub record_errors: u64,
@@ -108,6 +110,7 @@ struct Counters {
     already_known: AtomicU64,
     draws_waited: AtomicU64,
     draws_skipped: AtomicU64,
+    draws_failed: AtomicU64,
     wait_micros: AtomicU64,
     recorded: AtomicU64,
     record_errors: AtomicU64,
@@ -234,17 +237,31 @@ impl<B: PipelineBuilder> Shared<B> {
 struct Inner<B: PipelineBuilder> {
     shared: Arc<Shared<B>>,
     queue: Arc<CompileQueue<PsoKey, B::Built>>,
-    policy: DrawPolicy,
+    skip: AtomicBool,
     seen: Mutex<Option<mpsc::Sender<Arc<Pso>>>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
-impl<B: PipelineBuilder> Drop for Inner<B> {
-    fn drop(&mut self) {
+impl<B: PipelineBuilder> Inner<B> {
+    fn policy(&self) -> DrawPolicy {
+        if self.skip.load(Ordering::Relaxed) {
+            DrawPolicy::Skip
+        } else {
+            DrawPolicy::Wait
+        }
+    }
+
+    fn stop_threads(&self) {
         self.seen.lock().expect("seen channel").take();
         for thread in self.threads.lock().expect("threads").drain(..) {
             let _ = thread.join();
         }
+    }
+}
+
+impl<B: PipelineBuilder> Drop for Inner<B> {
+    fn drop(&mut self) {
+        self.stop_threads();
     }
 }
 
@@ -289,7 +306,7 @@ impl<B: PipelineBuilder> PipelineHandle<B> {
 
     /// The pipeline for a draw, by the configured [`DrawPolicy`].
     pub fn resolve(&self) -> Resolved<B::Built> {
-        self.resolve_with(self.inner.policy)
+        self.resolve_with(self.inner.policy())
     }
 
     pub fn resolve_with(&self, policy: DrawPolicy) -> Resolved<B::Built> {
@@ -298,6 +315,9 @@ impl<B: PipelineBuilder> PipelineHandle<B> {
         if let Some(known) = queue.poll(&self.key)
             && !known.is_pending()
         {
+            if matches!(known, Poll::Failed(_)) {
+                counters.draws_failed.fetch_add(1, Ordering::Relaxed);
+            }
             return Self::answer(known);
         }
         match policy {
@@ -408,7 +428,7 @@ impl<B: PipelineBuilder> PipelineService<B> {
             inner: Arc::new(Inner {
                 shared,
                 queue,
-                policy: config.draw_policy,
+                skip: AtomicBool::new(config.draw_policy == DrawPolicy::Skip),
                 seen: Mutex::new(seen),
                 threads: Mutex::new(threads),
             }),
@@ -475,12 +495,32 @@ impl<B: PipelineBuilder> PipelineService<B> {
             already_known: load(&c.already_known),
             draws_waited: load(&c.draws_waited),
             draws_skipped: load(&c.draws_skipped),
+            draws_failed: load(&c.draws_failed),
             wait_micros: load(&c.wait_micros),
             recorded: load(&c.recorded),
             record_errors: load(&c.record_errors),
             cache_saves: load(&c.cache_saves),
             replayed: load(&c.replayed) as usize,
         }
+    }
+
+    /// What a draw does when its pipeline is not ready.
+    pub fn draw_policy(&self) -> DrawPolicy {
+        self.inner.policy()
+    }
+
+    /// Changes the policy for draws from now on, handles that already exist included.
+    pub fn set_draw_policy(&self, policy: DrawPolicy) {
+        self.inner
+            .skip
+            .store(policy == DrawPolicy::Skip, Ordering::Relaxed);
+    }
+
+    /// Stops recording and replaying: the log is flushed and the pipeline cache written if builds finished since
+    /// it last was, and the log and environment threads end. Pipelines already created stay usable and builds
+    /// already queued still run; what is created later is built but no longer recorded.
+    pub fn shutdown(&self) {
+        self.inner.stop_threads();
     }
 
     /// Waits until the environment is loaded; false if it could not be.
