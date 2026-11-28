@@ -159,6 +159,7 @@ struct Report {
     approximate_shaders: [usize; 3],
     hazard_examples: BTreeMap<&'static str, Vec<String>>,
     patterns: BTreeMap<Pattern, ([usize; 3], String)>,
+    raised_without_hazard: [usize; 3],
     wide_ops: BTreeMap<String, ([usize; 3], String)>,
     instructions: usize,
     unsupported: usize,
@@ -243,7 +244,11 @@ impl Report {
                 examples.push(name.to_string());
             }
         }
-        for pattern in shader_ir::lane_patterns(code) {
+        let found = shader_ir::lane_patterns(code);
+        if found.contains(&Pattern::ExecRaised) && !found.iter().any(|p| p.needs_upper_lanes()) {
+            self.raised_without_hazard[slot] += 1;
+        }
+        for pattern in found {
             let entry = self.patterns.entry(pattern).or_default();
             entry.0[slot] += 1;
             if entry.1.is_empty() {
@@ -344,6 +349,12 @@ impl Report {
                 examples.unwrap_or_default()
             );
         }
+        println!(
+            "programs that switch on all lanes but name no lane past 31 (pixel / vertex / geometry): {} / {} / {}",
+            self.raised_without_hazard[0],
+            self.raised_without_hazard[1],
+            self.raised_without_hazard[2]
+        );
         println!("lane-mask patterns in those programs (pixel / vertex / geometry):");
         for (pattern, ([p, v, g], example)) in &self.patterns {
             let kind = if pattern.needs_upper_lanes() {
