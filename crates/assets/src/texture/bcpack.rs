@@ -4,12 +4,13 @@
 //! block stage that turns the lane symbols into BCn blocks: endpoint deltas against an earlier block or a built-in
 //! history entry, and index codebooks. [`decode`] runs both. Codecs whose block stage is not covered by the
 //! measured facts return [`BcPackError::Unsupported`] so the caller keeps its placeholder; a chunk that needs a
-//! built-in history entry that is only provisional, or not recovered, returns [`BcPackError::History`]. BC7 has
-//! no recovered history at all, so only its self-contained chunks decode.
+//! built-in history entry that is only provisional, or not recovered, returns [`BcPackError::History`]. All BC7
+//! history entries are provisional.
 
 use thiserror::Error;
 
 mod bc7;
+mod bc7_history;
 #[cfg(test)]
 mod bc7_tests;
 #[cfg(test)]

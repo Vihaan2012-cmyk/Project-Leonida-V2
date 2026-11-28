@@ -2,13 +2,15 @@
 //!
 //! Lane 15 carries two symbols per block that name its mode, partition, rotation and index selection. Lanes 0 and
 //! 1 carry the backward distances to the block whose endpoints (`de`) and indices (`di`) predict this one: 0 means
-//! zeros, `1..=i` an earlier block of the chunk, anything larger a built-in history entry, which is not recovered
-//! for BC7 and so is refused. Endpoint lanes are zigzag deltas on the predictor's endpoint bytes read at this
+//! zeros, `1..=i` an earlier block of the chunk, anything larger a built-in history entry (`bc7_history.rs`).
+//! Endpoint lanes are zigzag deltas on the predictor's endpoint bytes read at this
 //! mode's field width, with the p-bit riding as an extra low bit of the first channel; index lanes are zigzag
 //! deltas per pixel on 4-bit nibbles that are bit-interleaved in pairs.
 
+use super::bc7_history::BC7_HISTORY;
 use super::blocks::{interleave4, unzig};
 use super::bptc::{ANCHOR2, ANCHOR3A, ANCHOR3B, PART2, PART3, tables};
+use super::codebooks::Hist;
 use super::lanes::LaneSymbols;
 use super::{BcPackCodec, BcPackError, DecodeOptions, HistoryStatus};
 
@@ -54,13 +56,41 @@ impl Bits {
     }
 }
 
-fn fault_history(block: usize, distance: usize) -> BcPackError {
-    BcPackError::History {
-        codec: BcPackCodec::Bc7,
-        block,
-        entry: (256 + block - distance) as u8,
-        status: HistoryStatus::Unknown,
+/// The endpoint and index predictor `distance` blocks before block `i`, and whether it rests on a provisional
+/// history entry.
+fn predictor(
+    i: usize,
+    distance: usize,
+    endpoints: &[[u8; 24]],
+    indices: &[[u8; 32]],
+    opts: &DecodeOptions,
+) -> Result<([u8; 24], [u8; 32], bool), BcPackError> {
+    if distance == 0 {
+        return Ok(([0; 24], [0; 32], false));
     }
+    if distance <= i {
+        return Ok((endpoints[i - distance], indices[i - distance], false));
+    }
+    let entry = 256 + i - distance;
+    let refuse = |status| BcPackError::History {
+        codec: BcPackCodec::Bc7,
+        block: i,
+        entry: entry as u8,
+        status,
+    };
+    let (v, provisional) = match BC7_HISTORY[entry] {
+        Hist::Confirmed(v) => (v, false),
+        Hist::Provisional(v) if opts.allow_provisional => (v, true),
+        Hist::Provisional(_) => return Err(refuse(HistoryStatus::Provisional)),
+        Hist::Unknown => return Err(refuse(HistoryStatus::Unknown)),
+    };
+    let mut ep = [0u8; 24];
+    for sub in 0..3 {
+        ep[sub * 8..sub * 8 + 8].copy_from_slice(&v[..8]);
+    }
+    let mut ix = [0u8; 32];
+    ix[..16].copy_from_slice(&v[8..]);
+    Ok((ep, ix, provisional))
 }
 
 pub fn bc7(
@@ -89,18 +119,13 @@ pub fn bc7(
         }
         let di = usize::from(interleave4(l1[a], l1[b]));
         let de = (di as i32 + unzig(interleave4(l0[a], l0[b]))) as usize & 255;
-        for d in [de, di] {
-            if d > i {
-                return Err(fault_history(i, d));
-            }
-        }
-        tainted[i] = sig.inferred || (de > 0 && tainted[i - de]) || (di > 0 && tainted[i - di]);
-        let rep = if de == 0 {
-            [0u8; 24]
-        } else {
-            endpoints[i - de]
-        };
-        let rix = if di == 0 { [0u8; 32] } else { indices[i - di] };
+        let (rep, _, from_history_e) = predictor(i, de, &endpoints, &indices, opts)?;
+        let (_, rix, from_history_i) = predictor(i, di, &endpoints, &indices, opts)?;
+        tainted[i] = sig.inferred
+            || from_history_e
+            || from_history_i
+            || (de > 0 && de <= i && tainted[i - de])
+            || (di > 0 && di <= i && tainted[i - di]);
 
         let mode = usize::from(sig.mode);
         let (part, rot) = (usize::from(sig.part), usize::from(sig.rot));
