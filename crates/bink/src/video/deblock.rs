@@ -32,8 +32,9 @@
 //!   leaves that line alone.
 //! * Block rows past the picture (macroblock rows that hold only 16 rows of picture) are not filtered, and the
 //!   smoothing of the last picture row looks at the row below it as parsed.
-//! * Slice boundaries need no care: the library defers the edges across a boundary when slices are decoded by
-//!   different threads and ends with the same picture.
+//! * Slice boundaries are not treated specially. When slices are decoded by separate calls the library defers the
+//!   edges across a boundary to a pass over the whole frame (RVA 0xf550); this port assumes that leaves the same
+//!   picture a single call over all slices does.
 
 use super::motion::Mvs;
 use super::smooth;
