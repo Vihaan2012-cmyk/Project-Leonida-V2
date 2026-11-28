@@ -90,6 +90,53 @@ fn storage_format(h: &Handles, info: &Format, usage: vk::ImageUsageFlags) -> vk:
     }
 }
 
+/// `usage`, less the uses the GPU cannot combine with `format`: a depth attachment on a color format first (typeless
+/// formats ask for both), then storage, then color attachment. Each use dropped is noted once.
+fn supported_usage(
+    h: &Handles,
+    format: vk::Format,
+    ty: vk::ImageType,
+    flags: vk::ImageCreateFlags,
+    usage: vk::ImageUsageFlags,
+) -> Result<vk::ImageUsageFlags, ImageError> {
+    let fits = |usage: vk::ImageUsageFlags| {
+        // SAFETY: a pure query on the physical device the handles name.
+        unsafe {
+            h.instance
+                .get_physical_device_image_format_properties(
+                    h.physical,
+                    format,
+                    ty,
+                    vk::ImageTiling::OPTIMAL,
+                    usage,
+                    flags,
+                )
+                .is_ok()
+        }
+    };
+    let mut usage = usage;
+    for drop in [
+        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+        vk::ImageUsageFlags::STORAGE,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT,
+    ] {
+        if fits(usage) {
+            return Ok(usage);
+        }
+        if usage.contains(drop) {
+            usage &= !drop;
+            crate::com::note_once(format!(
+                "{format:?} images cannot also be {drop:?} on this GPU: made without that use"
+            ));
+        }
+    }
+    if fits(usage) {
+        Ok(usage)
+    } else {
+        Err(ImageError::Unsupported(format))
+    }
+}
+
 impl GpuImage {
     pub fn create(h: &Handles, desc: &ResourceDesc) -> Result<GpuImage, ImageError> {
         desc.validate()?;
@@ -115,6 +162,7 @@ impl GpuImage {
         if desc.dimension == Dimension::Texture2D && layers >= 6 {
             flags |= vk::ImageCreateFlags::CUBE_COMPATIBLE;
         }
+        let usage = supported_usage(h, format, ty, flags, usage)?;
         let samples = vk::SampleCountFlags::from_raw(desc.sample_count.max(1));
         let create = vk::ImageCreateInfo::default()
             .flags(flags)

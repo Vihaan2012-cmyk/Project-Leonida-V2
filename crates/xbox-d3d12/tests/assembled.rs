@@ -996,3 +996,12 @@ fn a_resource_describes_itself_into_the_callers_buffer_and_stays_whole() {
     // SAFETY: as above.
     assert_eq!(unsafe { *(texture as *const usize) }, vtable_before);
 }
+
+/// A typeless 16-bit texture can be read as color or depth, so it asks for both uses; the GPU's 16-bit float
+/// color format takes no depth attachment, and the texture is made without that use rather than refused.
+#[test]
+fn a_typeless_16_bit_texture_is_made_with_the_uses_the_gpu_allows() {
+    let Some(h) = harness() else { return };
+    let texture = h.committed(1, &texture_desc(64, 64, 53, 0x1 | 0x4), 0);
+    assert!(!texture.is_null());
+}
