@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use gpu::{CacheLoad, Gpu};
@@ -12,11 +12,24 @@ use shader_store::{
 };
 
 use crate::cli::PipelinesArgs;
+use crate::compute_env::ComputeEnv;
 use crate::pipeline_work::{Outcomes, Partners, Selection, build_pipeline, for_each_container};
 
 const BATCH: usize = 256;
+/// Compute programs take seconds to minutes each, so their results are kept more often.
+const COMPUTE_BATCH: usize = 8;
+const SAVE_EVERY: Duration = Duration::from_secs(300);
 const DATABASE: &str = "leonida.db";
-const CACHE: &str = "pipelines.cache";
+/// The cache the game's device opens, so what is built here is found when the game runs.
+const CACHE: &str = "game-pipelines.cache";
+
+/// Which programs a pass builds: compute ones through the game's own device environment, the rest through the
+/// checking device.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Compute,
+    Graphics,
+}
 
 #[derive(Default)]
 struct Counts {
@@ -44,8 +57,11 @@ fn note(failures: &mut BTreeMap<String, (usize, String)>, error: String, name: &
 }
 
 struct Run<'a> {
+    pass: Pass,
     store: &'a Store,
-    gpu: &'a Gpu,
+    gpu: Option<&'a Gpu>,
+    compute: Option<&'a ComputeEnv>,
+    last_save: Mutex<Instant>,
     device: u64,
     cache_path: &'a Path,
     each: bool,
@@ -81,9 +97,29 @@ impl Run<'_> {
         {
             return self.fail(error);
         }
+        self.save_cache(false);
+    }
+
+    /// Writes the pipeline cache: always when `force`, otherwise once `SAVE_EVERY` has passed since the last time.
+    fn save_cache(&self, force: bool) {
+        let mut last = self.last_save.lock().expect("no worker panicked");
+        if !force && last.elapsed() < SAVE_EVERY && self.pass == Pass::Compute {
+            return;
+        }
+        *last = Instant::now();
         let _saving = self.saving.lock().expect("no worker panicked");
-        if let Err(error) = self.gpu.save_pipeline_cache(self.cache_path) {
-            self.fail(error);
+        match (self.gpu, self.compute) {
+            (Some(gpu), _) => {
+                if let Err(error) = gpu.save_pipeline_cache(self.cache_path) {
+                    self.fail(error);
+                }
+            }
+            (None, Some(compute)) => {
+                if let Err(error) = compute.save() {
+                    self.fail(error);
+                }
+            }
+            (None, None) => {}
         }
     }
 
@@ -91,7 +127,11 @@ impl Run<'_> {
         let full = {
             let mut batch = self.batch.lock().expect("no worker panicked");
             batch.push((key, record));
-            batch.len() >= BATCH
+            batch.len()
+                >= match self.pass {
+                    Pass::Compute => COMPUTE_BATCH,
+                    Pass::Graphics => BATCH,
+                }
         };
         if full {
             self.flush();
@@ -99,6 +139,10 @@ impl Run<'_> {
     }
 
     fn container(&self, partners: &mut Partners, shader: &CarvedShader) {
+        let compute = shader.stage.is_some_and(|stage| stage.short_name() == "cs");
+        if compute != (self.pass == Pass::Compute) {
+            return;
+        }
         self.counts.lock().expect("no worker panicked").containers += 1;
         let sources = match container_programs(shader.stage, &shader.dxbc) {
             Ok(sources) => sources,
@@ -166,7 +210,11 @@ impl Run<'_> {
                 }
             };
             let started = Instant::now();
-            let (outcome, shared) = build_pipeline(self.gpu, partners, &built, &self.outcomes);
+            let (outcome, shared) = match (self.compute, self.gpu) {
+                (Some(env), _) => build_compute(env, shader, &built, &self.outcomes),
+                (None, Some(gpu)) => build_pipeline(gpu, partners, &built, &self.outcomes),
+                (None, None) => unreachable!("a pass has a device"),
+            };
             if self.each {
                 println!(
                     "{}: {} {} KiB, {:.2} s{} ({})",
@@ -195,6 +243,32 @@ impl Run<'_> {
     }
 }
 
+/// Builds a compute container's pipeline in the game's environment unless an identical program was built before.
+fn build_compute(
+    env: &ComputeEnv,
+    shader: &CarvedShader,
+    built: &shader_store::Built,
+    outcomes: &Outcomes,
+) -> (Result<(), String>, bool) {
+    let fingerprint = built.fingerprint();
+    let earlier = outcomes
+        .lock()
+        .expect("no worker panicked")
+        .get(&fingerprint)
+        .cloned();
+    if let Some(outcome) = earlier {
+        return (outcome, true);
+    }
+    let outcome = env
+        .build(&shader.dxbc)
+        .map_err(|error| format!("compute pipeline: {error}"));
+    outcomes
+        .lock()
+        .expect("no worker panicked")
+        .insert(fingerprint, outcome.clone());
+    (outcome, false)
+}
+
 fn print_failures(title: &str, failures: &BTreeMap<String, (usize, String)>) {
     let total: usize = failures.values().map(|(count, _)| count).sum();
     println!("{title}: {total}");
@@ -203,26 +277,24 @@ fn print_failures(title: &str, failures: &BTreeMap<String, (usize, String)>) {
     }
 }
 
-pub fn pipelines_command(args: &PipelinesArgs) -> Result<ExitCode> {
-    let gpu = Gpu::new().context("opening the GPU")?;
-    let cache_path = args.output.join(CACHE);
-    match gpu
-        .load_pipeline_cache(&cache_path)
-        .with_context(|| format!("reading {}", cache_path.display()))?
-    {
-        CacheLoad::Missing => println!("pipeline cache: none yet"),
-        CacheLoad::Loaded(bytes) => println!("pipeline cache: {} KiB loaded", bytes / 1024),
-        CacheLoad::Rejected(reason) => println!("pipeline cache: not used, {reason}"),
-    }
-    let db_path = args.output.join(DATABASE);
-    let store = Store::open(&db_path)
-        .with_context(|| format!("opening {}", db_path.display()))?
-        .with_overrides(args.overrides.clone());
+/// One pass over the archive: builds the programs of `pass` and reports them. True when nothing failed.
+fn run_pass(
+    pass: Pass,
+    args: &PipelinesArgs,
+    store: &Store,
+    gpu: Option<&Gpu>,
+    compute: Option<&ComputeEnv>,
+    device: u64,
+    cache_path: &Path,
+) -> Result<bool> {
     let run = Run {
-        store: &store,
-        gpu: &gpu,
-        device: gpu.pipeline_cache_id(),
-        cache_path: &cache_path,
+        pass,
+        store,
+        gpu,
+        compute,
+        last_save: Mutex::new(Instant::now()),
+        device,
+        cache_path,
         each: args.each,
         outcomes: Arc::new(Mutex::new(HashMap::new())),
         seen: Mutex::default(),
@@ -236,15 +308,24 @@ pub fn pipelines_command(args: &PipelinesArgs) -> Result<ExitCode> {
     let selection = Selection {
         game: args.game.as_ref(),
         limit: args.limit,
+        stage: (pass == Pass::Compute).then_some("cs"),
         ..Selection::default()
     };
     let worked = for_each_container(&selection, args.jobs, Partners::new, |partners, shader| {
         run.container(partners, shader)
     });
     run.flush();
+    run.save_cache(true);
     worked?;
 
     let counts = run.counts.lock().expect("no worker panicked");
+    println!(
+        "{} pass",
+        match pass {
+            Pass::Compute => "compute",
+            Pass::Graphics => "graphics",
+        }
+    );
     println!("containers: {}", counts.containers);
     println!(
         "programs: {} ({} repeated in other containers)",
@@ -258,21 +339,73 @@ pub fn pipelines_command(args: &PipelinesArgs) -> Result<ExitCode> {
     );
     print_failures("translation failures", &counts.translation_failures);
     print_failures("pipeline failures", &counts.pipeline_failures);
-    println!(
-        "database: {} programs; pipeline cache: {} KiB",
-        store.len()?,
-        gpu.pipeline_cache_data()?.len() / 1024
-    );
     println!("took {:.1} s", started.elapsed().as_secs_f64());
     let errors = run.errors.lock().expect("no worker panicked");
-    Ok(
-        if errors.is_empty()
-            && counts.translation_failures.is_empty()
-            && counts.pipeline_failures.is_empty()
-        {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        },
-    )
+    Ok(errors.is_empty()
+        && counts.translation_failures.is_empty()
+        && counts.pipeline_failures.is_empty())
+}
+
+fn report_cache(load: CacheLoad) {
+    match load {
+        CacheLoad::Missing => println!("pipeline cache: none yet"),
+        CacheLoad::Loaded(bytes) => println!("pipeline cache: {} KiB loaded", bytes / 1024),
+        CacheLoad::Rejected(reason) => println!("pipeline cache: not used, {reason}"),
+    }
+}
+
+pub fn pipelines_command(args: &PipelinesArgs) -> Result<ExitCode> {
+    let cache_path = args.output.join(CACHE);
+    let db_path = args.output.join(DATABASE);
+    let store = Store::open(&db_path)
+        .with_context(|| format!("opening {}", db_path.display()))?
+        .with_overrides(args.overrides.clone());
+    let started = Instant::now();
+    let mut clean = true;
+    {
+        let compute = ComputeEnv::open(&cache_path)?;
+        println!(
+            "pipeline cache: {}",
+            if compute.loaded() {
+                format!("{} KiB loaded", compute.cache_size()? / 1024)
+            } else {
+                "none yet".to_string()
+            }
+        );
+        clean &= run_pass(
+            Pass::Compute,
+            args,
+            &store,
+            None,
+            Some(&compute),
+            compute.cache_id(),
+            &cache_path,
+        )?;
+    }
+    let gpu = Gpu::new().context("opening the GPU")?;
+    report_cache(
+        gpu.load_pipeline_cache(&cache_path)
+            .with_context(|| format!("reading {}", cache_path.display()))?,
+    );
+    clean &= run_pass(
+        Pass::Graphics,
+        args,
+        &store,
+        Some(&gpu),
+        None,
+        gpu.pipeline_cache_id(),
+        &cache_path,
+    )?;
+    println!(
+        "database: {} programs; pipeline cache: {} KiB in {}",
+        store.len()?,
+        gpu.pipeline_cache_data()?.len() / 1024,
+        cache_path.display()
+    );
+    println!("took {:.1} s", started.elapsed().as_secs_f64());
+    Ok(if clean {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }

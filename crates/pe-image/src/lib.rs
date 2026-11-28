@@ -10,11 +10,15 @@ pub enum PeError {
     Not64,
 }
 
+pub mod authenticode;
+
 type Result<T> = std::result::Result<T, PeError>;
 
 pub const DIRECTORY_EXPORT: usize = 0;
 pub const DIRECTORY_IMPORT: usize = 1;
+pub const DIRECTORY_RESOURCE: usize = 2;
 pub const DIRECTORY_EXCEPTION: usize = 3;
+pub const DIRECTORY_SECURITY: usize = 4;
 pub const DIRECTORY_RELOCATION: usize = 5;
 pub const DIRECTORY_TLS: usize = 9;
 pub const DIRECTORY_DELAY_IMPORT: usize = 13;
@@ -76,6 +80,7 @@ pub struct Function {
 #[derive(Debug, Clone)]
 pub struct Image<'a> {
     bytes: &'a [u8],
+    optional: usize,
     pub machine: u16,
     pub timestamp: u32,
     pub characteristics: u16,
@@ -157,6 +162,7 @@ impl<'a> Image<'a> {
         }
         Ok(Image {
             bytes,
+            optional,
             machine,
             timestamp,
             characteristics,
@@ -169,6 +175,21 @@ impl<'a> Image<'a> {
             sections,
             directories,
         })
+    }
+
+    /// The whole file the image was parsed from.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// File offset of the 4-byte checksum field in the optional header.
+    pub fn checksum_offset(&self) -> usize {
+        self.optional + 64
+    }
+
+    /// File offset of the 8-byte entry for data directory `index` in the optional header.
+    pub fn directory_entry_offset(&self, index: usize) -> usize {
+        self.optional + 112 + 8 * index
     }
 
     pub fn directory(&self, index: usize) -> Option<(u32, u32)> {

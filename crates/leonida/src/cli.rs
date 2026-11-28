@@ -345,6 +345,13 @@ pub enum ExeCommand {
         #[arg(long, default_value_t = 4)]
         threads: usize,
     },
+    /// Look at every executable image in the game folder (the executable and all DLLs) for signs of malware, without
+    /// running or loading anything: entropy, risky imports, strings, overlay and Authenticode hash checks.
+    Triage {
+        /// Folder with the Windows copies of the runtime libraries to compare with. Defaults to System32.
+        #[arg(long)]
+        system: Option<PathBuf>,
+    },
     /// Readable text in the executable's data sections.
     Strings {
         /// Only strings containing this text.
@@ -458,6 +465,9 @@ pub struct ReportArgs {
     /// Also print one example of each missing instruction.
     #[arg(long)]
     pub examples: bool,
+    /// Only count lane patterns of 64-lane programs: skips lifting and building, which is much faster.
+    #[arg(long)]
+    pub lanes_only: bool,
 }
 
 #[derive(Debug, Args)]

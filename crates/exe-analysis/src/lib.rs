@@ -9,6 +9,9 @@ mod rtti;
 mod scan;
 #[cfg(test)]
 mod testimage;
+pub mod triage;
+#[cfg(test)]
+mod triage_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
