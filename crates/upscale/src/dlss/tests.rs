@@ -133,12 +133,8 @@ struct FakeParameter {
 impl FakeParameter {
     fn new() -> Box<FakeParameter> {
         let mut table = [0usize; 17];
-        for slot in 0..8 {
-            table[slot] = nop as *const () as usize;
-        }
-        for slot in 8..16 {
-            table[slot] = get_unused as *const () as usize;
-        }
+        table[..8].fill(nop as *const () as usize);
+        table[8..16].fill(get_unused as *const () as usize);
         table[slots::SET_U64] = set_u64 as *const () as usize;
         table[slots::SET_F32] = set_f32 as *const () as usize;
         table[slots::SET_F32 - 1] = set_f64 as *const () as usize;
@@ -232,11 +228,18 @@ fn availability_explains_why_dlss_is_not_available() {
 }
 
 #[test]
-fn without_a_configured_library_dlss_is_unavailable() {
-    let status = probe(&DlssConfig::default());
-    assert!(matches!(status, DlssStatus::Unavailable(r) if r.contains("no DLSS library")));
+fn without_a_library_anywhere_dlss_is_unavailable_and_says_where_to_put_it() {
+    let config = DlssConfig {
+        search_folders: Some(vec![scratch("empty-search")]),
+        ..DlssConfig::default()
+    };
+    let status = probe(&config);
+    assert!(
+        matches!(&status, DlssStatus::Unavailable(r) if r.contains("nvngx_dlss.dll was not found") && r.contains("next to leonida.exe") && r.contains("empty-search")),
+        "{status:?}"
+    );
     assert!(matches!(
-        DlssUpscaler::new(&DlssConfig::default()),
+        DlssUpscaler::new(&config),
         Err(UpscaleError::Unavailable { name: "DLSS", .. })
     ));
 }
@@ -249,6 +252,7 @@ fn the_configured_file_must_be_a_library_named_for_ngx() {
     let config = DlssConfig {
         dlss_dll: Some(misnamed),
         ngx_runtime: Some(dir.join("absent_nvngx.dll")),
+        search_folders: None,
     };
     assert!(matches!(
         probe(&config),
@@ -332,7 +336,7 @@ fn a_working_dlss_is_used_without_a_notice() {
 }
 
 #[test]
-fn the_real_factory_falls_back_when_no_library_is_configured() {
+fn the_real_factory_falls_back_when_no_library_is_found() {
     struct NoCompute;
     impl crate::Compute for NoCompute {
         fn dispatch(
@@ -351,16 +355,21 @@ fn the_real_factory_falls_back_when_no_library_is_configured() {
         UpscalerKind::Dlss,
         UpscalerKind::Fsr1,
         std::sync::Arc::new(NoCompute),
-        &DlssConfig::default(),
+        &DlssConfig {
+            search_folders: Some(vec![scratch("factory-empty")]),
+            ..DlssConfig::default()
+        },
         &DlssOptions::default(),
     );
     assert_eq!(chosen.kind, UpscalerKind::Fsr1);
-    assert!(
-        chosen
-            .notice
-            .unwrap()
-            .contains("no DLSS library is configured")
-    );
+    let notice = chosen.notice.unwrap();
+    assert!(notice.contains("nvngx_dlss.dll was not found"), "{notice}");
+}
+
+/// NGX is process-wide and crashes when several threads use it at once, so the tests that run it take turns.
+fn ngx_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Whether this machine has NGX at all; the GPU tests skip when it does not.
@@ -395,6 +404,7 @@ fn ngx_names_the_vulkan_extensions_it_needs() {
 
 #[test]
 fn ngx_initialises_on_the_nvidia_gpu_and_reports_availability() {
+    let _turn = ngx_turn();
     if !ngx_present() {
         return;
     }
@@ -428,73 +438,261 @@ fn ngx_initialises_on_the_nvidia_gpu_and_reports_availability() {
     }
 }
 
-fn synthetic_frame(size: [u32; 2], value: f32) -> (Image, Vec<u8>, Vec<u8>) {
-    let texels = (size[0] * size[1]) as usize;
-    let color = Image::from_rgba_f32(
-        size[0],
-        size[1],
-        PixelFormat::Rgba16Float,
-        &[value, value, value, 1.0].repeat(texels),
-    )
-    .unwrap();
-    let depth: Vec<u8> = std::iter::repeat_n(0.5f32.to_le_bytes(), texels)
-        .flatten()
-        .collect();
-    let motion = vec![0u8; texels * 8];
-    (color, depth, motion)
+/// A smooth HDR image: the colour at a point of the unit square.
+fn smooth(u: f32, v: f32) -> [f32; 3] {
+    [
+        0.15 + 0.6 * u,
+        0.2 + 0.5 * v + 0.1 * (u * 5.0).sin(),
+        0.7 - 0.3 * u * v,
+    ]
+}
+
+/// The image sampled at render resolution with the camera jittered by `jitter` (the sample in texel `i` sits at
+/// `i + 0.5 - jitter`).
+fn render_smooth(size: [u32; 2], jitter: [f32; 2]) -> Image {
+    let mut data = Vec::with_capacity((size[0] * size[1] * 4) as usize);
+    for y in 0..size[1] {
+        for x in 0..size[0] {
+            let u = (x as f32 + 0.5 - jitter[0]) / size[0] as f32;
+            let v = (y as f32 + 0.5 - jitter[1]) / size[1] as f32;
+            let [r, g, b] = smooth(u, v);
+            data.extend([r, g, b, 1.0]);
+        }
+    }
+    Image::from_rgba_f32(size[0], size[1], PixelFormat::Rgba16Float, &data).unwrap()
+}
+
+fn bilinear(image: &[f32], size: [u32; 2], u: f32, v: f32) -> [f32; 3] {
+    let x = (u * size[0] as f32 - 0.5).clamp(0.0, size[0] as f32 - 1.0);
+    let y = (v * size[1] as f32 - 0.5).clamp(0.0, size[1] as f32 - 1.0);
+    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+    let (x1, y1) = (
+        (x0 + 1).min(size[0] as usize - 1),
+        (y0 + 1).min(size[1] as usize - 1),
+    );
+    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+    let texel = |xx: usize, yy: usize, c: usize| image[(yy * size[0] as usize + xx) * 4 + c];
+    let mut out = [0.0; 3];
+    for (c, value) in out.iter_mut().enumerate() {
+        let top = texel(x0, y0, c) * (1.0 - fx) + texel(x1, y0, c) * fx;
+        let bottom = texel(x0, y1, c) * (1.0 - fx) + texel(x1, y1, c) * fx;
+        *value = top * (1.0 - fy) + bottom * fy;
+    }
+    out
+}
+
+/// The DLSS library to test with: `LEONIDA_DLSS_DLL`, else NVIDIA's folders. A missing one fails the test with the
+/// message that says where to put it.
+fn library_config() -> DlssConfig {
+    let config = DlssConfig::default();
+    match config.locate() {
+        Ok(found) => eprintln!(
+            "DLSS library: {} ({})",
+            found.path.display(),
+            found.source.describe()
+        ),
+        Err(missing) => panic!("{missing}"),
+    }
+    config
 }
 
 #[test]
-fn a_real_dlss_library_upscales_a_flat_image() {
-    let Some(dll) = std::env::var_os("LEONIDA_DLSS_DLL").map(PathBuf::from) else {
-        eprintln!("skipping: LEONIDA_DLSS_DLL names no nvngx_dlss.dll");
-        return;
-    };
-    let config = DlssConfig {
-        dlss_dll: Some(dll),
-        ngx_runtime: None,
-    };
-    let mut dlss = match DlssUpscaler::new(&config) {
-        Ok(dlss) => dlss,
-        Err(error) => panic!("DLSS could not start with the configured library: {error}"),
-    };
+#[ignore = "needs an NVIDIA GPU and nvngx_dlss.dll (set LEONIDA_DLSS_DLL)"]
+fn dlss_upscales_a_smooth_synthetic_frame_close_to_the_bilinear_upscale() {
+    let _turn = ngx_turn();
+    let mut dlss = DlssUpscaler::new(&library_config()).expect("DLSS starts");
+    eprintln!("GPU: {}", dlss.device_name());
     let output = [1280, 720];
-    let settings = dlss
-        .optimal_settings(output, DlssMode::Quality)
-        .expect("optimal settings");
-    let render = settings.render_size;
-    assert!(render[0] > 0 && render[0] < output[0], "{settings:?}");
-    let (color, depth, motion) = synthetic_frame(render, 0.5);
-    let mut last = None;
-    for frame in 0..4 {
-        let jitter = crate::jitter_offset(frame, 8);
-        let mut inputs = UpscaleInputs::new(color.as_ref(), render, output);
-        inputs.depth = Some(ImageRef::new(
-            render[0],
-            render[1],
-            PixelFormat::R32Float,
-            &depth,
-        ));
-        inputs.motion = Some(ImageRef::new(
-            render[0],
-            render[1],
-            PixelFormat::Rg32Float,
-            &motion,
-        ));
-        inputs.jitter = jitter;
-        inputs.reset = frame == 0;
-        last = Some(dlss.upscale(&inputs).expect("DLSS evaluates"));
+    for mode in [DlssMode::Quality, DlssMode::Performance] {
+        dlss.set_mode(mode);
+        let settings = dlss
+            .optimal_settings(output, mode)
+            .expect("optimal settings");
+        let render = settings.render_size;
+        eprintln!("{}: render {render:?} for output {output:?}", mode.name());
+        assert!(
+            render[0] > 0 && render[0] < output[0] && render[1] < output[1],
+            "{settings:?}"
+        );
+        let texels = (render[0] * render[1]) as usize;
+        let depth: Vec<u8> = (0..texels)
+            .flat_map(|i| {
+                (0.3 + 0.4 * (i % render[0] as usize) as f32 / render[0] as f32).to_le_bytes()
+            })
+            .collect();
+        let motion = vec![0u8; texels * 8];
+        let mut last = None;
+        let mut jittered_last = [0.0; 2];
+        for frame in 0..16 {
+            let jitter = crate::jitter_offset(frame, 8);
+            let color = render_smooth(render, jitter);
+            let mut inputs = UpscaleInputs::new(color.as_ref(), render, output);
+            inputs.depth = Some(ImageRef::new(
+                render[0],
+                render[1],
+                PixelFormat::R32Float,
+                &depth,
+            ));
+            inputs.motion = Some(ImageRef::new(
+                render[0],
+                render[1],
+                PixelFormat::Rg32Float,
+                &motion,
+            ));
+            inputs.jitter = jitter;
+            inputs.reset = frame == 0;
+            inputs.frame_time_ms = 16.6;
+            last = Some(dlss.upscale(&inputs).expect("DLSS evaluates"));
+            jittered_last = jitter;
+        }
+        let result = last.unwrap();
+        assert_eq!([result.width, result.height], output, "{}", mode.name());
+        let rgba = result
+            .as_ref()
+            .rgba_f32(output[0], output[1], "result")
+            .unwrap();
+        assert!(
+            rgba.iter().all(|v| v.is_finite()),
+            "NaN or infinity in {}",
+            mode.name()
+        );
+        let reference = render_smooth(render, [0.0, 0.0]);
+        let reference = reference
+            .as_ref()
+            .rgba_f32(render[0], render[1], "reference")
+            .unwrap();
+        let (mut sum, mut worst, mut count, mut mean) = (0.0f64, 0.0f32, 0u32, 0.0f64);
+        for y in 8..output[1] - 8 {
+            for x in 8..output[0] - 8 {
+                let at = ((y * output[0] + x) * 4) as usize;
+                let want = bilinear(
+                    &reference,
+                    render,
+                    (x as f32 + 0.5) / output[0] as f32,
+                    (y as f32 + 0.5) / output[1] as f32,
+                );
+                for c in 0..3 {
+                    let error = (rgba[at + c] - want[c]).abs();
+                    sum += error as f64;
+                    worst = worst.max(error);
+                    mean += rgba[at + c] as f64;
+                    count += 1;
+                }
+            }
+        }
+        let (mean_error, mean) = (sum / count as f64, mean / count as f64);
+        eprintln!(
+            "{}: mean {mean:.3}, mean error against bilinear {mean_error:.4}, worst {worst:.3} (last jitter {jittered_last:?})",
+            mode.name()
+        );
+        assert!(mean > 0.2, "the output is nearly black: mean {mean}");
+        assert!(
+            mean_error < 0.03,
+            "{}: mean error {mean_error}",
+            mode.name()
+        );
+        assert!(worst < 0.25, "{}: worst error {worst}", mode.name());
     }
-    let result = last.unwrap();
-    assert_eq!([result.width, result.height], output);
-    let rgba = result
-        .as_ref()
-        .rgba_f32(output[0], output[1], "result")
+}
+
+mod locating {
+    use std::path::PathBuf;
+
+    use crate::dlss::locate::{Source, locate_with};
+
+    fn folder(name: &str) -> PathBuf {
+        super::scratch(&format!("locate-{name}"))
+    }
+
+    fn put_library(dir: &std::path::Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("nvngx_dlss.dll");
+        std::fs::write(&path, b"MZ fake").unwrap();
+        path
+    }
+
+    #[test]
+    fn the_configured_file_wins_over_everything() {
+        let configured = put_library(&folder("configured"));
+        let other = put_library(&folder("configured-other"));
+        let found = locate_with(Some(&configured), Some(other.clone()), Some(&[folder("x")]));
+        let found = found.unwrap();
+        assert_eq!(found.path, configured);
+        assert_eq!(found.source, Source::Configured);
+    }
+
+    #[test]
+    fn a_configured_folder_is_searched_for_the_library() {
+        let dir = folder("configured-dir");
+        let library = put_library(&dir);
+        assert_eq!(locate_with(Some(&dir), None, None).unwrap().path, library);
+    }
+
+    #[test]
+    fn a_broken_configured_path_is_an_error_not_a_fallback() {
+        let other = put_library(&folder("broken-other"));
+        let missing = folder("broken").join("absent.dll");
+        let error = locate_with(Some(&missing), Some(other), None).unwrap_err();
+        assert!(error.to_string().starts_with("dlss_path: "), "{error}");
+    }
+
+    #[test]
+    fn the_environment_file_is_next_and_must_be_usable() {
+        let env = put_library(&folder("env"));
+        let found = locate_with(None, Some(env.clone()), None).unwrap();
+        assert_eq!((found.path, found.source), (env, Source::Environment));
+        let bad = folder("env-bad").join("nvngx_dlss.dll");
+        let error = locate_with(None, Some(bad), None).unwrap_err();
+        assert!(
+            error.to_string().starts_with("LEONIDA_DLSS_DLL: "),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn folders_are_tried_in_order_and_listed_when_empty() {
+        let first = folder("order-first");
+        let _ = std::fs::remove_dir_all(&first);
+        std::fs::create_dir_all(&first).unwrap();
+        let second = folder("order-second");
+        let library = put_library(&second);
+        let found = locate_with(None, None, Some(&[first.clone(), second.clone()])).unwrap();
+        assert_eq!(found.path, library);
+        let error = locate_with(None, None, Some(std::slice::from_ref(&first))).unwrap_err();
+        assert_eq!(error.searched, vec![first]);
+        assert!(error.problem.is_none());
+    }
+
+    #[test]
+    fn the_search_goes_down_into_versioned_model_folders() {
+        let root = folder("models");
+        let _ = std::fs::remove_dir_all(&root);
+        let deep = root.join("dlss").join("versions").join("7").join("files");
+        let library = put_library(&deep);
+        assert_eq!(super::super::locate::find_in(&root, 4), Some(library));
+        assert_eq!(super::super::locate::find_in(&root, 2), None);
+    }
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU and nvngx_dlss.dll (set LEONIDA_DLSS_DLL)"]
+fn several_dlss_instances_live_together_and_drop_in_any_order() {
+    let _turn = ngx_turn();
+    let config = library_config();
+    let flags = DlssOptions::default().feature_flags();
+    let mut first = DlssUpscaler::new(&config).expect("first");
+    let mut second = DlssUpscaler::new(&config).expect("second");
+    first
+        .prepare_feature([640, 360], [1280, 720], flags)
         .unwrap();
-    assert!(rgba.iter().all(|v| v.is_finite()));
-    let mean = rgba.chunks_exact(4).map(|p| p[0]).sum::<f32>() / (output[0] * output[1]) as f32;
-    assert!(
-        (mean - 0.5).abs() < 0.1,
-        "a flat 0.5 image came back as {mean}"
-    );
+    second
+        .prepare_feature([960, 540], [1920, 1080], flags)
+        .unwrap();
+    drop(first);
+    let mut third = DlssUpscaler::new(&config).expect("third");
+    third
+        .prepare_feature([640, 360], [1280, 720], flags)
+        .unwrap();
+    drop(second);
+    drop(third);
 }

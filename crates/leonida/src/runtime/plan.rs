@@ -30,6 +30,8 @@ pub struct RuntimePlan {
     pub custom_limit: bool,
     pub graphics: Graphics,
     pub upscaler: Upscaler,
+    /// The player's own `nvngx_dlss.dll` (upscaling.toml); DLSS looks in NVIDIA's folders when this is unset.
+    pub dlss_path: Option<PathBuf>,
     pub frame_generation: bool,
     pub widescreen: widescreen::Config,
     pub input: InputConfig,
@@ -98,6 +100,7 @@ impl RuntimePlan {
             frame_limit,
             graphics: settings.graphics.clone(),
             upscaler: settings.graphics.upscaler,
+            dlss_path: settings.upscaling.dlss_path.clone(),
             frame_generation: settings.graphics.frame_generation,
             widescreen: widescreen_config(&settings.graphics),
             input,
@@ -159,7 +162,18 @@ impl RuntimePlan {
             Upscaler::Off => return format!("off{}", self.describe_generation()),
             Upscaler::Fsr1 => "fsr1",
             Upscaler::Temporal => "temporal",
-            Upscaler::Dlss => "dlss",
+            Upscaler::Dlss => {
+                let report = upscale::dlss::report(&upscale::dlss::DlssConfig {
+                    dlss_dll: self.dlss_path.clone(),
+                    ..Default::default()
+                });
+                return format!(
+                    "dlss {}, rendering at {:.0}% of the window{}",
+                    report.summary,
+                    self.graphics.resolution_scale * 100.0,
+                    self.describe_generation()
+                );
+            }
         };
         format!(
             "{name}, rendering at {:.0}% of the window{}",

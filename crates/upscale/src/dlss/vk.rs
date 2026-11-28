@@ -397,8 +397,10 @@ impl Drop for VkContext {
             // SAFETY: the context created these and every child object was destroyed before it.
             unsafe {
                 self.device.device_wait_idle().ok();
-                self.device.destroy_device(None);
-                self.instance.destroy_instance(None);
+                if !super::ngx::left_initialised() {
+                    self.device.destroy_device(None);
+                    self.instance.destroy_instance(None);
+                }
             }
         }
     }

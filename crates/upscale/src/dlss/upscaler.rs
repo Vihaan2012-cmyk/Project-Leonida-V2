@@ -67,6 +67,14 @@ pub struct DlssUpscaler {
 // SAFETY: every Vulkan and NGX object is used only through `&mut self`.
 unsafe impl Send for DlssUpscaler {}
 
+/// The DLSS library to use, after checking that NGX itself can be loaded.
+fn ready(config: &super::DlssConfig) -> Result<PathBuf, UpscaleError> {
+    match super::probe(config) {
+        super::DlssStatus::Present { dlss, .. } => Ok(dlss),
+        super::DlssStatus::Unavailable(reason) => Err(unavailable(reason)),
+    }
+}
+
 pub(super) struct Opened {
     pub api: Arc<Api>,
     pub ctx: VkContext,
@@ -138,12 +146,10 @@ impl DlssUpscaler {
         config: &super::DlssConfig,
         options: DlssOptions,
     ) -> Result<DlssUpscaler, UpscaleError> {
-        if let super::DlssStatus::Unavailable(reason) = super::probe(config) {
-            return Err(unavailable(reason));
-        }
+        let located = ready(config)?;
         let Opened { api, ctx } =
             open_own_device(config.ngx_runtime.as_deref()).map_err(unavailable)?;
-        Self::from_parts(api, ctx, options, config.dlss_dll.clone())
+        Self::from_parts(api, ctx, options, Some(located))
     }
 
     /// Creates DLSS on the renderer's device. The device must have been created with the extensions
@@ -156,13 +162,11 @@ impl DlssUpscaler {
         options: DlssOptions,
         handles: VkHandles,
     ) -> Result<DlssUpscaler, UpscaleError> {
-        if let super::DlssStatus::Unavailable(reason) = super::probe(config) {
-            return Err(unavailable(reason));
-        }
+        let located = ready(config)?;
         let api = Arc::new(Api::open(config.ngx_runtime.as_deref()).map_err(unavailable)?);
         // SAFETY: forwarded from this function's contract.
         let ctx = unsafe { VkContext::borrow(handles) }.map_err(unavailable)?;
-        Self::from_parts(api, ctx, options, config.dlss_dll.clone())
+        Self::from_parts(api, ctx, options, Some(located))
     }
 
     pub fn device_name(&self) -> &str {

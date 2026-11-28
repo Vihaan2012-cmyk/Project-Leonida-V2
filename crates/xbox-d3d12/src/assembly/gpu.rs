@@ -7,8 +7,8 @@
 //! mesh shaders, pixel interlock and 64-bit image atomics are enabled when the GPU has them.
 
 use std::collections::HashSet;
-use std::ffi::{CStr, c_char};
-use std::sync::{Arc, Mutex};
+use std::ffi::{CStr, CString, c_char};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ash::vk;
 
@@ -70,10 +70,20 @@ pub struct Gpu {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OptionalExtensions {
+    /// Every device extension NVIDIA's NGX names is enabled, so DLSS can run on this device.
+    pub dlss: bool,
     pub barycentric: bool,
     pub mesh_shader: bool,
     pub pixel_interlock: bool,
     pub image_atomics_64: bool,
+}
+
+const NVIDIA_VENDOR_ID: u32 = 0x10DE;
+
+/// The extensions NGX asks for, read once from NVIDIA's runtime (empty when this machine has none).
+fn ngx_extensions() -> &'static upscale::dlss::RequiredExtensions {
+    static NAMES: OnceLock<upscale::dlss::RequiredExtensions> = OnceLock::new();
+    NAMES.get_or_init(upscale::dlss::required_extensions)
 }
 
 fn has(extensions: &[vk::ExtensionProperties], name: &CStr) -> bool {
@@ -100,6 +110,16 @@ impl Gpu {
             let mut names: Vec<*const c_char> = Vec::new();
             let mut wanted: Vec<&CStr> = present_vulkan::instance_extensions();
             wanted.push(present_vulkan::COLORSPACE_EXTENSION);
+            let ngx_instance: Vec<CString> = ngx_extensions()
+                .instance
+                .iter()
+                .filter_map(|n| CString::new(n.as_str()).ok())
+                .collect();
+            for name in &ngx_instance {
+                if !wanted.contains(&name.as_c_str()) {
+                    wanted.push(name);
+                }
+            }
             for name in wanted {
                 if has(&have, name) {
                     names.push(name.as_ptr());
@@ -381,10 +401,23 @@ impl Gpu {
                 .push_next(&mut e13)
                 .push_next(&mut e12)
                 .push_next(&mut e11);
-            let mut seen: HashSet<&CStr> = HashSet::new();
+            let ngx_device: Vec<CString> = if instance
+                .get_physical_device_properties(physical)
+                .vendor_id
+                == NVIDIA_VENDOR_ID
+            {
+                ngx_extensions()
+                    .device
+                    .iter()
+                    .filter_map(|n| CString::new(n.as_str()).ok())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let mut seen: HashSet<CString> = HashSet::new();
             let mut names: Vec<*const c_char> = Vec::new();
-            let mut add = |name: &'static CStr| {
-                if seen.insert(name) {
+            let mut add = |name: &CStr| {
+                if seen.insert(name.to_owned()) {
                     names.push(name.as_ptr());
                 }
             };
@@ -397,6 +430,12 @@ impl Gpu {
                 }
             }
             let mut optional = OptionalExtensions::default();
+            if !ngx_device.is_empty() && ngx_device.iter().all(|n| has(&extensions, n)) {
+                for name in &ngx_device {
+                    add(name);
+                }
+                optional.dlss = true;
+            }
             if pixel_shaders {
                 chain = chain.push_next(&mut e_bary);
                 add(ash::khr::fragment_shader_barycentric::NAME);

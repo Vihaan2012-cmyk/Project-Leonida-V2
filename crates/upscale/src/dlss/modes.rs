@@ -118,9 +118,12 @@ pub struct DlssOptions {
     pub auto_exposure: bool,
     /// Largest sizes the feature will see (a dynamic-resolution game creates for the maximum).
     pub max_render_size: Option<[u32; 2]>,
-    /// The NGX application id. 0 is accepted by the driver for applications without an id from NVIDIA; the driver's
-    /// project-id entry point is not used because its argument list is not published.
+    /// The NGX application id, used when `use_project_id` is off or the driver has no project-id entry point. DLSS
+    /// refuses 0 ("invalid app id"); NVIDIA hands out real ids.
     pub application_id: u64,
+    /// Initialise through the driver's `Init_ProjectID` with `project_id` (a GUID-like string of our own). The SDK
+    /// header only declares its static-library wrapper, so the driver's argument list (the `Init_Ext` list with the
+    /// project description in place of the application id) was settled by running it against NVIDIA's driver 616.64.
     pub use_project_id: bool,
     pub project_id: String,
     pub engine_version: String,

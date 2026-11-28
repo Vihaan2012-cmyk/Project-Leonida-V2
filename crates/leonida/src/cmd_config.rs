@@ -11,6 +11,7 @@ pub fn config_command(args: &ConfigArgs) -> Result<std::process::ExitCode> {
     let dir = &args.dir;
     match &args.command {
         None | Some(ConfigCommand::Show) => show(dir),
+        Some(ConfigCommand::Dlss) => dlss(dir),
         Some(ConfigCommand::Reset { file }) => reset(dir, file),
     }
     .map(|()| std::process::ExitCode::SUCCESS)
@@ -26,6 +27,19 @@ fn show(dir: &Path) -> Result<()> {
     print_file(DisplayConfig::FILE, &config.display.to_text());
     print_file(Widescreen::FILE, &config.widescreen.to_text());
     print_file(Upscaling::FILE, &config.upscaling.to_text());
+    Ok(())
+}
+
+fn dlss(dir: &Path) -> Result<()> {
+    let config = Config::load(dir)?;
+    let report = upscale::dlss::report(&upscale::dlss::DlssConfig {
+        dlss_dll: config.upscaling.dlss_path.clone(),
+        ..Default::default()
+    });
+    println!("DLSS is {}", report.summary);
+    if config.graphics.upscaler != config::Upscaler::Dlss {
+        println!("graphics.toml does not choose it: upscaler = \"dlss\" turns it on");
+    }
     Ok(())
 }
 

@@ -1,8 +1,9 @@
 //! Optional NVIDIA DLSS super resolution through NGX, the runtime that comes with NVIDIA's driver. Nothing of
 //! NVIDIA's is linked, bundled or shipped.
 //!
-//! The player supplies NVIDIA's files: the driver installs the NGX loader (`nvngx.dll`), and the player points the
-//! configuration at a DLSS library (`nvngx_dlss.dll`) they obtained from NVIDIA. DLSS only works on NVIDIA GPUs with
+//! The player supplies NVIDIA's files: the driver installs the NGX loader (`nvngx.dll`), and the player puts a DLSS
+//! library (`nvngx_dlss.dll`) they obtained from NVIDIA where [`locate::locate`] looks (the `dlss_path` setting,
+//! NVIDIA's NGX folders, next to the executable). DLSS only works on NVIDIA GPUs with
 //! tensor cores (GeForce RTX); anywhere else, or when NGX fails, [`create_with_fallback`] hands back FSR 1 or the
 //! temporal upscaler together with a message saying why.
 //!
@@ -21,6 +22,7 @@
 
 pub mod fallback;
 pub mod ffi;
+pub mod locate;
 pub mod modes;
 pub mod ngx;
 mod upscaler;
@@ -29,7 +31,7 @@ pub mod vk;
 #[cfg(test)]
 mod tests;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub use fallback::{Selection, create_with_fallback, select_upscaler};
 pub use modes::{DlssMode, DlssOptions};
@@ -44,62 +46,46 @@ pub const DLSS_LIBRARY_NAME: &str = "nvngx_dlss.dll";
 
 #[derive(Debug, Clone, Default)]
 pub struct DlssConfig {
-    /// The DLSS library the player points to (`nvngx_dlss.dll`).
+    /// The DLSS library the player points to (`nvngx_dlss.dll`); when `None` the places [`locate::locate`] names are
+    /// searched.
     pub dlss_dll: Option<PathBuf>,
     /// Where to find the NGX loader when it is not in the system folder.
     pub ngx_runtime: Option<PathBuf>,
+    /// Replaces the default search places (NGX's folders, the executable's folder) when `Some`.
+    pub search_folders: Option<Vec<PathBuf>>,
+}
+
+impl DlssConfig {
+    /// The DLSS library this configuration finds, or why there is none.
+    pub fn locate(&self) -> Result<locate::Located, locate::NotFound> {
+        locate::locate(self.dlss_dll.as_deref(), self.search_folders.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DlssStatus {
-    /// The loader and its entry points are present and a DLSS file is configured.
+    /// The loader and its entry points are present and a DLSS file was found.
     Present {
         ngx: PathBuf,
         dlss: PathBuf,
+        source: locate::Source,
     },
     Unavailable(String),
 }
 
-/// Looks for NVIDIA's NGX runtime and the configured DLSS file. Loads the NGX loader and unloads it again.
+/// Looks for NVIDIA's NGX runtime and the DLSS file. Loads the NGX loader and unloads it again.
 pub fn probe(config: &DlssConfig) -> DlssStatus {
-    let Some(dlss) = &config.dlss_dll else {
-        return DlssStatus::Unavailable("no DLSS library is configured".into());
+    let located = match config.locate() {
+        Ok(located) => located,
+        Err(missing) => return DlssStatus::Unavailable(missing.to_string()),
     };
-    if let Err(reason) = check_dlss_file(dlss) {
-        return DlssStatus::Unavailable(reason);
-    }
     match ngx::Api::open(config.ngx_runtime.as_deref()) {
         Ok(api) => DlssStatus::Present {
             ngx: api.library.path.clone(),
-            dlss: dlss.clone(),
+            dlss: located.path,
+            source: located.source,
         },
         Err(reason) => DlssStatus::Unavailable(reason),
-    }
-}
-
-fn check_dlss_file(path: &Path) -> Result<(), String> {
-    let mut head = [0u8; 2];
-    let read = std::fs::File::open(path).and_then(|mut file| {
-        std::io::Read::read_exact(&mut file, &mut head)?;
-        Ok(())
-    });
-    match read {
-        Err(error) => Err(format!("{}: {error}", path.display())),
-        Ok(()) if &head != b"MZ" => Err(format!("{} is not a Windows library", path.display())),
-        Ok(()) => {
-            let named = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.eq_ignore_ascii_case(DLSS_LIBRARY_NAME));
-            if named {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{} must be named {DLSS_LIBRARY_NAME}: NGX finds the DLSS library by that name",
-                    path.display()
-                ))
-            }
-        }
     }
 }
 
@@ -156,12 +142,13 @@ pub fn query_capabilities(
     output: [u32; 2],
 ) -> Result<DlssCapabilities, String> {
     let options = DlssOptions::default();
+    let located = config.locate().ok();
     let opened = upscaler::open_own_device(config.ngx_runtime.as_deref())?;
     let mut ngx = upscaler::init_ngx(
         opened.api,
         &opened.ctx,
         &options,
-        config.dlss_dll.as_deref(),
+        located.as_ref().map(|l| l.path.as_path()),
     )?;
     let availability = ngx.availability();
     let modes = DlssMode::ALL
@@ -176,4 +163,42 @@ pub fn query_capabilities(
         availability,
         modes,
     })
+}
+
+/// Whether DLSS can run on this machine and, when it cannot, the reason in a sentence for the player.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DlssReport {
+    pub available: bool,
+    pub summary: String,
+}
+
+/// Looks for the DLSS library and NGX, opens an NVIDIA device and asks NGX whether DLSS is available. Needs no
+/// renderer; takes a second or two because it creates a Vulkan device.
+pub fn report(config: &DlssConfig) -> DlssReport {
+    let unavailable = |reason: String| DlssReport {
+        available: false,
+        summary: format!("unavailable: {reason}"),
+    };
+    let located = match config.locate() {
+        Ok(located) => located,
+        Err(missing) => return unavailable(missing.to_string()),
+    };
+    if let Err(reason) = ngx::Api::open(config.ngx_runtime.as_deref()) {
+        return unavailable(reason);
+    }
+    match query_capabilities(config, [1920, 1080]) {
+        Err(reason) => unavailable(reason),
+        Ok(capabilities) => match capabilities.availability.reason() {
+            Some(reason) => unavailable(format!("{reason} ({})", capabilities.device_name)),
+            None => DlssReport {
+                available: true,
+                summary: format!(
+                    "available on {} (nvngx_dlss.dll from {}: {})",
+                    capabilities.device_name,
+                    located.source.describe(),
+                    located.path.display()
+                ),
+            },
+        },
+    }
 }
