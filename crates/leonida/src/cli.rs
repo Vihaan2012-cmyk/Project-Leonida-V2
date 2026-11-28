@@ -378,6 +378,39 @@ pub enum ShadersCommand {
     Census(CensusArgs),
     /// Translate every shader and have the graphics driver build it into a pipeline. Writes nothing.
     Verify(VerifyArgs),
+    /// Translate shaders to SPIR-V on the CPU only (no GPU, no pipelines) and count the failures by kind.
+    Translate(TranslateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TranslateArgs {
+    /// The game folder. Searched for when omitted.
+    #[arg(long)]
+    pub game: Option<PathBuf>,
+    /// Stop after this many shader containers.
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Translate every Nth container.
+    #[arg(long, default_value_t = 1)]
+    pub every: usize,
+    /// Only containers of this stage: ps, vs, gs, ms or cs.
+    #[arg(long)]
+    pub stage: Option<String>,
+    /// Only containers whose name contains this text.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Write each translated program into this folder, at most --save-max of them.
+    #[arg(long)]
+    pub save_spirv: Option<PathBuf>,
+    /// Most programs --save-spirv writes.
+    #[arg(long, default_value_t = 100)]
+    pub save_max: usize,
+    /// Print the name of every failing container.
+    #[arg(long)]
+    pub each: bool,
+    /// How many containers are translated at once.
+    #[arg(long, default_value_t = 1)]
+    pub jobs: usize,
 }
 
 #[derive(Debug, Args)]
