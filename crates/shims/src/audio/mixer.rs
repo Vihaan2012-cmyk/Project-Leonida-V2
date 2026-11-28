@@ -107,6 +107,8 @@ struct Voice {
     queue: VecDeque<Queued>,
     /// Position in the front buffer, in its frames.
     position: f64,
+    /// Source frames played since the voice was added; flushing and completing buffers do not rewind it.
+    played: f64,
     paused: bool,
 }
 
@@ -157,6 +159,7 @@ impl Mixer {
                 params,
                 queue: VecDeque::new(),
                 position: 0.0,
+                played: 0.0,
                 paused: false,
             },
         );
@@ -204,6 +207,11 @@ impl Mixer {
                 v.position = 0.0;
             })
             .is_some()
+    }
+
+    /// Source frames the voice has played since it was added (fractional: the mixer resamples).
+    pub fn voice_played(&self, id: VoiceId) -> Option<f64> {
+        self.voices.get(&id).map(|v| v.played)
     }
 
     pub fn queued_buffers(&self, id: VoiceId) -> usize {
@@ -294,6 +302,7 @@ impl Voice {
             let (l1, r1) = front.buffer.frame(next);
             let frame_out = (l0 + (l1 - l0) * fraction, r0 + (r1 - r0) * fraction);
             self.position += step;
+            self.played += step;
             let repeats = matches!(front.repeats, Looping::Forever | Looping::Times(1..));
             if self.position >= frames as f64 && !repeats {
                 completions.push(Completion {
@@ -464,5 +473,37 @@ mod tests {
         assert_eq!(m.take_completions().len(), 1);
         assert!(m.remove_voice(v));
         assert_eq!(m.voice_count(), 0);
+    }
+
+    #[test]
+    fn a_voice_counts_the_source_frames_it_has_played_across_buffers_and_flushes() {
+        let mut m = Mixer::new(2000);
+        let v = m.add_voice(VoiceParams::new(1000));
+        assert_eq!(m.voice_played(v), Some(0.0));
+        m.queue(v, buffer(1, 100, Looping::Once));
+        m.queue(v, buffer(2, 100, Looping::Once));
+        let mut out = vec![0.0; 2 * 40];
+        m.render(&mut out);
+        assert!(
+            (m.voice_played(v).unwrap() - 20.0).abs() < 1e-9,
+            "40 output frames at half rate"
+        );
+        m.set_paused(v, true);
+        m.render(&mut out);
+        assert!(
+            (m.voice_played(v).unwrap() - 20.0).abs() < 1e-9,
+            "a paused voice plays nothing"
+        );
+        m.set_paused(v, false);
+        m.flush(v);
+        m.render(&mut out);
+        assert!(
+            (m.voice_played(v).unwrap() - 20.0).abs() < 1e-9,
+            "nothing queued, nothing played"
+        );
+        m.queue(v, buffer(3, 100, Looping::Once));
+        m.render(&mut out);
+        assert!((m.voice_played(v).unwrap() - 40.0).abs() < 1e-9);
+        assert_eq!(m.voice_played(99), None);
     }
 }
