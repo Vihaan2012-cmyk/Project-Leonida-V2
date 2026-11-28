@@ -53,6 +53,26 @@ pub fn readable(address: usize, length: usize) -> bool {
     address.checked_add(length).is_some_and(|last| last <= end)
 }
 
+/// Where an address lies: its allocation base, region size, type and protection, as `VirtualQuery` says.
+pub fn region_of(address: usize) -> Option<String> {
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: VirtualQuery only inspects the address space.
+    let got = unsafe { VirtualQuery(address as *const c_void, &mut info, size_of_val(&info)) };
+    if got == 0 {
+        return None;
+    }
+    let kind = match info.Type {
+        0x20000 => "private",
+        0x40000 => "mapped",
+        0x1000000 => "image",
+        _ => "free",
+    };
+    Some(format!(
+        "allocation {:#x}, region {:#x}+{:#x}, {kind}, protect {:#x}",
+        info.AllocationBase as usize, info.BaseAddress as usize, info.RegionSize, info.Protect
+    ))
+}
+
 pub fn read_memory(address: usize, length: usize) -> Option<Vec<u8>> {
     // SAFETY: checked readable just above, and only copied.
     readable(address, length)
@@ -246,7 +266,8 @@ pub fn format_report(facts: &CrashFacts, headline: &str, explanation: &[String])
         let _ = writeln!(text, "  {}", row.join(" "));
     }
     for (name, address, bytes) in &facts.pointed {
-        let _ = writeln!(text, "memory at {name} = {address:#x}:");
+        let region = region_of(*address as usize).unwrap_or_default();
+        let _ = writeln!(text, "memory at {name} = {address:#x} ({region}):");
         for (row, chunk) in bytes.chunks(16).enumerate() {
             let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
             let _ = writeln!(text, "  {:04x}: {}", row * 16, hex.join(" "));
@@ -526,7 +547,7 @@ mod tests {
             pointed: vec![("rcx".into(), 0x4000, (0..20).collect())],
         };
         let text = format_report(&facts, "test", &[]);
-        assert!(text.contains("memory at rcx = 0x4000:"), "{text}");
+        assert!(text.contains("memory at rcx = 0x4000"), "{text}");
         assert!(
             text.contains("  0000: 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f"),
             "{text}"
