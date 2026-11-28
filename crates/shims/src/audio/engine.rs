@@ -108,6 +108,10 @@ impl Engine {
         self.mode = mode;
     }
 
+    pub fn mode(&self) -> OutputMode {
+        self.mode
+    }
+
     /// Records an unmeasured detail once per key.
     pub fn note_once(&mut self, key: &str, text: impl FnOnce() -> String) {
         if self.noted.insert(key.to_string()) {

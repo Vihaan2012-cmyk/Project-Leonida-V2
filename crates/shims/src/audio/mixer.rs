@@ -2,7 +2,8 @@
 //!
 //! A voice plays a queue of buffers of interleaved `f32` frames at its own sample rate; the mixer resamples
 //! linearly, applies gain, pitch and balance, sums, and clamps. Each buffer that finishes is reported as a
-//! [`Completion`] at the output frame where it ended, so completion follows the output clock.
+//! [`Completion`] at the output frame where it ended, so completion follows the output clock. A buffer with id 0
+//! never reports one.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -278,11 +279,13 @@ impl Voice {
                 if again {
                     self.position -= frames as f64;
                 } else {
-                    completions.push(Completion {
-                        voice: id,
-                        buffer: front.buffer.id,
-                        frame,
-                    });
+                    if front.buffer.id != 0 {
+                        completions.push(Completion {
+                            voice: id,
+                            buffer: front.buffer.id,
+                            frame,
+                        });
+                    }
                     self.position = (self.position - frames as f64).max(0.0);
                     self.queue.pop_front();
                 }
@@ -305,11 +308,13 @@ impl Voice {
             self.played += step;
             let repeats = matches!(front.repeats, Looping::Forever | Looping::Times(1..));
             if self.position >= frames as f64 && !repeats {
-                completions.push(Completion {
-                    voice: id,
-                    buffer: front.buffer.id,
-                    frame: frame + 1,
-                });
+                if front.buffer.id != 0 {
+                    completions.push(Completion {
+                        voice: id,
+                        buffer: front.buffer.id,
+                        frame: frame + 1,
+                    });
+                }
                 self.position -= frames as f64;
                 self.queue.pop_front();
             }
@@ -505,5 +510,19 @@ mod tests {
         m.render(&mut out);
         assert!((m.voice_played(v).unwrap() - 40.0).abs() < 1e-9);
         assert_eq!(m.voice_played(99), None);
+    }
+
+    #[test]
+    fn a_buffer_with_id_zero_plays_but_reports_no_completion() {
+        let mut mixer = Mixer::new(1000);
+        let voice = mixer.add_voice(VoiceParams::new(1000));
+        mixer.queue(voice, buffer(0, 4, Looping::Once));
+        mixer.queue(voice, buffer(7, 2, Looping::Once));
+        let mut out = vec![0.0f32; 12];
+        mixer.render(&mut out);
+        assert_eq!(out[2], 0.001, "the first buffer played");
+        let done = mixer.take_completions();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].buffer, 7);
     }
 }
