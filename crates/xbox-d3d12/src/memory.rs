@@ -38,9 +38,15 @@
 //!
 //! Runs below 4 GiB are never spilled: descriptor heaps must be there (`LOW_LIMIT`) and every shader reads them.
 //!
-//! `promote_spilled` mirrors spilled runs again as device-local memory frees, and `spill_range` drops the
-//! device-local copy of runs the layer knows the GPU reads only through other objects (the detiled image of a
-//! texture is made from the host bytes, so the window's copy of a texture's memory is dead weight).
+//! `promote_spilled` mirrors spilled runs again as device-local memory frees, hot runs first. The textures are the
+//! other half of it: the title's tiled texture data sits in the window, and the layer detiles it on the CPU into a
+//! `VkImage` the shaders sample, so once that is done the window's copy of the texture's memory is dead weight
+//! (the `cold` module). The resource layer says which ranges are texture data (`mark_cold`) and which are read or
+//! written through the window (`mark_hot`: buffers, targets, views over addresses, GPU writes), and between
+//! submissions `release_cold` splits the memory objects under cold islands into pieces of their own
+//! (`spill_range`), spilled and pinned, and mirrors what lay around them again. A released range is the title's
+//! own host memory bound into the window, so a write by the CPU needs no copy there; `take_cold_writes` tells the
+//! resource layer which images to make again. Counters: `Counters::released`, `WindowClasses`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, c_void};

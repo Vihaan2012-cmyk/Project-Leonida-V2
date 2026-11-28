@@ -339,8 +339,12 @@ impl AddressSpace {
         self.temp.released_at = Some(Instant::now());
         self.temp.due = false;
         let result = self.release_pass();
-        if result.is_err() {
+        if let Err(e) = &result {
+            self.temp.released_at = Some(Instant::now() + Duration::from_secs(5));
             self.temp.due = true;
+            self.h.budget.say(format!(
+                "vram: releasing detiled texture memory failed, trying again later: {e}"
+            ));
         }
         result
     }
