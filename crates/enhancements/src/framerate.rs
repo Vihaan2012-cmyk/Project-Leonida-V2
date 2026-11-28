@@ -360,8 +360,18 @@ pub fn select(
     custom_limit: bool,
     optional: &[&str],
 ) -> Result<Vec<Patch>, PatchError> {
+    select_without(finder, custom_limit, optional, &[])
+}
+
+/// [`select`], leaving out the entries named in `without` whatever their activation.
+pub fn select_without(
+    finder: &Finder,
+    custom_limit: bool,
+    optional: &[&str],
+    without: &[&str],
+) -> Result<Vec<Patch>, PatchError> {
     let mut patches = Vec::new();
-    for entry in ENTRIES {
+    for entry in ENTRIES.iter().filter(|entry| !without.contains(&entry.id)) {
         let wanted = match entry.activation {
             Activation::WithCustomLimit => custom_limit,
             Activation::Optional => optional.contains(&entry.id),

@@ -280,6 +280,11 @@ fn the_floor_patch_redirects_one_displacement() {
     // This image has none of the sites of the frame timers, which stop the whole selection.
     assert!(framerate::select(&finder, true, &[]).is_err());
     assert_eq!(all.len(), 3);
+    // Leaving the frame timers out, as `fix_frame_timers = false` does, selects the floors alone.
+    assert_eq!(
+        framerate::select_without(&finder, true, &[], &[framerate::FRAME_TIMERS.id]).unwrap(),
+        all
+    );
 }
 
 #[test]
