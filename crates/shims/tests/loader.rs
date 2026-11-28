@@ -382,16 +382,16 @@ fn derived_interfaces_answer_with_the_same_object_and_a_second_family_is_its_own
 #[test]
 fn an_unimplemented_slot_notes_the_call_and_fails() {
     let package = object("XPackageImpl");
-    // SAFETY: slot 12 is XPackageFindChunkAvailability, which nothing implements.
+    // SAFETY: slot 30 is XPackageGetWriteStats, which nothing implements.
     let hr = unsafe {
-        let call: unsafe extern "win64" fn(usize) -> i32 = slot(package, 12);
+        let call: unsafe extern "win64" fn(usize) -> i32 = slot(package, 30);
         call(package)
     };
     assert_eq!(hr, 0x8000_4001_u32 as i32);
     assert!(
         shims::trace::notes()
             .iter()
-            .any(|n| n.contains("XPackageImpl slot 12 (XPackageFindChunkAvailability)"))
+            .any(|n| n.contains("XPackageImpl slot 30 (XPackageGetWriteStats)"))
     );
 }
 
@@ -1087,7 +1087,7 @@ fn the_store_says_the_game_is_licensed_and_nothing_else_is_for_sale() {
             slot(store, 30);
         let addons_count: unsafe extern "win64" fn(usize, *mut Block, *mut u32) -> i32 =
             slot(store, 31);
-        let purchase: unsafe extern "win64" fn(usize) -> i32 = slot(store, 49);
+        let unserved: unsafe extern "win64" fn(usize) -> i32 = slot(store, 70);
         let mut context = 0usize;
         assert_eq!(create(store, 0, &mut context), 0x8007_0057_u32 as i32);
         assert_eq!(create(store, 1, &mut context), 0);
@@ -1106,7 +1106,11 @@ fn the_store_says_the_game_is_licensed_and_nothing_else_is_for_sale() {
         let mut count = 9u32;
         assert_eq!(addons_count(store, &mut block, &mut count), 0);
         assert_eq!(count, 0);
-        assert_eq!(purchase(store), 0x8000_4005_u32 as i32, "purchases fail");
+        assert_eq!(
+            unserved(store),
+            0x8000_4005_u32 as i32,
+            "XStoreIsAvailabilityPurchasable is not served"
+        );
         close(store, context);
     }
 }
