@@ -62,6 +62,16 @@ pub enum AspectMode {
     Stretch,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PipelineNotReady {
+    /// The draw waits for its pipeline to finish building: nothing is missing, the frame takes as long as the build.
+    #[default]
+    Wait,
+    /// The draw is left out until the pipeline is built: no stall, but objects are missing for a frame or more.
+    Skip,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Graphics {
@@ -79,6 +89,7 @@ pub struct Graphics {
     pub aspect_mode: AspectMode,
     pub fov_offset: f32,
     pub fov_scale: f32,
+    pub pipeline_not_ready: PipelineNotReady,
 }
 
 impl Default for Graphics {
@@ -98,6 +109,7 @@ impl Default for Graphics {
             aspect_mode: AspectMode::Letterbox,
             fov_offset: 0.0,
             fov_scale: 1.0,
+            pipeline_not_ready: PipelineNotReady::Wait,
         }
     }
 }
@@ -173,6 +185,11 @@ fov_offset = 0.0
 # Factor on the game's vertical field of view, applied to the game's code: 1.0 leaves it alone, 1.2 shows more of
 # the world. 0.5 to 1.8.
 fov_scale = 1.0
+
+# The game's shaders are turned into GPU pipelines on background threads. When a draw needs one that is not
+# finished: \"wait\" holds the frame until it is (nothing is missing, but the game may stutter), \"skip\" leaves
+# the draw out until it is (no stutter, but objects can be missing for a moment).
+pipeline_not_ready = \"wait\"
 "
         .to_string()
     }
@@ -248,6 +265,21 @@ anisotropic_filtering = 0\n";
             error.contains("fov_offset: must be between -30 and 30, got 40"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_draw_waits_for_an_unbuilt_pipeline_unless_told_to_skip() {
+        assert_eq!(
+            Graphics::default().pipeline_not_ready,
+            PipelineNotReady::Wait
+        );
+        assert_eq!(
+            Graphics::parse("pipeline_not_ready = \"skip\"")
+                .unwrap()
+                .pipeline_not_ready,
+            PipelineNotReady::Skip
+        );
+        assert!(Graphics::parse("pipeline_not_ready = \"later\"").is_err());
     }
 
     #[test]
