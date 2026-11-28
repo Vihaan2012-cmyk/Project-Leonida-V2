@@ -16,6 +16,7 @@ fn a_missing_or_foreign_file_is_reported_not_loaded() {
     let config = |path: PathBuf| DlssConfig {
         dlss_dll: Some(path),
         ngx_runtime: Some(dir.join("absent_nvngx.dll")),
+        search_folders: None,
     };
     assert!(matches!(
         probe(&config(text)),
@@ -35,6 +36,7 @@ fn a_missing_ngx_runtime_makes_dlss_unavailable() {
     let status = probe(&DlssConfig {
         dlss_dll: Some(library),
         ngx_runtime: Some(dir.join("absent_nvngx.dll")),
+        search_folders: None,
     });
     assert!(matches!(status, DlssStatus::Unavailable(_)), "{status:?}");
 }

@@ -232,11 +232,18 @@ fn availability_explains_why_dlss_is_not_available() {
 }
 
 #[test]
-fn without_a_configured_library_dlss_is_unavailable() {
-    let status = probe(&DlssConfig::default());
-    assert!(matches!(status, DlssStatus::Unavailable(r) if r.contains("no DLSS library")));
+fn without_a_library_anywhere_dlss_is_unavailable_and_says_where_to_put_it() {
+    let config = DlssConfig {
+        search_folders: Some(vec![scratch("empty-search")]),
+        ..DlssConfig::default()
+    };
+    let status = probe(&config);
+    assert!(
+        matches!(&status, DlssStatus::Unavailable(r) if r.contains("nvngx_dlss.dll was not found") && r.contains("next to leonida.exe") && r.contains("empty-search")),
+        "{status:?}"
+    );
     assert!(matches!(
-        DlssUpscaler::new(&DlssConfig::default()),
+        DlssUpscaler::new(&config),
         Err(UpscaleError::Unavailable { name: "DLSS", .. })
     ));
 }
@@ -249,6 +256,7 @@ fn the_configured_file_must_be_a_library_named_for_ngx() {
     let config = DlssConfig {
         dlss_dll: Some(misnamed),
         ngx_runtime: Some(dir.join("absent_nvngx.dll")),
+        search_folders: None,
     };
     assert!(matches!(
         probe(&config),
@@ -332,7 +340,7 @@ fn a_working_dlss_is_used_without_a_notice() {
 }
 
 #[test]
-fn the_real_factory_falls_back_when_no_library_is_configured() {
+fn the_real_factory_falls_back_when_no_library_is_found() {
     struct NoCompute;
     impl crate::Compute for NoCompute {
         fn dispatch(
@@ -351,16 +359,15 @@ fn the_real_factory_falls_back_when_no_library_is_configured() {
         UpscalerKind::Dlss,
         UpscalerKind::Fsr1,
         std::sync::Arc::new(NoCompute),
-        &DlssConfig::default(),
+        &DlssConfig {
+            search_folders: Some(vec![scratch("factory-empty")]),
+            ..DlssConfig::default()
+        },
         &DlssOptions::default(),
     );
     assert_eq!(chosen.kind, UpscalerKind::Fsr1);
-    assert!(
-        chosen
-            .notice
-            .unwrap()
-            .contains("no DLSS library is configured")
-    );
+    let notice = chosen.notice.unwrap();
+    assert!(notice.contains("nvngx_dlss.dll was not found"), "{notice}");
 }
 
 /// Whether this machine has NGX at all; the GPU tests skip when it does not.
@@ -452,7 +459,7 @@ fn a_real_dlss_library_upscales_a_flat_image() {
     };
     let config = DlssConfig {
         dlss_dll: Some(dll),
-        ngx_runtime: None,
+        ..DlssConfig::default()
     };
     let mut dlss = match DlssUpscaler::new(&config) {
         Ok(dlss) => dlss,
@@ -497,4 +504,83 @@ fn a_real_dlss_library_upscales_a_flat_image() {
         (mean - 0.5).abs() < 0.1,
         "a flat 0.5 image came back as {mean}"
     );
+}
+
+mod locating {
+    use std::path::PathBuf;
+
+    use crate::dlss::locate::{Source, locate_with};
+
+    fn folder(name: &str) -> PathBuf {
+        super::scratch(&format!("locate-{name}"))
+    }
+
+    fn put_library(dir: &std::path::Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("nvngx_dlss.dll");
+        std::fs::write(&path, b"MZ fake").unwrap();
+        path
+    }
+
+    #[test]
+    fn the_configured_file_wins_over_everything() {
+        let configured = put_library(&folder("configured"));
+        let other = put_library(&folder("configured-other"));
+        let found = locate_with(Some(&configured), Some(other.clone()), Some(&[folder("x")]));
+        let found = found.unwrap();
+        assert_eq!(found.path, configured);
+        assert_eq!(found.source, Source::Configured);
+    }
+
+    #[test]
+    fn a_configured_folder_is_searched_for_the_library() {
+        let dir = folder("configured-dir");
+        let library = put_library(&dir);
+        assert_eq!(locate_with(Some(&dir), None, None).unwrap().path, library);
+    }
+
+    #[test]
+    fn a_broken_configured_path_is_an_error_not_a_fallback() {
+        let other = put_library(&folder("broken-other"));
+        let missing = folder("broken").join("absent.dll");
+        let error = locate_with(Some(&missing), Some(other), None).unwrap_err();
+        assert!(error.to_string().starts_with("dlss_path: "), "{error}");
+    }
+
+    #[test]
+    fn the_environment_file_is_next_and_must_be_usable() {
+        let env = put_library(&folder("env"));
+        let found = locate_with(None, Some(env.clone()), None).unwrap();
+        assert_eq!((found.path, found.source), (env, Source::Environment));
+        let bad = folder("env-bad").join("nvngx_dlss.dll");
+        let error = locate_with(None, Some(bad), None).unwrap_err();
+        assert!(
+            error.to_string().starts_with("LEONIDA_DLSS_DLL: "),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn folders_are_tried_in_order_and_listed_when_empty() {
+        let first = folder("order-first");
+        let _ = std::fs::remove_dir_all(&first);
+        std::fs::create_dir_all(&first).unwrap();
+        let second = folder("order-second");
+        let library = put_library(&second);
+        let found = locate_with(None, None, Some(&[first.clone(), second.clone()])).unwrap();
+        assert_eq!(found.path, library);
+        let error = locate_with(None, None, Some(&[first.clone()])).unwrap_err();
+        assert_eq!(error.searched, vec![first]);
+        assert!(error.problem.is_none());
+    }
+
+    #[test]
+    fn the_search_goes_down_into_versioned_model_folders() {
+        let root = folder("models");
+        let _ = std::fs::remove_dir_all(&root);
+        let deep = root.join("dlss").join("versions").join("7").join("files");
+        let library = put_library(&deep);
+        assert_eq!(super::super::locate::find_in(&root, 4), Some(library));
+        assert_eq!(super::super::locate::find_in(&root, 2), None);
+    }
 }

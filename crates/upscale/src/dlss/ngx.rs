@@ -28,7 +28,7 @@ fn check(call: &'static str, result: ffi::Result) -> Result<(), NgxError> {
     }
 }
 
-pub use library::Library;
+pub use library::{Library, registered_ngx_folder};
 
 use super::ffi::slots;
 
@@ -77,7 +77,7 @@ mod library {
     }
 
     /// The folder the NVIDIA driver records for its NGX runtime (`NGXCore\FullPath`).
-    fn registered_folder() -> Option<PathBuf> {
+    pub fn registered_ngx_folder() -> Option<PathBuf> {
         let key: Vec<u16> = r"SOFTWARE\NVIDIA Corporation\Global\NGXCore"
             .encode_utf16()
             .chain([0])
@@ -123,7 +123,7 @@ mod library {
                 Ok(library) => return Ok(library),
                 Err(code) => code,
             };
-            if let Some(path) = registered_folder().map(|dir| dir.join("nvngx.dll"))
+            if let Some(path) = registered_ngx_folder().map(|dir| dir.join("nvngx.dll"))
                 && let Ok(library) = load(&path, LOAD_WITH_ALTERED_SEARCH_PATH, path.clone())
             {
                 return Ok(library);
@@ -149,6 +149,10 @@ mod library {
 
     pub struct Library {
         pub path: PathBuf,
+    }
+
+    pub fn registered_ngx_folder() -> Option<PathBuf> {
+        None
     }
 
     impl Library {
