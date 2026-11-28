@@ -115,7 +115,9 @@ impl Engine {
         }
     }
 
-    pub fn mixer(&self) -> SharedMixer {
+    /// The shared mixer. Asking for it means a sink is about to play on it, so the device opens now.
+    pub fn mixer(&mut self) -> SharedMixer {
+        self.activate();
         self.mixer.clone()
     }
 
@@ -224,7 +226,7 @@ impl Engine {
         self.output.is_some()
     }
 
-    /// The title turned the DSP on: start the device if there is one and the mode allows.
+    /// Something wants to play: start the device if there is one and the mode allows.
     pub fn activate(&mut self) {
         self.active = true;
         self.started.get_or_insert_with(Instant::now);

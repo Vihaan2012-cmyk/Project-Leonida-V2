@@ -156,11 +156,16 @@ impl Convolver {
         for p in 0..self.parts {
             let at = ((self.head + p) % self.parts) * bins;
             let ir = p * bins;
-            let (xr, xi) = (&self.hist_re[at..at + bins], &self.hist_im[at..at + bins]);
-            let (hr, hi) = (&self.ir_re[ir..ir + bins], &self.ir_im[ir..ir + bins]);
-            for k in 0..bins {
-                self.acc_re[k] += xr[k] * hr[k] - xi[k] * hi[k];
-                self.acc_im[k] += xr[k] * hi[k] + xi[k] * hr[k];
+            let x = self.hist_re[at..at + bins]
+                .iter()
+                .zip(&self.hist_im[at..at + bins]);
+            let h = self.ir_re[ir..ir + bins]
+                .iter()
+                .zip(&self.ir_im[ir..ir + bins]);
+            let acc = self.acc_re.iter_mut().zip(self.acc_im.iter_mut());
+            for (((xr, xi), (hr, hi)), (ar, ai)) in x.zip(h).zip(acc) {
+                *ar += xr * hr - xi * hi;
+                *ai += xr * hi + xi * hr;
             }
         }
         self.re[..bins].copy_from_slice(&self.acc_re);

@@ -15,11 +15,13 @@
 //!   region's address and a positive handle; `XApuEnqueueCommand(handle, command, 0)` hands it a 0x40-byte
 //!   command; `XApuGetResultCount()` is the number of results waiting and `XApuDequeueResult(handle, &result)`
 //!   takes one (0x40 bytes, negative `E_PENDING` when there is none); `XApuDisconnect(handle, 0x20)` ends it.
-//! - `XDspConnectWithMaximumStreamLimit(..., 0x80, 1, &out)`, `XDspActivate`, `XDspSubmitCommand(a, b)`,
-//!   `XDspDeactivate` and `XDspDisconnect` return 0. Activating opens the output device.
+//! - The `XDsp*` functions are the title's convolution reverb and nothing else (see [`dsp`]): the title mixes on
+//!   the CPU and plays through the host's own audio client, so no final mix passes through them.
+//!   `XDspConnectWithMaximumStreamLimit(memory, size, version, limit, 1, &handle)` opens a connection,
+//!   `XDspActivate(handle, &info, &status, &stream)` a stream, `XDspSubmitCommand(stream, &command, &fence)` runs one
+//!   batch to completion before it returns, `XDspDeactivate(stream)` and `XDspDisconnect(handle)` close them.
 //!
-//! Voices reach the mixer through [`Engine`]; the layout of the final mix the title submits through
-//! `XDspSubmitCommand` is unmeasured.
+//! Voices reach the mixer through [`Engine`]; the device opens when the first sink asks for the mixer.
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -49,6 +51,7 @@ pub use xma::{
 };
 
 static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
+static DSP: OnceLock<Mutex<Dsp>> = OnceLock::new();
 
 fn engine() -> MutexGuard<'static, Engine> {
     let lock = ENGINE.get_or_init(|| {
@@ -60,6 +63,17 @@ fn engine() -> MutexGuard<'static, Engine> {
         }))
     });
     lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn dsp() -> MutexGuard<'static, Dsp> {
+    DSP.get_or_init(|| Mutex::new(Dsp::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Runs `f` on the DSP the shims share.
+pub fn with_dsp<R>(f: impl FnOnce(&mut Dsp) -> R) -> R {
+    f(&mut dsp())
 }
 
 /// Runs `f` on the engine the shims share.
@@ -74,8 +88,8 @@ pub fn set_output_mode(mode: OutputMode) {
 
 #[cfg(windows)]
 mod ffi {
-    use super::engine;
     use super::xapu::{COMMAND_BYTES, RESULT_BYTES};
+    use super::{DspError, dsp, engine};
 
     const S_OK: i32 = 0;
     const E_PENDING: i32 = 0x8000_000Au32 as i32;
@@ -245,34 +259,107 @@ mod ffi {
         engine().xapu.result_count() as u32
     }
 
-    pub extern "win64" fn xdsp_connect(a: u64, b: u64, c: u64, limit: u64) -> u32 {
-        engine().note_once("xdsp-connect", || {
-            format!("XDspConnectWithMaximumStreamLimit({a:#x}, {b:#x}, {c:#x}, {limit:#x}): nothing is written")
+    pub extern "win64" fn xdsp_connect(
+        _memory: usize,
+        _size: u32,
+        version: u32,
+        limit: u32,
+        _flags: u32,
+        out: *mut u64,
+    ) -> u32 {
+        let handle = dsp().connect(version, limit);
+        if !out.is_null() {
+            // SAFETY: the title passes the address of the handle field of its device record.
+            unsafe { out.write_unaligned(handle) };
+        }
+        0
+    }
+
+    pub extern "win64" fn xdsp_activate(
+        connection: u64,
+        info: *const u8,
+        status_out: *mut usize,
+        stream_out: *mut u64,
+    ) -> u32 {
+        if info.is_null() {
+            return DspError::NullBuffer.code();
+        }
+        // SAFETY: the title passes the address of the 0x1c-byte description it built on its stack.
+        let bytes = unsafe { info.cast::<[u8; dsp::INFO_BYTES]>().read_unaligned() };
+        let info = dsp::StreamInfo::parse(&bytes);
+        // SAFETY: a convolution stream's address and length describe the impulse response the title keeps loaded
+        // while the stream opens.
+        let response = if info.kind == dsp::KIND_CONVOLUTION {
+            unsafe { dsp::read_response(&info) }
+        } else {
+            Vec::new()
+        };
+        let opened = dsp().activate(connection, &info, &response);
+        match opened {
+            Ok(opened) => {
+                if !status_out.is_null() {
+                    // SAFETY: the title passes the address of its status pointer field.
+                    unsafe { status_out.write_unaligned(opened.status) };
+                }
+                if !stream_out.is_null() {
+                    // SAFETY: the title passes the address of its stream handle field.
+                    unsafe { stream_out.write_unaligned(opened.stream) };
+                }
+                0
+            }
+            Err(error) => {
+                engine().note_once(&format!("xdsp-activate-{error}"), || {
+                    format!("XDspActivate refused: {error}")
+                });
+                error.code()
+            }
+        }
+    }
+
+    pub extern "win64" fn xdsp_submit_command(
+        stream: u64,
+        command: *const u8,
+        fence_out: *mut u32,
+    ) -> u32 {
+        if command.is_null() {
+            return DspError::NullBuffer.code();
+        }
+        // SAFETY: the title passes the address of the 0x20-byte command it built on its stack.
+        let bytes = unsafe { command.cast::<[u8; dsp::COMMAND_BYTES]>().read_unaligned() };
+        let command = dsp::Command::parse(&bytes);
+        let result = dsp().stream(stream).and_then(|stream| {
+            let mut stream = dsp::lock_stream(&stream);
+            // SAFETY: the title's command names the two buffers of a pair it took from its pool, each 0x1000
+            // bytes, which holds a whole batch (at most 1024 floats).
+            unsafe { stream.run(&command) }
         });
-        0
+        let code = match result {
+            Ok(fence) => {
+                if !fence_out.is_null() {
+                    // SAFETY: the title passes the address of its 32-bit fence variable.
+                    unsafe { fence_out.write_unaligned(fence) };
+                }
+                0
+            }
+            Err(error) => {
+                engine().note_once(&format!("xdsp-submit-{error}"), || {
+                    format!("XDspSubmitCommand refused: {error}")
+                });
+                error.code()
+            }
+        };
+        engine().pump();
+        code
     }
 
-    pub extern "win64" fn xdsp_activate() -> u32 {
-        engine().activate();
-        0
+    pub extern "win64" fn xdsp_deactivate(stream: u64) -> u32 {
+        dsp().deactivate(stream).map_or_else(|e| e.code(), |()| 0)
     }
 
-    pub extern "win64" fn xdsp_submit_command(a: u64, b: u64) -> u32 {
-        let mut e = engine();
-        e.note_once("xdsp-submit", || {
-            format!("XDspSubmitCommand({a:#x}, {b:#x}): ignored, the command layout is unmeasured")
-        });
-        e.pump();
-        0
-    }
-
-    pub extern "win64" fn xdsp_deactivate() -> u32 {
-        engine().deactivate();
-        0
-    }
-
-    pub extern "win64" fn xdsp_disconnect() -> u32 {
-        0
+    pub extern "win64" fn xdsp_disconnect(connection: u64) -> u32 {
+        dsp()
+            .disconnect(connection)
+            .map_or_else(|e| e.code(), |()| 0)
     }
 }
 

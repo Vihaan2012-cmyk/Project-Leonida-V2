@@ -588,6 +588,14 @@ impl Emitter {
         self.fail_if_ne32(value)
     }
 
+    /// Fails the step when `eax` is above `value` (unsigned).
+    pub fn fail_if_above32(&mut self, value: u32) -> Res {
+        let fail = self.fail_label();
+        self.asm.cmp(eax, value as i32)?;
+        self.asm.ja(fail)?;
+        Ok(())
+    }
+
     /// Fails the step when `eax` is below `value` (unsigned).
     pub fn fail_if_below32(&mut self, value: u32) -> Res {
         let fail = self.fail_label();
