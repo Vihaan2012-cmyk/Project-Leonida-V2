@@ -300,9 +300,11 @@ unsafe extern "win64" fn open_file(
                 .map_or(E_NOTIMPL, |c| win32_error(c as u32));
         }
     };
+    let file = Arc::new(file);
+    crate::files::readtrace::opened(Arc::as_ptr(&file) as HANDLE, &text);
     let object = new_object(FileObject {
         header: header(Kind::File),
-        file: Arc::new(file),
+        file,
     });
     // SAFETY: `out` was checked.
     unsafe { hand_out(object, out) }
@@ -403,11 +405,11 @@ unsafe fn parse_request(base: *const u8) -> Result<Request, String> {
         }
         // SAFETY: checked just above.
         let file = unsafe { (*(file as *const FileObject)).file.clone() };
-        Source::File {
-            file,
-            offset: word(base, 0x28),
-            size: word(base, 0x30),
+        let (offset, size): (u64, u32) = (word(base, 0x28), word(base, 0x30));
+        if crate::files::readtrace::wanted().is_some() {
+            crate::files::readtrace::request(Arc::as_ptr(&file) as HANDLE, offset, size, options);
         }
+        Source::File { file, offset, size }
     } else {
         Source::Memory {
             address: word(base, 0x20),
