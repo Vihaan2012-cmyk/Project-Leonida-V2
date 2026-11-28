@@ -379,14 +379,44 @@ fn self_contained_chunks_decode_without_history() {
 }
 
 #[test]
-fn the_public_entry_waits_for_a_recovered_history() {
-    assert!(!super::bc6h::has_history());
+fn the_public_entry_uses_the_fitted_history() {
+    use super::bc6h_history::{ENDPOINTS, INDICES};
+    let k = (3..256)
+        .find(|&k| {
+            matches!(ENDPOINTS[k], Entry::Provisional(_))
+                && matches!(INDICES[k], Entry::Provisional(_))
+        })
+        .expect("a fully fitted entry");
+    let mut rng = Rng(99);
+    let specs: Vec<Spec> = (0..3).map(|m| random_spec(&mut rng, m * 4)).collect();
+    let mut hist = History::empty();
+    let (Entry::Provisional(e), Entry::Provisional(i)) = (ENDPOINTS[k], INDICES[k]) else {
+        unreachable!()
+    };
+    hist.endpoints[k] = Entry::Confirmed(e);
+    hist.indices[k] = Entry::Confirmed(i);
+    let preds = [
+        (Pred::History(k), Pred::History(k)),
+        (Pred::Back(1), Pred::Back(1)),
+        (Pred::Back(2), Pred::None),
+    ];
+    let packed = pack_lanes(&encode(&specs, &preds, &hist), 3);
+    let strict = DecodeOptions::default();
     assert_eq!(
-        decode_with(BcPackCodec::Bc6h, &[0; 64], 4096, &DecodeOptions::default()),
-        Err(BcPackError::Unsupported {
-            codec: BcPackCodec::Bc6h
+        decode_with(BcPackCodec::Bc6h, &packed, 48, &strict),
+        Err(BcPackError::History {
+            codec: BcPackCodec::Bc6h,
+            block: 0,
+            entry: k as u8,
+            status: HistoryStatus::Provisional,
         })
     );
+    let loose = DecodeOptions {
+        allow_provisional: true,
+    };
+    let got = decode_with(BcPackCodec::Bc6h, &packed, 48, &loose).unwrap();
+    assert_eq!(got.data, expected(&specs));
+    assert_eq!(got.provisional_blocks, 3);
 }
 
 /// Interpolation weights of the public BC6H format.
