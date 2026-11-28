@@ -38,6 +38,21 @@ pub struct Audio {
     pub output: AudioOutput,
 }
 
+/// What the game may do with files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Files {
+    /// Limits the game to its own folder (read only), Leonida's output folder and the mods and fixes folders
+    /// (read only). Turn it off only to find out whether a missing file is the reason something fails.
+    pub sandbox: bool,
+}
+
+impl Default for Files {
+    fn default() -> Self {
+        Self { sandbox: true }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct General {
@@ -50,6 +65,7 @@ pub struct General {
     pub language: String,
     pub content: Content,
     pub audio: Audio,
+    pub files: Files,
 }
 
 impl Default for General {
@@ -60,6 +76,7 @@ impl Default for General {
             language: "en".to_string(),
             content: Content::default(),
             audio: Audio::default(),
+            files: Files::default(),
         }
     }
 }
@@ -98,6 +115,11 @@ nudity = \"block\"
 [audio]
 # \"auto\" plays the game's sound on the default audio device; \"off\" never opens one.
 output = \"auto\"
+
+[files]
+# true keeps the game to its own folder (read only), the output folder, and the mods and fixes folders (read
+# only); every other path on this PC is closed to it. false lifts that, for troubleshooting only.
+sandbox = true
 "
         .to_string()
     }
@@ -155,6 +177,33 @@ output = \"loud\"
 "
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn the_file_sandbox_is_on_unless_turned_off() {
+        assert!(General::default().files.sandbox);
+        assert!(General::parse("").unwrap().files.sandbox);
+        let general = General::parse(
+            "[files]
+sandbox = false
+",
+        )
+        .unwrap();
+        assert!(!general.files.sandbox);
+        assert!(
+            General::parse(
+                "[files]
+sandbox = \"no\"
+"
+            )
+            .is_err()
+        );
+        assert!(
+            General::parse(&General::default_text())
+                .unwrap()
+                .files
+                .sandbox
         );
     }
 
