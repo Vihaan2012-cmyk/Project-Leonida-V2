@@ -6,9 +6,11 @@ use std::time::Duration;
 use super::decoder::{AudioTrackInfo, DecodeError, DecodedFrame, MovieDecoder, Plane, StreamInfo};
 use super::header::HEADER_BYTES;
 
-/// A header with the fixed part and `tracks` stereo 48 kHz descriptors (ids 0, 3, 6, ...).
+/// A header with the fixed part, the extra word of revision `n` and `tracks` stereo 48 kHz descriptors (ids 0, 3, 6,
+/// ...).
 pub fn stream_header(frames: u32, width: u32, height: u32, tracks: u32) -> Vec<u8> {
-    let mut bytes = vec![0u8; HEADER_BYTES + tracks as usize * 12];
+    let base = HEADER_BYTES + 4;
+    let mut bytes = vec![0u8; base + tracks as usize * 12];
     bytes[..4].copy_from_slice(b"KB2n");
     let size = bytes.len() as u32 - 8;
     bytes[4..8].copy_from_slice(&size.to_le_bytes());
@@ -19,7 +21,7 @@ pub fn stream_header(frames: u32, width: u32, height: u32, tracks: u32) -> Vec<u
     bytes[0x1C..0x20].copy_from_slice(&30u32.to_le_bytes());
     bytes[0x20..0x24].copy_from_slice(&1u32.to_le_bytes());
     bytes[0x28..0x2C].copy_from_slice(&tracks.to_le_bytes());
-    let rates = HEADER_BYTES + tracks as usize * 4;
+    let rates = base + tracks as usize * 4;
     let ids = rates + tracks as usize * 4;
     for t in 0..tracks as usize {
         bytes[rates + t * 4..rates + t * 4 + 2].copy_from_slice(&48000u16.to_le_bytes());
