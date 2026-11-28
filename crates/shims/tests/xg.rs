@@ -154,7 +154,7 @@ fn impossible_textures_are_typed_errors() {
         Err(LayoutError::Unsupported(_))
     ));
     assert!(matches!(
-        compute(&tex(64, 64, 1, 28, SwizzleMode(1))),
+        compute(&tex(64, 64, 1, 28, SwizzleMode(30))),
         Err(LayoutError::Unsupported(_))
     ));
     let mut volume = tex(32, 32, 2, 10, mode);
@@ -323,4 +323,21 @@ mod exports {
         assert_eq!(unsafe { suggest(&d, 0, &mut mode) }, E_INVALIDARG);
         assert_eq!(mode, 0);
     }
+}
+
+/// Small textures in the 256-byte modes, which the title asks for: tiles of 256 bytes, every level its own.
+#[test]
+fn the_256_byte_modes_pad_each_level_to_256_byte_tiles() {
+    // 32x32 RGBA8 (4 bytes per texel) in a 256-byte mode: 8x8 tiles, levels of 4096, 1024, 256, 256, 256, 256.
+    let l = compute(&tex(32, 32, 0, 28, SwizzleMode(1))).unwrap();
+    assert_eq!(l.alignment, 256);
+    assert_eq!((l.tile_width_elements, l.tile_height_elements), (8, 8));
+    assert_eq!(l.first_tail, l.mips.len() as u32, "no shared tail");
+    let sizes: Vec<u64> = l.mips.iter().map(|m| m.size).collect();
+    assert_eq!(sizes, vec![4096, 1024, 256, 256, 256, 256]);
+    assert_eq!(l.size, sizes.iter().sum::<u64>());
+    // 1-byte texels: 16x16 tiles.
+    let r8 = compute(&tex(16, 16, 1, 61, SwizzleMode(2))).unwrap();
+    assert_eq!((r8.tile_width_elements, r8.tile_height_elements), (16, 16));
+    assert_eq!(r8.size, 256);
 }

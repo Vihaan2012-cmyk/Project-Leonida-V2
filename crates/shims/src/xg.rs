@@ -26,6 +26,7 @@
 pub mod layout {
     use thiserror::Error;
 
+    pub const TILE_256: u32 = 256;
     pub const TILE_4K: u32 = 4096;
     pub const TILE_64K: u32 = 65536;
 
@@ -56,7 +57,7 @@ pub mod layout {
         pub fn tile_bytes(self) -> Result<Option<u32>, LayoutError> {
             match self.0 {
                 0 | 25 => Ok(None),
-                1 | 2 => Err(LayoutError::Unsupported("256-byte swizzle modes")),
+                1 | 2 => Ok(Some(TILE_256)),
                 3..=6 | 15..=18 => Ok(Some(TILE_4K)),
                 7..=14 | 19..=22 => Ok(Some(TILE_64K)),
                 _ => Err(LayoutError::Unsupported("variable-size swizzle modes")),
@@ -185,8 +186,12 @@ pub mod layout {
             ));
         }
         let log = element.trailing_zeros();
-        let half_bits = if tile == TILE_4K { 6 } else { 8 };
-        let max_tail = if tile == TILE_4K { 8 } else { 12 };
+        // A 256-byte tile has no mip tail: every level is padded to whole tiles of its own.
+        let (half_bits, max_tail) = match tile {
+            TILE_256 => (4, 0),
+            TILE_4K => (6, 8),
+            _ => (8, 12),
+        };
         let bw = 1u32 << (half_bits - log / 2);
         let bh = 1u32 << (half_bits - log.div_ceil(2));
         let (mw, mh) = TILE_ORIGIN[log as usize];
