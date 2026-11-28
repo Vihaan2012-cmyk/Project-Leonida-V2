@@ -166,6 +166,9 @@ pub struct Counters {
     pub refused: u64,
     /// Bytes of the game's memory left unbound for now because nothing could back them.
     pub deferred: u64,
+    /// Device-local bytes of the game's memory given back so far because the GPU reads them only through the
+    /// detiled images of textures (`AddressSpace::release_cold`).
+    pub released: u64,
 }
 
 impl Counters {
@@ -182,7 +185,7 @@ impl Counters {
         format!(
             "vram: device-local {} of {} MiB budget in use ({} MiB ours: {} targets, {} game memory, {} \
              textures); spilled to system memory {} MiB ({} targets, {} game memory, {} textures), \
-             peak {} MiB; refused {}; left unbound {} MiB",
+             peak {} MiB; refused {}; left unbound {} MiB; released by detiled textures {} MiB",
             self.used / MIB,
             self.budget / MIB,
             self.local_total() / MIB,
@@ -196,6 +199,7 @@ impl Counters {
             self.peak_spilled / MIB,
             self.refused,
             self.deferred / MIB,
+            self.released / MIB,
         )
     }
 }
@@ -232,6 +236,7 @@ pub struct Budget {
     peak_spilled: AtomicU64,
     refused: AtomicU64,
     deferred: AtomicU64,
+    released: AtomicU64,
     noting: Mutex<Noting>,
     note: RwLock<Option<NoteFn>>,
 }
@@ -268,6 +273,7 @@ impl Budget {
             peak_spilled: AtomicU64::new(0),
             refused: AtomicU64::new(0),
             deferred: AtomicU64::new(0),
+            released: AtomicU64::new(0),
             noting: Mutex::new(Noting::default()),
             note: RwLock::new(None),
         })
@@ -338,7 +344,7 @@ impl Budget {
         (0..self.types.memory_type_count).any(|i| !self.is_local(i))
     }
 
-    fn say(&self, text: String) {
+    pub(super) fn say(&self, text: String) {
         if let Some(note) = self
             .note
             .read()
@@ -413,7 +419,14 @@ impl Budget {
             peak_spilled: self.peak_spilled.load(Ordering::Relaxed),
             refused: self.refused.load(Ordering::Relaxed),
             deferred: self.deferred.load(Ordering::Relaxed),
+            released: self.released.load(Ordering::Relaxed),
         }
+    }
+
+    /// Counts `bytes` of device-local memory given back from the mirror of the game's memory because textures
+    /// detiled into their images no longer need their copy there.
+    pub(super) fn note_released(&self, bytes: u64) {
+        self.released.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Records bytes of the game's memory left unbound (positive) or bound again (negative).
