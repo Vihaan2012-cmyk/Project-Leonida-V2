@@ -137,16 +137,16 @@ fn copy_names(count: u32, list: *mut vk::ExtensionProperties) -> Vec<String> {
 }
 
 impl Api {
-    /// The instance extensions frame generation needs. Asks NGX before it is initialised.
+    /// The instance extensions frame generation needs beyond `RequiredExtensions`. Asks NGX before it is initialised.
+    /// Empty when the driver exports no such query: NVIDIA's driver library (616.64) exports only
+    /// `NVSDK_NGX_VULKAN_RequiredExtensions`, whose list was enough to create and run frame generation on an RTX 4060.
     pub fn frame_generation_instance_extensions(
         &self,
         discovery: &Discovery,
     ) -> Result<Vec<String>, NgxError> {
-        let function = self.get_instance_extension_requirements.ok_or_else(|| {
-            NgxError::Runtime(
-                "NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements is not exported".into(),
-            )
-        })?;
+        let Some(function) = self.get_instance_extension_requirements else {
+            return Ok(Vec::new());
+        };
         let info = discovery.info();
         let (mut count, mut list) = (0u32, std::ptr::null_mut());
         let _turn = super::turn::ngx_turn();
@@ -168,11 +168,9 @@ impl Api {
         instance: vk::Instance,
         physical: vk::PhysicalDevice,
     ) -> Result<Vec<String>, NgxError> {
-        let function = self.get_device_extension_requirements.ok_or_else(|| {
-            NgxError::Runtime(
-                "NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements is not exported".into(),
-            )
-        })?;
+        let Some(function) = self.get_device_extension_requirements else {
+            return Ok(Vec::new());
+        };
         let info = discovery.info();
         let (mut count, mut list) = (0u32, std::ptr::null_mut());
         let _turn = super::turn::ngx_turn();
@@ -245,6 +243,15 @@ fn check_library(path: &Path) -> bool {
 pub struct Located {
     pub path: PathBuf,
     pub source: Source,
+}
+
+/// Where [`locate`] looked, in words (the environment variable is `LEONIDA_DLSSG_DLL` here).
+pub fn describe(source: Source) -> &'static str {
+    match source {
+        Source::Environment => "the LEONIDA_DLSSG_DLL variable",
+        Source::Configured => "the folder of the dlss_path setting",
+        other => other.describe(),
+    }
 }
 
 /// Looks for `nvngx_dlssg.dll`: the `LEONIDA_DLSSG_DLL` variable (a file), next to the player's `nvngx_dlss.dll`
