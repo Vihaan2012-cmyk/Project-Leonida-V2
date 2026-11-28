@@ -474,6 +474,7 @@ impl Presentation {
         config: PresentConfig,
         clock: Box<dyn Clock>,
     ) -> Presentation {
+        let sync = policy.pacing(0).sync;
         Presentation {
             events: FrameEvents::new(clock),
             backend: Arc::new(Mutex::new(backend)),
@@ -481,7 +482,7 @@ impl Presentation {
             generation: Mutex::new(None),
             policy,
             config: RwLock::new(config),
-            sync: Mutex::new(SyncMode::Vsync),
+            sync: Mutex::new(sync),
             topology: Mutex::new(None),
             window: None,
             notes: Box::new(|_| {}),
@@ -1191,6 +1192,74 @@ mod tests {
         assert_eq!((second.hresult, second.token), (S_OK, 2));
         p.present_planes(&[plane(2, 0)], 0.0);
         assert_eq!(log.lock().unwrap()[0].2, SyncMode::Immediate);
+    }
+
+    #[derive(Clone, Default)]
+    struct StillClock(Arc<std::sync::atomic::AtomicU64>);
+
+    impl Clock for StillClock {
+        fn now_us(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn with_limit(limit: crate::pacing::FrameLimit) -> (Presentation, Log) {
+        let log: Log = Arc::default();
+        let pacer = Arc::new(crate::pacing::Pacer::new(limit));
+        let p = Presentation::with_clock(
+            Box::new(Recorder {
+                frames: log.clone(),
+                hdr: false,
+                fail: None,
+            }),
+            Arc::new(crate::assembly::frames::PacerPolicy::new(pacer)),
+            PresentConfig::default(),
+            Box::new(StillClock::default()),
+        );
+        (p, log)
+    }
+
+    #[test]
+    fn uncapped_frame_events_follow_each_present_without_waiting() {
+        let (p, log) = with_limit(crate::pacing::FrameLimit::Uncapped);
+        p.set_frame_interval_x(0, FRAME_INTERVAL_60_HZ, 3, 0);
+        p.schedule_frame_event_x(FRAME_EVENT_ORIGIN, 0, 0);
+        for expected in 1..=200u64 {
+            let wait = p.wait_frame_event_x(FRAME_EVENT_ORIGIN, 0, 0);
+            assert_eq!((wait.hresult, wait.token), (S_OK, expected));
+            assert_eq!(p.present_planes(&[plane(wait.token, 0)], 0.0), S_OK);
+        }
+        assert_eq!(p.events().now_us(), 0, "no time passed between the frames");
+        let frames = log.lock().unwrap();
+        assert_eq!(frames.len(), 200);
+        assert!(frames.iter().all(|f| f.2 == SyncMode::Immediate));
+    }
+
+    #[test]
+    fn the_console_limit_holds_the_second_frame_event_back() {
+        let (p, _) = with_limit(crate::pacing::FrameLimit::Console);
+        p.set_frame_interval_x(0, FRAME_INTERVAL_60_HZ, 1, 0);
+        p.schedule_frame_event_x(FRAME_EVENT_ORIGIN, 0, 0);
+        let first = p.wait_frame_event_x(FRAME_EVENT_ORIGIN, 0, 0);
+        assert_eq!(first.hresult, S_OK);
+        p.present_planes(&[plane(first.token, 0)], 0.0);
+        assert_eq!(
+            p.wait_frame_event_x(FRAME_EVENT_ORIGIN, 0, 0).hresult,
+            S_FALSE
+        );
+    }
+
+    #[test]
+    fn a_present_before_the_title_registers_an_interval_already_uses_the_limits_mode() {
+        for (limit, mode) in [
+            (crate::pacing::FrameLimit::Uncapped, SyncMode::Immediate),
+            (crate::pacing::FrameLimit::VSync, SyncMode::Vsync),
+            (crate::pacing::FrameLimit::Cap(90.0), SyncMode::Mailbox),
+        ] {
+            let (p, log) = with_limit(limit);
+            assert_eq!(p.present_planes(&[plane(0, 0)], 0.0), S_OK);
+            assert_eq!(log.lock().unwrap()[0].2, mode, "{limit:?}");
+        }
     }
 
     #[test]
