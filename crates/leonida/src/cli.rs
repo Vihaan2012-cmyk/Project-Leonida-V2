@@ -413,6 +413,9 @@ pub struct VerifyArgs {
     /// Only containers whose name contains this text.
     #[arg(long)]
     pub name: Option<String>,
+    /// Work on every Nth container of those selected.
+    #[arg(long, default_value_t = 1)]
+    pub every: usize,
     /// Write each translated program into this folder.
     #[arg(long)]
     pub save_spirv: Option<PathBuf>,
