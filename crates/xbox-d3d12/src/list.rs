@@ -1046,12 +1046,37 @@ unsafe extern "win64" fn l_set_scratch_buffer(
     );
 }
 
-unsafe extern "win64" fn l_write_value(this: *mut c_void, a: usize, b: usize, c: usize, d: usize) {
-    unrecorded(this, 71, "WriteValueX", [a, b, c, d]);
+/// Slot 71, `(address, value, 0, 0)`: the title's two sites (rvas 0x04ed4670 at the start of each frame and 0x0248ffd0)
+/// write a frame number or marker into an `u32` table of 3 frames by 18 words that it allocates itself (rva
+/// 0x05cabb50); nothing in the executable reads the table back, so it is a GPU progress breadcrumb that no wait
+/// depends on. It records nothing.
+unsafe extern "win64" fn l_write_value(
+    _this: *mut c_void,
+    _address: u64,
+    _value: u64,
+    _c: u64,
+    _d: u64,
+) -> u32 {
+    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !NOTED.swap(true, Ordering::Relaxed) {
+        com::note(
+            "ID3D12GraphicsCommandList slot 71 (address, value): a progress breadcrumb nothing reads, ignored",
+        );
+    }
+    S_OK
 }
 
-unsafe extern "win64" fn l_wait_value(this: *mut c_void, a: usize, b: usize, c: usize, d: usize) {
-    unrecorded(this, 73, "WaitValueX", [a, b, c, d]);
+/// Slot 73: no call site on a command list was found in the executable (the `(1, 0)` and `(address, ..)` shapes at
+/// this offset belong to other interfaces), so no wait on a written value exists. It records nothing.
+unsafe extern "win64" fn l_wait_value(
+    _this: *mut c_void,
+    _a: u64,
+    _b: u64,
+    _c: u64,
+    _d: u64,
+) -> u32 {
+    unmeasured_call(73, "no call site measured");
+    S_OK
 }
 
 /// Console slot 146: the enhanced `Barrier(num_groups, groups)`.
