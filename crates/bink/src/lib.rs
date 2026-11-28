@@ -1,5 +1,6 @@
 //! Pure-Rust decoder for Bink 2 movies (`KB2` streams) and their Bink audio tracks.
 
+mod audio;
 mod bits;
 mod container;
 mod error;
@@ -9,6 +10,7 @@ mod vlc;
 
 use std::sync::Arc;
 
+pub use audio::AudioDecoder;
 pub use container::{AudioTrack, Container, Header};
 pub use error::{Error, Result};
 pub use video::{Frame, Plane};
@@ -21,6 +23,8 @@ pub struct Movie {
     next: u32,
     current: Option<Frame>,
     audio: Vec<Vec<f32>>,
+    audio_decoders: Vec<Option<AudioDecoder>>,
+    audio_failures: u32,
 }
 
 impl Movie {
@@ -28,17 +32,30 @@ impl Movie {
         let container = Container::parse(data)?;
         let video = VideoDecoder::new(&container.header)?;
         let tracks = container.header.audio.len();
+        let audio_decoders = container
+            .header
+            .audio
+            .iter()
+            .map(|t| AudioDecoder::new(t).ok())
+            .collect();
         Ok(Movie {
             container,
             video,
             next: 0,
             current: None,
             audio: vec![Vec::new(); tracks],
+            audio_decoders,
+            audio_failures: 0,
         })
     }
 
     pub fn header(&self) -> &Header {
         &self.container.header
+    }
+
+    /// How many track packets were replaced by silence because they could not be decoded.
+    pub fn audio_failures(&self) -> u32 {
+        self.audio_failures
     }
 
     /// Decodes the next frame; after the last one it reports `NoSuchFrame`.
@@ -52,6 +69,8 @@ impl Movie {
         let frame = self
             .video
             .decode(index, packets.video, key, self.current.as_ref())?;
+        self.audio_failures +=
+            audio::decode_frame(&mut self.audio_decoders, &packets.audio, &mut self.audio);
         self.next += 1;
         Ok(self.current.insert(frame))
     }
@@ -63,14 +82,18 @@ impl Movie {
         }
         self.next = self.container.key_at_or_before(frame);
         self.current = None;
+        self.audio_decoders
+            .iter_mut()
+            .flatten()
+            .for_each(AudioDecoder::reset);
         while self.next <= frame {
             self.decode_next()?;
         }
         Ok(())
     }
 
-    /// Interleaved samples carried by the last decoded frame for `track`. Audio decoding is not implemented, so
-    /// the result is always empty.
+    /// Interleaved samples in `-1..1` carried by the last decoded frame for `track`; empty when the frame has none,
+    /// and taken: a second call gives nothing until the next frame is decoded.
     pub fn audio(&mut self, track: usize) -> Vec<f32> {
         self.audio
             .get_mut(track)
