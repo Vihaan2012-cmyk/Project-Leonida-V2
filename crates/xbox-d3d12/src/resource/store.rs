@@ -585,10 +585,13 @@ impl Resources {
             .count()
     }
 
-    /// Gives the device-local copy of detiled textures' memory back (`AddressSpace::release_cold`). Call it between
-    /// submissions, with the GPU idle.
+    /// Gives the device-local copy of detiled textures' memory back (`AddressSpace::release_cold`), and moves the
+    /// game's memory out of device-local memory while the mirror is past a budget that shrank
+    /// (`AddressSpace::fit_budget`). Call it between submissions, with the GPU idle.
     pub fn release_detiled(&self) -> u64 {
-        self.space().release_cold().unwrap_or(0)
+        let mut space = self.space();
+        let cold = space.release_cold().unwrap_or(0);
+        cold + space.fit_budget().unwrap_or(0)
     }
 
     /// Says the GPU reads or writes `address..address + len` through the window: a view named it, a submission

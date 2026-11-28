@@ -431,3 +431,64 @@ fn a_spilled_run_over_many_file_section_views_works() {
         h.budget.set_mirror_limit(None);
     }
 }
+
+#[test]
+fn a_mirror_past_a_budget_that_shrank_moves_to_system_memory_keeping_what_the_gpu_wrote() {
+    for gpu in &TestGpu::open_all() {
+        let Some(mut space) = spilling(gpu) else {
+            continue;
+        };
+        let h = gpu.handles.clone();
+        h.budget.set_mirror_limit(Some(8 * MIB));
+        let kernel = Kernel::new(gpu);
+        let regions: Vec<Region> = (0..4)
+            .map(|_| Region::new_in(RUN, true, 5 << 30, 1 << 26, 28))
+            .collect();
+        for region in &regions {
+            space
+                .map_host(region.address, RUN, SyncPolicy::WriteWatch)
+                .unwrap();
+        }
+        assert_eq!(mirror_local(&h), 4 * RUN, "{}", gpu.name());
+        assert_eq!(space.spilled_bytes(), 0);
+        for (n, region) in regions.iter().enumerate() {
+            region.write(0, 10 + n as u32);
+            let jobs = [(region.address, region.address + 2 * PAGE)];
+            kernel.run_tracked(gpu, &mut space, &jobs);
+        }
+
+        h.budget.set_mirror_limit(Some(2 * RUN));
+        let freed = space.fit_budget().unwrap();
+        assert!(freed >= 2 * RUN, "{}: freed {freed}", gpu.name());
+        space.reclaim();
+        assert!(mirror_local(&h) <= 2 * RUN, "{}", gpu.name());
+        assert!(space.spilled_bytes() >= 2 * RUN);
+        assert_eq!(space.fit_budget().unwrap(), 0, "within the cap now");
+        for (n, region) in regions.iter().enumerate() {
+            assert_eq!(
+                region.read(2 * PAGE / 4),
+                11 + n as u32,
+                "run {n} kept the GPU's result"
+            );
+        }
+
+        for (n, region) in regions.iter().enumerate() {
+            region.write(0, 100 + n as u32);
+            let jobs = [(region.address, region.address + 2 * PAGE)];
+            kernel.run_tracked(gpu, &mut space, &jobs);
+            space.read_back(region.address, RUN).unwrap();
+            assert_eq!(
+                region.read(2 * PAGE / 4),
+                101 + n as u32,
+                "run {n} after the move"
+            );
+        }
+
+        for region in &regions {
+            space.unmap(region.address, RUN).unwrap();
+        }
+        space.reclaim();
+        kernel.finish(gpu);
+        h.budget.set_mirror_limit(None);
+    }
+}

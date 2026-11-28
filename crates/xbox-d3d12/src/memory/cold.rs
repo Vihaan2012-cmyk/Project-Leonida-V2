@@ -32,6 +32,12 @@ const RELEASE_PER_CALL: u64 = 512 << 20;
 /// Memory objects kept free of what releasing makes.
 const ALLOCATION_HEADROOM: u64 = 256;
 
+/// The most device-local memory one `fit_budget` call gives back, so the copies back of a frame stay bounded.
+const DEMOTE_PER_CALL: u64 = 512 << 20;
+
+/// A memory object `fit_budget` may move: whether it is hot, its highest address, its id, and its ranges.
+type Candidate = (bool, u64, u64, Vec<(u64, u64)>);
+
 pub(super) struct Temperature {
     cold: RangeSet,
     hot: RangeSet,
@@ -421,6 +427,78 @@ impl AddressSpace {
             return Ok(0);
         }
         Ok(self.spill_islands(&[(lo, hi)])?.freed)
+    }
+
+    /// Moves mirrored runs to system memory while the mirror holds more device-local memory than its cap. The cap
+    /// follows the budget, which shrinks when other programs take video memory after runs were placed; a mirror
+    /// past it makes the driver page device-local memory out to system memory behind the layer's back, which a boot
+    /// showed as 10 GB of system memory taken in ten seconds. Runs the resource layer has not called hot go first,
+    /// highest address first, at most `DEMOTE_PER_CALL` a call. What the GPU wrote is copied back first. They are
+    /// not pinned, so `promote_spilled` mirrors them again once there is room. Call it between submissions, with
+    /// the GPU idle. Returns the device-local bytes freed.
+    pub fn fit_budget(&mut self) -> Result<u64, MemoryError> {
+        if !self.spill || self.backing != Backing::Mirrored {
+            return Ok(0);
+        }
+        let taken = self.h.budget.counters().local[Class::Mirror as usize];
+        let cap = self.h.budget.mirror_cap();
+        if taken <= cap {
+            return Ok(0);
+        }
+        let mut over = taken - cap;
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for (&id, memory) in &self.memories {
+            if memory.is_spilled() || memory.mirror.is_none() {
+                continue;
+            }
+            let ranges: Vec<(u64, u64)> = self
+                .extents
+                .0
+                .iter()
+                .filter(|(_, e)| e.memory == id)
+                .map(|(&va, e)| (va, va + e.len))
+                .filter(|&(va, _)| va >= LOW_LIMIT)
+                .collect();
+            let Some(top) = ranges.iter().map(|r| r.0).max() else {
+                continue;
+            };
+            let hot = ranges.iter().any(|&(a, b)| self.temp.is_hot(a, b));
+            candidates.push((hot, top, id, ranges));
+        }
+        candidates.sort_by_key(|c| (c.0, std::cmp::Reverse(c.1)));
+        let mut freed = 0;
+        for (_, _, id, ranges) in candidates {
+            if over == 0 || freed >= DEMOTE_PER_CALL {
+                break;
+            }
+            if self.memories.len() as u64 + ALLOCATION_HEADROOM
+                > u64::from(self.support.max_allocation_count)
+            {
+                break;
+            }
+            let done = self.repiece(id, &ranges, false)?;
+            let moved: Vec<u64> = self
+                .extents
+                .0
+                .iter()
+                .filter(|&(&va, e)| ranges.iter().any(|&(a, b)| va < b && va + e.len > a))
+                .map(|(_, e)| e.memory)
+                .collect();
+            for memory in moved {
+                if let Some(m) = self.memories.get_mut(&memory) {
+                    m.pinned = false;
+                }
+            }
+            freed += done.freed;
+            over = over.saturating_sub(done.freed);
+        }
+        if freed > 0 {
+            self.h.budget.say(format!(
+                "vram: the budget shrank below what the mirror holds: {} MiB of the game's memory moved to system memory",
+                freed >> 20
+            ));
+        }
+        Ok(freed)
     }
 
     fn spill_islands(&mut self, islands: &[(u64, u64)]) -> Result<Repieced, MemoryError> {
