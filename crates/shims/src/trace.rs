@@ -15,7 +15,11 @@ mod crash;
 #[cfg(windows)]
 pub mod probes;
 #[cfg(windows)]
+mod screen;
+#[cfg(windows)]
 mod threads;
+#[cfg(windows)]
+pub mod watch;
 
 const CAPACITY: usize = 1 << 14;
 
@@ -517,6 +521,7 @@ pub fn watch_crashes(folder: PathBuf, base: usize, size: usize) {
             .unwrap_or(false);
         if first {
             crash::install();
+            screen::schedule(dumps.clone());
             threads::schedule(dumps);
         }
     }

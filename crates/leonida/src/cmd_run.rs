@@ -172,6 +172,11 @@ fn run(path: &Path, args: &RunArgs, plan: &RuntimePlan) -> Result<ExitCode> {
                 let armed = unsafe { shims::trace::probes::arm(module.base(), &probes) };
                 println!("trace: {armed} pass probes set");
             }
+            let watched = shims::trace::watch::sites_from_env();
+            if !watched.is_empty() {
+                shims::trace::watch::start(module.base(), &watched);
+                println!("trace: {} write watches set", watched.len());
+            }
         }
         let folder = boot.clone();
         std::thread::spawn(move || {

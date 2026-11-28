@@ -725,6 +725,26 @@ impl Presentation {
         self.present_planes_with(&list, threshold, extra.as_ref())
     }
 
+    /// Notes the first `PresentX` and then every 600th: how many planes, whether the first one's image was found,
+    /// and what came back. Shows whether frames reach the window at all.
+    fn note_progress(&self, planes: &[Plane], result: i32) {
+        static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if call == 1 || call.is_multiple_of(600) {
+            let first = planes.first().map_or("no plane", |p| {
+                if p.source.is_some() {
+                    "its image found"
+                } else {
+                    "its image not found"
+                }
+            });
+            (self.notes)(&format!(
+                "PresentX call {call}: {} plane(s), the first with {first}; returned {result:#x}",
+                planes.len()
+            ));
+        }
+    }
+
     /// What the upscaler dispatch of this frame named, as images; drained even when frame generation is off.
     fn resolve_generation_inputs(&self, resolver: &dyn ResourceResolver) -> Option<ResolvedInputs> {
         let inputs = upscale::framegen::take_inputs()?;
@@ -747,6 +767,17 @@ impl Presentation {
 
     /// `PresentX` on resolved planes with the depth and motion vectors of the frame, when the game described them.
     pub fn present_planes_with(
+        &self,
+        planes: &[Plane],
+        immediate_threshold: f32,
+        inputs: Option<&ResolvedInputs>,
+    ) -> i32 {
+        let result = self.present_checked(planes, immediate_threshold, inputs);
+        self.note_progress(planes, result);
+        result
+    }
+
+    fn present_checked(
         &self,
         planes: &[Plane],
         immediate_threshold: f32,

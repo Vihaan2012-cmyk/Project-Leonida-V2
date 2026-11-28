@@ -1,4 +1,4 @@
-//! `LEONIDA_PASS_AT=<rva,...>`: notes the first `HITS` times execution reaches each listed image offset, with
+//! `LEONIDA_PASS_AT=<rva,...>`: notes the first `HITS` times (or `LEONIDA_PASS_HITS`) execution reaches each listed image offset, with
 //! the thread, the argument registers (and the text any of them points at) and the caller, and lets it carry on.
 //! An `int3` sits on each site; when it is reached the original byte goes back, the instruction runs one step,
 //! and the `int3` is put back. Threads passing in that one step go unnoted. For telling which of several paths a
@@ -20,8 +20,18 @@ use super::{image_offset, note};
 const BREAKPOINT: u32 = 0x8000_0003;
 const SINGLE_STEP: u32 = 0x8000_0004;
 const TRAP_FLAG: u32 = 0x100;
-/// How many times each site is noted before its `int3` stays off.
+/// How many times each site is noted before its `int3` stays off, unless `LEONIDA_PASS_HITS` says otherwise.
 const HITS: u32 = 16;
+
+fn hits() -> u32 {
+    static HITS_SET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *HITS_SET.get_or_init(|| {
+        std::env::var("LEONIDA_PASS_HITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(HITS)
+    })
+}
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 
 /// Each armed site's address, its original byte, and how often it has been reached.
@@ -249,7 +259,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the site's own byte, put back so the instruction can run.
     unsafe { poke(at, entry.0) };
     drop(table);
-    if count < HITS {
+    if count < hits() {
         STEPPING.with(|s| s.set(at));
         context.EFlags |= TRAP_FLAG;
     }
