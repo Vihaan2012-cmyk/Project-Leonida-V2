@@ -86,6 +86,20 @@ const HOST_PREFIXES: &[&str] = &[
     "msvcp140",
 ];
 
+/// The Windows libraries an image's imports will be resolved from, by lower-case name and without repeats: the
+/// ones the allow-list names that the offline policy does not block. Console libraries and anything else, such as
+/// the copies of Microsoft libraries in the game folder, are never among them.
+pub fn system_libraries<'a>(dlls: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for dll in dlls {
+        let name = lower(dll);
+        if host_allowed(&name) && offline::import(&name, None).is_none() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 fn lower(dll: &str) -> String {
     let name = dll
         .rsplit(['/', '\\'])

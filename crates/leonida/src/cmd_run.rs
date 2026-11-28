@@ -21,6 +21,8 @@ pub fn run_command(args: &RunArgs) -> Result<ExitCode> {
             "this would start the game. Add --start-the-game if you mean to; --dry-run only reads its imports."
         );
     }
+    #[cfg(windows)]
+    runtime::protect_library_search();
     let settings = runtime::load_settings(&args.config, !args.dry_run)?;
     let given = args
         .game
@@ -43,6 +45,14 @@ pub fn run_command(args: &RunArgs) -> Result<ExitCode> {
     let bytes = map_file(&file).context("mapping the file")?;
     println!("{}", runtime::describe_mouse_patch(&plan, &bytes));
     let image = Image::parse(&bytes)?;
+    #[cfg(windows)]
+    {
+        let imports = image.imports();
+        match runtime::check_system_libraries(imports.iter().map(|dll| dll.name.as_str())) {
+            Ok(count) => println!("system libraries: {count} found in the Windows system folder"),
+            Err(error) => println!("system libraries: {error}"),
+        }
+    }
     let binder = Binder::new(&[]);
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut gaps: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
@@ -101,6 +111,14 @@ fn run(path: &Path, args: &RunArgs, plan: &RuntimePlan) -> Result<ExitCode> {
     runtime::print_plan(plan);
     runtime::configure(plan)?;
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    #[cfg(windows)]
+    {
+        let image = Image::parse(&bytes)?;
+        let imports = image.imports();
+        runtime::check_system_libraries(imports.iter().map(|dll| dll.name.as_str()))
+            .map_err(|error| anyhow!("{error}"))?;
+        shims::loader::set_main_path(path.to_path_buf());
+    }
     let mut binder = Binder::new(&[]);
     if args.trace {
         binder = binder.traced();

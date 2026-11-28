@@ -111,6 +111,20 @@ mod imp;
 #[cfg(windows)]
 pub use imp::read_location;
 
+/// Opens a file the game named for reading, through the same mapping and sandbox as its own file calls.
+pub fn open_read(text: &str) -> std::io::Result<std::fs::File> {
+    #[cfg(windows)]
+    {
+        let path = imp::read_location(text)
+            .map_err(|code| std::io::Error::from_raw_os_error(code as i32))?;
+        std::fs::File::open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::File::open(text)
+    }
+}
+
 pub fn shims() -> Vec<Shim> {
     #[cfg(windows)]
     {
