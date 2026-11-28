@@ -13,6 +13,7 @@ use shader_container::{
 
 use crate::cli::{DisasmArgs, ReportArgs, ScanArgs};
 use crate::game::resolve_game;
+use shader_ir::Pattern;
 use shader_store::translate::{Built, build, build_first_half};
 
 pub(crate) fn with_archive<T>(
@@ -153,9 +154,10 @@ struct Report {
     mesh_entries: usize,
     first_halves: usize,
     geometry_entries: usize,
-    narrow: usize,
-    approximate: BTreeMap<&'static str, usize>,
-    approximate_shaders: usize,
+    narrow_by_stage: [usize; 3],
+    approximate: BTreeMap<&'static str, [usize; 3]>,
+    approximate_shaders: [usize; 3],
+    patterns: BTreeMap<Pattern, [usize; 3]>,
     instructions: usize,
     unsupported: usize,
     missing: BTreeMap<String, (usize, usize, String, String)>,
@@ -180,13 +182,8 @@ impl Report {
         self.shaders += 1;
         self.wave64 += usize::from(wave64);
         let coverage = shader_ir::coverage(code, wave64);
-        if wave64 && matches!(stage, Some(Stage::Pixel | Stage::Vertex | Stage::Geometry)) {
-            self.narrow += 1;
-            let hazards = shader_ir::upper_lane_hazards(code);
-            self.approximate_shaders += usize::from(!hazards.is_empty());
-            for hazard in hazards {
-                *self.approximate.entry(hazard.describe()).or_default() += 1;
-            }
+        if wave64 {
+            self.count_narrow(stage, code);
         }
         self.instructions += coverage.instructions;
         self.unsupported += coverage.unsupported.len();
@@ -226,6 +223,24 @@ impl Report {
         Some(())
     }
 
+    fn count_narrow(&mut self, stage: Option<Stage>, code: &[u8]) {
+        let slot = match stage {
+            Some(Stage::Pixel) => 0,
+            Some(Stage::Vertex) => 1,
+            Some(Stage::Geometry) => 2,
+            _ => return,
+        };
+        self.narrow_by_stage[slot] += 1;
+        let hazards = shader_ir::upper_lane_hazards(code);
+        self.approximate_shaders[slot] += usize::from(!hazards.is_empty());
+        for hazard in hazards {
+            self.approximate.entry(hazard.describe()).or_default()[slot] += 1;
+        }
+        for pattern in shader_ir::lane_patterns(code) {
+            self.patterns.entry(pattern).or_default()[slot] += 1;
+        }
+    }
+
     /// The first half of a merged vertex-and-geometry shader, the extra program a vertex shader carries.
     fn add_first_half(&mut self, blob: &[u8], found: Option<&Interface>) {
         let Ok(fssm) = Fssm::parse(blob) else {
@@ -238,6 +253,9 @@ impl Report {
         let Some(code) = blob.get(start..end) else {
             return;
         };
+        if wave64 {
+            self.count_narrow(Some(Stage::Vertex), code);
+        }
         let result = shader_ir::lift(code, wave64)
             .map_err(|e| e.to_string())
             .and_then(|function| build_first_half(&fssm, found, &function));
@@ -290,12 +308,22 @@ impl Report {
         for (error, count) in &self.lift_errors {
             println!("  {count} stopped at: {error}");
         }
+        let [np, nv, ng] = self.narrow_by_stage;
+        let [ap, av, ag] = self.approximate_shaders;
         println!(
-            "64-lane pixel, vertex and geometry shaders, which run 32 at a time: {}, of which {} name lanes 32-63 and so carry an empty upper half",
-            self.narrow, self.approximate_shaders
+            "64-lane graphics programs, which run 32 lanes wide (pixel / vertex including merged first halves / geometry): {np} / {nv} / {ng}; of which name lanes 32-63 by number: {ap} / {av} / {ag}"
         );
-        for (reason, count) in &self.approximate {
-            println!("  {count} {reason}");
+        for (reason, [p, v, g]) in &self.approximate {
+            println!("  {p} / {v} / {g} {reason}");
+        }
+        println!("lane-mask patterns in those programs (pixel / vertex / geometry):");
+        for (pattern, [p, v, g]) in &self.patterns {
+            let kind = if pattern.needs_upper_lanes() {
+                "needs upper lanes"
+            } else {
+                "empty upper half is enough"
+            };
+            println!("  {p} / {v} / {g} {} [{kind}]", pattern.describe());
         }
         let mut missing: Vec<_> = self.missing.iter().collect();
         missing.sort_by(|a, b| (b.1.0, b.1.1).cmp(&(a.1.0, a.1.1)).then(a.0.cmp(b.0)));
