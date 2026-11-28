@@ -25,8 +25,8 @@
 //! is zero nothing is flagged, and an overlay that itself animates is warped with the scene. `hud_threshold` is the
 //! largest colour step in encoded values that counts as "the same"; 0 turns the test off.
 //!
-//! Optional DLSS frame generation is not offered: NVIDIA ships it through Streamline's swap-chain proxy, which cannot
-//! be driven from public documentation alone and is not loaded here.
+//! Optional DLSS frame generation (`crate::dlss::dlssg`) is NVIDIA's feature through NGX on Vulkan, which the
+//! presenter drives instead of these passes when the settings choose it and the GPU can run it.
 
 use std::time::Duration;
 

@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Result, anyhow, bail};
-use config::{AspectMode, Config, FrameRate, Graphics, Nudity, Upscaler, WindowMode};
+use config::{
+    AspectMode, Config, FrameGenerationMethod, FrameRate, Graphics, Nudity, Upscaler, WindowMode,
+};
 use enhancements::widescreen;
 use shims::audio::OutputMode;
 use shims::gameinput::InputConfig;
@@ -33,6 +35,7 @@ pub struct RuntimePlan {
     /// The player's own `nvngx_dlss.dll` (upscaling.toml); DLSS looks in NVIDIA's folders when this is unset.
     pub dlss_path: Option<PathBuf>,
     pub frame_generation: bool,
+    pub frame_generation_method: FrameGenerationMethod,
     pub widescreen: widescreen::Config,
     pub input: InputConfig,
     /// Bindings in input.toml that cannot be carried out, each with the reason.
@@ -102,6 +105,7 @@ impl RuntimePlan {
             upscaler: settings.graphics.upscaler,
             dlss_path: settings.upscaling.dlss_path.clone(),
             frame_generation: settings.graphics.frame_generation,
+            frame_generation_method: settings.graphics.frame_generation_method,
             widescreen: widescreen_config(&settings.graphics),
             input,
             input_skipped,
@@ -183,10 +187,10 @@ impl RuntimePlan {
     }
 
     fn describe_generation(&self) -> &'static str {
-        if self.frame_generation {
-            ", frame generation on"
-        } else {
-            ""
+        match (self.frame_generation, self.frame_generation_method) {
+            (false, _) => "",
+            (true, FrameGenerationMethod::Leonida) => ", frame generation on",
+            (true, FrameGenerationMethod::Dlss) => ", frame generation on (DLSS)",
         }
     }
 
@@ -389,6 +393,27 @@ mod tests {
         assert_eq!(native.widescreen.fov_scale, Some(1.2));
         let stretch = plan(&args(), &graphics("aspect_mode = \"stretch\"")).unwrap();
         assert_eq!(stretch.widescreen, widescreen::Config::default());
+    }
+
+    #[test]
+    fn the_frame_generation_method_follows_the_settings_and_defaults_to_leonida_s_own() {
+        let default = plan(&args(), &Settings::default()).unwrap();
+        assert_eq!(
+            default.frame_generation_method,
+            FrameGenerationMethod::Leonida
+        );
+        let settings = graphics(
+            "upscaler = \"temporal\"
+frame_generation = true
+frame_generation_method = \"dlss\"",
+        );
+        let plan = plan(&args(), &settings).unwrap();
+        assert_eq!(plan.frame_generation_method, FrameGenerationMethod::Dlss);
+        let text = plan.summary().join(
+            "
+",
+        );
+        assert!(text.contains("frame generation on (DLSS)"), "{text}");
     }
 
     #[test]

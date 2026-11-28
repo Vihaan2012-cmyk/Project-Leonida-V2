@@ -14,8 +14,8 @@ use ash::vk;
 use super::names;
 use super::params::{self, CreateParams, EvalOptions, Resources};
 use super::support::Capabilities;
-use crate::dlss::lock::ngx_lock;
 use crate::dlss::ffi;
+use crate::dlss::lock::ngx_lock;
 use crate::dlss::modes::DlssOptions;
 use crate::dlss::ngx::{Api, Ngx, NgxError, Parameters, VkInit};
 
