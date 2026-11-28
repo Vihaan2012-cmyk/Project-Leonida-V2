@@ -1173,6 +1173,8 @@ mod bench;
 mod budget_tests;
 pub mod hooks;
 #[cfg(test)]
+mod probe;
+#[cfg(test)]
 mod spill_tests;
 #[cfg(test)]
 mod sync_tests;
