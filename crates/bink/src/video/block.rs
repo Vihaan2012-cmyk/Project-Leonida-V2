@@ -7,7 +7,6 @@ use crate::vlc::Codebook;
 pub struct Codes {
     pub ac1: Codebook,
     pub ac2: Codebook,
-    #[allow(dead_code, reason = "kept for inter frames, which are not decoded yet")]
     pub mv: Codebook,
 }
 
@@ -21,11 +20,11 @@ impl Codes {
     }
 }
 
-/// Run of ones ended by a zero, at most 11 ones; a 12th bit is consumed either way.
+/// Run of ones ended by a zero; a run of 12 ones is complete without a terminating zero.
 #[inline]
 fn prefix(r: &mut BitReader) -> u32 {
-    let ones = (!r.peek(11)).trailing_zeros().min(11);
-    r.skip(ones + 1);
+    let ones = (!r.peek(12)).trailing_zeros().min(12);
+    r.skip(if ones == 12 { 12 } else { ones + 1 });
     ones
 }
 
@@ -50,6 +49,65 @@ pub fn read_level(r: &mut BitReader) -> i32 {
     let p = prefix(r) + 1;
     let v = magnitude(r, p);
     if r.read_bool() { -v } else { v }
+}
+
+/// Count of zero bits before a one, at most `max`; a run of `max` zeros stops without a terminating one.
+pub fn read_zeros(r: &mut BitReader, max: u32) -> u32 {
+    let mut count = 0;
+    while count < max {
+        if r.read_bool() {
+            return count;
+        }
+        count += 1;
+    }
+    count
+}
+
+/// One motion vector component: symbols 0..=7 are themselves, 8..=14 are minus 7..=1, 15 escapes to a longer code
+/// whose low bit is the sign.
+fn read_mv_component(r: &mut BitReader, codes: &Codes) -> Option<i32> {
+    let symbol = codes.mv.read(r)? as i32;
+    Some(match symbol {
+        0..=7 => symbol,
+        8..=14 => symbol - 15,
+        _ => {
+            let bits = read_zeros(r, 12) + 4;
+            let v = (r.read(bits) + (1 << bits) - 1) as i32;
+            if v & 1 != 0 { -(v >> 1) - 1 } else { v >> 1 }
+        }
+    })
+}
+
+/// The motion vectors of a macroblock: a flag picks one vector for the whole block or one per 16x16 quarter. All
+/// horizontal components come first, then all vertical ones. Returns the vector count and the `[x, y]` pairs.
+pub fn read_mvs(r: &mut BitReader, codes: &Codes) -> Option<(usize, [[i32; 2]; 4])> {
+    let count = if r.read_bool() { 1 } else { 4 };
+    let mut mv = [[0i32; 2]; 4];
+    for axis in 0..2 {
+        for v in mv.iter_mut().take(count) {
+            v[axis] = read_mv_component(r, codes)?;
+        }
+    }
+    Some((count, mv))
+}
+
+/// The scaled DC differences of a block group: a presence flag, then per value a magnitude and a sign.
+pub fn read_dc_diffs<const N: usize>(r: &mut BitReader, q: i32) -> [i32; N] {
+    let mut d = [0i32; N];
+    if r.read_bool() {
+        let scale = tables::QUANT_DC[q.max(8) as usize] as i32;
+        for v in d.iter_mut() {
+            let mut x = read_unsigned(r);
+            if x != 0 {
+                x = (x * scale + 0x200) >> 10;
+                if r.read_bool() {
+                    x = -x;
+                }
+            }
+            *v = x;
+        }
+    }
+    d
 }
 
 /// Reads `bits` run-coded booleans into `out`; `start` adds a leading false.
