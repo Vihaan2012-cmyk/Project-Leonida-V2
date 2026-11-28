@@ -67,6 +67,8 @@ pub enum ResourceError {
     NotATexture(ResourceId),
     #[error("resource {0} has no memory the game wrote its texels in")]
     NoGuestMemory(ResourceId),
+    #[error("the memory of resource {0} is not mapped yet")]
+    Unmapped(ResourceId),
     #[error("tiled data of {0:?} textures is not handled")]
     Format(Kind),
 }
@@ -507,11 +509,14 @@ impl Resources {
         if info.kind != Kind::Color {
             return Err(ResourceError::Format(info.kind));
         }
+        if !super::host::backed(r.memory, r.size, false) {
+            return Err(ResourceError::Unmapped(id));
+        }
         let sampled = desc.detiles_for_sampling();
         if sampled {
             self.space().rebase_writes(r.memory, r.size);
         }
-        // SAFETY: a placed texture's memory is host memory the game mapped at its address, `size` bytes long.
+        // SAFETY: checked above to be committed, readable host memory, `size` bytes long.
         let memory = unsafe { std::slice::from_raw_parts(r.memory as *const u8, r.size as usize) };
         let handles = self.handles();
         if desc.is_tiled() {
@@ -603,7 +608,11 @@ impl Resources {
         if info.kind != Kind::Color {
             return Err(ResourceError::Format(info.kind));
         }
-        // SAFETY: as in `upload_texture`; the game does not write the texture while it is being read back.
+        if !super::host::backed(r.memory, r.size, true) {
+            return Err(ResourceError::Unmapped(id));
+        }
+        // SAFETY: checked above to be committed, writable host memory; the game does not write the texture while
+        // it is being read back.
         let memory =
             unsafe { std::slice::from_raw_parts_mut(r.memory as *mut u8, r.size as usize) };
         let handles = self.handles();

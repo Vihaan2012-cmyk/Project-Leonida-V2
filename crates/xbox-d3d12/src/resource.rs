@@ -1,6 +1,7 @@
 //! Resources: committed, placed at a game address, reserved; their GPU addresses and console layouts.
 
 pub mod desc;
+pub mod host;
 pub mod image;
 pub mod layout;
 pub mod store;

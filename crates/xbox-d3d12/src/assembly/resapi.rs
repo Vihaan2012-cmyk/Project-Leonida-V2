@@ -148,8 +148,18 @@ impl Assembly {
         {
             return;
         }
-        if let Err(e) = resources.upload_texture(object.id) {
-            crate::com::note_once(format!("placed texture texels were not read: {e}"));
+        match resources.upload_texture(object.id) {
+            Ok(()) => {}
+            Err(ResourceError::Unmapped(_)) => {
+                self.uploaded
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&object.id);
+                crate::com::note_once(
+                    "a placed texture was used before its memory was mapped: its texels are read on a later use",
+                );
+            }
+            Err(e) => crate::com::note_once(format!("placed texture texels were not read: {e}")),
         }
     }
 }

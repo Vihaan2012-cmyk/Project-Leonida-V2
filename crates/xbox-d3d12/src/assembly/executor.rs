@@ -521,6 +521,7 @@ impl Assembly {
                         .get(object.id)
                         .is_some_and(|r| r.origin == Origin::Placed && r.image.is_some())
                         && let Err(e) = resources.upload_texture(object.id)
+                        && !matches!(e, crate::resource::ResourceError::Unmapped(_))
                     {
                         com::note_once(format!("placed texture texels were not read: {e}"));
                     }
