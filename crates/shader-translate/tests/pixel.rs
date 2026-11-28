@@ -649,3 +649,84 @@ fn wave64_lane_masks_run_as_a_32_lane_wave_with_an_empty_upper_half() {
     };
     run(&gpu, &case, true, &[], &[], &mut [], &[]);
 }
+
+#[test]
+fn lanes_past_31_hold_a_table_whatever_exec_is() {
+    let Some(gpu) = pixel_gpu() else { return };
+    let case = Case {
+        name: "lane_table",
+        source: "s_mov_b32 s0, 1.0
+             s_mov_b32 s1, 2.0
+             s_mov_b32 s2, 4.0
+             s_mov_b64 s[10:11], exec
+             v_mbcnt_lo_u32_b32 v10, -1, 0
+             v_mbcnt_hi_u32_b32 v10, -1, v10
+             v_and_b32_e32 v10, 1, v10
+             v_cmp_eq_u32_e32 vcc, 0, v10
+             s_and_saveexec_b64 s[12:13], vcc
+             v_writelane_b32 v6, s0, 3
+             v_writelane_b32 v6, s1, 33
+             v_writelane_b32 v6, s2, 47
+             s_mov_b64 exec, s[10:11]
+             s_wqm_b64 exec, exec
+             v_readlane_b32 s3, v6, 33
+             v_readlane_b32 s4, v6, 47
+             v_readlane_b32 s5, v6, 3
+             v_readlane_b32 s6, v6, 40
+             v_mov_b32_e32 v2, s3
+             v_mov_b32_e32 v3, s4
+             v_mov_b32_e32 v4, s5
+             v_mov_b32_e32 v5, s6
+             exp mrt0 v2, v3, v4, v5 done vm
+             s_endpgm",
+        inputs: 0x302,
+        user_sgprs: 0,
+        number: Number::Float,
+        depth: None,
+        expect: Box::new(|_, _| [f(2.0), f(4.0), f(1.0), 0]),
+        expect_depth: None,
+        close: false,
+    };
+    run(&gpu, &case, true, &[], &[], &mut [], &[]);
+}
+
+#[test]
+fn a_waterfall_loop_over_lanes_picked_by_find_first_set_bit_finishes() {
+    let Some(gpu) = pixel_gpu() else { return };
+    let case = Case {
+        name: "waterfall",
+        source: "v_mbcnt_lo_u32_b32 v10, -1, 0
+             v_mbcnt_hi_u32_b32 v10, -1, v10
+             v_and_b32_e32 v10, 3, v10
+             v_mov_b32_e32 v11, -1
+             v_mov_b32_e32 v13, 1.0
+             s_mov_b64 s[20:21], exec
+             s_mov_b64 s[22:23], exec
+             s_ff1_i32_b64 s8, s[20:21]
+             v_readlane_b32 s9, v10, s8
+             v_cmp_eq_u32_e32 vcc, s9, v10
+             s_and_b64 vcc, vcc, s[20:21]
+             s_and_saveexec_b64 s[24:25], vcc
+             v_mov_b32_e32 v11, s9
+             s_mov_b64 exec, s[24:25]
+             s_andn2_b64 s[20:21], s[20:21], vcc
+             s_cmp_lg_u64 s[20:21], 0
+             s_cbranch_scc1 -11
+             s_mov_b64 exec, s[22:23]
+             v_cmp_eq_u32_e32 vcc, v11, v10
+             v_cndmask_b32_e32 v2, 0, v13, vcc
+             v_mov_b32_e32 v3, v2
+             v_mov_b32_e32 v4, v2
+             v_mov_b32_e32 v5, v2
+             exp mrt0 v2, v3, v4, v5 done vm
+             s_endpgm",
+        inputs: 0x302,
+        user_sgprs: 0,
+        number: Number::Float,
+        depth: None,
+        expect: Box::new(|_, _| [f(1.0); 4]),
+        expect_depth: None,
+        close: false,
+    };
+    run(&gpu, &case, true, &[], &[], &mut [], &[]);
+}

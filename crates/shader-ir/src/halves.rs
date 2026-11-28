@@ -178,7 +178,7 @@ pub(crate) fn patterns_of(insts: &[Inst]) -> Vec<Pattern> {
         if names(inst, &["exec_hi", "vcc_hi"]) {
             add(Pattern::MaskHighHalf);
         }
-        let on_mask = names(inst, &["exec", "vcc"]);
+        let on_mask = names(inst, &["exec", "vcc"]) || name.contains("saveexec");
         match base {
             "s_bcnt1_i32_b64" | "s_bcnt0_i32_b64" | "s_ff1_i32_b64" | "s_ff0_i32_b64"
             | "s_flbit_i32_b64" | "s_flbit_i32_i64" => add(Pattern::MaskCount),
@@ -327,5 +327,15 @@ mod tests {
         );
         assert!(!found.contains(&Pattern::ExecRaised), "{found:?}");
         assert!(found.contains(&Pattern::MaskArithmetic));
+    }
+
+    #[test]
+    fn saving_exec_while_setting_every_lane_raises_it() {
+        let found = patterns("s_or_saveexec_b64 s[0:1], -1
+s_endpgm");
+        assert!(found.contains(&Pattern::ExecRaised), "{found:?}");
+        let found = patterns("s_or_saveexec_b64 s[0:1], s[2:3]
+s_endpgm");
+        assert!(!found.contains(&Pattern::ExecRaised), "{found:?}");
     }
 }
