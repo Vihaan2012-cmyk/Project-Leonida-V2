@@ -154,7 +154,13 @@ fn trace_path(text: &str) {
 
 /// Notes a refused name once for the boot trace.
 pub(super) fn note_refusal(refusal: Refusal, text: &str) {
-    note_once(text, format!("file access refused ({refusal:?}): {text}"));
+    let site = crate::trace::calling_site()
+        .map(|rva| format!(" (asked from image offset {rva:#x})"))
+        .unwrap_or_default();
+    note_once(
+        text,
+        format!("file access refused ({refusal:?}): {text}{site}"),
+    );
 }
 
 /// Adds `line` to the boot trace unless a line was already added for `key`.

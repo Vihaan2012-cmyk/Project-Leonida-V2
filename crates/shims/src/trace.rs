@@ -36,6 +36,31 @@ pub fn image_offset(address: usize) -> String {
         format!("{address:#x}")
     }
 }
+/// The first return address on this thread's stack that lies in the program's image, as an image offset: which
+/// of the program's functions made the call being served.
+#[cfg(windows)]
+pub fn calling_site() -> Option<usize> {
+    let (base, size) = IMAGE.lock().map(|i| *i).unwrap_or((0, 0));
+    if size == 0 {
+        return None;
+    }
+    let mut frames = [std::ptr::null_mut::<std::ffi::c_void>(); 24];
+    // SAFETY: captures this thread's return addresses into the buffer.
+    let count = unsafe {
+        windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(
+            0,
+            frames.len() as u32,
+            frames.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    } as usize;
+    frames[..count]
+        .iter()
+        .map(|f| *f as usize)
+        .find(|a| (base..base + size).contains(a))
+        .map(|a| a - base)
+}
+
 static NOTES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Call counts for one image's imports. The counters live as long as the process: generated code points at
