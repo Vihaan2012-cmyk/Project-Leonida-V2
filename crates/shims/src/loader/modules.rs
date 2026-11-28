@@ -368,6 +368,13 @@ extern "win64" fn get_proc_address(module: usize, name: *const u8) -> usize {
             fail(windows_sys::Win32::Foundation::ERROR_PROC_NOT_FOUND);
             return 0;
         }
+        if crate::files::sandboxed() && crate::files::blocked_api(function_text) {
+            note(format!(
+                "{function_text} refused: the file sandbox does not allow it"
+            ));
+            fail(windows_sys::Win32::Foundation::ERROR_PROC_NOT_FOUND);
+            return 0;
+        }
         if let Some(dll) = host_module_name(module)
             && let Some(address) = host_shim(&dll, function_text)
         {

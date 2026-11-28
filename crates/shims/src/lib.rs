@@ -141,6 +141,11 @@ fn function_name(import: &ImportRef<'_>) -> String {
     }
 }
 
+/// Whether the file sandbox keeps the program from a system function it would otherwise reach directly.
+fn sandbox_blocks(import: &ImportRef<'_>) -> bool {
+    import.name.is_some_and(files::blocked_api) && files::sandboxed()
+}
+
 /// Binds imports for one loaded image.
 pub struct Binder {
     shims: Vec<Shim>,
@@ -190,7 +195,7 @@ impl Binder {
             return Binding::Shim;
         }
         #[cfg(windows)]
-        if host_allowed(import.dll) && host::find(import).is_some() {
+        if host_allowed(import.dll) && !sandbox_blocks(import) && host::find(import).is_some() {
             return Binding::Host;
         }
         Binding::Missing
@@ -216,6 +221,7 @@ impl Binder {
         #[cfg(windows)]
         if blocked.is_none()
             && host_allowed(import.dll)
+            && !sandbox_blocks(import)
             && let Some(address) = host::find(import)
         {
             return match (&self.trace, trace::path_argument(import)) {

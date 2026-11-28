@@ -10,8 +10,10 @@ use std::sync::RwLock;
 
 use crate::Shim;
 
+mod blocked;
 mod map;
 mod policy;
+pub use blocked::blocked_api;
 pub use map::{Refusal, Roots, Target};
 
 // integration
