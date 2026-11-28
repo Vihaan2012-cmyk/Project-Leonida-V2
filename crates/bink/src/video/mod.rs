@@ -2,15 +2,23 @@
 
 mod block;
 mod dsp;
+mod inter;
+#[cfg(test)]
+mod inter_tests;
+mod motion;
 mod pred;
+#[cfg(test)]
+mod testutil;
 
 use crate::bits::BitReader;
 use crate::container::Header;
 use crate::error::{Error, Result};
 use crate::tables;
 use block::{
-    Codes, read_acs, read_cbp_chroma, read_cbp_luma, read_flags, read_quant, read_unsigned,
+    Codes, read_acs, read_cbp_chroma, read_cbp_luma, read_dc_diffs, read_flags, read_quant,
 };
+use inter::{BlockKind, TypeLru};
+use motion::MvLine;
 use pred::{ChromaDc, DcRange, LumaDc, QuantLine};
 
 #[derive(Debug, Clone)]
@@ -39,6 +47,14 @@ pub struct VideoDecoder {
     codes: Codes,
 }
 
+/// What is constant across the macroblocks of one row.
+struct Row {
+    by: usize,
+    top: bool,
+    wide: bool,
+    alpha: bool,
+}
+
 struct SliceState {
     quant: QuantLine,
     y: LumaDc,
@@ -49,6 +65,10 @@ struct SliceState {
     cbp_u: u32,
     cbp_v: u32,
     cbp_a: u32,
+    mvs: MvLine,
+    lru: TypeLru,
+    /// Coded-block patterns of the inter blocks (luma, U, V, alpha).
+    cbp_inter: [u32; 4],
 }
 
 impl SliceState {
@@ -63,6 +83,9 @@ impl SliceState {
             cbp_u: 0,
             cbp_v: 0,
             cbp_a: 0,
+            mvs: MvLine::new(blocks),
+            lru: TypeLru::new(),
+            cbp_inter: [0; 4],
         }
     }
 }
@@ -135,7 +158,7 @@ impl VideoDecoder {
         index: u32,
         data: &[u8],
         key: bool,
-        _reference: Option<&Frame>,
+        reference: Option<&Frame>,
     ) -> Result<Frame> {
         let fail = |reason| Error::Frame {
             frame: index,
@@ -165,12 +188,13 @@ impl VideoDecoder {
                     (self.height as usize).div_ceil(16) * 2 - 1,
                 );
             }
+            // The column count follows the width rounded up to a whole macroblock, the row count only to 16.
             if flags & 0x4000 == 0 {
                 read_flags(
                     &mut reader,
                     &mut scratch,
                     true,
-                    (self.width as usize).div_ceil(16) * 2 - 1,
+                    (self.width as usize).div_ceil(32) * 4 - 1,
                 );
             }
         }
@@ -178,9 +202,11 @@ impl VideoDecoder {
         if skip_alpha {
             frame.planes[3].data.fill((flags >> 24) as u8);
         }
-        if !key {
-            return Err(Error::Unsupported('P'));
-        }
+        let reference = match (key, reference) {
+            (true, _) => None,
+            (false, Some(r)) if r.width == self.width && r.height == self.height => Some(r),
+            (false, _) => return Err(Error::MissingReference(index)),
+        };
         let bw = (self.width as usize).div_ceil(32);
         let mut first = 0;
         for (i, &end) in self.slice_ends.iter().enumerate() {
@@ -199,8 +225,14 @@ impl VideoDecoder {
                     by == first,
                     bw,
                     !skip_alpha,
+                    reference,
                 )
-                .ok_or_else(|| fail("bad intra macroblock data"))?;
+                .ok_or_else(|| fail("bad macroblock data"))?;
+            }
+            // Slices are padded to whole 32-bit words, so a correct parse ends within the last word.
+            let limit = offsets.get(i).map_or(data.len(), |&o| o) * 8;
+            if r.pos() > limit || limit - r.pos() >= 32 {
+                return Err(fail("slice does not end where the next one starts"));
             }
             first = end;
         }
@@ -218,65 +250,105 @@ impl VideoDecoder {
         top: bool,
         bw: usize,
         with_alpha: bool,
+        reference: Option<&Frame>,
     ) -> Option<()> {
         st.cbp_y = 0;
         st.cbp_u = 0;
         st.cbp_v = 0;
         st.cbp_a = 0;
-        let wide = flags & 0x4_0000 != 0;
-        let range = DcRange { lo: 0, hi: 0x7FF };
+        st.cbp_inter = [0; 4];
+        st.lru = TypeLru::new();
+        let row = Row {
+            by,
+            top,
+            wide: flags & 0x4_0000 != 0,
+            alpha: self.alpha && with_alpha,
+        };
         for bx in 0..bw {
-            let left = bx == 0;
-            let predicted = st.quant.predict(bx * 2, top);
-            let q = read_quant(r, predicted)?;
-            st.quant.set(bx * 2, q);
-            let luma_at = |plane: &Plane| by * 32 * plane.stride + bx * 32;
-            let at = luma_at(&frame.planes[0]);
+            let kind = if reference.is_some() {
+                st.lru.read(r)
+            } else {
+                BlockKind::Intra
+            };
+            match (kind, reference) {
+                (BlockKind::Intra, _) => {
+                    self.intra_mb(r, st, frame, &row, bx, reference.is_some())?
+                }
+                (kind, Some(refr)) => self.inter_mb(r, st, frame, refr, &row, bx, kind)?,
+                (_, None) => return None,
+            }
+        }
+        st.quant.next_row();
+        st.mvs.next_row();
+        st.y.next_row();
+        st.u.next_row();
+        st.v.next_row();
+        st.a.next_row();
+        Some(())
+    }
+
+    /// An intra macroblock. In inter frames it also keeps the inter quantiser and vector predictors current.
+    fn intra_mb(
+        &self,
+        r: &mut BitReader,
+        st: &mut SliceState,
+        frame: &mut Frame,
+        row: &Row,
+        bx: usize,
+        inter_frame: bool,
+    ) -> Option<()> {
+        let (by, top, wide) = (row.by, row.top, row.wide);
+        let left = bx == 0;
+        let range = DcRange { lo: 0, hi: 0x7FF };
+        if inter_frame {
+            let inter_q = st.quant.predict(bx * 2 + 1, top);
+            st.quant.set(bx * 2 + 1, inter_q);
+            st.mvs.predict(bx, top, left, 0, &[[0; 2]; 4]);
+        }
+        let predicted = st.quant.predict(bx * 2, top);
+        let q = read_quant(r, predicted)?;
+        st.quant.set(bx * 2, q);
+        let luma_at = |plane: &Plane| by * 32 * plane.stride + bx * 32;
+        let at = luma_at(&frame.planes[0]);
+        self.intra_luma(
+            r,
+            &mut st.y,
+            &mut st.cbp_y,
+            q,
+            bx,
+            top,
+            left,
+            wide,
+            &range,
+            &mut frame.planes[0],
+            at,
+        )?;
+        for p in [2usize, 1] {
+            let (dc, cbp) = if p == 2 {
+                (&mut st.v, &mut st.cbp_v)
+            } else {
+                (&mut st.u, &mut st.cbp_u)
+            };
+            let plane = &mut frame.planes[p];
+            let at = by * 16 * plane.stride + bx * 16;
+            self.intra_chroma(r, dc, cbp, q, bx, top, left, &range, plane, at)?;
+        }
+        if row.alpha {
+            let at = luma_at(&frame.planes[3]);
             self.intra_luma(
                 r,
-                &mut st.y,
-                &mut st.cbp_y,
+                &mut st.a,
+                &mut st.cbp_a,
                 q,
                 bx,
                 top,
                 left,
                 wide,
                 &range,
-                &mut frame.planes[0],
+                &mut frame.planes[3],
                 at,
             )?;
-            for p in [2usize, 1] {
-                let (dc, cbp) = if p == 2 {
-                    (&mut st.v, &mut st.cbp_v)
-                } else {
-                    (&mut st.u, &mut st.cbp_u)
-                };
-                let plane = &mut frame.planes[p];
-                let at = by * 16 * plane.stride + bx * 16;
-                self.intra_chroma(r, dc, cbp, q, bx, top, left, &range, plane, at)?;
-            }
-            if self.alpha && with_alpha {
-                let at = luma_at(&frame.planes[3]);
-                self.intra_luma(
-                    r,
-                    &mut st.a,
-                    &mut st.cbp_a,
-                    q,
-                    bx,
-                    top,
-                    left,
-                    wide,
-                    &range,
-                    &mut frame.planes[3],
-                    at,
-                )?;
-            }
         }
-        st.quant.next_row();
-        st.y.next_row();
-        st.u.next_row();
-        st.v.next_row();
-        st.a.next_row();
         Some(())
     }
 
@@ -297,20 +369,7 @@ impl VideoDecoder {
     ) -> Option<()> {
         let cbp = read_cbp_luma(r, *cbp_state, wide);
         *cbp_state = cbp;
-        let mut d = [0i32; 16];
-        if r.read_bool() {
-            let scale = tables::QUANT_DC[q.max(8) as usize] as i32;
-            for v in d.iter_mut() {
-                let mut x = read_unsigned(r);
-                if x != 0 {
-                    x = (x * scale + 0x200) >> 10;
-                    if r.read_bool() {
-                        x = -x;
-                    }
-                }
-                *v = x;
-            }
-        }
+        let d: [i32; 16] = read_dc_diffs(r, q);
         let dcs = dc.predict_intra(bx, &d, top, left, range);
         let mut blocks = [[0i32; 64]; 16];
         for quad in 0..4 {
@@ -352,20 +411,7 @@ impl VideoDecoder {
     ) -> Option<()> {
         let cbp = read_cbp_chroma(r, *cbp_state);
         *cbp_state = cbp;
-        let mut d = [0i32; 4];
-        if r.read_bool() {
-            let scale = tables::QUANT_DC[q.max(8) as usize] as i32;
-            for v in d.iter_mut() {
-                let mut x = read_unsigned(r);
-                if x != 0 {
-                    x = (x * scale + 0x200) >> 10;
-                    if r.read_bool() {
-                        x = -x;
-                    }
-                }
-                *v = x;
-            }
-        }
+        let d: [i32; 4] = read_dc_diffs(r, q);
         let dcs = dc.predict_intra(bx, &d, top, left, range);
         let mut blocks = [[0i32; 64]; 4];
         if !read_acs(

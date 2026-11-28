@@ -74,7 +74,6 @@ pub const QUANT_INTRA_CHROMA: [[u16; 64]; 4] = [
     ],
 ];
 
-#[allow(dead_code, reason = "kept for inter frames, which are not decoded yet")]
 pub const QUANT_INTER: [[u16; 64]; 4] = [
     [
         1024, 1193, 1076, 844, 1052, 914, 1225, 1492, 1193, 1391, 1254, 983, 1227, 1065, 1463,

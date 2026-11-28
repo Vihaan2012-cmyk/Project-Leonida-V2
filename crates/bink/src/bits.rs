@@ -11,7 +11,6 @@ impl<'a> BitReader<'a> {
         Self { data, pos: 0 }
     }
 
-    #[allow(dead_code, reason = "kept for inter frames, which are not decoded yet")]
     pub fn pos(&self) -> usize {
         self.pos
     }
@@ -63,19 +62,6 @@ impl<'a> BitReader<'a> {
     pub fn read_bool(&mut self) -> bool {
         self.read(1) != 0
     }
-
-    /// Count of consecutive one bits before a zero, at most `max`. A run of `max` ones stops without a terminating zero.
-    #[allow(dead_code, reason = "kept for inter frames, which are not decoded yet")]
-    pub fn read_unary(&mut self, max: u32) -> u32 {
-        let mut count = 0;
-        while count < max {
-            if !self.read_bool() {
-                return count;
-            }
-            count += 1;
-        }
-        count
-    }
 }
 
 #[cfg(test)]
@@ -109,13 +95,5 @@ mod tests {
         r.skip(8);
         assert_eq!(r.read(4), 0);
         assert!(r.overrun());
-    }
-
-    #[test]
-    fn unary_stops_at_max_or_zero() {
-        let mut r = BitReader::new(&[0b0001_0111]);
-        assert_eq!(r.read_unary(12), 3);
-        assert_eq!(r.read_unary(1), 1);
-        assert_eq!(r.read_unary(12), 0);
     }
 }
