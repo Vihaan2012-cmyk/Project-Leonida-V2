@@ -58,12 +58,14 @@ struct Paths {
     game_dir: Option<PathBuf>,
     output_dir: Option<PathBuf>,
     main_module: usize,
+    main_path: Option<PathBuf>,
 }
 
 static PATHS: Mutex<Paths> = Mutex::new(Paths {
     game_dir: None,
     output_dir: None,
     main_module: 0,
+    main_path: None,
 });
 
 /// Tells the runtime where the game package (for `MicrosoftGame.Config`) and the `Output` folder (saves and
@@ -81,6 +83,17 @@ pub fn set_main_module(base: usize) {
     if let Ok(mut paths) = PATHS.lock() {
         paths.main_module = base;
     }
+}
+
+/// Where the game's executable lies, which `GetModuleFileName` reports for it instead of Leonida's own.
+pub fn set_main_path(path: PathBuf) {
+    if let Ok(mut paths) = PATHS.lock() {
+        paths.main_path = Some(path);
+    }
+}
+
+pub(crate) fn main_path() -> Option<PathBuf> {
+    PATHS.lock().ok().and_then(|p| p.main_path.clone())
 }
 
 pub(crate) fn main_module() -> usize {

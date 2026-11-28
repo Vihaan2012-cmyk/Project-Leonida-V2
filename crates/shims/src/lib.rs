@@ -18,6 +18,8 @@ pub mod dstorage;
 pub mod fidelityfx;
 pub mod files;
 pub mod gameinput;
+#[cfg(windows)]
+pub mod hostlib;
 pub mod loader;
 pub mod media;
 #[cfg(windows)]
@@ -139,6 +141,11 @@ fn function_name(import: &ImportRef<'_>) -> String {
     }
 }
 
+/// Whether the file sandbox keeps the program from a system function it would otherwise reach directly.
+fn sandbox_blocks(import: &ImportRef<'_>) -> bool {
+    import.name.is_some_and(files::blocked_api) && files::sandboxed()
+}
+
 /// Binds imports for one loaded image.
 pub struct Binder {
     shims: Vec<Shim>,
@@ -188,7 +195,7 @@ impl Binder {
             return Binding::Shim;
         }
         #[cfg(windows)]
-        if host_allowed(import.dll) && host::find(import).is_some() {
+        if host_allowed(import.dll) && !sandbox_blocks(import) && host::find(import).is_some() {
             return Binding::Host;
         }
         Binding::Missing
@@ -214,6 +221,7 @@ impl Binder {
         #[cfg(windows)]
         if blocked.is_none()
             && host_allowed(import.dll)
+            && !sandbox_blocks(import)
             && let Some(address) = host::find(import)
         {
             return match (&self.trace, trace::path_argument(import)) {
@@ -260,16 +268,12 @@ impl Resolver for Binder {
 #[cfg(windows)]
 mod host {
     use pe_loader::ImportRef;
-    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
 
     pub fn find(import: &ImportRef<'_>) -> Option<usize> {
-        let wide: Vec<u16> = import.dll.encode_utf16().chain([0]).collect();
-        // SAFETY: loads a Windows DLL the allow-list names and asks it for one export.
+        // SAFETY: loads a Windows DLL the allow-list names, from the system folder only, and asks it for one export.
         unsafe {
-            let module = LoadLibraryW(wide.as_ptr());
-            if module.is_null() {
-                return None;
-            }
+            let module = crate::hostlib::load(import.dll, 0).ok()? as *mut std::ffi::c_void;
             let found = match (import.name, import.ordinal) {
                 (Some(name), _) => {
                     let name: Vec<u8> = name.bytes().chain([0]).collect();
