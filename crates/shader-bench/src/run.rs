@@ -211,7 +211,28 @@ fn words(bytes: &[u8]) -> Vec<u32> {
 fn one(gpu: &Gpu, settings: &Settings, vertex: &[u32], program: &Program) -> Result<Row> {
     let translated = translate_built(&program.source).map_err(|f| anyhow!("{}", f.error))?;
     let built = translated.built;
-    let current = built.spirv().to_vec();
+    if built.spirv().len() > settings.max_words {
+        return Err(anyhow!(
+            "{} words of SPIR-V is over the limit",
+            built.spirv().len()
+        ));
+    }
+    if settings.translate_only {
+        if let Some(folder) = &settings.save {
+            std::fs::write(
+                folder.join(format!("{}.spv", program.name)),
+                bytes(built.spirv()),
+            )?;
+        }
+        return Ok(Row {
+            name: program.name.clone(),
+            kind: program.kind,
+            words: [built.spirv().len(); 2],
+            nanos: [1.0; 2],
+            verdict: Verdict::default(),
+        });
+    }
+    let mut current = built.spirv().to_vec();
     let file = format!("{}.spv", program.name);
     if let Some(folder) = &settings.save {
         std::fs::write(folder.join(&file), bytes(&current))?;
@@ -222,6 +243,11 @@ fn one(gpu: &Gpu, settings: &Settings, vertex: &[u32], program: &Program) -> Res
         ),
         None => current.clone(),
     };
+    if let Some(folder) = &settings.candidate {
+        current = words(
+            &std::fs::read(folder.join(&file)).with_context(|| format!("no candidate {file}"))?,
+        );
+    }
     let analysis = shader_census::analyze(&program.code, !program.wave64);
     let job = Job {
         program,
@@ -230,9 +256,16 @@ fn one(gpu: &Gpu, settings: &Settings, vertex: &[u32], program: &Program) -> Res
         plain: settings.plain,
         vertex,
     };
+    let started = std::time::Instant::now();
     let (a, _) = exec(gpu, &job, &base, &Mode::Check)?;
+    let first = started.elapsed();
     let (b, _) = exec(gpu, &job, &current, &Mode::Check)?;
     let (again, _) = exec(gpu, &job, &base, &Mode::Check)?;
+    println!(
+        "  first run {:.1} s (pipeline build included), three check runs {:.1} s",
+        first.as_secs_f64(),
+        started.elapsed().as_secs_f64()
+    );
     let verdict = compare(&a, &b, &again);
 
     let skip = settings.repeats as usize / 4;
@@ -247,7 +280,7 @@ fn one(gpu: &Gpu, settings: &Settings, vertex: &[u32], program: &Program) -> Res
         work = ((LONGEST_NANOS / per_group.max(1.0)) as u64).clamp(64, 1 << 20);
     }
     let mut totals = [Vec::new(), Vec::new()];
-    for _round in 0..3 {
+    for _round in 0..5 {
         for (slot, spirv) in [&base, &current].into_iter().enumerate() {
             let (_, nanos) = exec(
                 gpu,
@@ -271,6 +304,124 @@ fn one(gpu: &Gpu, settings: &Settings, vertex: &[u32], program: &Program) -> Res
     })
 }
 
+fn row_line(row: &Row) -> String {
+    format!(
+        "ROW|{}|{}|{}|{}|{}|{}|{}|{}",
+        row.kind,
+        row.name,
+        row.nanos[0],
+        row.nanos[1],
+        row.words[0],
+        row.words[1],
+        row.verdict.mismatches,
+        row.verdict.compared
+    )
+}
+
+fn parse_row(line: &str) -> Option<Row> {
+    let mut f = line.strip_prefix("ROW|")?.split('|');
+    let kind = if f.next()? == "pixel" {
+        "pixel"
+    } else {
+        "compute"
+    };
+    let name = f.next()?.to_string();
+    let nanos = [f.next()?.parse().ok()?, f.next()?.parse().ok()?];
+    let words = [f.next()?.parse().ok()?, f.next()?.parse().ok()?];
+    let verdict = Verdict {
+        mismatches: f.next()?.parse().ok()?,
+        compared: f.next()?.parse().ok()?,
+        ..Verdict::default()
+    };
+    Some(Row {
+        name,
+        kind,
+        words,
+        nanos,
+        verdict,
+    })
+}
+
+/// Runs each program in a child process and kills a child that takes more than `args.timeout` seconds, as
+/// the driver can spend minutes building a few translations.
+pub fn supervise(args: &crate::Args, programs: Vec<Program>) -> Result<()> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let exe = std::env::current_exe()?;
+    let mut rows = Vec::new();
+    for program in &programs {
+        println!(
+            "running {} {} ({} code bytes)",
+            program.kind,
+            program.name,
+            program.code.len()
+        );
+        let mut child = Command::new(&exe)
+            .args(args.child_flags(&program.name))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut out = child.stdout.take().expect("piped");
+        let reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = out.read_to_string(&mut text);
+            text
+        });
+        let started = Instant::now();
+        let limit = Duration::from_secs(args.timeout);
+        let mut timed_out = false;
+        loop {
+            if child.try_wait()?.is_some() {
+                break;
+            }
+            if started.elapsed() > limit {
+                let _ = child.kill();
+                let _ = child.wait();
+                timed_out = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let text = reader.join().unwrap_or_default();
+        for line in text.lines() {
+            if let Some(row) = parse_row(line) {
+                println!("  {}", describe(&row));
+                rows.push(row);
+            } else if line.contains("skipped") || line.contains("first run") {
+                println!("{line}");
+            }
+        }
+        if timed_out {
+            println!(
+                "  skipped: no result within {} s (the driver build or the run did not finish)",
+                args.timeout
+            );
+        }
+    }
+    summary(&rows);
+    Ok(())
+}
+
+fn describe(row: &Row) -> String {
+    format!(
+        "{:>8.3} ms -> {:>8.3} ms  x{:.3}  spirv {} -> {} words  {}",
+        row.nanos[0] / 1e6,
+        row.nanos[1] / 1e6,
+        row.nanos[0] / row.nanos[1],
+        row.words[0],
+        row.words[1],
+        if row.verdict.mismatches == 0 {
+            "output same".to_string()
+        } else {
+            format!(
+                "DIFFERENT: {} of {} values",
+                row.verdict.mismatches, row.verdict.compared
+            )
+        }
+    )
+}
+
 pub fn all(settings: &Settings, programs: Vec<Program>) -> Result<()> {
     let gpu = Gpu::new().context("opening the GPU")?;
     gpu.use_local_memory(true);
@@ -286,20 +437,19 @@ pub fn all(settings: &Settings, programs: Vec<Program>) -> Result<()> {
         );
         match one(&gpu, settings, &vertex, program) {
             Ok(row) => {
-                println!(
-                    "  {:>8.3} ms -> {:>8.3} ms  x{:.3}  spirv {} -> {} words  {}",
-                    row.nanos[0] / 1e6,
-                    row.nanos[1] / 1e6,
-                    row.nanos[0] / row.nanos[1],
-                    row.words[0],
-                    row.words[1],
-                    row.verdict.text()
-                );
+                println!("  {}", row.name);
+                println!("  {}  {}", describe(&row), row.verdict.text());
+                println!("{}", row_line(&row));
                 rows.push(row);
             }
             Err(error) => println!("  skipped: {error:#}"),
         }
     }
+    summary(&rows);
+    Ok(())
+}
+
+fn summary(rows: &[Row]) {
     for kind in ["compute", "pixel"] {
         let of: Vec<&Row> = rows.iter().filter(|r| r.kind == kind).collect();
         if of.is_empty() {
@@ -323,5 +473,4 @@ pub fn all(settings: &Settings, programs: Vec<Program>) -> Result<()> {
             of.iter().filter(|r| r.verdict.mismatches > 0).count()
         );
     }
-    Ok(())
 }
