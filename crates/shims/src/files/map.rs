@@ -392,4 +392,108 @@ mod tests {
         assert_eq!(roots.map("\\\\.\\PhysicalDrive0"), Err(Refusal::Device));
         assert_eq!(Refusal::Escapes.code(), 123);
     }
+
+    fn sandboxed() -> Roots {
+        roots()
+            .sandboxed(vec![PathBuf::from("E:\\Games\\Leo\\Mods")])
+            .expect("sandboxed")
+    }
+
+    #[test]
+    fn the_sandbox_keeps_the_allowed_mappings() {
+        let roots = sandboxed();
+        let plain = self::roots();
+        for path in [
+            "GAME:\\data\\a.bin",
+            "g:/data/a.bin",
+            "data\\a.bin",
+            "\\data\\a.bin",
+            "./data/../data/./a.bin",
+            "E:\\Games\\Pkg\\data\\a.bin",
+            "e:/GAMES/pkg/DATA/a.bin",
+            "T:\\cache\\x.tmp",
+            "E:\\Games\\Leo\\Output\\saves\\a.sav",
+            "e:\\games\\leo\\output",
+            "E:\\Games\\Leo\\Mods\\fix\\a.bin",
+            "e:/games/leo/mods/fix/a.bin",
+        ] {
+            assert!(roots.map(path).is_ok(), "{path}");
+            assert_eq!(roots.map(path), plain.map(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_sandbox_closes_every_other_path() {
+        let roots = sandboxed();
+        for path in [
+            "C:\\Windows\\Fonts\\a.ttf",
+            "c:/users/someone/documents/a.docx",
+            "E:\\",
+            "E:\\Games",
+            "E:\\Games\\Pkg2\\a.bin",
+            "E:\\Games\\Leo\\other.txt",
+            "E:\\Games\\Leo\\Outputs\\a",
+            "Z:\\x",
+            "D:rel\\x",
+            "E:\\Games\\Pkg\\..\\Leo\\other",
+        ] {
+            assert_eq!(roots.map(path), Err(Refusal::Outside), "{path}");
+        }
+        assert_eq!(Refusal::Outside.code_for(false), 3);
+        assert_eq!(Refusal::Outside.code_for(true), 5);
+        assert_eq!(Refusal::Link.code_for(false), 3);
+        assert_eq!(Refusal::Pipe.code_for(false), 2);
+        assert_eq!(Refusal::Invalid.code_for(true), 123);
+    }
+
+    #[test]
+    fn the_sandbox_refuses_special_names() {
+        let roots = sandboxed();
+        let cases: &[(&str, Refusal)] = &[
+            ("\\\\?\\E:\\Games\\Pkg\\data\\a.bin", Refusal::Device),
+            ("\\??\\E:\\Games\\Pkg\\a", Refusal::Device),
+            ("\\\\.\\PhysicalDrive0", Refusal::Device),
+            ("\\\\.\\C:", Refusal::Device),
+            ("\\\\.\\pipe\\crash", Refusal::Pipe),
+            ("GAME:\\data\\a.bin:stream", Refusal::Invalid),
+            ("GAME:\\data\\a.bin::$DATA", Refusal::Invalid),
+            ("GAME:\\data\\a.bin.", Refusal::Invalid),
+            ("GAME:\\data\\a.bin ", Refusal::Invalid),
+            ("GAME:\\data\\...\\a", Refusal::Invalid),
+            ("GAME:\\data\\*.bin", Refusal::Invalid),
+            ("GAME:\\data\\a|b", Refusal::Invalid),
+            ("GAME:\\data\\NUL", Refusal::Device),
+            ("data\\com3.txt", Refusal::Device),
+            ("T:\\lpt1", Refusal::Device),
+            ("GAME:\\..\\x", Refusal::Escapes),
+            ("a\\..\\..\\x", Refusal::Escapes),
+        ];
+        for (path, refusal) in cases {
+            assert_eq!(roots.map(path), Err(*refusal), "{path}");
+        }
+        assert_eq!(
+            roots.map("\\\\server\\share\\a"),
+            Err(Refusal::Network(offline::Reason::NetworkShares))
+        );
+        assert_eq!(
+            roots.map("\\\\?\\UNC\\server\\share\\a"),
+            Err(Refusal::Network(offline::Reason::NetworkShares))
+        );
+        assert!(self::roots().map("\\\\.\\pipe\\crash").is_ok());
+    }
+
+    #[test]
+    fn dot_dot_cannot_climb_out_of_an_allowed_folder() {
+        let roots = sandboxed();
+        assert!(roots.map("GAME:\\a\\..\\b").is_ok());
+        assert!(roots.map("E:\\Games\\Leo\\Output\\..\\Mods\\x").is_ok());
+        assert_eq!(
+            roots.map("E:\\Games\\Leo\\Output\\..\\..\\x"),
+            Err(Refusal::Outside)
+        );
+        assert_eq!(
+            roots.map("E:\\Games\\Leo\\Mods\\..\\Output2"),
+            Err(Refusal::Outside)
+        );
+    }
 }
