@@ -272,6 +272,20 @@ pub enum ExeCommand {
         /// Most instructions to print.
         #[arg(long, default_value_t = 400)]
         limit: usize,
+        /// Disassemble from the address up to this one instead of the whole function (code the exception table
+        /// does not cover, or code of a function split in several pieces).
+        #[arg(long)]
+        end: Option<String>,
+    },
+    /// Hex dump of bytes at an address (hex RVA or virtual address).
+    Dump {
+        address: String,
+        /// How many bytes.
+        #[arg(default_value_t = 64)]
+        len: usize,
+        /// Bytes per line, grouped by this many bytes.
+        #[arg(long, default_value_t = 16)]
+        width: usize,
     },
     /// C-like pseudocode for the function containing an address (hex RVA or virtual address).
     Decompile {
