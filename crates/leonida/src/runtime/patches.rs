@@ -83,7 +83,17 @@ pub fn select(
     if plan.custom_limit {
         let image = Image::parse(bytes).context("reading the executable's sections")?;
         let finder = Finder::new(&image);
-        patches.extend(framerate::select(&finder, plan.custom_limit, &[])?);
+        let without: &[&str] = if plan.graphics.fix_frame_timers {
+            &[]
+        } else {
+            &[framerate::FRAME_TIMERS.id]
+        };
+        patches.extend(framerate::select_without(
+            &finder,
+            plan.custom_limit,
+            &[],
+            without,
+        )?);
     }
     // The widescreen groups are applied here, with the framerate patches, as one set.
     for group in plan.widescreen.groups()? {

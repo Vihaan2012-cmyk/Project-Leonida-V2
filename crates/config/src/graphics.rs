@@ -90,6 +90,9 @@ pub struct Graphics {
     pub fov_offset: f32,
     pub fov_scale: f32,
     pub pipeline_not_ready: PipelineNotReady,
+    /// With a frame rate other than the console's, also patch the game logic that counts frames or floors its
+    /// step at 1/60 s, so it keeps its 60 fps speed (`enhancements::frame_timers`).
+    pub fix_frame_timers: bool,
 }
 
 impl Default for Graphics {
@@ -110,6 +113,7 @@ impl Default for Graphics {
             fov_offset: 0.0,
             fov_scale: 1.0,
             pipeline_not_ready: PipelineNotReady::Wait,
+            fix_frame_timers: true,
         }
     }
 }
@@ -190,6 +194,10 @@ fov_scale = 1.0
 # finished: \"wait\" holds the frame until it is (nothing is missing, but the game may stutter), \"skip\" leaves
 # the draw out until it is (no stutter, but objects can be missing for a moment).
 pipeline_not_ready = \"wait\"
+
+# Above 60 fps, some of the game's timers count frames and some steps stop at 1/60 s, so they would run fast.
+# true patches them to keep their 60 fps speed; false leaves them as the console runs them.
+fix_frame_timers = true
 "
         .to_string()
     }
