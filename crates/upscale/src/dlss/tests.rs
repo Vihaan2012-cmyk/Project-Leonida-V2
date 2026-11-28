@@ -133,12 +133,8 @@ struct FakeParameter {
 impl FakeParameter {
     fn new() -> Box<FakeParameter> {
         let mut table = [0usize; 17];
-        for slot in 0..8 {
-            table[slot] = nop as *const () as usize;
-        }
-        for slot in 8..16 {
-            table[slot] = get_unused as *const () as usize;
-        }
+        table[..8].fill(nop as *const () as usize);
+        table[8..16].fill(get_unused as *const () as usize);
         table[slots::SET_U64] = set_u64 as *const () as usize;
         table[slots::SET_F32] = set_f32 as *const () as usize;
         table[slots::SET_F32 - 1] = set_f64 as *const () as usize;
@@ -569,7 +565,7 @@ mod locating {
         let library = put_library(&second);
         let found = locate_with(None, None, Some(&[first.clone(), second.clone()])).unwrap();
         assert_eq!(found.path, library);
-        let error = locate_with(None, None, Some(&[first.clone()])).unwrap_err();
+        let error = locate_with(None, None, Some(std::slice::from_ref(&first))).unwrap_err();
         assert_eq!(error.searched, vec![first]);
         assert!(error.problem.is_none());
     }
