@@ -12,7 +12,7 @@ mod coeffs;
 mod transform;
 
 use crate::bits::BitReader;
-use crate::container::AudioTrack;
+use crate::container::{AudioTrack, Container};
 use crate::error::{Error, Result};
 
 use coeffs::Layout;
@@ -119,29 +119,129 @@ impl AudioDecoder {
     }
 }
 
-/// Decodes each track's packet of one frame into `out[track]`, replacing what was there. A track that cannot be
-/// decoded, or whose packet is damaged, yields silence of the length the packet announces; the number of such
-/// tracks is returned.
-pub(crate) fn decode_frame(
-    decoders: &mut [Option<AudioDecoder>],
-    packets: &[&[u8]],
-    out: &mut [Vec<f32>],
-) -> u32 {
-    let mut failed = 0;
-    for ((decoder, packet), samples) in decoders.iter_mut().zip(packets).zip(out.iter_mut()) {
-        samples.clear();
-        let Some(decoder) = decoder else {
-            failed += 1;
-            continue;
-        };
-        if decoder.decode_packet(packet, samples).is_err() {
-            samples.clear();
-            samples.resize(decoder.packet_samples(packet) * decoder.channels(), 0.0);
-            decoder.reset();
-            failed += 1;
+/// The audio of a whole movie: one decoder per track and the samples of the frame decoded last.
+pub(crate) struct Audio {
+    decoders: Vec<Option<AudioDecoder>>,
+    /// Per track: samples from before the frame a seek lands on that still belong after it.
+    preroll: Vec<Vec<f32>>,
+    frame: Vec<Vec<f32>>,
+    failures: u32,
+}
+
+impl Audio {
+    pub fn new(tracks: &[AudioTrack]) -> Audio {
+        Audio {
+            decoders: tracks.iter().map(|t| AudioDecoder::new(t).ok()).collect(),
+            preroll: vec![Vec::new(); tracks.len()],
+            frame: vec![Vec::new(); tracks.len()],
+            failures: 0,
         }
     }
-    failed
+
+    /// How many track packets were replaced by silence because they could not be decoded.
+    pub fn failures(&self) -> u32 {
+        self.failures
+    }
+
+    /// The samples of the frame decoded last for `track`, handed over once.
+    pub fn take(&mut self, track: usize) -> Vec<f32> {
+        self.frame
+            .get_mut(track)
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// Decodes each track's packet of the next frame; a track that cannot be decoded, or whose packet is damaged,
+    /// yields silence of the length the packet announces.
+    pub fn decode_frame(&mut self, packets: &[&[u8]]) {
+        let tracks = self
+            .decoders
+            .iter_mut()
+            .zip(packets)
+            .zip(self.frame.iter_mut());
+        for (t, ((decoder, packet), samples)) in tracks.enumerate() {
+            samples.clear();
+            let Some(decoder) = decoder else {
+                self.failures += 1;
+                continue;
+            };
+            if decoder.decode_packet(packet, samples).is_err() {
+                samples.clear();
+                samples.resize(decoder.packet_samples(packet) * decoder.channels(), 0.0);
+                decoder.reset();
+                self.failures += 1;
+            }
+            if !self.preroll[t].is_empty() {
+                let mut joined = std::mem::take(&mut self.preroll[t]);
+                joined.append(samples);
+                *samples = joined;
+            }
+        }
+    }
+
+    /// Positions the audio for decoding to continue at frame `next`. The packets run ahead of the pictures (a
+    /// movie's first frame carries the first 0.7 s of sound), so the sound that belongs at `next` is in the
+    /// packets of earlier frames: it is decoded from there and kept to go out with the audio of `next`.
+    pub fn seek(&mut self, container: &Container, next: u32) {
+        let header = &container.header;
+        for (t, decoder) in self.decoders.iter_mut().enumerate() {
+            self.preroll[t].clear();
+            self.frame[t].clear();
+            let Some(decoder) = decoder else {
+                continue;
+            };
+            decoder.reset();
+            let rate = u64::from(header.audio[t].rate);
+            let target =
+                u64::from(next) * u64::from(header.fps_den) * rate / u64::from(header.fps_num);
+            let counts: Vec<u64> = (0..next)
+                .map(|f| {
+                    container
+                        .packets(f)
+                        .ok()
+                        .and_then(|p| p.audio.get(t).map(|a| decoder.packet_samples(a) as u64))
+                        .unwrap_or(0)
+                })
+                .collect();
+            let mut before = 0;
+            let mut containing = None;
+            for (f, count) in counts.iter().enumerate() {
+                if before + count > target {
+                    containing = Some(f);
+                    break;
+                }
+                before += count;
+            }
+            let Some(containing) = containing else {
+                continue;
+            };
+            let first = counts[..containing]
+                .iter()
+                .rposition(|c| *c > 0)
+                .unwrap_or(containing);
+            let first_before: u64 = counts[..first].iter().sum();
+            let channels = decoder.channels();
+            let mut samples = Vec::new();
+            for f in first..next as usize {
+                let packet = container
+                    .packets(f as u32)
+                    .ok()
+                    .and_then(|p| p.audio.get(t).copied());
+                let Some(packet) = packet else {
+                    continue;
+                };
+                if decoder.decode_packet(packet, &mut samples).is_err() {
+                    let missing = counts[f] as usize * channels;
+                    samples.resize(samples.len() + missing, 0.0);
+                    decoder.reset();
+                    self.failures += 1;
+                }
+            }
+            let skip = ((target - first_before) as usize * channels).min(samples.len());
+            samples.drain(..skip);
+            self.preroll[t] = samples;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -323,17 +423,87 @@ mod tests {
         let good = packet(&layout, &[&[(5, 3)]], 1);
         let mut bad = good.clone();
         bad.truncate(40);
-        let mut decoders = vec![
-            AudioDecoder::new(&track(1, true)).ok(),
-            AudioDecoder::new(&track(1, true)).ok(),
-            None,
-        ];
-        let mut out = vec![vec![7.0], Vec::new(), Vec::new()];
-        let failed = decode_frame(&mut decoders, &[&good, &bad, &good], &mut out);
-        assert_eq!(failed, 2);
-        assert_eq!(out[0].len(), 1920);
-        assert!(out[0].iter().any(|v| *v != 0.0));
-        assert_eq!(out[1], vec![0.0; 1920]);
-        assert!(out[2].is_empty());
+        let mut audio = Audio::new(&[track(1, true), track(1, true), track(2, false)]);
+        audio.decode_frame(&[&good, &bad, &good]);
+        assert_eq!(audio.failures(), 2);
+        let first = audio.take(0);
+        assert_eq!(first.len(), 1920);
+        assert!(first.iter().any(|v| *v != 0.0));
+        assert_eq!(audio.take(1), vec![0.0; 1920]);
+        assert!(audio.take(2).is_empty());
+        assert!(audio.take(0).is_empty(), "handed over once");
+    }
+
+    /// A stream of `frames` frames at 30 fps with one mono 48 kHz DCT track and no picture data.
+    fn movie(frame_packets: &[Vec<u8>]) -> Container {
+        let frames = frame_packets.len();
+        let index = 0x3C;
+        let mut bytes = vec![0u8; index + 4 * frames];
+        bytes[..4].copy_from_slice(b"KB2n");
+        let put = |bytes: &mut Vec<u8>, at: usize, v: u32| {
+            bytes[at..at + 4].copy_from_slice(&v.to_le_bytes())
+        };
+        put(&mut bytes, 8, frames as u32);
+        put(&mut bytes, 0x10, frames as u32);
+        put(&mut bytes, 0x14, 16);
+        put(&mut bytes, 0x18, 16);
+        put(&mut bytes, 0x1C, 30);
+        put(&mut bytes, 0x20, 1);
+        put(&mut bytes, 0x28, 1);
+        put(&mut bytes, 0x34, 48000 | 0x1000 << 16);
+        for (f, packet) in frame_packets.iter().enumerate() {
+            let at = bytes.len() as u32;
+            put(&mut bytes, index + 4 * f, at | u32::from(f == 0));
+            bytes.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(packet);
+        }
+        Container::parse(bytes.into()).unwrap()
+    }
+
+    fn sounding_movie(frames: usize) -> Container {
+        let layout = Layout::new(48000);
+        let packets: Vec<Vec<u8>> = (0..frames)
+            .map(|f| packet(&layout, &[&[(3 + f % 5, 1 + (f % 7) as i32)]], 1))
+            .collect();
+        movie(&packets)
+    }
+
+    fn everything(container: &Container) -> Vec<f32> {
+        let mut decoder = AudioDecoder::new(&container.header.audio[0]).unwrap();
+        let mut all = Vec::new();
+        for f in 0..container.header.frames {
+            decoder
+                .decode_packet(container.packets(f).unwrap().audio[0], &mut all)
+                .unwrap();
+        }
+        all
+    }
+
+    #[test]
+    fn after_a_seek_the_sound_for_the_frame_comes_from_the_packets_before_it() {
+        let container = sounding_movie(40);
+        let reference = everything(&container);
+        for next in [3usize, 12, 30, 39] {
+            let mut audio = Audio::new(&container.header.audio);
+            audio.seek(&container, next as u32);
+            let packets = container.packets(next as u32).unwrap();
+            audio.decode_frame(&packets.audio);
+            let got = audio.take(0);
+            let start = next * 1600;
+            let end = 1920 * (next + 1);
+            assert_eq!(got.len(), end - start, "frame {next}");
+            assert_eq!(got[..], reference[start..end], "frame {next}");
+            assert_eq!(audio.failures(), 0);
+        }
+    }
+
+    #[test]
+    fn seeking_to_the_start_keeps_nothing_and_the_first_frame_is_decoded_whole() {
+        let container = sounding_movie(8);
+        let reference = everything(&container);
+        let mut audio = Audio::new(&container.header.audio);
+        audio.seek(&container, 0);
+        audio.decode_frame(&container.packets(0).unwrap().audio);
+        assert_eq!(audio.take(0), reference[..1920]);
     }
 }
