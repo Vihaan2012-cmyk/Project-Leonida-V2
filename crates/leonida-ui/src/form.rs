@@ -308,10 +308,10 @@ fn performance() -> Page {
             Field::new(
                 FRAME_LIMIT,
                 "Frame limit",
-                "console, uncapped, vsync or a number of frames a second.",
+                "uncapped, vsync, console or a number of frames a second.",
                 Kind::Combo(choices(&[
-                    ("console", "console"),
                     ("uncapped", "uncapped"),
+                    ("console", "console"),
                     ("vsync", "vsync"),
                     ("30", "30"),
                     ("60", "60"),

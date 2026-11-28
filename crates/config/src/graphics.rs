@@ -33,10 +33,11 @@ pub enum FrameGenerationMethod {
 #[serde(rename_all = "lowercase")]
 pub enum FrameRateMode {
     /// The console's pacing: 30 or 60 frames a second as the game asks.
-    #[default]
     Console,
     /// At most `frame_rate_cap` frames a second.
     Cap,
+    /// No limit anywhere: the game's frame events fire as soon as the last frame is presented.
+    #[default]
     Uncapped,
     /// One frame per screen refresh.
     Vsync,
@@ -114,7 +115,7 @@ impl Default for Graphics {
             upscaler: Upscaler::Off,
             frame_generation: false,
             frame_generation_method: FrameGenerationMethod::Leonida,
-            frame_rate_mode: FrameRateMode::Console,
+            frame_rate_mode: FrameRateMode::Uncapped,
             frame_rate_cap: 60,
             window_mode: WindowMode::Windowed,
             window_width: 1920,
@@ -174,9 +175,9 @@ frame_generation = false
 # folders). When DLSS cannot run, Leonida's own is used and `leonida run` says why.
 frame_generation_method = \"leonida\"
 
-# \"console\" keeps the console's 30 or 60 frames a second; \"cap\" stops at frame_rate_cap; \"uncapped\" runs as
-# fast as it can; \"vsync\" shows one frame per screen refresh.
-frame_rate_mode = \"console\"
+# \"uncapped\" runs as fast as it can; \"cap\" stops at frame_rate_cap; \"vsync\" shows one frame per screen
+# refresh; \"console\" keeps the console's 30 or 60 frames a second.
+frame_rate_mode = \"uncapped\"
 # Used only when frame_rate_mode is \"cap\". 15 to 1000.
 frame_rate_cap = 60
 
@@ -281,6 +282,27 @@ frame_generation_method = \"dlss\"
             chosen
                 .to_text()
                 .contains("frame_generation_method = \"dlss\"")
+        );
+    }
+
+    #[test]
+    fn the_frame_rate_is_uncapped_unless_chosen_otherwise() {
+        assert_eq!(Graphics::default().frame_rate(), FrameRate::Uncapped);
+        assert_eq!(
+            Graphics::parse("").unwrap().frame_rate(),
+            FrameRate::Uncapped
+        );
+        let text = Graphics::default_text();
+        assert!(text.contains("frame_rate_mode = \"uncapped\""));
+        assert_eq!(
+            Graphics::parse(&text).unwrap().frame_rate(),
+            FrameRate::Uncapped
+        );
+        assert_eq!(
+            Graphics::parse("frame_rate_mode = \"console\"")
+                .unwrap()
+                .frame_rate(),
+            FrameRate::Console
         );
     }
 

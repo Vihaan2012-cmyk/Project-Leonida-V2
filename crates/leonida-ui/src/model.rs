@@ -79,12 +79,12 @@ fn limit_text(graphics: &Table) -> String {
     let mode = graphics
         .get("frame_rate_mode")
         .and_then(Value::as_str)
-        .unwrap_or("console");
+        .unwrap_or("uncapped");
     match mode {
         "cap" => graphics
             .get("frame_rate_cap")
             .and_then(Value::as_integer)
-            .map_or_else(|| "console".to_string(), |cap| cap.to_string()),
+            .map_or_else(|| "uncapped".to_string(), |cap| cap.to_string()),
         other => other.to_string(),
     }
 }
@@ -412,7 +412,7 @@ impl Form {
             if text == "true" {
                 put(self, FRAME_LIMIT, "vsync");
             } else if matches!(parse_limit(self.value(FRAME_LIMIT)), Ok(Limit::Vsync)) {
-                put(self, FRAME_LIMIT, "console");
+                put(self, FRAME_LIMIT, "uncapped");
             }
         }
         changed
@@ -673,6 +673,7 @@ mod tests {
     fn vertical_sync_and_the_frame_limit_stay_one_setting() {
         let mut form = form();
         assert_eq!(form.value(VSYNC), "false");
+        assert_eq!(form.value(FRAME_LIMIT), "uncapped");
         assert_eq!(form.set(VSYNC, "true"), [FRAME_LIMIT]);
         assert_eq!(form.value(FRAME_LIMIT), "vsync");
         assert_eq!(
@@ -680,7 +681,7 @@ mod tests {
             config::FrameRate::Vsync
         );
         assert_eq!(form.set(VSYNC, "false"), [FRAME_LIMIT]);
-        assert_eq!(form.value(FRAME_LIMIT), "console");
+        assert_eq!(form.value(FRAME_LIMIT), "uncapped");
         assert_eq!(form.set(FRAME_LIMIT, "vsync"), [VSYNC]);
         assert_eq!(form.value(VSYNC), "true");
         assert_eq!(form.set(FRAME_LIMIT, "60"), [VSYNC]);
