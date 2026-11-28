@@ -19,7 +19,7 @@ use crate::com::{self, E_FAIL, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER
 use crate::descriptor::views::{SrvKind, ViewResource};
 use crate::descriptor::{self, SLOT_BYTES};
 use crate::heap;
-use crate::pipeline::{ComputePsoDesc, PipelineError};
+use crate::pipeline::{ComputePsoDesc, GraphicsPsoDesc, PipelineError};
 use crate::pso_stream::{Dialect, HostMemory, Memory, PipelineStream};
 use crate::resource::desc::AllocationInfo;
 use crate::resource::{HeapKind, layout};
@@ -540,6 +540,23 @@ unsafe extern "win64" fn d_create_root_signature(
     }
 }
 
+/// Hands a graphics description to the service and returns the pipeline object, whose build is still going.
+fn create_graphics(
+    this: *mut c_void,
+    desc: GraphicsPsoDesc,
+    riid: *const u8,
+    out: *mut *mut c_void,
+) -> u32 {
+    let Some(asm) = asm(this) else {
+        return E_FAIL;
+    };
+    if let Err(e) = desc.check() {
+        return pipeline_hresult("a graphics pipeline", e);
+    }
+    let handle = asm.pipeline_service.create_graphics(desc);
+    new_pipeline(this, handle, false, riid, out)
+}
+
 unsafe extern "win64" fn d_create_graphics_pipeline_state(
     this: *mut c_void,
     desc: *const u8,
@@ -549,36 +566,27 @@ unsafe extern "win64" fn d_create_graphics_pipeline_state(
     if desc.is_null() || out.is_null() {
         return E_POINTER;
     }
-    let Some(asm) = asm(this) else {
-        return E_FAIL;
-    };
     // SAFETY: the title's description and the root signature it names.
     unsafe {
         let Some(root) = root_of(pso_root(desc)) else {
             com::note_once("a graphics pipeline without a root signature was refused");
             return E_INVALIDARG;
         };
-        let desc = read_graphics_pso(desc, root);
-        match asm.pipelines.create_graphics(&desc) {
-            Ok(pipeline) => new_pipeline(this, &asm, pipeline, riid, out),
-            Err(e) => pipeline_hresult("a graphics pipeline", e),
-        }
+        create_graphics(this, read_graphics_pso(desc, root), riid, out)
     }
 }
 
 fn create_compute(
     this: *mut c_void,
-    desc: &ComputePsoDesc,
+    desc: ComputePsoDesc,
     riid: *const u8,
     out: *mut *mut c_void,
 ) -> u32 {
     let Some(asm) = asm(this) else {
         return E_FAIL;
     };
-    match asm.pipelines.create_compute(desc) {
-        Ok(pipeline) => new_pipeline(this, &asm, pipeline, riid, out),
-        Err(e) => pipeline_hresult("a compute pipeline", e),
-    }
+    let handle = asm.pipeline_service.create_compute(desc);
+    new_pipeline(this, handle, true, riid, out)
 }
 
 /// Slot 11, and slot 62 with two words between: `D3D12_COMPUTE_PIPELINE_STATE_DESC`.
@@ -593,7 +601,7 @@ unsafe extern "win64" fn d_create_compute_pipeline_state(
     }
     // SAFETY: the title's description and the root signature it names.
     let desc = unsafe { read_compute_pso(desc, root_of(pso_root(desc))) };
-    create_compute(this, &desc, riid, out)
+    create_compute(this, desc, riid, out)
 }
 
 unsafe extern "win64" fn d_create_compute_pipeline_state_x(
@@ -655,16 +663,13 @@ fn create_from_stream(
             "a pipeline state stream asks for {kind}, which is not honoured"
         ));
     }
-    let Some(asm) = asm(this) else {
-        return E_FAIL;
-    };
     // SAFETY: the title's root signature object, or any pointer, which `root_of` checks by kind.
     let root = stream
         .root_signature
         .and_then(|p| unsafe { root_of(p as usize as *mut c_void) });
     if stream.is_compute() {
         return match stream.compute(root) {
-            Ok(desc) => create_compute(this, &desc, riid, out),
+            Ok(desc) => create_compute(this, desc, riid, out),
             Err(e) => pipeline_hresult("a compute pipeline stream", e.into()),
         };
     }
@@ -673,10 +678,7 @@ fn create_from_stream(
         return E_INVALIDARG;
     };
     match stream.graphics(root) {
-        Ok(desc) => match asm.pipelines.create_graphics(&desc) {
-            Ok(pipeline) => new_pipeline(this, &asm, pipeline, riid, out),
-            Err(e) => pipeline_hresult("a graphics pipeline", e),
-        },
+        Ok(desc) => create_graphics(this, desc, riid, out),
         Err(e) => pipeline_hresult("a graphics pipeline stream", e.into()),
     }
 }

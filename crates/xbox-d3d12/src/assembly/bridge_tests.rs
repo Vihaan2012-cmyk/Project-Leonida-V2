@@ -7,13 +7,13 @@ use ash::vk;
 
 use super::bridge::*;
 use super::indirect::IndirectLayout;
+use super::pipelines::PendingPipeline;
 use crate::com::{self, ComPtr, Kind};
 use crate::execute::barrier::{COPY_DEST, PIXEL_SHADER_RESOURCE, RENDER_TARGET, UNORDERED_ACCESS};
 use crate::execute::{
     Barrier, BindPoint, BufferFootprint, Command, ImageRef, IndirectKind, Resource, Subresource,
     TargetView,
 };
-use crate::pipeline::Pipeline;
 use crate::root::{HeapBases, RootSignature, RootVersion};
 use crate::stream::{
     self, Box3, CommandStream, CopyLocation, Footprint, RootView, VertexBufferView,
@@ -87,7 +87,7 @@ impl Resolver for Fake {
         self.roots.get(&key(object)).cloned()
     }
 
-    fn pipeline(&self, _object: &ComPtr) -> Option<Arc<Pipeline>> {
+    fn pipeline(&self, _object: &ComPtr) -> Option<Arc<dyn PendingPipeline>> {
         None
     }
 

@@ -9,6 +9,7 @@
 //!   image set, the pipeline environment and the presenter, and builds the `Integration` of `create_device`.
 //! - `executor`, `bridge`: closed command lists become replay commands and run on the queue.
 //! - `timeline`, `arena`: fences as timeline semaphores; upload, code and spill memory in the GPU's address space.
+//! - `pipelines`: the service that builds pipelines on worker threads, and what the title's pipeline objects hold.
 //! - `devmethods`, `objects`, `rawdesc`, `resapi`: the device methods (resources, descriptors, root signatures,
 //!   pipelines) and the COM objects they make.
 //! - `frames`: the frame events, `PresentX`, `SuspendX` and `ResumeX`, with the frame limit policy.
@@ -29,6 +30,7 @@ pub mod gpu;
 pub mod hooks;
 pub mod indirect;
 pub mod objects;
+pub mod pipelines;
 pub mod rawdesc;
 mod resapi;
 pub mod state;
@@ -47,6 +49,7 @@ use crate::pacing::FrameLimit;
 use crate::present::VulkanContext;
 
 pub use hooks::{InputEvent, MouseButton, set_content_filter, set_input_sink, set_motion_sink};
+pub use pipelines::{PipelinesSeen, SharedBuilder};
 pub use resapi::Placement;
 pub use state::{
     Assembly, AssemblyConfig, AssemblyError, Output, WindowOptionsConfig, current, register,

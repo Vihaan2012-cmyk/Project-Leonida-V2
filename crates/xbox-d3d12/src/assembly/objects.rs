@@ -8,13 +8,13 @@ use std::ffi::c_void;
 use std::sync::{Arc, OnceLock};
 
 use super::indirect::IndirectLayout;
+use super::pipelines::{Created, Handle, PendingPipeline};
 use super::state::Assembly;
 use crate::com::{
     self, ComPtr, E_INVALIDARG, E_POINTER, Guid, Kind, S_OK, add_ref, hand_out, kind_of,
     new_object, query_interface_for, release, state,
 };
 use crate::device::{DeviceCore, device_core};
-use crate::pipeline::Pipeline;
 use crate::resource::desc::{Dimension, Layout, ResourceDesc};
 use crate::resource::{HeapKind, Origin, ResourceId};
 use crate::root::RootSignature;
@@ -40,8 +40,8 @@ pub struct RootObject {
 
 pub struct PipelineObject {
     device: ComPtr,
-    asm: Arc<Assembly>,
-    pub pipeline: Arc<Pipeline>,
+    /// The pipeline, which may still be building.
+    pub pending: Arc<Created>,
 }
 
 pub struct SignatureObject {
@@ -364,8 +364,8 @@ pub unsafe fn root_of(p: *mut c_void) -> Option<Arc<RootSignature>> {
 
 pub fn new_pipeline(
     device: *mut c_void,
-    asm: &Arc<Assembly>,
-    pipeline: Arc<Pipeline>,
+    handle: Handle,
+    compute: bool,
     riid: *const u8,
     out: *mut *mut c_void,
 ) -> u32 {
@@ -391,8 +391,7 @@ pub fn new_pipeline(
         vtable,
         PipelineObject {
             device: device_ref,
-            asm: asm.clone(),
-            pipeline,
+            pending: Arc::new(Created { handle, compute }),
         },
     );
     // SAFETY: the creation reference is handed out.
@@ -423,7 +422,10 @@ unsafe extern "win64" fn ps_cached_blob(this: *mut c_void, out: *mut *mut c_void
     }
     // SAFETY: a pipeline state of this layer.
     let object = unsafe { state::<PipelineObject>(this) };
-    let data = object.asm.pipelines.cached_blob(&object.pipeline);
+    let Some(data) = object.pending.handle.cached_blob() else {
+        com::note_once("GetCachedBlob was asked before the pipeline environment could be made");
+        return com::E_FAIL;
+    };
     // SAFETY: `out` is writable.
     unsafe { *out = new_blob(data) };
     S_OK
@@ -445,17 +447,35 @@ unsafe extern "win64" fn ps_scratch_blob(
     S_OK
 }
 
-/// The pipeline behind a COM pointer.
+/// The pipeline behind a COM pointer, which may still be building.
 ///
 /// # Safety
 /// `p` is null or a live COM object.
-pub unsafe fn pipeline_of(p: *mut c_void) -> Option<Arc<Pipeline>> {
+pub unsafe fn pipeline_of(p: *mut c_void) -> Option<Arc<dyn PendingPipeline>> {
     if p.is_null() {
         return None;
     }
     // SAFETY: as the caller promises.
     unsafe {
-        (kind_of(p)? == Kind::PipelineState).then(|| state::<PipelineObject>(p).pipeline.clone())
+        (kind_of(p)? == Kind::PipelineState).then(|| {
+            let pending: Arc<dyn PendingPipeline> = state::<PipelineObject>(p).pending.clone();
+            pending
+        })
+    }
+}
+
+/// The service handle of a pipeline state object of this layer.
+///
+/// # Safety
+/// `p` is null or a live COM object.
+pub unsafe fn pipeline_handle_of(p: *mut c_void) -> Option<Handle> {
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: as the caller promises.
+    unsafe {
+        (kind_of(p)? == Kind::PipelineState)
+            .then(|| state::<PipelineObject>(p).pending.handle.clone())
     }
 }
 

@@ -14,9 +14,11 @@ use super::executor::AssemblyExecutor;
 use super::frames::{AssemblyFrames, PacerPolicy};
 use super::gpu::{Gpu, GpuConfig, GpuError};
 use super::hooks::{self, Translator};
+use super::pipelines::{self, PipelinesSeen, Service, SharedBuilder};
 use super::timeline::VkTimelines;
 use super::views::ViewCache;
 use crate::com;
+use crate::compile_queue::DrawPolicy;
 use crate::descriptor::Descriptors;
 use crate::device::{DeviceCore, Integration};
 use crate::heap::console::{ConsolePlacement, HeapAllocator, NoAllocator};
@@ -96,6 +98,13 @@ pub struct AssemblyConfig {
     pub present: PresentConfig,
     pub frame_limit: FrameLimit,
     pub pipeline_cache: Option<PathBuf>,
+    /// The log of pipelines the title created, replayed at start so the next session finds them built. `None`
+    /// records and replays nothing.
+    pub pipelines_seen: Option<PipelinesSeen>,
+    /// What a draw does when its pipeline is still being built.
+    pub draw_policy: DrawPolicy,
+    /// Threads that build pipelines; `None` leaves two processors to the game.
+    pub pipeline_workers: Option<usize>,
     pub gpu: GpuConfig,
     /// Make the `XMem*` shims report the game's memory to this device's address space.
     pub memory_hooks: bool,
@@ -109,6 +118,9 @@ impl AssemblyConfig {
             present: PresentConfig::default(),
             frame_limit: super::frame_limit(),
             pipeline_cache: std::env::var_os("LEONIDA_PIPELINE_CACHE").map(PathBuf::from),
+            pipelines_seen: std::env::var_os("LEONIDA_PIPELINES_SEEN").map(PipelinesSeen::beside),
+            draw_policy: DrawPolicy::Wait,
+            pipeline_workers: None,
             gpu: GpuConfig::from_env(true),
             memory_hooks: true,
         }
@@ -138,7 +150,9 @@ pub struct Assembly {
     pub descriptors: Mutex<Descriptors>,
     pub views: ViewCache,
     pub bindless: Bindless,
-    pub pipelines: PipelineEnv,
+    pub pipelines: Arc<PipelineEnv>,
+    /// Builds the pipelines the title creates on worker threads.
+    pub pipeline_service: Service,
     pub code: Arc<CodeArena>,
     pub upload: Arc<UploadArena>,
     pub exec: Mutex<ExecState>,
@@ -196,6 +210,14 @@ fn open_address_space(gpu: &Gpu) -> Result<AddressSpace, MemoryError> {
 
 impl Assembly {
     pub fn build(config: &AssemblyConfig) -> Result<Arc<Assembly>, AssemblyError> {
+        Self::build_with(config, |env| env)
+    }
+
+    /// As `build`, with the pipeline builder the service uses made from the device's `PipelineEnv` by `wrap`.
+    pub fn build_with(
+        config: &AssemblyConfig,
+        wrap: impl FnOnce(Arc<PipelineEnv>) -> SharedBuilder,
+    ) -> Result<Arc<Assembly>, AssemblyError> {
         let gpu = Arc::new(Gpu::create(&config.gpu)?);
         let space = Arc::new(Mutex::new(open_address_space(&gpu)?));
         if config.memory_hooks {
@@ -214,6 +236,13 @@ impl Assembly {
             code.clone(),
         )?;
         pipelines.note = Arc::new(|text| com::note_once(text.to_string()));
+        let pipelines = Arc::new(pipelines);
+        let pipeline_service = pipelines::start(
+            config.pipelines_seen.as_ref(),
+            config.pipeline_workers,
+            config.draw_policy,
+            wrap(pipelines.clone()),
+        );
         let pacer = Arc::new(Pacer::new(config.frame_limit));
         let policy = Arc::new(PacerPolicy::new(pacer.clone()));
         let mut presentation = match &config.output {
@@ -275,6 +304,7 @@ impl Assembly {
             descriptors: Mutex::new(Descriptors::new()),
             bindless,
             pipelines,
+            pipeline_service,
             code,
             exec: Mutex::new(exec),
             presentation: Arc::new(presentation),
@@ -344,6 +374,24 @@ pub fn register(core: &Arc<DeviceCore>, assembly: &Arc<Assembly>) {
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .push((Arc::as_ptr(core) as usize, assembly.clone()));
+}
+
+/// A device object was destroyed, so every object it made is gone: when it was the assembly's last device, the
+/// pipeline service stops recording and writes the pipeline cache.
+pub(crate) fn device_released(core: &Arc<DeviceCore>) {
+    let key = Arc::as_ptr(core) as usize;
+    let last = {
+        let mut registry = REGISTRY.write().unwrap_or_else(PoisonError::into_inner);
+        let Some(at) = registry.iter().position(|(k, _)| *k == key) else {
+            return;
+        };
+        let (_, assembly) = registry.remove(at);
+        let remaining = registry.iter().any(|(_, a)| Arc::ptr_eq(a, &assembly));
+        (!remaining).then_some(assembly)
+    };
+    if let Some(assembly) = last {
+        assembly.pipeline_service.shutdown();
+    }
 }
 
 /// The assembly behind a device object.
