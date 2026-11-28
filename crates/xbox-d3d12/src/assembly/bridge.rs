@@ -157,7 +157,10 @@ fn layout_state(layout: u32) -> u32 {
 }
 
 pub fn convert(stream: &CommandStream, resolver: &dyn Resolver) -> Converted {
-    let mut out = Converted::default();
+    let mut out = Converted {
+        commands: Vec::with_capacity(stream.commands.len()),
+        writes: Vec::new(),
+    };
     let mut state = State::default();
     convert_into(stream, resolver, &mut state, &mut out, 0);
     out
