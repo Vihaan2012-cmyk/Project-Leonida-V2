@@ -104,6 +104,50 @@ unsafe extern "win64" fn d_create_committed_resource(
     create_resource(this, Placement::Committed(heap), desc, state, riid, out)
 }
 
+/// The resource state a `D3D12_BARRIER_LAYOUT` puts a resource in, for the methods that take a layout.
+fn state_of_layout(layout: u32) -> u32 {
+    match layout {
+        1 => 0xAC3,
+        2 => 0x4,
+        3 => 0x8,
+        4 => 0x10,
+        5 => 0x20,
+        6 => 0xC0,
+        7 => 0x800,
+        8 => 0x400,
+        _ => 0,
+    }
+}
+
+/// Slot 127, `CreateCommittedResource3` by its measured call (`0x193e1b4`, the display buffers made in device setup):
+/// `(heap properties, heap flags, desc1, initial layout, clear value, protected session, castable format count,
+/// castable formats, riid, out)`. `D3D12_RESOURCE_DESC1` starts with the `D3D12_RESOURCE_DESC` fields.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "win64" fn d_create_committed_resource3(
+    this: *mut c_void,
+    props: *const u8,
+    _heap_flags: u32,
+    desc: *const u8,
+    layout: u32,
+    _clear: *const c_void,
+    _protected: *const c_void,
+    _castable_count: u32,
+    _castable: *const u32,
+    riid: *const u8,
+    out: *mut *mut c_void,
+) -> u32 {
+    // SAFETY: the title's heap properties.
+    let heap = unsafe { read_heap_kind(props) };
+    create_resource(
+        this,
+        Placement::Committed(heap),
+        desc,
+        state_of_layout(layout),
+        riid,
+        out,
+    )
+}
+
 /// Slot 30: `(desc, initial state, clear value, riid, out)`.
 unsafe extern "win64" fn d_create_reserved_resource(
     this: *mut c_void,
@@ -991,6 +1035,7 @@ pub fn table() -> Vec<(usize, usize)> {
         (101, f!(d_create_state_object)),
         (108, f!(d_resource_allocation_info1)),
         (119, f!(d_crash_handler_call)),
+        (127, f!(d_create_committed_resource3)),
         (132, f!(d_crash_handler_call)),
         (133, f!(d_create_placed_resource_x)),
     ]

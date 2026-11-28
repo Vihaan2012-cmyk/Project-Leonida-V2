@@ -61,6 +61,7 @@ ID3D12Device 86 CreatePipelineStateStreamX measured
 ID3D12Device 101 CreateStateObject measured (a ray tracing subobject list with riid and out, one site: the library builder at rva 0x024801b0; a failure only returns 0 from that builder and leaves the holder's state object null; the HRESULT check at rva 0x04e9b660 reacts only to device removed, hung, reset and driver internal error)
 ID3D12Device 108 GetResourceAllocationInfo1 measured (slot 25's arguments and an array of three-word infos; the title retries with alignment 0 when the answer is not the 4 KiB it asked)
 ID3D12Device 119 CrashContextAppendX measured (only from the crash handler: buffer, size, 0)
+ID3D12Device 127 CreateCommittedResource3 measured (called at rva 0x0193e1b4 as (heap properties, heap flags 8, desc1, initial layout, clear value, 0, 0, 0, riid, out) for the display buffers made in device setup)
 ID3D12Device 132 RequestGpuDumpX measured (only from the crash handler: called as (3))
 ID3D12Device 78 SetFrameIntervalX measured
 ID3D12Device 79 ScheduleFrameEventX measured
