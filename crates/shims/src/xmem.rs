@@ -299,9 +299,10 @@ mod imp {
         kind: u32,
         access: u32,
     ) -> *mut c_void {
-        let reserve = kind & MEM_RESERVE != 0;
+        // A commit with no address reserves too (Windows does so implicitly), so it is placed like a reserve.
+        let reserve = kind & MEM_RESERVE != 0 || address.is_null();
         let flags = if reserve {
-            kind | MEM_WRITE_WATCH
+            kind | MEM_RESERVE | MEM_WRITE_WATCH
         } else {
             kind
         };

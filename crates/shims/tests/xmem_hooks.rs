@@ -186,6 +186,32 @@ fn the_placeholder_the_title_carves_its_descriptor_heap_from_is_placed_below_4_g
     }
 }
 
+/// The first real boot stopped here: the title commits GPU memory with no address and no reserve bit
+/// (`0x20401000`, attributes 0x283, from `sub_02478440`), which Windows reserves anywhere unless it is placed.
+#[test]
+fn a_commit_with_no_address_and_no_reserve_bit_is_placed_in_the_window() {
+    let window = (64 * GIB, 64 * GIB);
+    let hooks = Installed::new(window);
+    let alloc: VirtualAlloc = shim("XMemVirtualAlloc");
+    // SAFETY: the shape the executable uses.
+    unsafe {
+        let base = alloc(
+            std::ptr::null_mut(),
+            PAGE as usize,
+            0x2040_1000,
+            0x283,
+            0x4_2404,
+        );
+        assert!(inside(window, base, PAGE), "{base:p}");
+        assert_eq!(base as u64 % PAGE, 0);
+        (base as *mut u8).write_volatile(7);
+        assert_eq!(
+            hooks.take(),
+            vec![Event::Mapped(base as u64, PAGE, SyncPolicy::WriteWatch)]
+        );
+    }
+}
+
 #[test]
 fn gpu_allocations_are_placed_in_the_window_reported_and_unreported_on_free() {
     let window = (64 * GIB, 64 * GIB);
