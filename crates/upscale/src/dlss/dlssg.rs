@@ -13,7 +13,7 @@
 //!   states no queue, semaphore or layout rule beyond that and "the resources are in a state suitable for reading
 //!   (outputs for writing)". Here inputs are in `SHADER_READ_ONLY_OPTIMAL` and the output in `GENERAL`, and the queue
 //!   the commands go to must be a graphics or compute queue of the device NGX was initialised on.
-//! - NGX is not thread-safe: every call runs under [`turn::ngx_turn`].
+//! - NGX is not thread-safe: every call runs under the lock `dlss::lock::ngx_lock` that super resolution uses too.
 //!
 //! Per real frame ([`session::Session::evaluate`]): the final colour of the newest frame (the feature keeps the one
 //! before itself), depth and motion vectors as they were given to the upscaler, the camera and a reset flag; the output
@@ -26,7 +26,6 @@ pub mod pacing;
 pub mod params;
 pub mod session;
 pub mod support;
-pub mod turn;
 
 #[cfg(test)]
 mod tests;
@@ -88,5 +87,56 @@ pub fn vk_init(ctx: &VkContext) -> VkInit {
         device: ctx.device.handle(),
         get_instance_proc_addr: ctx.entry.static_fn().get_instance_proc_addr,
         get_device_proc_addr: ctx.instance.fp_v1_0().get_device_proc_addr,
+    }
+}
+
+/// What frame generation can do on this machine, for a message to the player.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    pub available: bool,
+    /// One sentence: where it runs, or why it cannot.
+    pub summary: String,
+    /// The folder holding `nvngx_dlssg.dll` when one was found.
+    pub library_dir: Option<std::path::PathBuf>,
+}
+
+/// Opens an NVIDIA device, initialises NGX on it and asks whether frame generation is available. Needs no renderer and
+/// takes a second or two. `dlss_dll` is the player's `nvngx_dlss.dll` setting, whose folder is searched for
+/// `nvngx_dlssg.dll` too.
+pub fn report(dlss_dll: Option<&std::path::Path>) -> Report {
+    let located = support::locate(dlss_dll);
+    let library_dir = located
+        .as_ref()
+        .and_then(|l| l.path.parent().map(std::path::Path::to_path_buf));
+    let options = DlssOptions::default();
+    let outcome = (|| -> Result<String, String> {
+        let api = std::sync::Arc::new(Api::open(None)?);
+        let ctx = open_device(&api, &options)?;
+        let session = Session::new(api, &vk_init(&ctx), &options, library_dir.as_deref())
+            .map_err(|e| e.to_string())?;
+        let multiplier = session.capabilities().max_multiplier();
+        Ok(format!(
+            "available on {} (up to {multiplier}x, nvngx_dlssg.dll from {})",
+            ctx.device_name,
+            located
+                .as_ref()
+                .map_or("NVIDIA's driver".to_string(), |l| format!(
+                    "{}: {}",
+                    support::describe(l.source),
+                    l.path.display()
+                ))
+        ))
+    })();
+    match outcome {
+        Ok(summary) => Report {
+            available: true,
+            summary,
+            library_dir,
+        },
+        Err(reason) => Report {
+            available: false,
+            summary: reason,
+            library_dir,
+        },
     }
 }

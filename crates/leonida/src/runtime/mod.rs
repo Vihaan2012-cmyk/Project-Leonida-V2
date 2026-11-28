@@ -6,6 +6,7 @@
 
 mod audio;
 mod content;
+mod framegen;
 mod input;
 mod patches;
 mod paths;
@@ -72,6 +73,9 @@ pub fn configure(plan: &RuntimePlan) -> Result<()> {
     }
     if let Some(note) = upscaler::configure(plan).context("setting up the upscaler")? {
         println!("upscaler: {note}");
+    }
+    if let Some(note) = framegen::configure(plan) {
+        println!("frame generation: {note}");
     }
     let line = content::configure(plan).context("setting up the nudity filter")?;
     println!("{line}");

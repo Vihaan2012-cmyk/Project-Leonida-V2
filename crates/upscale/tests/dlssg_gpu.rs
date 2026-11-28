@@ -431,3 +431,12 @@ fn a_generated_frame_between_two_moving_gradients_lies_between_them() {
     }
     rig.ctx.destroy_image(output);
 }
+
+#[test]
+#[ignore = "needs an RTX 40 series GPU (and nvngx_dlssg.dll from LEONIDA_DLSSG_DLL or the driver)"]
+fn the_report_says_frame_generation_is_available_on_this_pc() {
+    let report = dlssg::report(None);
+    eprintln!("{report:?}");
+    assert!(report.available, "{}", report.summary);
+    assert!(report.summary.contains("up to 2x"), "{}", report.summary);
+}

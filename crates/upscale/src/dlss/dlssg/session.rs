@@ -1,7 +1,7 @@
 //! NGX initialised for frame generation, and the feature instance on top of it.
 //!
 //! A [`Session`] owns one NGX initialisation for the device it was given and at most one frame generation feature.
-//! Every NGX call runs under [`ngx_turn`](super::turn::ngx_turn). The commands NGX records are the caller's to submit:
+//! Every NGX call runs under the NGX lock (`dlss::lock::ngx_lock`, shared with super resolution). The commands NGX records are the caller's to submit:
 //! creation and evaluation both record into a command buffer that is open and recording on a graphics or compute
 //! queue of the device, and the caller restores any state it relies on afterwards.
 
@@ -14,8 +14,8 @@ use ash::vk;
 use super::names;
 use super::params::{self, CreateParams, EvalOptions, Resources};
 use super::support::Capabilities;
-use super::turn::ngx_turn;
 use crate::dlss::ffi;
+use crate::dlss::lock::ngx_lock;
 use crate::dlss::modes::DlssOptions;
 use crate::dlss::ngx::{Api, Ngx, NgxError, Parameters, VkInit};
 
@@ -36,7 +36,7 @@ struct Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
-        let _turn = ngx_turn();
+        let _turn = ngx_lock();
         // SAFETY: the handle came from CreateFeature and is released once; the map is destroyed after the feature.
         unsafe {
             (self.api.release_feature)(self.handle);
@@ -51,11 +51,11 @@ pub struct Session {
     device: vk::Device,
     capabilities: Capabilities,
     instance: Option<Instance>,
-    // Dropped by hand, under the NGX turn, after the feature.
+    // Dropped by hand, under the NGX lock, after the feature.
     ngx: ManuallyDrop<Ngx>,
 }
 
-// SAFETY: every NGX and Vulkan object is used only through `&mut self`, and every NGX call takes the process-wide turn.
+// SAFETY: every NGX and Vulkan object is used only through `&mut self`, and every NGX call takes the process-wide lock.
 unsafe impl Send for Session {}
 
 impl Session {
@@ -67,7 +67,7 @@ impl Session {
         options: &DlssOptions,
         dlssg_dir: Option<&Path>,
     ) -> Result<Session, NgxError> {
-        let _turn = ngx_turn();
+        let _turn = ngx_lock();
         let ngx = Ngx::init(api.clone(), vk_init, options, dlssg_dir)?;
         let capabilities = Capabilities::read(ngx.capability_map());
         let session = Session {
@@ -108,7 +108,7 @@ impl Session {
             return Ok(false);
         }
         self.instance = None;
-        let _turn = ngx_turn();
+        let _turn = ngx_lock();
         let mut map = Parameters::allocate(&self.api)?;
         params::apply_create(&mut *map, create);
         let mut handle = std::ptr::null_mut();
@@ -170,7 +170,7 @@ impl Session {
         let Some(instance) = self.instance.as_mut() else {
             return Err(NgxError::Other("prepare was not called".into()));
         };
-        let _turn = ngx_turn();
+        let _turn = ngx_lock();
         let map = &mut **instance.params;
         // SAFETY: `resources` and `options` are borrowed until the evaluate call below returns, and NGX only reads
         // through the pointers during it.
@@ -188,8 +188,8 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.instance = None;
-        let _turn = ngx_turn();
-        // SAFETY: dropped once, here, after the feature was released and under the NGX turn.
+        let _turn = ngx_lock();
+        // SAFETY: dropped once, here, after the feature was released and under the NGX lock.
         unsafe { ManuallyDrop::drop(&mut self.ngx) };
     }
 }

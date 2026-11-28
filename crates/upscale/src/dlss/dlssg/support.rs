@@ -149,7 +149,7 @@ impl Api {
         };
         let info = discovery.info();
         let (mut count, mut list) = (0u32, std::ptr::null_mut());
-        let _turn = super::turn::ngx_turn();
+        let _turn = crate::dlss::lock::ngx_lock();
         // SAFETY: `info` and its strings live for the call; the out-pointers are valid; NGX owns the array it returns.
         let result = unsafe { function(&info, &mut count, &mut list) };
         if ffi::failed(result) {
@@ -173,7 +173,7 @@ impl Api {
         };
         let info = discovery.info();
         let (mut count, mut list) = (0u32, std::ptr::null_mut());
-        let _turn = super::turn::ngx_turn();
+        let _turn = crate::dlss::lock::ngx_lock();
         // SAFETY: as above; the handles belong to the caller's live instance.
         let result = unsafe { function(instance, physical, &info, &mut count, &mut list) };
         if ffi::failed(result) {
@@ -201,7 +201,7 @@ impl Api {
             min_hw_architecture: 0,
             min_os_version: [0; 255],
         };
-        let _turn = super::turn::ngx_turn();
+        let _turn = crate::dlss::lock::ngx_lock();
         // SAFETY: as above; `requirement` is a valid out-structure.
         let result = unsafe { function(instance, physical, &info, &mut requirement) };
         if ffi::failed(result) {
