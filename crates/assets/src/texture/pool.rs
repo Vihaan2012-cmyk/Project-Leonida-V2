@@ -642,11 +642,11 @@ mod tests {
     fn bcpack_chunk_is_a_typed_unsupported_read() {
         let first = first_page(1, 1);
         let recs = [record(64, 64, 1, 0, 71, 1, 1, 2, first, 0, 0)];
-        let file = pool(&recs, &[1], &[Packed::BcPack(6, vec![0x1f; 100], 2048)]);
+        let file = pool(&recs, &[1], &[Packed::BcPack(2, vec![0x1f; 100], 2048)]);
         let p = Pool::parse(&file).unwrap();
         let base = p.descriptor(0).unwrap().base;
         let set = p.codecs(base, 2048).unwrap();
-        assert_eq!(set.undecodable_bcpack(), Some(BcPackCodec::Bc6h));
+        assert_eq!(set.undecodable_bcpack(), Some(BcPackCodec::Bc2));
         assert!(!set.readable());
         let err = p
             .read_range(base, 2048, &mut ChunkCache::new())
@@ -655,7 +655,7 @@ mod tests {
             err,
             ReadError::BcPack {
                 source: BcPackError::Unsupported {
-                    codec: BcPackCodec::Bc6h
+                    codec: BcPackCodec::Bc2
                 },
                 ..
             }

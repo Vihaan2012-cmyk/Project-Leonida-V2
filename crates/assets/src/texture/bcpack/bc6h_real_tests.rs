@@ -1,5 +1,7 @@
 //! BC6H on the game's real chunks, gated on `LEONIDA_GAME_DIR`.
 
+#![allow(clippy::needless_range_loop)]
+
 use super::bc6h::{Entry as Hist, History, Trace, rebuild};
 use super::lanes::decode_slice;
 use super::survey_tests::{chunk_entries, pool_paths, read_chunk};

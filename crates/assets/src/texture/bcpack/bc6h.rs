@@ -216,6 +216,7 @@ pub(super) fn stream_w(mode: usize, w: u32) -> u32 {
 pub(super) enum Entry<T> {
     Unknown,
     Provisional(T),
+    #[cfg_attr(not(test), allow(dead_code))]
     Confirmed(T),
 }
 
@@ -226,6 +227,7 @@ pub(super) struct History {
 
 impl History {
     /// No built-in entry known.
+    #[cfg(test)]
     pub fn empty() -> History {
         History {
             endpoints: vec![Entry::Unknown; 256],
