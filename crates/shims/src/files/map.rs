@@ -7,21 +7,40 @@
 
 use std::path::{Path, PathBuf};
 
+use super::policy;
+
 /// Why a path cannot be opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     Network(offline::Reason),
     Escapes,
     Device,
+    /// A path the sandbox does not allow: not in the game folder, `Output/` or a mods or fixes folder.
+    Outside,
+    /// A link or junction inside an allowed folder that leads out of it.
+    Link,
+    /// A named pipe, which the sandbox keeps the game from reaching.
+    Pipe,
+    /// A name Windows would read as something other than a plain file name: a stream, a wildcard, a trailing dot.
+    Invalid,
 }
 
 impl Refusal {
-    /// The Windows error code to report.
+    /// The Windows error code to report for a call that changes files.
     pub fn code(self) -> u32 {
         match self {
             Refusal::Network(_) => 53,
-            Refusal::Escapes => 123,
-            Refusal::Device => 5,
+            Refusal::Escapes | Refusal::Invalid => 123,
+            Refusal::Device | Refusal::Outside | Refusal::Link => 5,
+            Refusal::Pipe => 2,
+        }
+    }
+
+    /// The code for a call that only looks: a path outside the sandbox is answered as a path that is not there.
+    pub fn code_for(self, writes: bool) -> u32 {
+        match self {
+            Refusal::Outside | Refusal::Link | Refusal::Device if !writes => 3,
+            other => other.code(),
         }
     }
 }
@@ -44,6 +63,8 @@ pub struct Roots {
     output: PathBuf,
     package_key: (char, Vec<String>),
     output_key: (char, Vec<String>),
+    sandbox: Option<Vec<(char, Vec<String>)>>,
+    reads: Vec<PathBuf>,
 }
 
 enum Anchor {
@@ -73,7 +94,7 @@ fn normalise(rest: &str) -> Result<Vec<String>, Refusal> {
     Ok(parts)
 }
 
-fn parse(path: &str) -> Result<Parsed, Refusal> {
+fn parse(path: &str, strict: bool) -> Result<Parsed, Refusal> {
     if let Some(reason) = offline::path(path) {
         return Err(Refusal::Network(reason));
     }
@@ -83,6 +104,9 @@ fn parse(path: &str) -> Result<Parsed, Refusal> {
     let mut prefixed = false;
     for prefix in ["\\\\?\\", "\\??\\"] {
         if lower.starts_with(prefix) {
+            if strict {
+                return Err(Refusal::Device);
+            }
             rest = &unified[prefix.len()..];
             prefixed = true;
             let tail = rest.to_ascii_lowercase();
@@ -93,7 +117,11 @@ fn parse(path: &str) -> Result<Parsed, Refusal> {
     }
     if lower.starts_with("\\\\.\\") {
         return if lower.starts_with("\\\\.\\pipe\\") {
-            Ok(Parsed::Pipe)
+            if strict {
+                Err(Refusal::Pipe)
+            } else {
+                Ok(Parsed::Pipe)
+            }
         } else {
             Err(Refusal::Device)
         };
@@ -116,7 +144,13 @@ fn parse(path: &str) -> Result<Parsed, Refusal> {
     } else {
         (Anchor::Relative, rest)
     };
-    Ok(Parsed::Path(anchor, normalise(body)?))
+    let parts = normalise(body)?;
+    if strict {
+        for part in &parts {
+            policy::check_name(part)?;
+        }
+    }
+    Ok(Parsed::Path(anchor, parts))
 }
 
 fn host_path(drive: char, parts: &[String]) -> PathBuf {
@@ -148,7 +182,28 @@ impl Roots {
             output_key: key(&output)?,
             package,
             output,
+            sandbox: None,
+            reads: Vec::new(),
         })
+    }
+
+    /// Closes every path but the package (read only), `Output/` and the `reads` folders (read only). `None` when a
+    /// folder in `reads` has no drive letter.
+    pub fn sandboxed(mut self, reads: Vec<PathBuf>) -> Option<Roots> {
+        let keys = reads.iter().map(|p| key(p)).collect::<Option<Vec<_>>>()?;
+        policy::forget();
+        self.sandbox = Some(keys);
+        self.reads = reads;
+        Some(self)
+    }
+
+    pub fn is_sandboxed(&self) -> bool {
+        self.sandbox.is_some()
+    }
+
+    /// The folders a sandboxed game may read besides `Output/`: the package and the extra folders.
+    pub(super) fn read_roots(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.package.as_path()).chain(self.reads.iter().map(PathBuf::as_path))
     }
 
     pub fn package(&self) -> &Path {
@@ -182,7 +237,7 @@ impl Roots {
 
     /// Maps a path the game names.
     pub fn map(&self, path: &str) -> Result<Target, Refusal> {
-        let (anchor, parts) = match parse(path)? {
+        let (anchor, parts) = match parse(path, self.sandbox.is_some())? {
             Parsed::Pipe => return Ok(Target::Passthrough),
             Parsed::Path(anchor, parts) => (anchor, parts),
         };
@@ -204,6 +259,14 @@ impl Roots {
             }
             if let Some(skip) = Self::under(&self.package_key, drive, &parts) {
                 return Ok(self.layered(&parts[skip..]));
+            }
+            if let Some(reads) = &self.sandbox
+                && !reads
+                    .iter()
+                    .any(|root| Self::under(root, drive, &parts).is_some())
+                && matches!(anchor, Anchor::Drive(_))
+            {
+                return Err(Refusal::Outside);
             }
         }
         match anchor {
@@ -328,5 +391,109 @@ mod tests {
         assert_eq!(roots.map("a\\..\\..\\x"), Err(Refusal::Escapes));
         assert_eq!(roots.map("\\\\.\\PhysicalDrive0"), Err(Refusal::Device));
         assert_eq!(Refusal::Escapes.code(), 123);
+    }
+
+    fn sandboxed() -> Roots {
+        roots()
+            .sandboxed(vec![PathBuf::from("E:\\Games\\Leo\\Mods")])
+            .expect("sandboxed")
+    }
+
+    #[test]
+    fn the_sandbox_keeps_the_allowed_mappings() {
+        let roots = sandboxed();
+        let plain = self::roots();
+        for path in [
+            "GAME:\\data\\a.bin",
+            "g:/data/a.bin",
+            "data\\a.bin",
+            "\\data\\a.bin",
+            "./data/../data/./a.bin",
+            "E:\\Games\\Pkg\\data\\a.bin",
+            "e:/GAMES/pkg/DATA/a.bin",
+            "T:\\cache\\x.tmp",
+            "E:\\Games\\Leo\\Output\\saves\\a.sav",
+            "e:\\games\\leo\\output",
+            "E:\\Games\\Leo\\Mods\\fix\\a.bin",
+            "e:/games/leo/mods/fix/a.bin",
+        ] {
+            assert!(roots.map(path).is_ok(), "{path}");
+            assert_eq!(roots.map(path), plain.map(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_sandbox_closes_every_other_path() {
+        let roots = sandboxed();
+        for path in [
+            "C:\\Windows\\Fonts\\a.ttf",
+            "c:/users/someone/documents/a.docx",
+            "E:\\",
+            "E:\\Games",
+            "E:\\Games\\Pkg2\\a.bin",
+            "E:\\Games\\Leo\\other.txt",
+            "E:\\Games\\Leo\\Outputs\\a",
+            "Z:\\x",
+            "D:rel\\x",
+            "E:\\Games\\Pkg\\..\\Leo\\other",
+        ] {
+            assert_eq!(roots.map(path), Err(Refusal::Outside), "{path}");
+        }
+        assert_eq!(Refusal::Outside.code_for(false), 3);
+        assert_eq!(Refusal::Outside.code_for(true), 5);
+        assert_eq!(Refusal::Link.code_for(false), 3);
+        assert_eq!(Refusal::Pipe.code_for(false), 2);
+        assert_eq!(Refusal::Invalid.code_for(true), 123);
+    }
+
+    #[test]
+    fn the_sandbox_refuses_special_names() {
+        let roots = sandboxed();
+        let cases: &[(&str, Refusal)] = &[
+            ("\\\\?\\E:\\Games\\Pkg\\data\\a.bin", Refusal::Device),
+            ("\\??\\E:\\Games\\Pkg\\a", Refusal::Device),
+            ("\\\\.\\PhysicalDrive0", Refusal::Device),
+            ("\\\\.\\C:", Refusal::Device),
+            ("\\\\.\\pipe\\crash", Refusal::Pipe),
+            ("GAME:\\data\\a.bin:stream", Refusal::Invalid),
+            ("GAME:\\data\\a.bin::$DATA", Refusal::Invalid),
+            ("GAME:\\data\\a.bin.", Refusal::Invalid),
+            ("GAME:\\data\\a.bin ", Refusal::Invalid),
+            ("GAME:\\data\\...\\a", Refusal::Invalid),
+            ("GAME:\\data\\*.bin", Refusal::Invalid),
+            ("GAME:\\data\\a|b", Refusal::Invalid),
+            ("GAME:\\data\\NUL", Refusal::Device),
+            ("data\\com3.txt", Refusal::Device),
+            ("T:\\lpt1", Refusal::Device),
+            ("GAME:\\..\\x", Refusal::Escapes),
+            ("a\\..\\..\\x", Refusal::Escapes),
+        ];
+        for (path, refusal) in cases {
+            assert_eq!(roots.map(path), Err(*refusal), "{path}");
+        }
+        assert_eq!(
+            roots.map("\\\\server\\share\\a"),
+            Err(Refusal::Network(offline::Reason::NetworkShares))
+        );
+        assert_eq!(
+            roots.map("\\\\?\\UNC\\server\\share\\a"),
+            Err(Refusal::Network(offline::Reason::NetworkShares))
+        );
+        assert!(self::roots().map("\\\\.\\pipe\\crash").is_ok());
+    }
+
+    #[test]
+    fn dot_dot_cannot_climb_out_of_an_allowed_folder() {
+        let roots = sandboxed();
+        assert!(roots.map("GAME:\\a\\..\\b").is_ok());
+        assert!(roots.map("E:\\Games\\Leo\\Output\\..\\Mods\\x").is_ok());
+        assert_eq!(
+            roots.map("E:\\Games\\Leo\\Output\\..\\..\\x"),
+            Err(Refusal::Outside)
+        );
+        assert_eq!(
+            roots.map("E:\\Games\\Leo\\Mods\\..\\Output2"),
+            Err(Refusal::Outside)
+        );
     }
 }

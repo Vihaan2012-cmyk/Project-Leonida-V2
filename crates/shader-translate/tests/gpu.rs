@@ -618,3 +618,31 @@ fn barriers_order_lds_across_the_waves_of_a_group() {
         }
     }
 }
+
+#[test]
+fn translating_a_program_again_gives_the_same_words() {
+    let mut source = String::new();
+    for r in 1..24 {
+        source += &format!(
+            "s_mov_b32 s{}, {r}
+v_add_nc_u32_e32 v{r}, s{}, v0
+",
+            r + 20,
+            r + 20
+        );
+    }
+    source += "s_endpgm";
+    let code = rdna::assemble(&source, true).unwrap();
+    let function = shader_ir::lift(&code, false).unwrap();
+    let options = HarnessOptions {
+        lds_words: LDS_WORDS as u32,
+        nan_preserve: false,
+        flush_denormals: false,
+        preserve_denormals: false,
+        code_base: 0,
+    };
+    let first = harness(&function, &options).unwrap();
+    for _ in 0..8 {
+        assert_eq!(harness(&function, &options).unwrap(), first);
+    }
+}

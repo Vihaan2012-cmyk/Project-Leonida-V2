@@ -10,7 +10,10 @@ use std::sync::RwLock;
 
 use crate::Shim;
 
+mod blocked;
 mod map;
+mod policy;
+pub use blocked::blocked_api;
 pub use map::{Refusal, Roots, Target};
 
 // integration
@@ -21,17 +24,45 @@ pub use map::{Refusal, Roots, Target};
 static ROOTS: RwLock<Option<Roots>> = RwLock::new(None);
 
 /// Sets the package folder and the `Output/` folder. Both must be absolute paths with drive letters. Until this is
-/// called, paths pass to Windows unchanged.
+/// called, paths pass to Windows unchanged, and after it any path outside the two still reaches the host: use
+/// [`configure_sandboxed`] to close them.
 pub fn configure(package: PathBuf, output: PathBuf) -> bool {
-    let Some(roots) = Roots::new(package, output) else {
-        return false;
-    };
+    Roots::new(package, output).is_some_and(install)
+}
+
+/// Like [`configure`], and closes every path but the package (read only), `Output/` (read and write) and the
+/// `reads` folders (read only, for the mods and fixes). Everything else is refused as the console would refuse a
+/// path outside its sandbox, and no link inside the allowed folders may lead out of them.
+pub fn configure_sandboxed(package: PathBuf, output: PathBuf, reads: Vec<PathBuf>) -> bool {
+    Roots::new(package, output)
+        .and_then(|roots| roots.sandboxed(reads))
+        .is_some_and(install)
+}
+
+fn install(roots: Roots) -> bool {
     if let Ok(mut slot) = ROOTS.write() {
         *slot = Some(roots);
         true
     } else {
         false
     }
+}
+
+/// Whether the sandbox is on, which also decides what `LoadLibrary`, the registry and the pipes may do.
+pub fn sandboxed() -> bool {
+    ROOTS
+        .read()
+        .ok()
+        .is_some_and(|roots| roots.as_ref().is_some_and(Roots::is_sandboxed))
+}
+
+/// Whether the game folder holds `path`, for the library loader to tell a console DLL's name from a stray path.
+pub fn in_package(path: &str) -> bool {
+    ROOTS.read().ok().is_some_and(|roots| {
+        roots.as_ref().is_some_and(|roots| {
+            matches!(roots.map(path), Ok(Target::Layered { base, .. }) if base.starts_with(roots.package()))
+        })
+    })
 }
 
 /// Where a package file really is when a mod or a fix replaces it: given the path below the package folder, the
@@ -58,16 +89,19 @@ pub fn resolve(path: &str) -> Result<Target, Refusal> {
     };
     let target = roots.map(path)?;
     let Target::Layered { base, overlay } = target else {
+        roots.verify(&target)?;
         return Ok(target);
     };
     let replaced = REDIRECT.read().ok().and_then(|slot| {
         let relative = base.strip_prefix(roots.package()).ok()?;
         slot.as_ref().and_then(|redirect| redirect(relative))
     });
-    Ok(Target::Layered {
+    let target = Target::Layered {
         base: replaced.unwrap_or(base),
         overlay,
-    })
+    };
+    roots.verify(&target)?;
+    Ok(target)
 }
 
 // end of integration

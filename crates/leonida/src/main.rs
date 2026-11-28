@@ -14,6 +14,7 @@ mod cmd_shaders;
 mod cmd_systems;
 mod cmd_triage;
 mod cmd_verify;
+mod compute_env;
 mod game;
 mod pipeline_work;
 mod runtime;

@@ -7,23 +7,23 @@ use windows_sys::Win32::Storage::FileSystem::{ReadFile, WIN32_FIND_DATAW, WriteF
 use super::*;
 use crate::files::{configure, set_redirect};
 
-static LOCK: Mutex<()> = Mutex::new(());
+pub(super) static LOCK: Mutex<()> = Mutex::new(());
 
-const GENERIC_READ: u32 = 0x8000_0000;
-const GENERIC_WRITE: u32 = 0x4000_0000;
-const OPEN_EXISTING: u32 = 3;
-const CREATE_ALWAYS: u32 = 2;
-const CREATE_NEW: u32 = 1;
-const SHARE: u32 = 7;
+pub(super) const GENERIC_READ: u32 = 0x8000_0000;
+pub(super) const GENERIC_WRITE: u32 = 0x4000_0000;
+pub(super) const OPEN_EXISTING: u32 = 3;
+pub(super) const CREATE_ALWAYS: u32 = 2;
+pub(super) const CREATE_NEW: u32 = 1;
+pub(super) const SHARE: u32 = 7;
 
-struct Setup {
-    _guard: std::sync::MutexGuard<'static, ()>,
-    _dir: tempfile::TempDir,
-    package: PathBuf,
-    output: PathBuf,
+pub(super) struct Setup {
+    pub(super) _guard: std::sync::MutexGuard<'static, ()>,
+    pub(super) _dir: tempfile::TempDir,
+    pub(super) package: PathBuf,
+    pub(super) output: PathBuf,
 }
 
-fn setup() -> Setup {
+pub(super) fn setup() -> Setup {
     let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp");
     std::fs::create_dir_all(&scratch).expect("scratch");
@@ -46,11 +46,11 @@ fn setup() -> Setup {
     }
 }
 
-fn w(text: &str) -> Vec<u16> {
+pub(super) fn w(text: &str) -> Vec<u16> {
     text.encode_utf16().chain([0]).collect()
 }
 
-fn open(name: &str, access: u32, disposition: u32) -> HANDLE {
+pub(super) fn open(name: &str, access: u32, disposition: u32) -> HANDLE {
     let name = w(name);
     // SAFETY: a terminated name; the shim is the one under test.
     unsafe {
@@ -66,7 +66,7 @@ fn open(name: &str, access: u32, disposition: u32) -> HANDLE {
     }
 }
 
-fn read_all(handle: HANDLE) -> Vec<u8> {
+pub(super) fn read_all(handle: HANDLE) -> Vec<u8> {
     let mut buffer = vec![0u8; 4096];
     let mut got = 0;
     // SAFETY: a host handle and a buffer of the stated size.
@@ -84,7 +84,7 @@ fn read_all(handle: HANDLE) -> Vec<u8> {
     buffer
 }
 
-fn write_all(handle: HANDLE, bytes: &[u8]) {
+pub(super) fn write_all(handle: HANDLE, bytes: &[u8]) {
     let mut done = 0;
     // SAFETY: a host handle and the bytes' own length.
     let ok = unsafe {
@@ -99,17 +99,17 @@ fn write_all(handle: HANDLE, bytes: &[u8]) {
     assert_ne!(ok, 0);
 }
 
-fn close(handle: HANDLE) {
+pub(super) fn close(handle: HANDLE) {
     // SAFETY: a handle this test opened.
     unsafe { CloseHandle(handle) };
 }
 
-fn last_error() -> u32 {
+pub(super) fn last_error() -> u32 {
     // SAFETY: reads the thread's last error.
     unsafe { GetLastError() }
 }
 
-fn list(pattern: &str) -> Vec<(String, u32)> {
+pub(super) fn list(pattern: &str) -> Vec<(String, u32)> {
     let wide = w(pattern);
     // SAFETY: an all-zero find record is valid.
     let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };

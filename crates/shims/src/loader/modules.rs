@@ -44,8 +44,6 @@ const LOADER_DLLS: &[&str] = &[
 
 const GET_MODULE_HANDLE_EX_UNCHANGED_REFCOUNT: u32 = 0x1;
 const GET_MODULE_HANDLE_EX_FROM_ADDRESS: u32 = 0x4;
-const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x8;
-const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x800;
 
 struct Fake {
     handle: usize,
@@ -159,19 +157,51 @@ fn load(name: Option<String>, flags: u32) -> usize {
         refused(&name, reason.describe());
         return 0;
     }
+    if let Some(why) = path_refusal(&name) {
+        refused(&name, why);
+        return 0;
+    }
     let dll = dll_name(&name);
     if is_console_dll(&dll) {
         return fake_handle(&dll, true);
     }
     if host_allowed(&dll) {
-        let flags = (flags & !LOAD_WITH_ALTERED_SEARCH_PATH) | LOAD_LIBRARY_SEARCH_SYSTEM32;
-        // SAFETY: loads a Windows DLL the allow-list names, by bare name from the system folder.
-        return unsafe {
-            host::LoadLibraryExW(wide(&dll).as_ptr(), std::ptr::null_mut(), flags) as usize
+        return match crate::hostlib::load(&dll, flags) {
+            Ok(module) => module,
+            Err(error) => {
+                refused(&name, &error.to_string());
+                0
+            }
         };
     }
     refused(&name, "not a console or allowed Windows library");
     0
+}
+
+/// Why a library named with a folder may not be loaded. With the file sandbox on, only a name without a folder, a
+/// path into the Windows system folder, or (for a console library, which is never loaded from there) a path into
+/// the game folder is accepted.
+fn path_refusal(name: &str) -> Option<&'static str> {
+    if !name.contains(['\\', '/', ':']) || !crate::files::sandboxed() {
+        return None;
+    }
+    let folder = name
+        .rsplit_once(['\\', '/'])
+        .map_or("", |(folder, _)| folder);
+    let in_system = crate::hostlib::system_directory().is_some_and(|system| {
+        let plain = |text: &str| {
+            text.trim_end_matches(['\\', '/'])
+                .replace('/', "\\")
+                .to_lowercase()
+        };
+        plain(folder) == plain(&system.to_string_lossy())
+    });
+    let console = is_console_dll(&dll_name(name));
+    if in_system || (console && crate::files::in_package(name)) {
+        None
+    } else {
+        Some("a library path outside the Windows system folder is not allowed")
+    }
 }
 
 extern "win64" fn load_library_a(name: *const u8) -> usize {
@@ -338,6 +368,13 @@ extern "win64" fn get_proc_address(module: usize, name: *const u8) -> usize {
             fail(windows_sys::Win32::Foundation::ERROR_PROC_NOT_FOUND);
             return 0;
         }
+        if crate::files::sandboxed() && crate::files::blocked_api(function_text) {
+            note(format!(
+                "{function_text} refused: the file sandbox does not allow it"
+            ));
+            fail(windows_sys::Win32::Foundation::ERROR_PROC_NOT_FOUND);
+            return 0;
+        }
         if let Some(dll) = host_module_name(module)
             && let Some(address) = host_shim(&dll, function_text)
         {
@@ -346,6 +383,67 @@ extern "win64" fn get_proc_address(module: usize, name: *const u8) -> usize {
     }
     // SAFETY: asks a module Windows loaded for one export.
     unsafe { host::GetProcAddress(module as *mut c_void, name) }.map_or(0, |f| f as usize)
+}
+
+/// The file name the program is told for `module` with the sandbox on: the game's executable and the console
+/// libraries lie in the game folder, so Leonida's own folder never shows. `None` leaves the answer to Windows.
+fn sandboxed_module_path(module: usize) -> Option<std::path::PathBuf> {
+    if !crate::files::sandboxed() {
+        return None;
+    }
+    let main = super::main_module();
+    if module == 0 || (main != 0 && module == main) {
+        return super::main_path();
+    }
+    let dll = fake_name(module)?;
+    Some(super::game_dir()?.join(dll))
+}
+
+/// Copies `text` into the program's buffer the way `GetModuleFileName` does, truncating with a terminator.
+fn put_module_name<T: Copy + Default>(text: &[T], out: *mut T, size: u32) -> u32 {
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+    if out.is_null() || size == 0 {
+        fail(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    let room = size as usize - 1;
+    let copied = text.len().min(room);
+    // SAFETY: `out` holds `size` elements, and `copied + 1 <= size`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), out, copied);
+        *out.add(copied) = T::default();
+    }
+    if copied < text.len() {
+        fail(ERROR_INSUFFICIENT_BUFFER);
+        return size;
+    }
+    copied as u32
+}
+
+extern "win64" fn get_module_file_name_w(module: usize, out: *mut u16, size: u32) -> u32 {
+    match sandboxed_module_path(module) {
+        Some(path) => {
+            let text: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
+            put_module_name(&text, out, size)
+        }
+        // SAFETY: the program's own buffer and size.
+        None => unsafe { host::GetModuleFileNameW(module as *mut c_void, out, size) },
+    }
+}
+
+extern "win64" fn get_module_file_name_a(module: usize, out: *mut u8, size: u32) -> u32 {
+    match sandboxed_module_path(module) {
+        Some(path) => {
+            let text: Vec<u8> = path
+                .to_string_lossy()
+                .chars()
+                .map(|c| if c.is_ascii() { c as u8 } else { b'?' })
+                .collect();
+            put_module_name(&text, out, size)
+        }
+        // SAFETY: the program's own buffer and size.
+        None => unsafe { host::GetModuleFileNameA(module as *mut c_void, out, size) },
+    }
 }
 
 extern "win64" fn free_library(module: usize) -> i32 {
@@ -365,7 +463,7 @@ extern "win64" fn disable_thread_library_calls(module: usize) -> i32 {
 }
 
 pub fn shims() -> Vec<Shim> {
-    let functions: [(&'static str, usize); 11] = [
+    let functions: [(&'static str, usize); 13] = [
         ("LoadLibraryA", load_library_a as *const () as usize),
         ("LoadLibraryW", load_library_w as *const () as usize),
         ("LoadLibraryExA", load_library_ex_a as *const () as usize),
@@ -388,6 +486,14 @@ pub fn shims() -> Vec<Shim> {
         ),
         ("GetProcAddress", get_proc_address as *const () as usize),
         ("FreeLibrary", free_library as *const () as usize),
+        (
+            "GetModuleFileNameW",
+            get_module_file_name_w as *const () as usize,
+        ),
+        (
+            "GetModuleFileNameA",
+            get_module_file_name_a as *const () as usize,
+        ),
         (
             "DisableThreadLibraryCalls",
             disable_thread_library_calls as *const () as usize,

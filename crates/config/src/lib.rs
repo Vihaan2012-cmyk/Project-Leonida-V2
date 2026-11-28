@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 pub use display::DisplayConfig;
-pub use general::{Audio, AudioOutput, Content, General, Nudity};
+pub use general::{Audio, AudioOutput, Content, Files, General, Nudity};
 pub use graphics::{
     AspectMode, FrameGenerationMethod, FrameRate, FrameRateMode, Graphics, PipelineNotReady,
     Upscaler, WindowMode, adjust_sampler,

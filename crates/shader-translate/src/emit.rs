@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rspirv::binary::Assemble;
 use rspirv::dr::{Builder, Operand};
@@ -257,8 +257,8 @@ struct Emitter {
     glsl: Word,
     t: Types,
     constants: HashMap<(u8, u64), Word>,
-    sgpr: HashMap<u8, Word>,
-    vgpr: HashMap<u8, Word>,
+    sgpr: BTreeMap<u8, Word>,
+    vgpr: BTreeMap<u8, Word>,
     scc: Word,
     lane: Word,
     local: Word,
@@ -273,7 +273,7 @@ struct Emitter {
     thread_indexes: [Word; 2],
     varying: Vec<bool>,
     values_hi: Vec<Word>,
-    vgpr_hi: HashMap<u8, Word>,
+    vgpr_hi: BTreeMap<u8, Word>,
     state: Word,
     memory: Word,
     lds_image: Word,
@@ -621,7 +621,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
     let main = ok(b.begin_function(void, None, FunctionControl::NONE, function_type))?;
     let entry_label = ok(b.begin_block(None))?;
     let (scalars, vectors) = registers(function);
-    let sgpr: HashMap<u8, Word> = scalars
+    let sgpr: BTreeMap<u8, Word> = scalars
         .iter()
         .map(|r| {
             (
@@ -630,7 +630,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
             )
         })
         .collect();
-    let vgpr: HashMap<u8, Word> = vectors
+    let vgpr: BTreeMap<u8, Word> = vectors
         .iter()
         .map(|r| {
             (
@@ -639,7 +639,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
             )
         })
         .collect();
-    let vgpr_hi: HashMap<u8, Word> = if pair {
+    let vgpr_hi: BTreeMap<u8, Word> = if pair {
         vectors
             .iter()
             .map(|r| {
@@ -650,7 +650,7 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
             })
             .collect()
     } else {
-        HashMap::new()
+        BTreeMap::new()
     };
     let scc = b.variable(t.ptr_function_bool, None, StorageClass::Function, None);
     let iterations = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);

@@ -141,6 +141,26 @@ pub fn lane_patterns(code: &[u8]) -> Vec<Pattern> {
     patterns_of(&rdna::decode_all(code, false, 0).insts)
 }
 
+/// The distinct scalar instructions of `code` that work on 64-bit values, which is where lane masks are handled.
+pub fn wide_scalar_ops(code: &[u8]) -> Vec<String> {
+    let mut found: Vec<String> = rdna::decode_all(code, false, 0)
+        .insts
+        .iter()
+        .filter(|inst| {
+            let name = inst.name.as_str();
+            name.starts_with("s_")
+                && (name.ends_with("_b64")
+                    || name.ends_with("_u64")
+                    || name.ends_with("_i64")
+                    || name.contains("saveexec"))
+        })
+        .map(|inst| inst.name.clone())
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
 pub(crate) fn patterns_of(insts: &[Inst]) -> Vec<Pattern> {
     let mut found: Vec<Pattern> = hazards_of(insts).into_iter().map(Pattern::Hazard).collect();
     let mut add = |pattern: Pattern| {
@@ -158,7 +178,7 @@ pub(crate) fn patterns_of(insts: &[Inst]) -> Vec<Pattern> {
         if names(inst, &["exec_hi", "vcc_hi"]) {
             add(Pattern::MaskHighHalf);
         }
-        let on_mask = names(inst, &["exec", "vcc"]);
+        let on_mask = names(inst, &["exec", "vcc"]) || name.contains("saveexec");
         match base {
             "s_bcnt1_i32_b64" | "s_bcnt0_i32_b64" | "s_ff1_i32_b64" | "s_ff0_i32_b64"
             | "s_flbit_i32_b64" | "s_flbit_i32_i64" => add(Pattern::MaskCount),
@@ -307,5 +327,19 @@ mod tests {
         );
         assert!(!found.contains(&Pattern::ExecRaised), "{found:?}");
         assert!(found.contains(&Pattern::MaskArithmetic));
+    }
+
+    #[test]
+    fn saving_exec_while_setting_every_lane_raises_it() {
+        let found = patterns(
+            "s_or_saveexec_b64 s[0:1], -1
+s_endpgm",
+        );
+        assert!(found.contains(&Pattern::ExecRaised), "{found:?}");
+        let found = patterns(
+            "s_or_saveexec_b64 s[0:1], s[2:3]
+s_endpgm",
+        );
+        assert!(!found.contains(&Pattern::ExecRaised), "{found:?}");
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use rspirv::dr::Operand;
 use rspirv::spirv::{BuiltIn, Capability, Decoration, StorageClass, Word};
@@ -16,7 +16,7 @@ pub(super) struct PixelState {
     front_facing: Word,
     bary: Word,
     helper: Word,
-    attributes: HashMap<u8, Word>,
+    attributes: BTreeMap<u8, Word>,
     locations: Vec<Option<u8>>,
     outputs: Vec<(PixelOutput, Word)>,
     depth: Option<Word>,
@@ -109,7 +109,7 @@ impl Emitter {
             front_facing,
             bary,
             helper,
-            attributes: HashMap::new(),
+            attributes: BTreeMap::new(),
             locations: options.attribute_locations.clone(),
             outputs,
             depth,

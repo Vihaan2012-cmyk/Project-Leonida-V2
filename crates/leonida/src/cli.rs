@@ -469,6 +469,9 @@ pub struct ReportArgs {
     /// Also print one example of each missing instruction.
     #[arg(long)]
     pub examples: bool,
+    /// Only count lane patterns of 64-lane programs: skips lifting and building, which is much faster.
+    #[arg(long)]
+    pub lanes_only: bool,
 }
 
 #[derive(Debug, Args)]
