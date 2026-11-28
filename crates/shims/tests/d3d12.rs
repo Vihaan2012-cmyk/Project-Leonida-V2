@@ -15,6 +15,10 @@ fn slot(object: *mut c_void, index: usize) -> usize {
 
 #[test]
 fn the_console_device_notes_each_method_it_does_not_have() {
+    if let Err(error) = xbox_d3d12::execute::VkContext::standalone() {
+        eprintln!("skipping: {error}");
+        return;
+    }
     let shim = shims::builtin()
         .into_iter()
         .find(|s| s.name == "D3D12XboxCreateDevice")

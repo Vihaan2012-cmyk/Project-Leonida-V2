@@ -11,6 +11,17 @@ use std::process::Command;
 
 use standin::{Environment, Report, RunOptions, Script, Stage, steps};
 
+/// Whether this machine has a Vulkan GPU for the assembled device; the stages that make one are skipped without.
+fn gpu() -> bool {
+    match xbox_d3d12::execute::VkContext::standalone() {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("skipping: {error}");
+            false
+        }
+    }
+}
+
 fn environment() -> Environment {
     let under = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("standin");
     Environment::new(&under).expect("folders for the stand-in")
@@ -203,7 +214,9 @@ fn audio() {
 
 #[test]
 fn device() {
-    in_child("device");
+    if gpu() {
+        in_child("device");
+    }
 }
 
 #[test]
@@ -219,7 +232,9 @@ fn a_failed_check_names_its_step() {
 
 #[test]
 fn boot_to_device() {
-    in_child("boot-to-device");
+    if gpu() {
+        in_child("boot-to-device");
+    }
 }
 
 #[test]
