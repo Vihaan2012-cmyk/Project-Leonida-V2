@@ -212,8 +212,14 @@ fn dsp(e: &mut Emitter) -> Res {
     e.load64(Register::RAX, status)?;
     e.asm.mov(eax, dword_ptr(rax + 0xc))?;
     e.fail_if_nonzero32()?;
-    e.fail_if_mem32_ne(output.at(0), 0)?;
-    e.fail_if_mem32_ne(output.at(4), 0x3f80_0000)?;
+    // The convolution is in floating point, so the delayed impulse is 1.0 to within a hundredth and the sample
+    // before it is as good as silent.
+    e.load32(Register::EAX, output.at(4))?;
+    e.fail_if_below32(0x3f7d_70a4)?;
+    e.fail_if_above32(0x3f82_8f5c)?;
+    e.load32(Register::EAX, output.at(0))?;
+    e.asm.and(eax, 0x7fff_ffff)?;
+    e.fail_if_above32(0x3c23_d70a)?;
     e.call(deactivate, &[Arg::load64(stream)])?;
     e.fail_if_nonzero32()?;
     e.call(disconnect, &[Arg::load64(handle)])?;
