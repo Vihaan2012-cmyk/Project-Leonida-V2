@@ -23,7 +23,8 @@ use upscale::{ColorSpace, Image, ImageRef, SharedCompute, UpscaleError, Upscaler
 use super::plan::RuntimePlan;
 
 /// The upscaler that runs. A DLSS choice runs DLSS when NVIDIA's files and an NVIDIA GPU are there, and otherwise the
-/// temporal upscaler (see [`choose`] and [`build`]).
+/// temporal upscaler (see [`choose`] and [`build`]); dispatches without depth or motion vectors always take the
+/// temporal upscaler (see [`Context::upscale`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Fsr1,
@@ -55,11 +56,72 @@ impl Held {
     }
 }
 
+/// One game context: the upscaler the settings chose and, for DLSS, the temporal upscaler that serves the dispatches
+/// DLSS cannot (see [`Context::upscale`]).
+struct Context {
+    held: Held,
+    temporal: Option<Held>,
+    on_temporal: bool,
+}
+
+impl Context {
+    fn new(held: Held) -> Self {
+        Context {
+            held,
+            temporal: None,
+            on_temporal: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.held.reset();
+        if let Some(temporal) = &mut self.temporal {
+            temporal.reset();
+        }
+    }
+
+    /// Upscales one dispatch. DLSS needs depth and motion vectors; a dispatch without them goes to the temporal
+    /// upscaler instead (noted once), so the player still gets an upscaled frame.
+    fn upscale(
+        &mut self,
+        inputs: &upscale::UpscaleInputs<'_>,
+        compute: Option<&SharedCompute>,
+    ) -> Result<Image, UpscaleFailure> {
+        let lacks_inputs = matches!(self.held, Held::Dlss(_))
+            && (inputs.depth.is_none() || inputs.motion.is_none());
+        if !lacks_inputs {
+            if std::mem::take(&mut self.on_temporal) {
+                self.held.reset();
+            }
+            return self.held.upscale(inputs).map_err(failure);
+        }
+        let temporal = match &mut self.temporal {
+            Some(temporal) => temporal,
+            empty => {
+                let compute = compute.ok_or_else(|| {
+                    failure("a dispatch without depth or motion vectors needs the temporal upscaler, which needs a GPU compute device")
+                })?;
+                shims::trace::note(
+                    "upscaler: a dispatch has no depth or motion vectors, which DLSS needs; the temporal upscaler serves such dispatches".to_string(),
+                );
+                empty.insert(Held::Temporal(Box::new(TemporalUpscaler::new(
+                    compute.clone(),
+                    TemporalConfig::default(),
+                ))))
+            }
+        };
+        if !std::mem::replace(&mut self.on_temporal, true) {
+            temporal.reset();
+        }
+        temporal.upscale(inputs).map_err(failure)
+    }
+}
+
 struct State {
     kind: Kind,
     dlss: DlssConfig,
     compute: Option<SharedCompute>,
-    contexts: HashMap<usize, Held>,
+    contexts: HashMap<usize, Context>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -193,7 +255,7 @@ fn build(
 
 /// One dispatch: read the game's textures, upscale, write the output.
 fn run(
-    contexts: &mut HashMap<usize, Held>,
+    contexts: &mut HashMap<usize, Context>,
     kind: Kind,
     dlss: &DlssConfig,
     compute: Option<&SharedCompute>,
@@ -207,7 +269,7 @@ fn run(
     let reactive = read(access, &inputs.reactive)?;
     let held = match contexts.entry(inputs.context) {
         Entry::Occupied(held) => held.into_mut(),
-        Entry::Vacant(slot) => slot.insert(build(kind, compute, dlss)?),
+        Entry::Vacant(slot) => slot.insert(Context::new(build(kind, compute, dlss)?)),
     };
     if inputs.reset {
         held.reset();
@@ -219,7 +281,7 @@ fn run(
         motion.as_ref(),
         reactive.as_ref(),
     );
-    let result = held.upscale(&converted).map_err(failure)?;
+    let result = held.upscale(&converted, compute)?;
     access.write(&inputs.output, &result)
 }
 
@@ -523,7 +585,13 @@ mod tests {
         let (kind, note) = choose(Choice::Dlss, &config);
         assert_eq!(kind, Some(Kind::Dlss), "{note:?}");
         run(&mut contexts, Kind::Dlss, &config, None, &access, &inputs).unwrap();
-        assert!(matches!(contexts.get(&7), Some(Held::Dlss(_))));
+        assert!(matches!(
+            contexts.get(&7),
+            Some(Context {
+                held: Held::Dlss(_),
+                ..
+            })
+        ));
         let written = access.written.lock().unwrap();
         let (target, image) = &written[0];
         assert_eq!(
@@ -537,5 +605,52 @@ mod tests {
         assert!(rgba.iter().all(|v| v.is_finite()));
         let mean = rgba.chunks_exact(4).map(|p| p[1]).sum::<f32>() / (output[0] * output[1]) as f32;
         assert!((mean - 0.5).abs() < 0.1, "mean {mean}");
+    }
+
+    #[test]
+    #[ignore = "needs an NVIDIA GPU and nvngx_dlss.dll (set LEONIDA_DLSS_DLL)"]
+    fn a_dlss_dispatch_without_depth_or_motion_is_served_by_the_temporal_upscaler() {
+        let access = fake();
+        let compute = std::sync::Arc::new(gpu::Gpu::new().expect("a GPU")) as SharedCompute;
+        let mut contexts = HashMap::new();
+        let config = DlssConfig::default();
+        let mut inputs = dispatch_inputs();
+        inputs.render_size = [64, 64];
+        inputs.upscale_size = [128, 128];
+        inputs.color.resource = 1;
+        let mut access = access;
+        access.color = Image::from_rgba_f32(
+            64,
+            64,
+            PixelFormat::Rgba16Float,
+            &[0.3, 0.5, 0.7, 1.0].repeat(64 * 64),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            run(
+                &mut contexts,
+                Kind::Dlss,
+                &config,
+                Some(&compute),
+                &access,
+                &inputs,
+            )
+            .expect("the dispatch is served");
+        }
+        let context = contexts.get(&7).unwrap();
+        assert!(matches!(context.held, Held::Dlss(_)));
+        assert!(matches!(context.temporal, Some(Held::Temporal(_))));
+        let written = access.written.lock().unwrap();
+        assert_eq!(written.len(), 2);
+        assert_eq!((written[1].1.width, written[1].1.height), (128, 128));
+        let notes = shims::trace::notes();
+        assert_eq!(
+            notes
+                .iter()
+                .filter(|n| n.contains("no depth or motion vectors"))
+                .count(),
+            1,
+            "{notes:?}"
+        );
     }
 }

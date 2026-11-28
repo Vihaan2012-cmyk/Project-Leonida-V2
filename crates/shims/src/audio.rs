@@ -16,10 +16,15 @@
 //!   command; `XApuGetResultCount()` is the number of results waiting and `XApuDequeueResult(handle, &result)`
 //!   takes one (0x40 bytes, negative `E_PENDING` when there is none); `XApuDisconnect(handle, 0x20)` ends it.
 //! - The `XDsp*` functions are the title's convolution reverb and nothing else (see [`dsp`]): the title mixes on
-//!   the CPU and plays through the host's own audio client, so no final mix passes through them.
+//!   the CPU in 256-sample blocks, so no final mix passes through them.
 //!   `XDspConnectWithMaximumStreamLimit(memory, size, version, limit, 1, &handle)` opens a connection,
 //!   `XDspActivate(handle, &info, &status, &stream)` a stream, `XDspSubmitCommand(stream, &command, &fence)` runs one
 //!   batch to completion before it returns, `XDspDeactivate(stream)` and `XDspDisconnect(handle)` close them.
+//!
+//! - The title's own output goes through `CoCreateInstance(MMDeviceEnumerator)` and the spatial audio client (see
+//!   [`spatial`] and `spatial_com`). That import is provided here: the host's objects when they can open the
+//!   stream the title asks for, this crate's own otherwise (`LEONIDA_SPATIAL_AUDIO=host|emulate|auto`, and always
+//!   with `LEONIDA_AUDIO=off`). The own objects mix the title's speaker buffers to stereo on the shared mixer.
 //!
 //! Voices reach the mixer through [`Engine`]; the device opens when the first sink asks for the mixer.
 
@@ -35,6 +40,9 @@ pub mod hal;
 mod mixer;
 pub mod opus;
 mod output;
+pub mod spatial;
+#[cfg(windows)]
+pub mod spatial_com;
 pub mod xapu;
 mod xma;
 pub mod xma_hw;
@@ -421,6 +429,10 @@ pub fn shims() -> Vec<Shim> {
             ("XDspDeactivate", ffi::xdsp_deactivate as *const () as usize),
             ("XDspDisconnect", ffi::xdsp_disconnect as *const () as usize),
         ];
+        let com: [(&str, usize); 1] = [(
+            "CoCreateInstance",
+            spatial_com::co_create_instance as *const () as usize,
+        )];
         let table = |dll: &'static str, list: &[(&'static str, usize)]| {
             list.iter()
                 .map(|&(name, address)| Shim { dll, name, address })
@@ -429,6 +441,7 @@ pub fn shims() -> Vec<Shim> {
         let mut shims = table("AcpHal.dll", &acp);
         shims.extend(table("xapu.dll", &apu));
         shims.extend(table("chad.dll", &dsp));
+        shims.extend(table("api-ms-win-core-com-l1-1-0.dll", &com));
         shims
     }
     #[cfg(not(windows))]

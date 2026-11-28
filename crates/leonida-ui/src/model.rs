@@ -17,6 +17,8 @@ pub enum Severity {
     Error,
     /// Worth knowing; the settings are still saved.
     Note,
+    /// Information shown beside the field, in the usual hint colour.
+    Info,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +43,14 @@ impl FieldError {
             id: Some(id.to_string()),
             message: message.into(),
             severity: Severity::Note,
+        }
+    }
+
+    pub fn info(id: &str, message: impl Into<String>) -> Self {
+        Self {
+            id: Some(id.to_string()),
+            message: message.into(),
+            severity: Severity::Info,
         }
     }
 }

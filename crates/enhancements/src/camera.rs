@@ -2,11 +2,14 @@
 //! its code and never by running it. Addresses are RVAs; add `0x1_4000_0000` for the virtual address. Function names
 //! are the disassembler's `sub_<rva>`.
 //!
-//! There is no code patch here. The place where the on-foot follow camera, the aim cameras, the vehicle chase
-//! cameras and the first person camera integrate the look input into their yaw and pitch was not found, and a patch
-//! that adds mouse counts to the camera angles needs it. What was found is the input side, the one shared function
-//! that turns the look controls into a rate for the cinematic and mounted cameras, and the places that were ruled
-//! out. The input shim (`shims::gameinput::curve`) keeps making the mouse look like a stick that the game turns by a
+//! The place where the player's view direction takes its per frame look delta was found in a second pass (see
+//! [`crate::camera_mouse`], which holds the patch and the evidence): the look controller update `sub_0420a0e0`
+//! stores a heading and a pitch delta at `+0x1ca0` and `+0x1ca4` from data driven input channels, and the camera
+//! reads them through the component with type hash `0x6bb7d1b6`. The look controls are not named in that code, so
+//! the first search by control index could not reach it. This module records the input side, the one shared
+//! function that turns the look controls into a rate for the cinematic and mounted cameras, and the places that
+//! were ruled out. What stays unproven: that the channel at `+0x380`/`+0x518` of the look controller carries the
+//! right stick of the on foot follow camera, and the sign of the angles. The input shim (`shims::gameinput::curve`) keeps making the mouse look like a stick that the game turns by a
 //! fixed angle per count. [`ENTRIES`] records each finding with its address and how sure it is.
 //!
 //! # From GameInput to the pad object
@@ -309,9 +312,30 @@ pub const ENTRIES: [Entry; 8] = [
     },
     Entry {
         id: "look-integration",
-        summary: "Where the on-foot follow, aim, vehicle chase and first person cameras turn the look input into yaw and pitch",
-        proof: Proof::Missing,
-        evidence: &[],
+        summary: "The look controller adds a heading and pitch delta in radians to the live view direction, which the camera reads",
+        proof: Proof::Inferred,
+        evidence: &[
+            Evidence {
+                rva: 0x0420_a0e0,
+                what: "look controller update; stores (A + B) * scale of the channels at +0x380 and +0x518 to +0x1ca0 and +0x1ca4",
+            },
+            Evidence {
+                rva: 0x0420_a1e7,
+                what: "the 40 bytes the mouse patch replaces: heading store, pitch computation, pitch store",
+            },
+            Evidence {
+                rva: 0x008f_36c0,
+                what: "adds the deltas to the direction rebuilt by sub_00677760, wraps the heading, reflects the pitch, applies limits",
+            },
+            Evidence {
+                rva: 0x0424_2dd0,
+                what: "camera modifier reading wrap(+0x1ca0 + +0x1c30) and reflect(+0x1ca4 + +0x1c34) of the component",
+            },
+            Evidence {
+                rva: 0x0516_2240,
+                what: "component lookup by type hash 0x6bb7d1b6",
+            },
+        ],
     },
 ];
 
@@ -359,7 +383,7 @@ pub fn game_stick_length(raw: f32, inner: f32, outer: f32) -> f32 {
     ((raw - inner) / (1.0 - inner - outer)).clamp(0.0, 1.0)
 }
 
-/// Whether a code patch for the mouse camera exists for this build. It does not.
+/// Whether a code patch for the mouse camera exists for this build: [`crate::camera_mouse`].
 pub fn patch_available() -> bool {
     ENTRIES
         .iter()
@@ -387,7 +411,7 @@ mod tests {
             let mut seen = std::collections::HashSet::new();
             assert!(e.evidence.iter().all(|x| seen.insert(x.rva)), "{}", e.id);
         }
-        assert!(!patch_available());
+        assert!(patch_available());
     }
 
     #[test]

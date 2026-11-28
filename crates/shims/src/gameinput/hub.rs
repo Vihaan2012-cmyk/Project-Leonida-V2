@@ -808,7 +808,9 @@ impl Hub {
                     inner.mouse_position.0 += i64::from(dx);
                     inner.mouse_position.1 += i64::from(dy);
                     let now = self.now();
-                    inner.look.push(now, i64::from(dx), i64::from(dy));
+                    if !super::direct::push(dx, dy) {
+                        inner.look.push(now, i64::from(dx), i64::from(dy));
+                    }
                     if dx.abs() + dy.abs() >= 2 {
                         inner.last_used = LastUsed::KeyboardMouse;
                     }

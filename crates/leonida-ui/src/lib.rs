@@ -3,6 +3,7 @@
 mod cache;
 mod checks;
 mod child;
+mod dlss;
 mod form;
 mod game;
 mod jobs;

@@ -561,7 +561,7 @@ mod tests {
             &[1],
             &[
                 Packed::Zlib(low.to_vec()),
-                Packed::BcPack(6, vec![0x1f; 300], high.len() as u64),
+                Packed::BcPack(2, vec![0x1f; 300], high.len() as u64),
             ],
         );
         let p = Pool::parse(&file).unwrap();
@@ -575,10 +575,7 @@ mod tests {
             panic!("expected partial");
         };
         assert_eq!(first_mip, 1);
-        assert_eq!(
-            missing,
-            Unsupported::BcPack(super::super::BcPackCodec::Bc6h)
-        );
+        assert_eq!(missing, Unsupported::BcPack(super::super::BcPackCodec::Bc2));
         assert_eq!(
             (texture.info.width, texture.info.height, texture.info.mips),
             (128, 128, 3)
@@ -591,7 +588,7 @@ mod tests {
         // 64x64 BC1, one mip: 16x16 blocks fill exactly one 4 KiB tile.
         let first = first_page(1, 1);
         let rec = record(64, 64, 1, 0, 71, 1, 1, 2, first, 0, 0);
-        let file = pool(&[rec], &[1], &[Packed::BcPack(6, vec![0x1f; 300], 4096)]);
+        let file = pool(&[rec], &[1], &[Packed::BcPack(2, vec![0x1f; 300], 4096)]);
         let p = Pool::parse(&file).unwrap();
         match p.decode_texture(0, &mut ChunkCache::new()).unwrap() {
             TextureResult::Placeholder {
@@ -599,7 +596,7 @@ mod tests {
                 original,
                 reason,
             } => {
-                assert_eq!(reason, Unsupported::BcPack(super::super::BcPackCodec::Bc6h));
+                assert_eq!(reason, Unsupported::BcPack(super::super::BcPackCodec::Bc2));
                 assert_eq!((original.width, original.format), (64, 71));
                 assert_eq!(texture.info.format, 28);
             }

@@ -20,6 +20,7 @@ mod com;
 pub mod config;
 pub mod curve;
 mod device;
+pub mod direct;
 pub mod hub;
 pub mod mapping;
 pub mod settings;

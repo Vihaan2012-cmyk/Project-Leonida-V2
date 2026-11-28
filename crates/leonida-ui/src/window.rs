@@ -18,6 +18,7 @@ use crate::Error;
 use crate::cache;
 use crate::checks::{self, World};
 use crate::child;
+use crate::dlss;
 use crate::form::{self, Choice, Env, Field, Kind};
 use crate::game::{self, GameState};
 use crate::jobs::{Jobs, Outcome, Wake};
@@ -100,6 +101,7 @@ struct State {
     prefs: Settings,
     mods: ModList,
     shown_job: String,
+    dlss: dlss::Probe,
 }
 
 #[derive(Clone)]
@@ -510,6 +512,7 @@ impl Window {
                 prefs: Settings::load(),
                 mods,
                 shown_job: String::new(),
+                dlss: dlss::Probe::default(),
             })),
             colors: Rc::new(RefCell::new((HashSet::new(), HashSet::new()))),
             status_color: Rc::new(Cell::new(GREEN)),
@@ -848,10 +851,20 @@ impl Window {
     /// Checks everything and redraws what depends on it: the hints, the enabled fields, the status line.
     fn refresh(&self) {
         let (errors, dirty, game_line, manifests_ok) = {
-            let state = self.state.borrow();
+            let mut state = self.state.borrow_mut();
             let mut errors: Vec<FieldError> = Vec::new();
             match state.form.build() {
                 Ok(config) => {
+                    let asks_ngx = config.graphics.upscaler == config::Upscaler::Dlss
+                        && config
+                            .upscaling
+                            .dlss_path
+                            .as_ref()
+                            .is_none_or(|path| path.is_file());
+                    state
+                        .dlss
+                        .want(asks_ngx.then(|| config.upscaling.dlss_path.clone()));
+                    let line = state.dlss.line();
                     let paths = Paths::of(&state.root, config::DEFAULT_DIR, &config.general);
                     errors.extend(checks::check(
                         &config,
@@ -859,6 +872,7 @@ impl Window {
                             manifests: &state.manifests,
                             paths: &paths,
                             monitors: state.monitors,
+                            dlss: line.as_ref(),
                         },
                     ));
                 }
@@ -892,7 +906,7 @@ impl Window {
             match severity {
                 Some(Severity::Error) => self.colors.borrow_mut().0.insert(key),
                 Some(Severity::Note) => self.colors.borrow_mut().1.insert(key),
-                None => false,
+                Some(Severity::Info) | None => false,
             };
             let _ = ui.hint.hwnd().SetWindowText(&text);
             ui.hint.hwnd().InvalidateRect(None, true).ok();
@@ -1137,6 +1151,9 @@ impl Window {
                 self.state.borrow_mut().shown_job = text.clone();
                 self.job.hwnd().SetWindowText(&text)?;
             }
+        }
+        if self.state.borrow_mut().dlss.poll() {
+            self.refresh();
         }
         if let Some(outcome) = polled.finished {
             self.progress.set_marquee(false);

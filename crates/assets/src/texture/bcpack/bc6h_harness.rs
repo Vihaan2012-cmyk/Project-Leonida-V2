@@ -241,7 +241,7 @@ fn bootstrap(items: &mut [Item], tab: &Table) {
 fn history_of(item: &Item, tab: &Table) -> History {
     let mut hist = History::empty();
     for k in 0..256 {
-        let used = |roots: &[i16]| roots.iter().any(|r| *r == k as i16);
+        let used = |roots: &[i16]| roots.contains(&(k as i16));
         if used(&item.model.root_e) {
             hist.endpoints[k] = Entry::Confirmed(tab.endpoints(k));
         }
