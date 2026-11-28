@@ -222,7 +222,7 @@ impl Audio {
             let first_before: u64 = counts[..first].iter().sum();
             let channels = decoder.channels();
             let mut samples = Vec::new();
-            for f in first..next as usize {
+            for (f, count) in counts.iter().enumerate().skip(first) {
                 let packet = container
                     .packets(f as u32)
                     .ok()
@@ -231,7 +231,7 @@ impl Audio {
                     continue;
                 };
                 if decoder.decode_packet(packet, &mut samples).is_err() {
-                    let missing = counts[f] as usize * channels;
+                    let missing = *count as usize * channels;
                     samples.resize(samples.len() + missing, 0.0);
                     decoder.reset();
                     self.failures += 1;
