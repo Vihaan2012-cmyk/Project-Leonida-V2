@@ -514,3 +514,206 @@ fn the_xma_integration_point_feeds_the_mixer() {
     set_decoder(None);
     with_engine(|e| e.deactivate());
 }
+
+mod spatial {
+    use std::ffi::c_void;
+    use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+    use super::*;
+
+    type Ptr = *mut c_void;
+    type Hr = i32;
+
+    const CLSID_ENUMERATOR: [u8; 16] = [
+        0x95, 0x03, 0xde, 0xbc, 0x2f, 0xe5, 0x7c, 0x46, 0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69,
+        0x2e,
+    ];
+    const IID_ENUMERATOR: [u8; 16] = [
+        0xd2, 0x64, 0x56, 0xa9, 0x14, 0x96, 0x35, 0x4f, 0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17,
+        0xe6,
+    ];
+    const IID_SPATIAL_CLIENT: [u8; 16] = [
+        0x66, 0xe0, 0xf8, 0xbb, 0xaa, 0xaa, 0xbe, 0x49, 0x9a, 0x4d, 0xfd, 0x2a, 0x85, 0x8e, 0xa2,
+        0x7f,
+    ];
+    const IID_RENDER_STREAM: [u8; 16] = [
+        0x73, 0xf4, 0xb5, 0xba, 0x23, 0xb4, 0x7b, 0x47, 0x85, 0xf5, 0xb5, 0xa3, 0x32, 0xa0, 0x41,
+        0x53,
+    ];
+    const FRONT_LEFT: u32 = 2;
+    const FRONT_RIGHT: u32 = 4;
+
+    type CoCreate = unsafe extern "system" fn(*const u8, Ptr, u32, *const u8, *mut Ptr) -> Hr;
+    type Release = unsafe extern "system" fn(Ptr) -> u32;
+    type GetDefault = unsafe extern "system" fn(Ptr, u32, u32, *mut Ptr) -> Hr;
+    type Activate = unsafe extern "system" fn(Ptr, *const u8, u32, Ptr, *mut Ptr) -> Hr;
+    type Formats = unsafe extern "system" fn(Ptr, *mut Ptr) -> Hr;
+    type GetFormat = unsafe extern "system" fn(Ptr, u32, *mut *const u8) -> Hr;
+    type Supported = unsafe extern "system" fn(Ptr, *const u8) -> Hr;
+    type ActivateStream = unsafe extern "system" fn(Ptr, *const u8, *const u8, *mut Ptr) -> Hr;
+    type Begin = unsafe extern "system" fn(Ptr, *mut u32, *mut u32) -> Hr;
+    type End = unsafe extern "system" fn(Ptr) -> Hr;
+    type ActivateObject = unsafe extern "system" fn(Ptr, u32, *mut Ptr) -> Hr;
+    type GetBuffer = unsafe extern "system" fn(Ptr, *mut *mut f32, *mut u32) -> Hr;
+
+    /// The function at `index` of `object` vtable.
+    unsafe fn slot<F: Copy>(object: Ptr, index: usize) -> F {
+        assert_eq!(std::mem::size_of::<F>(), std::mem::size_of::<usize>());
+        // SAFETY: the caller passes a COM object, whose first word is its vtable.
+        unsafe {
+            let vtable = *(object as *const *const usize);
+            std::mem::transmute_copy(&*vtable.add(index))
+        }
+    }
+
+    #[test]
+    fn the_output_loop_of_the_title_runs_on_the_emulated_spatial_client_without_waiting_in_vain() {
+        let _guard = serial();
+        let create: CoCreate = shim("api-ms-win-core-com-l1-1-0.dll", "CoCreateInstance");
+        let voices_before = with_engine(|e| e.mixer().lock().unwrap().voice_count());
+        let frames_before = with_engine(|e| e.mixer().lock().unwrap().rendered_frames());
+        let mut enumerator: Ptr = std::ptr::null_mut();
+        let mut device: Ptr = std::ptr::null_mut();
+        let mut client: Ptr = std::ptr::null_mut();
+        let mut formats: Ptr = std::ptr::null_mut();
+        let mut stream: Ptr = std::ptr::null_mut();
+        let mut format: *const u8 = std::ptr::null();
+        // SAFETY: the calls the executable makes, on objects the shim just returned.
+        unsafe {
+            assert_eq!(
+                create(
+                    CLSID_ENUMERATOR.as_ptr(),
+                    std::ptr::null_mut(),
+                    0x17,
+                    IID_ENUMERATOR.as_ptr(),
+                    &mut enumerator
+                ),
+                0
+            );
+            assert_eq!(
+                slot::<GetDefault>(enumerator, 4)(enumerator, 0, 0, &mut device),
+                0
+            );
+            assert_eq!(
+                slot::<Activate>(device, 3)(
+                    device,
+                    IID_SPATIAL_CLIENT.as_ptr(),
+                    1,
+                    std::ptr::null_mut(),
+                    &mut client
+                ),
+                0
+            );
+            assert_eq!(slot::<Formats>(client, 6)(client, &mut formats), 0);
+            assert_eq!(slot::<GetFormat>(formats, 4)(formats, 0, &mut format), 0);
+            assert_eq!(slot::<Supported>(client, 8)(client, format), 0);
+
+            let event = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            let mut params = [0u8; 0x28];
+            params[..8].copy_from_slice(&(format as usize).to_le_bytes());
+            params[8..12].copy_from_slice(&(FRONT_LEFT | FRONT_RIGHT).to_le_bytes());
+            params[0x14..0x18].copy_from_slice(&6u32.to_le_bytes());
+            params[0x18..0x20].copy_from_slice(&(event as usize).to_le_bytes());
+            let mut variant = [0u8; 24];
+            variant[0..2].copy_from_slice(&0x41u16.to_le_bytes());
+            variant[8..12].copy_from_slice(&0x28u32.to_le_bytes());
+            variant[16..24].copy_from_slice(&(params.as_ptr() as usize).to_le_bytes());
+            assert_eq!(
+                slot::<ActivateStream>(client, 10)(
+                    client,
+                    variant.as_ptr(),
+                    IID_RENDER_STREAM.as_ptr(),
+                    &mut stream
+                ),
+                0
+            );
+
+            let mut objects: [Ptr; 2] = [std::ptr::null_mut(); 2];
+            let started = Instant::now();
+            for period in 0..30 {
+                assert_eq!(
+                    WaitForSingleObject(event, 1000),
+                    0,
+                    "period {period}: the event was never raised"
+                );
+                let (mut dynamic, mut frames) = (7u32, 0u32);
+                assert_eq!(
+                    slot::<Begin>(stream, 8)(stream, &mut dynamic, &mut frames),
+                    0
+                );
+                assert_eq!((dynamic, frames), (0, 480));
+                for (index, kind) in [FRONT_LEFT, FRONT_RIGHT].into_iter().enumerate() {
+                    if objects[index].is_null() {
+                        assert_eq!(
+                            slot::<ActivateObject>(stream, 10)(stream, kind, &mut objects[index]),
+                            0
+                        );
+                    }
+                    let (mut buffer, mut bytes) = (std::ptr::null_mut::<f32>(), 0u32);
+                    assert_eq!(
+                        slot::<GetBuffer>(objects[index], 3)(
+                            objects[index],
+                            &mut buffer,
+                            &mut bytes
+                        ),
+                        0
+                    );
+                    assert_eq!(bytes, 480 * 4);
+                    std::slice::from_raw_parts_mut(buffer, frames as usize).fill(if index == 0 {
+                        0.5
+                    } else {
+                        -0.5
+                    });
+                }
+                assert_eq!(slot::<End>(stream, 9)(stream), 0);
+            }
+            let took = started.elapsed();
+            assert!(
+                took < Duration::from_secs(3),
+                "30 periods of 10 ms took {took:?}"
+            );
+            for object in objects {
+                slot::<Release>(object, 2)(object);
+            }
+            for object in [stream, formats, client, device, enumerator] {
+                slot::<Release>(object, 2)(object);
+            }
+            CloseHandle(event);
+        }
+        let frames_after = with_engine(|e| e.mixer().lock().unwrap().rendered_frames());
+        assert!(
+            frames_after - frames_before >= 15 * 480,
+            "the silent clock followed the periods of the title"
+        );
+        assert_eq!(
+            with_engine(|e| e.mixer().lock().unwrap().voice_count()),
+            voices_before,
+            "releasing the stream removed its voice"
+        );
+    }
+
+    #[test]
+    fn other_classes_pass_through_to_the_host() {
+        let _guard = serial();
+        let create: CoCreate = shim("api-ms-win-core-com-l1-1-0.dll", "CoCreateInstance");
+        let unknown_class = [0x5au8; 16];
+        let mut out: Ptr = std::ptr::null_mut();
+        // SAFETY: valid pointers; the host answers for a class nobody registered.
+        let hr = unsafe {
+            create(
+                unknown_class.as_ptr(),
+                std::ptr::null_mut(),
+                0x17,
+                IID_ENUMERATOR.as_ptr(),
+                &mut out,
+            )
+        };
+        assert!(
+            hr < 0 && out.is_null(),
+            "the host refuses, not the emulation: {hr:#x}"
+        );
+    }
+}
