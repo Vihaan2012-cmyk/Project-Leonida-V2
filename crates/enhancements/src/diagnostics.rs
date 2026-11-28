@@ -432,3 +432,60 @@ mod break_tests {
         assert!(parse_sites("").is_empty());
     }
 }
+
+/// The title's watchdog thread (`sub_02215a60`) crashes the program on purpose, `mov dword ptr [0], 0` at rva
+/// 0x2215c35, when the main loop's heartbeat has not moved for 30 seconds. On a PC the first start can stall longer
+/// than that (pipelines are built the first time they are used), and the trace already records real hangs. The
+/// thread skips its whole loop when bit 0 of the byte at rva 0x71b6340 is set; only the title's shutdown sets it.
+pub const WATCHDOG_CRASH: u32 = 0x0221_5c35;
+pub const WATCHDOG_OFF: u32 = 0x071b_6340;
+/// `mov dword ptr [0], 0`.
+const STORE_TO_NULL: [u8; 11] = [0xC7, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// The patch that turns the title's watchdog off, when the code is the build it was measured in.
+pub fn watchdog_off(memory: &dyn CodeMemory) -> Option<Patch> {
+    let crash = memory.read(WATCHDOG_CRASH, STORE_TO_NULL.len()).ok()?;
+    let flag = memory.read(WATCHDOG_OFF, 1).ok()?;
+    (crash == STORE_TO_NULL && flag == [0]).then(|| Patch {
+        name: "title watchdog off".into(),
+        rva: WATCHDOG_OFF,
+        original: vec![0],
+        replacement: vec![1],
+    })
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+
+    struct Fake(std::collections::HashMap<u32, Vec<u8>>);
+
+    impl CodeMemory for Fake {
+        fn read(&self, rva: u32, len: usize) -> Result<Vec<u8>, PatchError> {
+            self.0
+                .get(&rva)
+                .filter(|b| b.len() == len)
+                .cloned()
+                .ok_or(PatchError::NotFound {
+                    name: "test".into(),
+                })
+        }
+        fn write(&mut self, _rva: u32, _bytes: &[u8]) -> Result<(), PatchError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_watchdog_is_turned_off_only_where_its_crash_store_is() {
+        let mut memory = Fake(std::collections::HashMap::new());
+        memory.0.insert(WATCHDOG_CRASH, STORE_TO_NULL.to_vec());
+        memory.0.insert(WATCHDOG_OFF, vec![0]);
+        let patch = watchdog_off(&memory).unwrap();
+        assert_eq!(
+            (patch.rva, patch.replacement.clone()),
+            (WATCHDOG_OFF, vec![1])
+        );
+        memory.0.insert(WATCHDOG_CRASH, vec![0x90; 11]);
+        assert!(watchdog_off(&memory).is_none(), "another build");
+    }
+}

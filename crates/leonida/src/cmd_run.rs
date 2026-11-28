@@ -132,6 +132,16 @@ fn run(path: &Path, args: &RunArgs, plan: &RuntimePlan) -> Result<ExitCode> {
     binder.seal().map_err(|e| anyhow!(e))?;
     shims::trace::set_image(module.base(), module.size());
     runtime::patch(plan, &bytes, &module);
+    if std::env::var_os("LEONIDA_KEEP_WATCHDOG").is_none() {
+        // SAFETY: the mapping of the module just loaded, which stays loaded.
+        let mut memory = unsafe { enhancements::patch::Mapped::new(module.base(), module.size()) };
+        if let Some(patch) = enhancements::diagnostics::watchdog_off(&memory) {
+            match enhancements::patch::apply_all(&mut memory, &[patch]) {
+                Ok(_) => println!("the title's 30-second hang watchdog is off"),
+                Err(error) => eprintln!("warning: the title's watchdog stays on: {error}"),
+            }
+        }
+    }
     let binder: &'static Binder = Box::leak(Box::new(binder));
     let boot = plan.output_dir.join("boot");
     if let Some(trace) = binder.trace() {
