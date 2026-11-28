@@ -314,9 +314,6 @@ impl Resources {
         desc: &ResourceDesc,
     ) -> Result<ResourceId, ResourceError> {
         let AllocationInfo { size, .. } = desc.allocation_info()?;
-        if !va.is_multiple_of(PAGE) {
-            return Err(ResourceError::Unaligned(va));
-        }
         if desc.is_buffer() {
             if self.find(va).is_some() || self.by_address.range(va..va + size).next().is_some() {
                 return Err(ResourceError::Overlap {
@@ -325,14 +322,16 @@ impl Resources {
                 });
             }
             self.note_game_range(va, size);
-            let mut at = va;
-            while at < va + size {
+            // The console places buffers at any address in memory the title mapped; the window binds whole pages.
+            let last = (va + size).next_multiple_of(PAGE);
+            let mut at = va - va % PAGE;
+            while at < last {
                 if self.space().is_bound(at) {
                     at += PAGE;
                     continue;
                 }
                 let mut end = at + PAGE;
-                while end < va + size && !self.space().is_bound(end) {
+                while end < last && !self.space().is_bound(end) {
                     end += PAGE;
                 }
                 self.space().map_host(at, end - at, SyncPolicy::Always)?;

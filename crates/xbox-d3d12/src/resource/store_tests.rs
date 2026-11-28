@@ -93,9 +93,16 @@ fn a_buffer_placed_in_game_memory_is_that_memory() {
         ));
         assert!(matches!(
             resources.create_placed(region.address + 4, &desc),
-            Err(ResourceError::Unaligned(_))
+            Err(ResourceError::Overlap { .. })
         ));
         resources.destroy(id).unwrap();
+        // The console places buffers at any address of mapped memory, as the title does at boot.
+        let small = resources
+            .create_placed(region.address + 0x840, &ResourceDesc::buffer(0x100))
+            .unwrap();
+        assert_eq!(resources.get(small).unwrap().address, region.address + 0x840);
+        assert!(resources.space().is_bound(region.address));
+        resources.destroy(small).unwrap();
         resources
             .space_mut()
             .unmap(region.address, 3 * PAGE)
