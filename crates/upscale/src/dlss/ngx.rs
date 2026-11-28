@@ -167,7 +167,9 @@ pub struct Api {
     pub library: Library,
     pub required_extensions: Option<ffi::FnRequiredExtensions>,
     pub init: Option<ffi::FnInit>,
-    pub init_with_project_id: Option<ffi::FnInitWithProjectId>,
+    pub init_ext: Option<ffi::FnInitExt>,
+    pub init_ext2: Option<ffi::FnInitExt2>,
+    pub init_project_id: Option<ffi::FnInitProjectId>,
     pub shutdown: Option<ffi::FnShutdown>,
     pub shutdown1: Option<ffi::FnShutdown1>,
     pub get_capability_parameters: ffi::FnGetParameters,
@@ -217,10 +219,9 @@ impl Api {
             missing.push("NVSDK_NGX_VULKAN_EvaluateFeature");
         }
         let init = library.symbol("NVSDK_NGX_VULKAN_Init");
-        let init_with_project_id = library
-            .symbol("NVSDK_NGX_VULKAN_Init_with_ProjectID")
-            .or_else(|| library.symbol("NVSDK_NGX_VULKAN_Init_ProjectID"));
-        if init.is_none() && init_with_project_id.is_none() {
+        let init_ext = library.symbol("NVSDK_NGX_VULKAN_Init_Ext");
+        let init_ext2 = library.symbol("NVSDK_NGX_VULKAN_Init_Ext2");
+        if init.is_none() && init_ext.is_none() && init_ext2.is_none() {
             missing.push("NVSDK_NGX_VULKAN_Init");
         }
         let shutdown = library.symbol("NVSDK_NGX_VULKAN_Shutdown");
@@ -243,7 +244,9 @@ impl Api {
             Ok(Api {
                 required_extensions: library.symbol("NVSDK_NGX_VULKAN_RequiredExtensions"),
                 init,
-                init_with_project_id,
+                init_ext,
+                init_ext2,
+                init_project_id: library.symbol("NVSDK_NGX_VULKAN_Init_ProjectID"),
                 shutdown,
                 shutdown1,
                 get_capability_parameters,
@@ -534,7 +537,40 @@ impl Api {
 }
 
 fn wide(path: &Path) -> Vec<u16> {
-    path.to_string_lossy().encode_utf16().chain([0]).collect()
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .encode_utf16()
+        .chain([0])
+        .collect()
+}
+
+static LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+unsafe extern "C" fn collect_log(
+    message: *const c_char,
+    _level: ffi::LoggingLevel,
+    _feature: ffi::Feature,
+) {
+    if message.is_null() {
+        return;
+    }
+    // SAFETY: NGX passes a NUL-terminated string valid for the call.
+    let line = unsafe { std::ffi::CStr::from_ptr(message) }
+        .to_string_lossy()
+        .trim_end()
+        .to_string();
+    if let Ok(mut log) = LOG.lock()
+        && log.len() < 4096
+    {
+        log.push(line);
+    }
+}
+
+/// The NGX log lines collected since the last call (see [`DlssOptions::log_level`]).
+pub fn take_log() -> Vec<String> {
+    LOG.lock()
+        .map(|mut log| std::mem::take(&mut *log))
+        .unwrap_or_default()
 }
 
 /// An initialised NGX instance for one Vulkan device.
@@ -590,54 +626,83 @@ impl Ngx {
             },
             internal_data: std::ptr::null_mut(),
             logging_info: ffi::LoggingInfo {
-                logging_callback: None,
-                minimum_logging_level: ffi::LOGGING_OFF,
+                logging_callback: (options.log_level != ffi::LOGGING_OFF)
+                    .then_some(collect_log as ffi::AppLogCallback),
+                minimum_logging_level: options.log_level,
                 disable_other_logging_sinks: false,
             },
         });
-        let project = cname(&options.project_id);
-        let engine_version = cname(&options.engine_version);
         let gipa = Some(vk.get_instance_proc_addr);
         let gdpa = Some(vk.get_device_proc_addr);
-        // SAFETY: every pointer argument refers to a buffer that lives in `wide_paths`, `feature_info`, `project` or
-        // `engine_version`, all alive for the call; the Vulkan handles belong to the caller's live device.
-        let info: *const ffi::FeatureCommonInfo = if path_array.is_empty() {
-            std::ptr::null()
-        } else {
-            &*feature_info
-        };
+        let info: *const ffi::FeatureCommonInfo = &*feature_info;
+        let app_id = options.application_id;
+        // SAFETY: every pointer argument refers to a buffer that lives in `wide_paths` or `feature_info`, both alive
+        // for the call; the Vulkan handles belong to the caller's live device.
         let result = unsafe {
-            match (options.use_project_id, api.init_with_project_id, api.init) {
-                (true, Some(init), _) => (
-                    "NVSDK_NGX_VULKAN_Init_ProjectID",
+            match (api.init_ext2, api.init_ext, api.init) {
+                _ if options.use_project_id && api.init_project_id.is_some() => {
+                    let project = cname(&options.project_id);
+                    let engine = cname(&options.engine_version);
+                    (
+                        "NVSDK_NGX_VULKAN_Init_ProjectID",
+                        api.init_project_id.unwrap()(
+                            project.as_ptr(),
+                            ffi::ENGINE_TYPE_CUSTOM,
+                            engine.as_ptr(),
+                            wide_paths[0].as_ptr(),
+                            vk.instance,
+                            vk.physical,
+                            vk.device,
+                            ffi::VERSION_API,
+                            info,
+                        ),
+                    )
+                }
+                (Some(init), _, _) => (
+                    "NVSDK_NGX_VULKAN_Init_Ext2",
                     init(
-                        project.as_ptr(),
-                        ffi::ENGINE_TYPE_CUSTOM,
-                        engine_version.as_ptr(),
+                        app_id,
                         wide_paths[0].as_ptr(),
                         vk.instance,
                         vk.physical,
                         vk.device,
                         gipa,
                         gdpa,
-                        info,
                         ffi::VERSION_API,
+                        info,
                     ),
                 ),
-                (_, _, Some(init)) => (
-                    "NVSDK_NGX_VULKAN_Init",
+                (None, Some(init), _) => (
+                    "NVSDK_NGX_VULKAN_Init_Ext",
                     init(
-                        0,
+                        app_id,
                         wide_paths[0].as_ptr(),
                         vk.instance,
                         vk.physical,
                         vk.device,
-                        gipa,
-                        gdpa,
-                        info,
                         ffi::VERSION_API,
+                        info,
                     ),
                 ),
+                (None, None, Some(init)) => {
+                    if !path_array.is_empty() {
+                        return Err(NgxError::Call {
+                            call: "NVSDK_NGX_VULKAN_Init (the driver has no Init_Ext for search paths)",
+                            result: ffi::RESULT_FAIL_OUT_OF_DATE,
+                        });
+                    }
+                    (
+                        "NVSDK_NGX_VULKAN_Init",
+                        init(
+                            app_id,
+                            wide_paths[0].as_ptr(),
+                            vk.instance,
+                            vk.physical,
+                            vk.device,
+                            ffi::VERSION_API,
+                        ),
+                    )
+                }
                 _ => {
                     return Err(NgxError::Runtime(
                         "NGX has no usable Init entry point".into(),
