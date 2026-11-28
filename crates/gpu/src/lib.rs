@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{CStr, c_void};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use ash::vk;
 
@@ -288,7 +288,17 @@ pub struct Gpu {
     memory: vk::PhysicalDeviceMemoryProperties,
     cache: vk::PipelineCache,
     cache_identity: [u8; 24],
+    timestamp_period: f32,
+    local_memory: AtomicBool,
     pub info: DeviceInfo,
+}
+
+/// Asks `dispatch_timed` and `draw_timed` for the GPU time of `repeats` back-to-back runs of the work.
+#[derive(Debug, Clone, Default)]
+pub struct Timing {
+    pub repeats: u32,
+    /// Nanoseconds each run took, filled in by the call.
+    pub nanos: Vec<f64>,
 }
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
@@ -576,6 +586,8 @@ impl Gpu {
                 memory,
                 cache,
                 cache_identity,
+                timestamp_period: properties.limits.timestamp_period,
+                local_memory: AtomicBool::new(false),
                 info,
             })
         }
@@ -615,19 +627,37 @@ impl Gpu {
                 None,
             )?;
             let needs = device.get_buffer_memory_requirements(buffer);
+            let local = self
+                .local_memory
+                .load(Ordering::Relaxed)
+                .then(|| {
+                    self.memory_type_with(
+                        needs.memory_type_bits,
+                        vk::MemoryPropertyFlags::DEVICE_LOCAL
+                            | vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )
+                })
+                .flatten();
             let Some(kind) = self.memory_type(needs.memory_type_bits) else {
                 device.destroy_buffer(buffer, None);
                 return Err(GpuError::NoMemory);
             };
             let mut flags = vk::MemoryAllocateFlagsInfo::default()
                 .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-            let memory = device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(needs.size)
-                    .memory_type_index(kind)
-                    .push_next(&mut flags),
-                None,
-            )?;
+            let allocate = |kind: u32, flags: &mut vk::MemoryAllocateFlagsInfo<'_>| {
+                device.allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(needs.size)
+                        .memory_type_index(kind)
+                        .push_next(flags),
+                    None,
+                )
+            };
+            let memory = match local.map(|kind| allocate(kind, &mut flags)) {
+                Some(Ok(memory)) => memory,
+                _ => allocate(kind, &mut flags)?,
+            };
             device.bind_buffer_memory(buffer, memory, 0)?;
             let mapped =
                 device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())? as *mut u32;
@@ -674,7 +704,58 @@ impl Gpu {
             groups,
             subgroup_size,
         };
-        self.submit(work, buffers, push, resources)
+        self.submit(work, buffers, push, resources, None)
+    }
+
+    /// Whether buffers live in host-visible device memory when the GPU has some, so shaders read them at video
+    /// memory speed. Off by default.
+    pub fn use_local_memory(&self, on: bool) {
+        self.local_memory.store(on, Ordering::Relaxed);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Like `dispatch_resources`, running the dispatch `timing.repeats` times back to back and recording the
+    /// GPU time of each run. The buffers hold what the last run left.
+    pub fn dispatch_timed(
+        &self,
+        spirv: &[u32],
+        buffers: &mut [&mut [u32]],
+        push: impl FnOnce(&[u64]) -> Vec<u32>,
+        groups: [u32; 3],
+        subgroup_size: Option<u32>,
+        resources: &mut [(u32, Resource)],
+        timing: &mut Timing,
+    ) -> Result<(), GpuError> {
+        let work = Work::Compute {
+            spirv,
+            groups,
+            subgroup_size,
+        };
+        self.submit(work, buffers, push, resources, Some(timing))
+    }
+
+    /// Like `draw`, drawing `timing.repeats` times and recording the GPU time of each.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_timed(
+        &self,
+        first: FirstStage<'_>,
+        fragment: &[u32],
+        extent: [u32; 2],
+        targets: &mut [Target],
+        depth: Option<&mut Target>,
+        buffers: &mut [&mut [u32]],
+        push: impl FnOnce(&[u64]) -> Vec<u32>,
+        resources: &mut [(u32, Resource)],
+        timing: &mut Timing,
+    ) -> Result<(), GpuError> {
+        let work = Work::Draw {
+            first,
+            fragment,
+            extent,
+            targets,
+            depth,
+        };
+        self.submit(work, buffers, push, resources, Some(timing))
     }
 
     /// Draws one triangle (three vertices, no vertex buffers) into `targets`, cleared first, and reads every
@@ -698,7 +779,7 @@ impl Gpu {
             targets,
             depth,
         };
-        self.submit(work, buffers, push, resources)
+        self.submit(work, buffers, push, resources, None)
     }
 
     fn submit(
@@ -707,6 +788,7 @@ impl Gpu {
         buffers: &mut [&mut [u32]],
         push: impl FnOnce(&[u64]) -> Vec<u32>,
         resources: &mut [(u32, Resource)],
+        mut timing: Option<&mut Timing>,
     ) -> Result<(), GpuError> {
         let empty = match &work {
             Work::Compute { spirv, .. } => spirv.is_empty(),
@@ -949,6 +1031,16 @@ impl Gpu {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
+            let repeats = timing.as_ref().map_or(1, |t| t.repeats.max(1));
+            if timing.is_some() {
+                scratch.queries = device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(2 * repeats),
+                    None,
+                )?;
+                device.cmd_reset_query_pool(command, scratch.queries, 0, 2 * repeats);
+            }
             for upload in &scratch.uploads {
                 upload.record(device, command);
             }
@@ -972,9 +1064,44 @@ impl Gpu {
                 device.cmd_push_constants(command, scratch.pipeline_layout, stages, 0, &bytes);
             }
             let mut target_readbacks = Vec::new();
+            let stamp = |run: u32, end: bool| {
+                if timing.is_some() {
+                    let stage = if end {
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE
+                    } else {
+                        vk::PipelineStageFlags::TOP_OF_PIPE
+                    };
+                    device.cmd_write_timestamp(
+                        command,
+                        stage,
+                        scratch.queries,
+                        2 * run + end as u32,
+                    );
+                }
+            };
             match &work {
                 Work::Compute { groups, .. } => {
-                    device.cmd_dispatch(command, groups[0], groups[1], groups[2]);
+                    for run in 0..repeats {
+                        stamp(run, false);
+                        device.cmd_dispatch(command, groups[0], groups[1], groups[2]);
+                        stamp(run, true);
+                        let again = vk::MemoryBarrier::default()
+                            .src_access_mask(
+                                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ,
+                            )
+                            .dst_access_mask(
+                                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ,
+                            );
+                        device.cmd_pipeline_barrier(
+                            command,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[again],
+                            &[],
+                            &[],
+                        );
+                    }
                 }
                 Work::Draw {
                     first,
@@ -1000,11 +1127,19 @@ impl Gpu {
                                 device.cmd_bind_vertex_buffers(command, 0, &[vertices.0], &[0]);
                                 scratch.staging.push(vertices);
                             }
-                            device.cmd_draw(command, 3, 1, 0, 0);
+                            for run in 0..repeats {
+                                stamp(run, false);
+                                device.cmd_draw(command, 3, 1, 0, 0);
+                                stamp(run, true);
+                            }
                         }
                         FirstStage::Mesh { groups, .. } => {
                             let mesh = ash::ext::mesh_shader::Device::new(&self.instance, device);
-                            mesh.cmd_draw_mesh_tasks(command, groups[0], groups[1], groups[2]);
+                            for run in 0..repeats {
+                                stamp(run, false);
+                                mesh.cmd_draw_mesh_tasks(command, groups[0], groups[1], groups[2]);
+                                stamp(run, true);
+                            }
                         }
                     }
                     device.cmd_end_rendering(command);
@@ -1060,6 +1195,19 @@ impl Gpu {
                 scratch.fence,
             )?;
             device.wait_for_fences(&[scratch.fence], true, u64::MAX)?;
+            if let Some(timing) = timing.as_deref_mut() {
+                let mut stamps = vec![0u64; 2 * repeats as usize];
+                device.get_query_pool_results(
+                    scratch.queries,
+                    0,
+                    &mut stamps,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                )?;
+                timing.nanos = stamps
+                    .chunks(2)
+                    .map(|pair| (pair[1] - pair[0]) as f64 * f64::from(self.timestamp_period))
+                    .collect();
+            }
             for (data, (_, memory, size)) in buffers.iter_mut().zip(&scratch.buffers) {
                 let mapped = device.map_memory(*memory, 0, *size, vk::MemoryMapFlags::empty())?
                     as *const u32;
@@ -1800,6 +1948,7 @@ struct Scratch<'a> {
     pool: vk::DescriptorPool,
     command_pool: vk::CommandPool,
     fence: vk::Fence,
+    queries: vk::QueryPool,
     /// Whether dropping waits for the device first, as it must once work was submitted.
     wait: bool,
 }
@@ -1824,6 +1973,7 @@ impl<'a> Scratch<'a> {
             pool: vk::DescriptorPool::null(),
             command_pool: vk::CommandPool::null(),
             fence: vk::Fence::null(),
+            queries: vk::QueryPool::null(),
             wait: true,
         }
     }
@@ -1838,6 +1988,7 @@ impl Drop for Scratch<'_> {
                 let _ = d.device_wait_idle();
             }
             d.destroy_fence(self.fence, None);
+            d.destroy_query_pool(self.queries, None);
             d.destroy_command_pool(self.command_pool, None);
             d.destroy_descriptor_pool(self.pool, None);
             d.destroy_pipeline(self.pipeline, None);
