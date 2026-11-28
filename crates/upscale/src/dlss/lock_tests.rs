@@ -78,6 +78,18 @@ fn parameter_calls_wait_for_the_lock() {
     other.handle.join().unwrap();
 }
 
+#[cfg(windows)]
+#[test]
+fn opening_ngx_switches_its_updater_off_first() {
+    let missing = std::path::Path::new("E:/leonida-no-such-folder/nvngx.dll");
+    assert!(ngx::Api::open(Some(missing)).is_err());
+    assert_eq!(
+        std::env::var("__NGX_DISABLE_UPDATER").as_deref(),
+        Ok("1"),
+        "NGX's over-the-air updater would start"
+    );
+}
+
 /// A smooth frame and flat depth and motion for a render size.
 fn drive(dlss: &mut DlssUpscaler, output: [u32; 2], frames: u32) -> crate::Image {
     let render = dlss
@@ -155,4 +167,71 @@ fn several_threads_create_and_evaluate_dlss_at_once() {
             worker.join().expect("a DLSS thread panicked");
         }
     });
+}
+
+#[cfg(windows)]
+mod updater {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    /// How many `nvngx_update.exe` processes exist that this process started.
+    fn updaters_started_by_us() -> usize {
+        let me = std::process::id();
+        let mut count = 0;
+        // SAFETY: a process snapshot is read through a handle that is closed again; `entry` is a plain struct whose
+        // size field is set as the API requires.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot.is_null() || snapshot as isize == -1 {
+                return 0;
+            }
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+            let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+            while more {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+                if name.eq_ignore_ascii_case("nvngx_update.exe") && entry.th32ParentProcessID == me
+                {
+                    count += 1;
+                }
+                more = Process32NextW(snapshot, &mut entry) != 0;
+            }
+            CloseHandle(snapshot);
+        }
+        count
+    }
+
+    #[test]
+    #[ignore = "needs an NVIDIA GPU and nvngx_dlss.dll (set LEONIDA_DLSS_DLL)"]
+    fn ngx_does_not_start_its_updater() {
+        let config = super::library_config();
+        let stop = AtomicBool::new(false);
+        let launched = std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                let mut most = 0;
+                while !stop.load(Ordering::SeqCst) {
+                    most = most.max(updaters_started_by_us());
+                    std::thread::sleep(std::time::Duration::from_millis(3));
+                }
+                most.max(updaters_started_by_us())
+            });
+            let mut dlss = super::DlssUpscaler::new(&config).expect("DLSS starts");
+            super::drive(&mut dlss, [640, 360], 3);
+            drop(dlss);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            stop.store(true, Ordering::SeqCst);
+            watcher.join().unwrap()
+        });
+        assert_eq!(launched, 0, "NGX started its over-the-air updater");
+    }
 }

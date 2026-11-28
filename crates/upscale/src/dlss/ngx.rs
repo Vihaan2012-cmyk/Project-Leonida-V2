@@ -40,6 +40,7 @@ mod library {
     use std::path::{Path, PathBuf};
 
     use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::Environment::SetEnvironmentVariableW;
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW,
     };
@@ -107,10 +108,28 @@ mod library {
         (!text.is_empty()).then(|| PathBuf::from(text))
     }
 
+    /// The environment variable NGX Core reads to skip its over-the-air updater (it logs "OTA disabled by
+    /// environment. Using embedded snippet only"). NVIDIA's SDK documents no switch for this; without it NGX starts
+    /// `nvngx_update.exe` from the driver store for every feature it loads, and that program contacts NVIDIA's servers.
+    const DISABLE_UPDATER: &str = "__NGX_DISABLE_UPDATER";
+
+    /// Sets [`DISABLE_UPDATER`] in this process, before NGX Core is loaded.
+    fn disable_updater() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let name: Vec<u16> = DISABLE_UPDATER.encode_utf16().chain([0]).collect();
+            let value: Vec<u16> = "1".encode_utf16().chain([0]).collect();
+            // SAFETY: both strings are NUL-terminated and outlive the call.
+            unsafe { SetEnvironmentVariableW(name.as_ptr(), value.as_ptr()) };
+        });
+    }
+
     impl Library {
         /// Loads `nvngx.dll` from the system folder or, failing that, from the folder the NVIDIA driver registers
-        /// for NGX; or the library at `explicit`.
+        /// for NGX; or the library at `explicit`. NGX's over-the-air updater is switched off first, so nothing
+        /// started by NGX reaches the network.
         pub fn open(explicit: Option<&Path>) -> Result<Library, String> {
+            disable_updater();
             if let Some(path) = explicit {
                 return load(path, LOAD_WITH_ALTERED_SEARCH_PATH, path.to_path_buf())
                     .map_err(|code| not_found(path, code));
