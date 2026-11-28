@@ -1087,7 +1087,7 @@ fn the_store_says_the_game_is_licensed_and_nothing_else_is_for_sale() {
             slot(store, 30);
         let addons_count: unsafe extern "win64" fn(usize, *mut Block, *mut u32) -> i32 =
             slot(store, 31);
-        let purchase: unsafe extern "win64" fn(usize) -> i32 = slot(store, 49);
+        let unserved: unsafe extern "win64" fn(usize) -> i32 = slot(store, 70);
         let mut context = 0usize;
         assert_eq!(create(store, 0, &mut context), 0x8007_0057_u32 as i32);
         assert_eq!(create(store, 1, &mut context), 0);
@@ -1106,7 +1106,11 @@ fn the_store_says_the_game_is_licensed_and_nothing_else_is_for_sale() {
         let mut count = 9u32;
         assert_eq!(addons_count(store, &mut block, &mut count), 0);
         assert_eq!(count, 0);
-        assert_eq!(purchase(store), 0x8000_4005_u32 as i32, "purchases fail");
+        assert_eq!(
+            unserved(store),
+            0x8000_4005_u32 as i32,
+            "XStoreIsAvailabilityPurchasable is not served"
+        );
         close(store, context);
     }
 }
