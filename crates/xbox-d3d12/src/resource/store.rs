@@ -253,7 +253,8 @@ impl Resources {
     ) -> ResourceId {
         let id = self.next;
         self.next += 1;
-        self.by_address.insert(address, id);
+        // Aliasing buffers may start at the same address; the first one keeps the entry.
+        self.by_address.entry(address).or_insert(id);
         self.items.insert(
             id,
             Resource {
@@ -315,12 +316,7 @@ impl Resources {
     ) -> Result<ResourceId, ResourceError> {
         let AllocationInfo { size, .. } = desc.allocation_info()?;
         if desc.is_buffer() {
-            if self.find(va).is_some() || self.by_address.range(va..va + size).next().is_some() {
-                return Err(ResourceError::Overlap {
-                    address: va,
-                    len: size,
-                });
-            }
+            // D3D12 lets placed resources alias, and the title places buffers over memory other buffers use.
             self.note_game_range(va, size);
             // The console places buffers at any address in memory the title mapped; the window binds whole pages.
             let last = (va + size).next_multiple_of(PAGE);
@@ -426,7 +422,17 @@ impl Resources {
 
     pub fn destroy(&mut self, id: ResourceId) -> Result<(), ResourceError> {
         let r = self.items.remove(&id).ok_or(ResourceError::Unknown(id))?;
-        self.by_address.remove(&r.address);
+        if self.by_address.get(&r.address) == Some(&id) {
+            self.by_address.remove(&r.address);
+            if let Some(alias) = self
+                .items
+                .values()
+                .find(|other| other.address == r.address)
+                .map(|other| other.id)
+            {
+                self.by_address.insert(r.address, alias);
+            }
+        }
         self.detiled
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

@@ -87,15 +87,24 @@ fn a_buffer_placed_in_game_memory_is_that_memory() {
             (region.address, 3 * PAGE),
         );
         assert_eq!(region.read(PAGE / 4), 8);
-        assert!(matches!(
-            resources.create_placed(region.address + PAGE, &ResourceDesc::buffer(PAGE)),
-            Err(ResourceError::Overlap { .. })
-        ));
-        assert!(matches!(
-            resources.create_placed(region.address + 4, &desc),
-            Err(ResourceError::Overlap { .. })
-        ));
+        // Placed buffers may alias, as D3D12 allows; the title places them over memory others use.
+        let inside = resources
+            .create_placed(region.address + PAGE, &ResourceDesc::buffer(PAGE))
+            .unwrap();
+        let same_start = resources.create_placed(region.address, &desc).unwrap();
+        assert_eq!(
+            resources.get(inside).unwrap().address,
+            region.address + PAGE
+        );
+        assert_eq!(resources.find(region.address).unwrap().0, id);
         resources.destroy(id).unwrap();
+        assert_eq!(
+            resources.find(region.address).unwrap().0,
+            same_start,
+            "the alias takes over the address when the first goes"
+        );
+        resources.destroy(same_start).unwrap();
+        resources.destroy(inside).unwrap();
         // The console places buffers at any address of mapped memory, as the title does at boot.
         let small = resources
             .create_placed(region.address + 0x840, &ResourceDesc::buffer(0x100))
