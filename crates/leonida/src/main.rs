@@ -1,3 +1,8 @@
+/// Leonida's own heap, apart from the process heap the title's C runtime uses.
+#[cfg(windows)]
+#[global_allocator]
+static ALLOCATOR: shims::heap::PrivateHeap = shims::heap::PrivateHeap;
+
 mod cli;
 mod cmd_assets;
 mod cmd_census;

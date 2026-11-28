@@ -21,6 +21,8 @@ pub mod fidelityfx;
 pub mod files;
 pub mod gameinput;
 #[cfg(windows)]
+pub mod heap;
+#[cfg(windows)]
 pub mod hostlib;
 pub mod loader;
 pub mod media;
