@@ -407,7 +407,18 @@ unsafe fn parse_request(base: *const u8) -> Result<Request, String> {
         let file = unsafe { (*(file as *const FileObject)).file.clone() };
         let (offset, size): (u64, u32) = (word(base, 0x28), word(base, 0x30));
         if crate::files::readtrace::wanted().is_some() {
-            crate::files::readtrace::request(Arc::as_ptr(&file) as HANDLE, offset, size, options);
+            let into = if options & OPTION_PAGE_DESTINATION != 0 {
+                format!("pages at {:#x}", word::<u64>(base, 8))
+            } else {
+                format!("{:#x}+{}", word::<u64>(base, 8), uncompressed)
+            };
+            crate::files::readtrace::request(
+                Arc::as_ptr(&file) as HANDLE,
+                offset,
+                size,
+                options,
+                &into,
+            );
         }
         Source::File { file, offset, size }
     } else {

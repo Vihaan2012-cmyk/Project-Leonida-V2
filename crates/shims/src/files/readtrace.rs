@@ -1,6 +1,6 @@
 //! `LEONIDA_TRACE_READS=<part of a path>`: notes where the program reads files whose path contains that text,
-//! through `ReadFile` and `SetFilePointerEx` (served by Windows otherwise) and DirectStorage. Off, these calls go
-//! straight to Windows.
+//! through `ReadFile` and `SetFilePointerEx` (served by Windows otherwise) and DirectStorage, each with the memory
+//! it fills so overlapping destinations show. Off, these calls go straight to Windows.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -64,10 +64,10 @@ pub fn write(text: String) {
 }
 
 /// Notes a DirectStorage request on a traced file.
-pub fn request(key: HANDLE, offset: u64, size: u32, options: u64) {
+pub fn request(key: HANDLE, offset: u64, size: u32, options: u64, into: &str) {
     if let Some(path) = path_of(key) {
         write(format!(
-            "DirectStorage read {path} at {offset}, {size} bytes, options {options:#x}"
+            "DirectStorage read {path} at {offset}, {size} bytes, options {options:#x}, into {into}"
         ));
     }
 }
@@ -103,7 +103,9 @@ pub(super) unsafe extern "win64" fn read_file(
             };
             format!("{offset} (overlapped)")
         };
-        write(format!("read {path} at {at}, {bytes} bytes"));
+        write(format!(
+            "read {path} at {at}, {bytes} bytes, into {buffer:p}"
+        ));
     }
     // SAFETY: the program's arguments, passed on unchanged.
     unsafe { ReadFile(handle, buffer, bytes, read, overlapped) }
