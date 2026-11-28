@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WIN32_FIND_DATAW, WriteFile};
@@ -7,7 +6,7 @@ use windows_sys::Win32::Storage::FileSystem::{ReadFile, WIN32_FIND_DATAW, WriteF
 use super::*;
 use crate::files::{configure, set_redirect};
 
-pub(super) static LOCK: Mutex<()> = Mutex::new(());
+pub(super) use crate::files::TEST_LOCK as LOCK;
 
 pub(super) const GENERIC_READ: u32 = 0x8000_0000;
 pub(super) const GENERIC_WRITE: u32 = 0x4000_0000;

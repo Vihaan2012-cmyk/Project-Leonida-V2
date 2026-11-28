@@ -21,6 +21,10 @@ pub use map::{Refusal, Roots, Target};
 // The only place paths are resolved. `vfs::resolve` replaces `resolve` and `configure` once it exists; the shims
 // below depend on nothing else.
 
+/// Held by tests that read or change the folders, since they are process-wide.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 static ROOTS: RwLock<Option<Roots>> = RwLock::new(None);
 
 /// Sets the package folder and the `Output/` folder. Both must be absolute paths with drive letters. Until this is
@@ -45,6 +49,13 @@ fn install(roots: Roots) -> bool {
         true
     } else {
         false
+    }
+}
+
+/// Forgets the folders, so paths pass to Windows unchanged again.
+pub fn unconfigure() {
+    if let Ok(mut slot) = ROOTS.write() {
+        *slot = None;
     }
 }
 
