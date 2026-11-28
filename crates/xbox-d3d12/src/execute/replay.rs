@@ -78,6 +78,16 @@ pub struct ReplayReport {
     pub notes: Vec<String>,
 }
 
+/// What `Replayer::record_chunked` ends with: the command buffer it was recording into when it stopped, which
+/// can be a later one than it started with, and how it went.
+pub struct Chunked {
+    pub cb: vk::CommandBuffer,
+    pub result: Result<ReplayReport, ReplayError>,
+}
+
+/// The most commands one chunk of `record_chunked` grows to.
+const MAX_CHUNK: usize = 1 << 16;
+
 pub(crate) const PUSH_WORDS: usize = shader_translate::PUSH_WORDS as usize;
 
 struct Bound {
@@ -240,6 +250,74 @@ impl<'a> Replayer<'a> {
         self.flush_barriers();
         self.end_rendering();
         Ok(self.report)
+    }
+
+    /// As `record`, handing the command buffer on when it has taken `first` commands, then twice as many, and so
+    /// on, at the next barrier or change of targets: `next` gets the buffer to finish (and submit, so the GPU
+    /// starts on it while the rest is recorded) and returns the one to go on with. The state the old buffer held
+    /// is forgotten, so what the new one needs is set again.
+    pub fn record_chunked(
+        mut self,
+        commands: &[Command],
+        first: usize,
+        next: &mut dyn FnMut(vk::CommandBuffer) -> Result<vk::CommandBuffer, ReplayError>,
+    ) -> Chunked {
+        let (mut every, mut since) = (first.max(1), 0usize);
+        for command in commands {
+            if !command.is_lazy() {
+                self.flush_barriers();
+            }
+            if since >= every
+                && matches!(
+                    command,
+                    Command::Barriers(_) | Command::SetRenderTargets { .. }
+                )
+            {
+                self.flush_barriers();
+                self.end_rendering();
+                match next(self.cb) {
+                    Ok(cb) => {
+                        self.cb = cb;
+                        self.forget_applied();
+                        since = 0;
+                        every = (every * 2).min(MAX_CHUNK);
+                    }
+                    Err(e) => {
+                        return Chunked {
+                            cb: self.cb,
+                            result: Err(e),
+                        };
+                    }
+                }
+            }
+            if let Err(e) = self.command(command) {
+                return Chunked {
+                    cb: self.cb,
+                    result: Err(e),
+                };
+            }
+            since += 1;
+        }
+        self.flush_barriers();
+        self.end_rendering();
+        Chunked {
+            cb: self.cb,
+            result: Ok(self.report),
+        }
+    }
+
+    /// A new command buffer holds no state: bind, push and set everything again at the next draw.
+    fn forget_applied(&mut self) {
+        for bound in [&mut self.graphics, &mut self.compute] {
+            bound.handle = vk::Pipeline::null();
+            bound.bindless = false;
+        }
+        self.pushed = PushShadow::default();
+        self.pushed_by = None;
+        self.dirty = DynamicDirty::all();
+        self.topology_applied = None;
+        self.vertex.invalidate();
+        self.index_applied = None;
     }
 
     fn flush_barriers(&mut self) {

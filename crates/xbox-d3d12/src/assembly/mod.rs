@@ -81,6 +81,14 @@ pub fn set_heap_allocator(allocator: Option<Arc<dyn HeapAllocator>>) {
     *ALLOCATOR.write().unwrap_or_else(PoisonError::into_inner) = allocator;
 }
 
+/// The title's allocation hook, when one is set.
+pub(crate) fn heap_allocator() -> Option<Arc<dyn HeapAllocator>> {
+    ALLOCATOR
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
 /// Builds the assembly if it does not exist yet (and installs the memory hooks, so call it before the game
 /// allocates), and makes it the current one. The same assembly is returned after the first call.
 pub fn init(config: AssemblyConfig) -> Result<Arc<Assembly>, AssemblyError> {

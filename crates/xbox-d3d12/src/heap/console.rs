@@ -105,6 +105,11 @@ pub const OBJECT_TYPE: u64 = 4;
 pub const OBJECT_TYPE_MASK: u64 = 0x3fff;
 /// The attributes of a descriptor heap's `XMemAlloc`: only the two fields the title's hook reads.
 pub const DESCRIPTOR_HEAP_ATTRIBUTES: u64 = (ALLOCATOR_ID << 16) | OBJECT_TYPE;
+/// The attributes of a committed resource's `XMemAlloc`. The title's display-buffer arena (callback 0x56a2a60,
+/// pushed by 0x247ad10 around the creation of its display buffers) serves requests whose bits 14 and 15 are `10`
+/// from one 64 KiB-aligned bump allocation, and the title then checks that the arena is used up. Bit 1 asks the
+/// XMem layer for GPU-visible memory when no override answers.
+pub const RESOURCE_ATTRIBUTES: u64 = (ALLOCATOR_ID << 16) | 0x8000 | 0x2;
 
 /// Memory the title's allocation hook answered with.
 pub struct Hooked {

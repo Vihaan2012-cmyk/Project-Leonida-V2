@@ -151,8 +151,12 @@ pub struct ExecTimings {
     pub memory: Duration,
     /// The replay of the commands into the command buffer, uploads and downloads included.
     pub record: Duration,
-    /// Ending the command buffer, submitting it and waiting for the GPU.
-    pub submit_wait: Duration,
+    /// Ending the command buffer.
+    pub end: Duration,
+    /// The queue submission call.
+    pub submit: Duration,
+    /// Waiting for the fence: the GPU's run of the work.
+    pub gpu: Duration,
     /// Releasing detiled memory and reclaiming after the GPU is done.
     pub finish: Duration,
     pub total: Duration,
@@ -170,6 +174,11 @@ pub struct ExecState {
     pub fence: vk::Fence,
     pub spill: SpillRing,
     pub timings: ExecTimings,
+    /// Commands in the first command buffer of a long list, which is submitted while the rest is recorded; the
+    /// ones after it take twice as many each. `usize::MAX` records a submission into one buffer.
+    pub first_chunk: usize,
+    /// The replay command vectors of the last submission, emptied, for the next one to fill.
+    pub(super) spare: Vec<super::bridge::Converted>,
 }
 
 pub struct Assembly {
@@ -339,6 +348,8 @@ impl Assembly {
                 fence: device.create_fence(&vk::FenceCreateInfo::default(), None)?,
                 spill: SpillRing::new(&resources),
                 timings: ExecTimings::default(),
+                first_chunk: super::executor::FIRST_CHUNK,
+                spare: Vec::new(),
             }
         };
         Ok(Arc::new(Assembly {

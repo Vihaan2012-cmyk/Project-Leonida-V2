@@ -1,10 +1,12 @@
 //! `Executor`: closed command lists replayed on the Vulkan queue.
 //!
 //! One `ExecuteCommandLists` call is one submission: every list is converted to replay commands (`bridge`), the
-//! descriptors they can reach are registered and the bindless set brought up to date, one command buffer is
-//! recorded (host memory copied into a mirrored window first, what the GPU wrote copied back after) and the call
-//! returns when the GPU has finished. Submissions run one at a time.
+//! descriptors they can reach are registered and the bindless set brought up to date, the lists are recorded (host
+//! memory copied into a mirrored window first, what the GPU wrote copied back after) and the call returns when the
+//! GPU has finished. A long list goes into several command buffers, each submitted as it is finished so the GPU
+//! works while the rest is recorded. Submissions run one at a time.
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
@@ -22,6 +24,7 @@ use super::state::Assembly;
 use super::views::identity;
 use crate::com::{self, ComPtr, Kind};
 use crate::compile_queue::DrawPolicy;
+use crate::descriptor::fasthash::FastSet;
 use crate::descriptor::vulkan::ViewInfo;
 use crate::descriptor::{self, gfx10};
 use crate::execute::{
@@ -74,6 +77,9 @@ struct Context<'a> {
     asm: &'a Assembly,
     resources: &'a Resources,
     filter: Option<hooks::FilterHandle>,
+    /// The tables (root signature, parameter, handle) whose descriptors were registered in this submission: the
+    /// heap does not change while its lists are converted, so a table bound again registers nothing new.
+    tables: RefCell<FastSet<(usize, u32, u64)>>,
 }
 
 /// A heap's type and GPU start, through its own vtable: the heap object is the heap step's.
@@ -138,17 +144,17 @@ impl Context<'_> {
             unsafe { std::slice::from_raw_parts(start as usize as *const u32, count as usize * 8) };
         let mut descriptors = self.asm.descriptors();
         if samplers {
-            for (_, registration) in descriptors.scan_samplers(words, 8) {
+            descriptors.scan_samplers_with(words, 8, |_, registration| {
                 if registration.new {
                     self.asm.bindless.note_sampler(registration.index);
                 }
-            }
+            });
         } else {
-            for (_, registration) in descriptors.scan_textures(words, 8) {
+            descriptors.scan_textures_with(words, 8, |_, registration| {
                 if registration.new {
                     self.asm.bindless.note_texture(registration.index);
                 }
-            }
+            });
         }
     }
 }
@@ -245,6 +251,10 @@ impl Resolver for Context<'_> {
     }
 
     fn table_bound(&self, root: &RootSignature, param: u32, handle: u64) {
+        let key = (std::ptr::from_ref(root) as usize, param, handle);
+        if !self.tables.borrow_mut().insert(key) {
+            return;
+        }
         let Some(core) = self.asm.core.get() else {
             return;
         };
@@ -314,6 +324,134 @@ impl Context<'_> {
     }
 }
 
+/// How many emptied replay command vectors are kept for the next submission.
+const MAX_SPARE: usize = 8;
+/// Vectors that grew past this many commands are freed instead of kept.
+const MAX_SPARE_COMMANDS: usize = 1 << 19;
+
+/// Commands in the first command buffer of a long list; each one after it takes twice as many.
+pub(super) const FIRST_CHUNK: usize = 1024;
+
+/// The command buffers one `execute` records, submitted as they are finished so the GPU starts on a long list
+/// while the rest of it is still being recorded. Dropping it waits for the queue if it submitted work that was
+/// not waited for, then frees the buffers.
+struct Submission<'a> {
+    asm: &'a Assembly,
+    pool: vk::CommandPool,
+    buffers: Vec<vk::CommandBuffer>,
+    submitted: bool,
+    waited: bool,
+    /// A Vulkan call failed while cutting a buffer: nothing more is recorded.
+    broken: Option<vk::Result>,
+    end: Duration,
+    submit: Duration,
+}
+
+impl<'a> Submission<'a> {
+    fn new(asm: &'a Assembly, pool: vk::CommandPool) -> Submission<'a> {
+        Submission {
+            asm,
+            pool,
+            buffers: Vec::new(),
+            submitted: false,
+            waited: false,
+            broken: None,
+            end: Duration::ZERO,
+            submit: Duration::ZERO,
+        }
+    }
+
+    /// A new command buffer, recording.
+    fn begin(&mut self) -> Result<vk::CommandBuffer, vk::Result> {
+        let d = &self.asm.gpu.ctx.device;
+        // SAFETY: the buffer comes from a pool of this device; it is freed after the queue is done with it.
+        unsafe {
+            let cb = d.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.pool)
+                    .command_buffer_count(1),
+            )?[0];
+            self.buffers.push(cb);
+            d.begin_command_buffer(
+                cb,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            Ok(cb)
+        }
+    }
+
+    fn send(&mut self, cb: vk::CommandBuffer, fence: vk::Fence) -> Result<(), vk::Result> {
+        let d = &self.asm.gpu.ctx.device;
+        let mut mark = Instant::now();
+        // SAFETY: `cb` is recording and has no open rendering scope.
+        unsafe { d.end_command_buffer(cb)? };
+        self.end += lap(&mut mark);
+        let buffers = [cb];
+        let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
+        let queue = self
+            .asm
+            .gpu
+            .vulkan
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: the buffer is ended and used by this submission only.
+        unsafe { d.queue_submit(*queue, &submit, fence)? };
+        self.submit += lap(&mut mark);
+        self.submitted = true;
+        Ok(())
+    }
+
+    /// Ends and submits `cb`, which the replay leaves outside a rendering scope, and starts the next one.
+    fn cut(&mut self, cb: vk::CommandBuffer) -> Result<vk::CommandBuffer, vk::Result> {
+        if let Some(e) = self.broken {
+            return Err(e);
+        }
+        self.send(cb, vk::Fence::null())
+            .and_then(|()| self.begin())
+            .inspect_err(|e| self.broken = Some(*e))
+    }
+
+    /// Ends and submits the last buffer, with the fence.
+    fn finish(&mut self, cb: vk::CommandBuffer, fence: vk::Fence) -> Result<(), vk::Result> {
+        self.send(cb, fence)
+    }
+
+    fn wait(&mut self, fence: vk::Fence) -> Result<(), vk::Result> {
+        let d = &self.asm.gpu.ctx.device;
+        // SAFETY: the fence was submitted with the last buffer.
+        unsafe {
+            d.wait_for_fences(&[fence], true, u64::MAX)?;
+            d.reset_fences(&[fence])?;
+        }
+        self.waited = true;
+        Ok(())
+    }
+}
+
+impl Drop for Submission<'_> {
+    fn drop(&mut self) {
+        let d = &self.asm.gpu.ctx.device;
+        // SAFETY: after the wait nothing uses the buffers; without one, the queue is drained first.
+        unsafe {
+            if self.submitted && !self.waited {
+                let queue = self
+                    .asm
+                    .gpu
+                    .vulkan
+                    .queue
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let _ = d.queue_wait_idle(*queue);
+            }
+            if !self.buffers.is_empty() {
+                d.free_command_buffers(self.pool, &self.buffers);
+            }
+        }
+    }
+}
+
 /// The time since `*mark`, which moves to now.
 fn lap(mark: &mut Instant) -> Duration {
     let now = Instant::now();
@@ -344,56 +482,12 @@ impl Assembly {
         fence: vk::Fence,
         record: impl FnOnce(vk::CommandBuffer) -> R,
     ) -> Result<R, vk::Result> {
-        self.run_commands_timed(pool, fence, record)
-            .map(|(value, _)| value)
-    }
-
-    /// As `run_commands`, also returning the time spent in `record` and the time spent ending, submitting and
-    /// waiting.
-    fn run_commands_timed<R>(
-        &self,
-        pool: vk::CommandPool,
-        fence: vk::Fence,
-        record: impl FnOnce(vk::CommandBuffer) -> R,
-    ) -> Result<(R, [Duration; 2]), vk::Result> {
-        let d = &self.gpu.ctx.device;
-        // SAFETY: the command buffer comes from a pool of this device, is recorded once, submitted once and freed
-        // after the fence says the GPU is done.
-        unsafe {
-            let cb = d.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(pool)
-                    .command_buffer_count(1),
-            )?[0];
-            let result = (|| {
-                d.begin_command_buffer(
-                    cb,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )?;
-                let started = Instant::now();
-                let value = record(cb);
-                let recorded = started.elapsed();
-                let started = Instant::now();
-                d.end_command_buffer(cb)?;
-                let buffers = [cb];
-                let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
-                {
-                    let queue = self
-                        .gpu
-                        .vulkan
-                        .queue
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    d.queue_submit(*queue, &submit, fence)?;
-                }
-                d.wait_for_fences(&[fence], true, u64::MAX)?;
-                d.reset_fences(&[fence])?;
-                Ok((value, [recorded, started.elapsed()]))
-            })();
-            d.free_command_buffers(pool, &[cb]);
-            result
-        }
+        let mut submission = Submission::new(self, pool);
+        let cb = submission.begin()?;
+        let value = record(cb);
+        submission.finish(cb, fence)?;
+        submission.wait(fence)?;
+        Ok(value)
     }
 
     /// Texels the title wrote into placed texture memory reach the image before the GPU reads it: at each
@@ -549,10 +643,12 @@ impl Assembly {
             asm: self,
             resources: &resources,
             filter,
+            tables: RefCell::default(),
         };
+        let mut spare = std::mem::take(&mut exec.spare);
         let converted: Vec<Converted> = lists
             .iter()
-            .map(|list| bridge::convert(list, &context))
+            .map(|list| bridge::convert_reusing(list, &context, spare.pop().unwrap_or_default()))
             .collect();
         drop(context);
         let convert = lap(&mut mark);
@@ -568,7 +664,7 @@ impl Assembly {
                 .flat_map(|c| c.writes.iter().copied())
                 .collect(),
         );
-        let (pool, fence) = (exec.pool, exec.fence);
+        let (pool, fence, first_chunk) = (exec.pool, exec.fence, exec.first_chunk);
         let spill: &mut dyn SpillAllocator = &mut exec.spill;
         let mut space = resources.space();
         for &(start, len) in &writes {
@@ -583,7 +679,10 @@ impl Assembly {
         };
         let memory = lap(&mut mark);
         let mut report = Vec::new();
-        let result = self.run_commands_timed(pool, fence, |cb| {
+        let mut submission = Submission::new(self, pool);
+        let recording = Instant::now();
+        let sent = (|| -> Result<(), vk::Result> {
+            let mut cb = submission.begin()?;
             space.record_uploads(cb);
             for list in &converted {
                 let env = ReplayEnv {
@@ -592,7 +691,16 @@ impl Assembly {
                     bindless: Some(set),
                     spill: Some(&mut *spill),
                 };
-                match Replayer::new(&self.gpu.ctx, env, cb).record(&list.commands) {
+                let out = Replayer::new(&self.gpu.ctx, env, cb).record_chunked(
+                    &list.commands,
+                    first_chunk,
+                    &mut |old| Ok(submission.cut(old)?),
+                );
+                cb = out.cb;
+                if let Some(e) = submission.broken {
+                    return Err(e);
+                }
+                match out.result {
                     Ok(r) => report.extend(r.notes),
                     Err(e) => com::note_once(format!("a list could not be replayed: {e}")),
                 }
@@ -602,21 +710,44 @@ impl Assembly {
                     space.record_downloads(cb, *start, *len);
                 }
             }
-        });
+            submission.finish(cb, fence)
+        })();
+        let record = recording
+            .elapsed()
+            .saturating_sub(submission.end + submission.submit);
+        if let Err(e) = sent {
+            drop(space);
+            drop(resources);
+            for note in report {
+                com::note_once(note);
+            }
+            return Err(e);
+        }
+        for mut list in converted {
+            list.commands.clear();
+            list.writes.clear();
+            if list.commands.capacity() <= MAX_SPARE_COMMANDS {
+                spare.push(list);
+            }
+        }
+        spare.truncate(MAX_SPARE);
+        exec.spare = spare;
+        let mut mark = Instant::now();
+        submission.wait(fence)?;
+        let gpu = lap(&mut mark);
         drop(space);
         drop(resources);
         for note in report {
             com::note_once(note);
         }
-        let (_, [record, submit_wait]) = result?;
-        mark = Instant::now();
+        let (ended, submitted) = (submission.end, submission.submit);
+        drop(submission);
         {
             let resources = self.resources();
             resources.release_detiled();
             resources.space().reclaim();
         }
         self.gpu.handles.budget.tick();
-        drop(converted);
         let finish = lap(&mut mark);
         let t = &mut exec.timings;
         t.submissions += 1;
@@ -625,7 +756,9 @@ impl Assembly {
         t.bindless += bindless;
         t.memory += memory;
         t.record += record;
-        t.submit_wait += submit_wait;
+        t.end += ended;
+        t.submit += submitted;
+        t.gpu += gpu;
         t.finish += finish;
         t.total += begun.elapsed();
         Ok(())

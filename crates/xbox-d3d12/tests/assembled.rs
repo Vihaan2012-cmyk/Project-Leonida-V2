@@ -926,3 +926,48 @@ fn the_allocation_info_state_object_range_and_crash_slots_answer() {
         assert_eq!(append(h.device, 0, 0x80, 0), 0);
     }
 }
+
+/// The display buffers the title makes in device setup come from slot 127 (`CreateCommittedResource3`), called at
+/// `0x193e1b4` with ten arguments: heap properties, heap flags 8, a `D3D12_RESOURCE_DESC1`, the render target
+/// layout, a clear value, no protected session and no castable formats.
+#[test]
+fn a_display_buffer_made_through_slot_127_is_a_resource() {
+    let Some(h) = harness() else { return };
+    let heap = [1u32, 0, 0, 1, 1];
+    let mut desc1 = [0u8; 72];
+    desc1[..56].copy_from_slice(&texture_desc(64, 64, 28, 1));
+    let clear = [0u32; 5];
+    let mut out = std::ptr::null_mut();
+    type Create3 = unsafe extern "win64" fn(
+        Ptr,
+        *const u32,
+        u32,
+        *const u8,
+        u32,
+        *const u32,
+        *const c_void,
+        u32,
+        *const u32,
+        *const u8,
+        *mut Ptr,
+    ) -> u32;
+    // SAFETY: slot 127 with the measured argument order; every pointer is valid for the call.
+    let result = unsafe {
+        let create: Create3 = slot(h.device, 127);
+        create(
+            h.device,
+            heap.as_ptr(),
+            8,
+            desc1.as_ptr(),
+            2,
+            clear.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            guid(&iid::RESOURCE).as_ptr(),
+            &mut out,
+        )
+    };
+    assert_eq!(result, 0);
+    assert!(!out.is_null());
+}

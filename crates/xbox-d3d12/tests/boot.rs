@@ -922,3 +922,29 @@ fn the_device_byte_the_title_reads_at_0x18_sends_it_through_the_descriptor_calls
     assert_eq!(flag, xbox_d3d12::device::DESCRIPTORS_THROUGH_API);
     assert_ne!(flag, 0);
 }
+
+/// A list leaving the title's pool is reset through slot 139 as `(allocator, 0, 0)`, and the allocator is given
+/// the title's chunk memory callback through its slot 9; both must succeed (0x2474cce checks the first with a
+/// breakpoint).
+#[test]
+fn the_pool_reset_slot_and_the_allocator_callback_slot_succeed() {
+    let device = new_device(Arc::default());
+    let allocator = make_allocator(device, 0);
+    let iid = guid_bytes(&iid::GRAPHICS_COMMAND_LIST);
+    let (_, list) = make_list(device, allocator, &iid);
+    // SAFETY: allocator slot 9 and list slots 9 (`Close`) and 139 with their measured shapes.
+    unsafe {
+        let set_callback: unsafe extern "win64" fn(Ptr, usize, Ptr) -> u32 = slot(allocator, 9);
+        assert_eq!(set_callback(allocator, 0x1000, std::ptr::null_mut()), 0);
+        let close: unsafe extern "win64" fn(Ptr) -> u32 = slot(list, 9);
+        let reset_x: unsafe extern "win64" fn(Ptr, Ptr, Ptr, u64) -> u32 = slot(list, 139);
+        assert_eq!(
+            reset_x(list, allocator, std::ptr::null_mut(), 0),
+            E_FAIL,
+            "still open"
+        );
+        assert_eq!(close(list), 0);
+        assert_eq!(reset_x(list, allocator, std::ptr::null_mut(), 0), 0);
+        assert_eq!(close(list), 0);
+    }
+}

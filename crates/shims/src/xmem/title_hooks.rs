@@ -78,13 +78,20 @@ pub(super) fn current() -> Option<TitleHooks> {
 }
 
 thread_local! {
-    static LAST_DEFAULT: Cell<usize> = const { Cell::new(0) };
+    static LAST_DEFAULT: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
-/// Remembers what `XMemAllocDefault` just returned on this thread, so the caller of a hook can tell memory the
-/// hook chain made from memory the title owns.
-pub(super) fn note_default_allocation(address: usize) {
-    LAST_DEFAULT.with(|last| last.set(address));
+/// Remembers what `XMemAllocDefault` just returned on this thread and its size, so the caller of a hook can tell
+/// memory the hook chain made for the request from memory the title owns (a title arena allocates more than the
+/// request from the default allocator and hands out its start).
+pub(super) fn note_default_allocation(address: usize, size: usize) {
+    LAST_DEFAULT.with(|last| last.set((address, size)));
+}
+
+/// Whether `address` is exactly what the default allocator made for a request of `bytes`.
+fn made_by_default(address: usize, bytes: u64) -> bool {
+    let (last, size) = LAST_DEFAULT.with(Cell::get);
+    last == address && size as u64 == bytes
 }
 
 /// The descriptor heap memory of the console runtime: `XMemAlloc` through the title's allocation hook.
@@ -102,13 +109,13 @@ pub fn title_heap_allocator() -> std::sync::Arc<TitleHeapAllocator> {
 impl HeapAllocator for TitleHeapAllocator {
     fn allocate(&self, bytes: u64, attributes: u64) -> Option<Hooked> {
         let hook = current()?.alloc?;
-        note_default_allocation(0);
+        note_default_allocation(0, 0);
         // SAFETY: a hook of the loaded title, called as the console's `XMemAlloc` calls it.
         let address = unsafe { hook(usize::try_from(bytes).ok()?, attributes) } as usize;
         if address == 0 {
             return None;
         }
-        if LAST_DEFAULT.with(Cell::get) == address {
+        if made_by_default(address, bytes) {
             imp::free_default(address as *mut c_void, attributes);
             return None;
         }

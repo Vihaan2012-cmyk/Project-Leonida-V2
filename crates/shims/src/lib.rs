@@ -13,6 +13,8 @@ pub mod bvh_builder;
 mod code;
 #[cfg(windows)]
 pub mod constants;
+#[cfg(windows)]
+pub mod cpu_compat;
 pub mod d3d12;
 pub mod dstorage;
 pub mod fidelityfx;

@@ -140,7 +140,7 @@ mod imp {
     /// `XMemAllocDefault`: the allocation itself, which the last node of every hook chain calls.
     pub extern "win64" fn alloc_default(size: usize, attributes: u64) -> *mut c_void {
         let address = allocate(size, attributes);
-        title_hooks::note_default_allocation(address as usize);
+        title_hooks::note_default_allocation(address as usize, size);
         address
     }
 

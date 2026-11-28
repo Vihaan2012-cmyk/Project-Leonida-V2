@@ -155,6 +155,8 @@ fn run(path: &Path, args: &RunArgs, plan: &RuntimePlan) -> Result<ExitCode> {
         });
     }
     println!("starting {} at {:#x}", path.display(), module.entry());
+    #[cfg(windows)]
+    shims::cpu_compat::install();
     // SAFETY: the player asked to run this executable; its imports are bound and its pages protected.
     let code = unsafe { module.call_entry() };
     runtime::detach_mouse();

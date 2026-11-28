@@ -6,6 +6,7 @@
 //! in the lookup tables the shaders search. Descriptors the game builds itself in heap memory are registered by
 //! `scan_textures` and `scan_samplers` before the commands that use them run.
 
+pub mod fasthash;
 pub mod format;
 pub mod gfx10;
 pub mod registry;
@@ -139,6 +140,24 @@ impl Descriptors {
 
     pub fn scan_samplers(&mut self, heap: &[u32], stride: usize) -> Vec<(usize, Registration)> {
         self.registry.scan_samplers(heap, stride)
+    }
+
+    pub fn scan_textures_with(
+        &mut self,
+        heap: &[u32],
+        stride: usize,
+        each: impl FnMut(usize, Registration),
+    ) {
+        self.registry.scan_textures_with(heap, stride, each);
+    }
+
+    pub fn scan_samplers_with(
+        &mut self,
+        heap: &[u32],
+        stride: usize,
+        each: impl FnMut(usize, Registration),
+    ) {
+        self.registry.scan_samplers_with(heap, stride, each);
     }
 
     /// The lookup tables to upload to set 1 bindings 0 (textures) and 1 (samplers).
