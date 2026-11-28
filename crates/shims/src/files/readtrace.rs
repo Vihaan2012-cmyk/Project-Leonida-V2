@@ -103,9 +103,26 @@ pub(super) unsafe extern "win64" fn read_file(
             };
             format!("{offset} (overlapped)")
         };
+        // SAFETY: the program's arguments, passed on unchanged.
+        let ok = unsafe { ReadFile(handle, buffer, bytes, read, overlapped) };
+        // SAFETY: reads the thread's last error right after the call.
+        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        let done = if read.is_null() {
+            "?".to_string()
+        } else {
+            // SAFETY: the program's out word, just written by `ReadFile`.
+            unsafe { *read }.to_string()
+        };
         write(format!(
-            "read {path} at {at}, {bytes} bytes, into {buffer:p}"
+            "read {path} at {at}, {bytes} bytes, into {buffer:p}: {} with {done} bytes{}",
+            if ok != 0 { "done" } else { "failed" },
+            if ok != 0 {
+                String::new()
+            } else {
+                format!(", error {error}")
+            }
         ));
+        return ok;
     }
     // SAFETY: the program's arguments, passed on unchanged.
     unsafe { ReadFile(handle, buffer, bytes, read, overlapped) }
