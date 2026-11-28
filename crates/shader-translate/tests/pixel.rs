@@ -608,3 +608,44 @@ fn attributes_read_the_locations_linking_gives_them() {
         &[Some(2), None],
     );
 }
+
+#[test]
+fn wave64_lane_masks_run_as_a_32_lane_wave_with_an_empty_upper_half() {
+    let Some(gpu) = pixel_gpu() else { return };
+    let case = Case {
+        name: "lane_masks",
+        source: "v_mbcnt_lo_u32_b32 v6, -1, 0
+             v_mbcnt_hi_u32_b32 v6, -1, v6
+             v_cmp_gt_u32 vcc, 32, v6
+             s_bcnt1_i32_b64 s4, vcc
+             s_bcnt1_i32_b64 s5, exec
+             s_mov_b32 s7, exec_hi
+             s_ff1_i32_b64 s8, vcc
+             s_not_b64 s[10:11], vcc
+             s_and_b64 s[10:11], s[10:11], exec
+             s_or_b32 s12, s10, s11
+             s_or_b32 s12, s12, s7
+             s_cmp_eq_u32 s4, s5
+             s_cselect_b32 s13, 1.0, 0
+             s_cmp_eq_u32 s12, 0
+             s_cselect_b32 s14, 1.0, 0
+             s_cmp_lt_u32 s8, 32
+             s_cselect_b32 s15, 1.0, 0
+             s_cmp_lt_u32 s5, 33
+             s_cselect_b32 s16, 1.0, 0
+             v_mov_b32_e32 v2, s13
+             v_mov_b32_e32 v3, s14
+             v_mov_b32_e32 v4, s15
+             v_mov_b32_e32 v5, s16
+             exp mrt0 v2, v3, v4, v5 done vm
+             s_endpgm",
+        inputs: 0x302,
+        user_sgprs: 0,
+        number: Number::Float,
+        depth: None,
+        expect: Box::new(|_, _| [f(1.0); 4]),
+        expect_depth: None,
+        close: false,
+    };
+    run(&gpu, &case, true, &[], &[], &mut [], &[]);
+}
