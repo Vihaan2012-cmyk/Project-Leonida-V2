@@ -1195,7 +1195,7 @@ impl Gpu {
                 scratch.fence,
             )?;
             device.wait_for_fences(&[scratch.fence], true, u64::MAX)?;
-            if let Some(timing) = timing.as_deref_mut() {
+            if let Some(timing) = timing.as_mut() {
                 let mut stamps = vec![0u64; 2 * repeats as usize];
                 device.get_query_pool_results(
                     scratch.queries,

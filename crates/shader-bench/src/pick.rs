@@ -37,6 +37,7 @@ pub fn pick(
     pixel: usize,
     names: &[String],
     max_code: usize,
+    skip: &[String],
 ) -> Result<Vec<Program>> {
     let path = package_path(game, "shaders.rpf");
     let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
@@ -49,7 +50,7 @@ pub fn pick(
             _ => return ControlFlow::Continue(()),
         };
         let name = sanitize(&shader.name);
-        if !names.is_empty() && !names.iter().any(|n| name.contains(n.as_str())) {
+        if skip.iter().any(|s| name.contains(s.as_str())) {
             return ControlFlow::Continue(());
         }
         let Ok(sources) = container_programs(shader.stage, &shader.dxbc) else {
@@ -71,6 +72,9 @@ pub fn pick(
             }
             let code = code.to_vec();
             let unique = format!("{name}.{}", &key_hex(&source.key())[..8]);
+            if !names.is_empty() && !names.iter().any(|n| unique.contains(n.as_str())) {
+                continue;
+            }
             all.push(Program {
                 name: unique,
                 kind,
