@@ -54,6 +54,12 @@ pub struct PipelinesArgs {
     /// Print each program with its size and how long the driver took.
     #[arg(long)]
     pub each: bool,
+    /// Only containers of this stage: ps, vs, gs, ms or cs.
+    #[arg(long)]
+    pub stage: Option<String>,
+    /// Only containers whose name contains this text.
+    #[arg(long)]
+    pub name: Option<String>,
     /// Where leonida.db and the pipeline cache are.
     #[arg(long, default_value = "Output")]
     pub output: PathBuf,
