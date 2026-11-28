@@ -431,75 +431,160 @@ fn ngx_initialises_on_the_nvidia_gpu_and_reports_availability() {
     }
 }
 
-fn synthetic_frame(size: [u32; 2], value: f32) -> (Image, Vec<u8>, Vec<u8>) {
-    let texels = (size[0] * size[1]) as usize;
-    let color = Image::from_rgba_f32(
-        size[0],
-        size[1],
-        PixelFormat::Rgba16Float,
-        &[value, value, value, 1.0].repeat(texels),
-    )
-    .unwrap();
-    let depth: Vec<u8> = std::iter::repeat_n(0.5f32.to_le_bytes(), texels)
-        .flatten()
-        .collect();
-    let motion = vec![0u8; texels * 8];
-    (color, depth, motion)
+/// A smooth HDR image: the colour at a point of the unit square.
+fn smooth(u: f32, v: f32) -> [f32; 3] {
+    [
+        0.15 + 0.6 * u,
+        0.2 + 0.5 * v + 0.1 * (u * 5.0).sin(),
+        0.7 - 0.3 * u * v,
+    ]
+}
+
+/// The image sampled at render resolution with the camera jittered by `jitter` (the sample in texel `i` sits at
+/// `i + 0.5 - jitter`).
+fn render_smooth(size: [u32; 2], jitter: [f32; 2]) -> Image {
+    let mut data = Vec::with_capacity((size[0] * size[1] * 4) as usize);
+    for y in 0..size[1] {
+        for x in 0..size[0] {
+            let u = (x as f32 + 0.5 - jitter[0]) / size[0] as f32;
+            let v = (y as f32 + 0.5 - jitter[1]) / size[1] as f32;
+            let [r, g, b] = smooth(u, v);
+            data.extend([r, g, b, 1.0]);
+        }
+    }
+    Image::from_rgba_f32(size[0], size[1], PixelFormat::Rgba16Float, &data).unwrap()
+}
+
+fn bilinear(image: &[f32], size: [u32; 2], u: f32, v: f32) -> [f32; 3] {
+    let x = (u * size[0] as f32 - 0.5).clamp(0.0, size[0] as f32 - 1.0);
+    let y = (v * size[1] as f32 - 0.5).clamp(0.0, size[1] as f32 - 1.0);
+    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+    let (x1, y1) = (
+        (x0 + 1).min(size[0] as usize - 1),
+        (y0 + 1).min(size[1] as usize - 1),
+    );
+    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+    let texel = |xx: usize, yy: usize, c: usize| image[(yy * size[0] as usize + xx) * 4 + c];
+    let mut out = [0.0; 3];
+    for (c, value) in out.iter_mut().enumerate() {
+        let top = texel(x0, y0, c) * (1.0 - fx) + texel(x1, y0, c) * fx;
+        let bottom = texel(x0, y1, c) * (1.0 - fx) + texel(x1, y1, c) * fx;
+        *value = top * (1.0 - fy) + bottom * fy;
+    }
+    out
+}
+
+/// The DLSS library to test with: `LEONIDA_DLSS_DLL`, else NVIDIA's folders. A missing one fails the test with the
+/// message that says where to put it.
+fn library_config() -> DlssConfig {
+    let config = DlssConfig::default();
+    match config.locate() {
+        Ok(found) => eprintln!(
+            "DLSS library: {} ({})",
+            found.path.display(),
+            found.source.describe()
+        ),
+        Err(missing) => panic!("{missing}"),
+    }
+    config
 }
 
 #[test]
-fn a_real_dlss_library_upscales_a_flat_image() {
-    let Some(dll) = std::env::var_os("LEONIDA_DLSS_DLL").map(PathBuf::from) else {
-        eprintln!("skipping: LEONIDA_DLSS_DLL names no nvngx_dlss.dll");
-        return;
-    };
-    let config = DlssConfig {
-        dlss_dll: Some(dll),
-        ..DlssConfig::default()
-    };
-    let mut dlss = match DlssUpscaler::new(&config) {
-        Ok(dlss) => dlss,
-        Err(error) => panic!("DLSS could not start with the configured library: {error}"),
-    };
+#[ignore = "needs an NVIDIA GPU and nvngx_dlss.dll (set LEONIDA_DLSS_DLL)"]
+fn dlss_upscales_a_smooth_synthetic_frame_close_to_the_bilinear_upscale() {
+    let mut dlss = DlssUpscaler::new(&library_config()).expect("DLSS starts");
+    eprintln!("GPU: {}", dlss.device_name());
     let output = [1280, 720];
-    let settings = dlss
-        .optimal_settings(output, DlssMode::Quality)
-        .expect("optimal settings");
-    let render = settings.render_size;
-    assert!(render[0] > 0 && render[0] < output[0], "{settings:?}");
-    let (color, depth, motion) = synthetic_frame(render, 0.5);
-    let mut last = None;
-    for frame in 0..4 {
-        let jitter = crate::jitter_offset(frame, 8);
-        let mut inputs = UpscaleInputs::new(color.as_ref(), render, output);
-        inputs.depth = Some(ImageRef::new(
-            render[0],
-            render[1],
-            PixelFormat::R32Float,
-            &depth,
-        ));
-        inputs.motion = Some(ImageRef::new(
-            render[0],
-            render[1],
-            PixelFormat::Rg32Float,
-            &motion,
-        ));
-        inputs.jitter = jitter;
-        inputs.reset = frame == 0;
-        last = Some(dlss.upscale(&inputs).expect("DLSS evaluates"));
+    for mode in [DlssMode::Quality, DlssMode::Performance] {
+        dlss.set_mode(mode);
+        let settings = dlss
+            .optimal_settings(output, mode)
+            .expect("optimal settings");
+        let render = settings.render_size;
+        eprintln!("{}: render {render:?} for output {output:?}", mode.name());
+        assert!(
+            render[0] > 0 && render[0] < output[0] && render[1] < output[1],
+            "{settings:?}"
+        );
+        let texels = (render[0] * render[1]) as usize;
+        let depth: Vec<u8> = (0..texels)
+            .flat_map(|i| {
+                (0.3 + 0.4 * (i % render[0] as usize) as f32 / render[0] as f32).to_le_bytes()
+            })
+            .collect();
+        let motion = vec![0u8; texels * 8];
+        let mut last = None;
+        let mut jittered_last = [0.0; 2];
+        for frame in 0..16 {
+            let jitter = crate::jitter_offset(frame, 8);
+            let color = render_smooth(render, jitter);
+            let mut inputs = UpscaleInputs::new(color.as_ref(), render, output);
+            inputs.depth = Some(ImageRef::new(
+                render[0],
+                render[1],
+                PixelFormat::R32Float,
+                &depth,
+            ));
+            inputs.motion = Some(ImageRef::new(
+                render[0],
+                render[1],
+                PixelFormat::Rg32Float,
+                &motion,
+            ));
+            inputs.jitter = jitter;
+            inputs.reset = frame == 0;
+            inputs.frame_time_ms = 16.6;
+            last = Some(dlss.upscale(&inputs).expect("DLSS evaluates"));
+            jittered_last = jitter;
+        }
+        let result = last.unwrap();
+        assert_eq!([result.width, result.height], output, "{}", mode.name());
+        let rgba = result
+            .as_ref()
+            .rgba_f32(output[0], output[1], "result")
+            .unwrap();
+        assert!(
+            rgba.iter().all(|v| v.is_finite()),
+            "NaN or infinity in {}",
+            mode.name()
+        );
+        let reference = render_smooth(render, [0.0, 0.0]);
+        let reference = reference
+            .as_ref()
+            .rgba_f32(render[0], render[1], "reference")
+            .unwrap();
+        let (mut sum, mut worst, mut count, mut mean) = (0.0f64, 0.0f32, 0u32, 0.0f64);
+        for y in 8..output[1] - 8 {
+            for x in 8..output[0] - 8 {
+                let at = ((y * output[0] + x) * 4) as usize;
+                let want = bilinear(
+                    &reference,
+                    render,
+                    (x as f32 + 0.5) / output[0] as f32,
+                    (y as f32 + 0.5) / output[1] as f32,
+                );
+                for c in 0..3 {
+                    let error = (rgba[at + c] - want[c]).abs();
+                    sum += error as f64;
+                    worst = worst.max(error);
+                    mean += rgba[at + c] as f64;
+                    count += 1;
+                }
+            }
+        }
+        let (mean_error, mean) = (sum / count as f64, mean / count as f64);
+        eprintln!(
+            "{}: mean {mean:.3}, mean error against bilinear {mean_error:.4}, worst {worst:.3} (last jitter {jittered_last:?})",
+            mode.name()
+        );
+        assert!(mean > 0.2, "the output is nearly black: mean {mean}");
+        assert!(
+            mean_error < 0.03,
+            "{}: mean error {mean_error}",
+            mode.name()
+        );
+        assert!(worst < 0.25, "{}: worst error {worst}", mode.name());
     }
-    let result = last.unwrap();
-    assert_eq!([result.width, result.height], output);
-    let rgba = result
-        .as_ref()
-        .rgba_f32(output[0], output[1], "result")
-        .unwrap();
-    assert!(rgba.iter().all(|v| v.is_finite()));
-    let mean = rgba.chunks_exact(4).map(|p| p[0]).sum::<f32>() / (output[0] * output[1]) as f32;
-    assert!(
-        (mean - 0.5).abs() < 0.1,
-        "a flat 0.5 image came back as {mean}"
-    );
 }
 
 mod locating {
