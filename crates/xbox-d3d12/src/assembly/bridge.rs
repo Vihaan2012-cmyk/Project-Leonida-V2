@@ -51,6 +51,10 @@ pub trait Resolver {
     fn table_bound(&self, root: &RootSignature, param: u32, handle: u64) {
         let _ = (root, param, handle);
     }
+    /// Whether `skip_draw` can ever say yes: draws skip the address gathering when it cannot.
+    fn filters_draws(&self) -> bool {
+        true
+    }
     /// Whether a draw reading these buffer addresses is dropped (the content filter).
     fn skip_draw(&self, buffers: &[u64]) -> bool {
         let _ = buffers;
@@ -481,6 +485,9 @@ fn convert_into(
 
 /// Whether the draw about to be recorded reads a buffer the content filter hides.
 fn skipped(state: &State, r: &dyn Resolver) -> bool {
+    if !r.filters_draws() {
+        return false;
+    }
     let mut addresses: SmallVec<[u64; 17]> = state.vertex.iter().flatten().map(|v| v.va).collect();
     if let Some(index) = state.index {
         addresses.push(index.va);

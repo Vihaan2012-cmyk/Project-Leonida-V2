@@ -400,6 +400,10 @@ impl Resolver for Stub {
     }
 
     fn note(&self, _text: &str) {}
+
+    fn filters_draws(&self) -> bool {
+        self.filtering
+    }
 }
 
 fn stub(filtering: bool) -> Stub {
