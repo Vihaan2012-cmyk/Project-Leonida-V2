@@ -176,6 +176,43 @@ fn experiments(image: &Image<'_>) -> Vec<(String, [u8; 32])> {
             }
         }
     }
+    if bytes.len() <= EXPERIMENT_LIMIT {
+        let full = regions_for(image, &standard);
+        for section in image.sections.iter().filter(|s| s.raw_size != 0) {
+            let (start, end) = (
+                section.raw_offset as usize,
+                (section.raw_offset + section.raw_size) as usize,
+            );
+            let kept: Vec<Region> = full
+                .iter()
+                .filter(|r| !(r.start == start && r.end == end.min(bytes.len())))
+                .cloned()
+                .collect();
+            out.push((
+                format!("section {} left out", section.name),
+                sha256(bytes, &kept),
+            ));
+            let mut copy = bytes.to_vec();
+            if let Some(part) = copy.get_mut(start..end.min(bytes.len())) {
+                part.fill(0);
+            }
+            out.push((
+                format!("section {} zeroed", section.name),
+                sha256(&copy, &full),
+            ));
+        }
+        let mut copy = bytes.to_vec();
+        for entry in debug_entries(image) {
+            let at = entry.pointer as usize;
+            if let Some(part) = copy.get_mut(at..at + entry.size as usize) {
+                part.fill(0);
+            }
+        }
+        out.push((
+            "debug directory data zeroed".to_string(),
+            sha256(&copy, &full),
+        ));
+    }
     out
 }
 
@@ -792,6 +829,38 @@ pub fn write_library_comparison(
             show(&only_theirs)
         )?;
     }
+    let imported = |image: &Image<'_>| -> std::collections::BTreeSet<String> {
+        image
+            .imports()
+            .into_iter()
+            .flat_map(|dll| dll.entries.into_iter().filter_map(|e| e.name))
+            .collect()
+    };
+    let (ia, ib) = (imported(ours), imported(theirs));
+    let extra: Vec<&String> = ia.difference(&ib).collect();
+    writeln!(
+        out,
+        "  imported function names here {}, there {}, only here {}",
+        ia.len(),
+        ib.len(),
+        extra.len()
+    )?;
+    if !extra.is_empty() {
+        writeln!(out, "  imported only here: {}", show(&extra))?;
+    }
+    let risky = |names: Vec<&String>| -> Vec<String> {
+        names
+            .into_iter()
+            .filter(|n| exe_analysis::triage::classify_api(n).is_some())
+            .cloned()
+            .collect()
+    };
+    writeln!(
+        out,
+        "  classified (risky or noteworthy) imports only here: [{}]; only there: [{}]",
+        risky(ia.difference(&ib).collect()).join(", "),
+        risky(ib.difference(&ia).collect()).join(", ")
+    )?;
     let layout = |image: &Image<'_>| -> Vec<String> {
         image
             .sections
