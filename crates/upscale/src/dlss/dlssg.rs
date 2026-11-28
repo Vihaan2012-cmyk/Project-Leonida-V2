@@ -13,7 +13,7 @@
 //!   states no queue, semaphore or layout rule beyond that and "the resources are in a state suitable for reading
 //!   (outputs for writing)". Here inputs are in `SHADER_READ_ONLY_OPTIMAL` and the output in `GENERAL`, and the queue
 //!   the commands go to must be a graphics or compute queue of the device NGX was initialised on.
-//! - NGX is not thread-safe: every call runs under [`turn::ngx_turn`].
+//! - NGX is not thread-safe: every call runs under the lock `dlss::lock::ngx_lock` that super resolution uses too.
 //!
 //! Per real frame ([`session::Session::evaluate`]): the final colour of the newest frame (the feature keeps the one
 //! before itself), depth and motion vectors as they were given to the upscaler, the camera and a reset flag; the output
@@ -26,7 +26,6 @@ pub mod pacing;
 pub mod params;
 pub mod session;
 pub mod support;
-pub mod turn;
 
 #[cfg(test)]
 mod tests;
