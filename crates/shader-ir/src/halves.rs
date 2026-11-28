@@ -141,6 +141,26 @@ pub fn lane_patterns(code: &[u8]) -> Vec<Pattern> {
     patterns_of(&rdna::decode_all(code, false, 0).insts)
 }
 
+/// The distinct scalar instructions of `code` that work on 64-bit values, which is where lane masks are handled.
+pub fn wide_scalar_ops(code: &[u8]) -> Vec<String> {
+    let mut found: Vec<String> = rdna::decode_all(code, false, 0)
+        .insts
+        .iter()
+        .filter(|inst| {
+            let name = inst.name.as_str();
+            name.starts_with("s_")
+                && (name.ends_with("_b64")
+                    || name.ends_with("_u64")
+                    || name.ends_with("_i64")
+                    || name.contains("saveexec"))
+        })
+        .map(|inst| inst.name.clone())
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
 pub(crate) fn patterns_of(insts: &[Inst]) -> Vec<Pattern> {
     let mut found: Vec<Pattern> = hazards_of(insts).into_iter().map(Pattern::Hazard).collect();
     let mut add = |pattern: Pattern| {
