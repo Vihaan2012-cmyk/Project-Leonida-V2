@@ -8,6 +8,7 @@ use std::sync::Arc;
 use ash::vk;
 
 use super::ffi::{self, names};
+use super::lock::{held_by_this_thread, ngx_lock};
 use super::modes::DlssOptions;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -302,6 +303,7 @@ impl ParamMap {
 
     /// Slot `index` of the parameter object's virtual table, as a function pointer type `F`.
     fn slot<F: Copy>(&self, index: usize) -> F {
+        debug_assert!(held_by_this_thread(), "NGX called without the NGX lock");
         assert_eq!(size_of::<F>(), size_of::<usize>());
         // SAFETY: `ptr` is a live NGX parameter object, a C++ object whose first word points at its table of virtual
         // functions; the table has the 17 slots `slots` documents, so `index` is inside it.
@@ -312,6 +314,7 @@ impl ParamMap {
     }
 
     pub fn set_u32(&mut self, name: &str, value: u32) {
+        let _lock = ngx_lock();
         let name = cname(name);
         let set: ffi::FnSetU32 = self.slot(slots::SET_U32);
         // SAFETY: `ptr` is a live parameter map and `name` is NUL-terminated.
@@ -319,6 +322,7 @@ impl ParamMap {
     }
 
     pub fn set_i32(&mut self, name: &str, value: i32) {
+        let _lock = ngx_lock();
         let name = cname(name);
         let set: ffi::FnSetI32 = self.slot(slots::SET_I32);
         // SAFETY: as in `set_u32`.
@@ -326,6 +330,7 @@ impl ParamMap {
     }
 
     pub fn set_f32(&mut self, name: &str, value: f32) {
+        let _lock = ngx_lock();
         let name = cname(name);
         let set: ffi::FnSetF32 = self.slot(slots::SET_F32);
         // SAFETY: as in `set_u32`.
@@ -333,6 +338,7 @@ impl ParamMap {
     }
 
     pub fn set_u64(&mut self, name: &str, value: u64) {
+        let _lock = ngx_lock();
         let name = cname(name);
         let set: ffi::FnSetU64 = self.slot(slots::SET_U64);
         // SAFETY: as in `set_u32`.
@@ -344,6 +350,7 @@ impl ParamMap {
     /// # Safety
     /// `value` must stay valid until the NGX call that reads it has returned.
     pub unsafe fn set_ptr(&mut self, name: &str, value: *mut c_void) {
+        let _lock = ngx_lock();
         let name = cname(name);
         let set: ffi::FnSetPtr = self.slot(slots::SET_PTR);
         // SAFETY: as in `set_u32`; the pointer is only dereferenced by NGX during the evaluate call.
@@ -351,6 +358,7 @@ impl ParamMap {
     }
 
     pub fn get_u32(&self, name: &str) -> Option<u32> {
+        let _lock = ngx_lock();
         let name = cname(name);
         let get: ffi::FnGetU32 = self.slot(slots::GET_U32);
         let mut value = 0u32;
@@ -360,6 +368,7 @@ impl ParamMap {
     }
 
     pub fn get_i32(&self, name: &str) -> Option<i32> {
+        let _lock = ngx_lock();
         let name = cname(name);
         let get: ffi::FnGetI32 = self.slot(slots::GET_I32);
         let mut value = 0i32;
@@ -369,6 +378,7 @@ impl ParamMap {
     }
 
     pub fn get_f32(&self, name: &str) -> Option<f32> {
+        let _lock = ngx_lock();
         let name = cname(name);
         let get: ffi::FnGetF32 = self.slot(slots::GET_F32);
         let mut value = 0f32;
@@ -378,6 +388,7 @@ impl ParamMap {
     }
 
     pub fn get_ptr(&self, name: &str) -> Option<*mut c_void> {
+        let _lock = ngx_lock();
         let name = cname(name);
         let get: ffi::FnGetPtr = self.slot(slots::GET_PTR);
         let mut value = std::ptr::null_mut();
@@ -416,6 +427,7 @@ impl Parameters {
         call: &'static str,
         function: ffi::FnGetParameters,
     ) -> Result<Parameters, NgxError> {
+        let _lock = ngx_lock();
         let mut ptr = std::ptr::null_mut();
         // SAFETY: `ptr` is a valid out-pointer; NGX fills it with a parameter map it owns until DestroyParameters.
         check(call, unsafe { function(&mut ptr) })?;
@@ -447,6 +459,7 @@ impl Parameters {
 
 impl Drop for Parameters {
     fn drop(&mut self) {
+        let _lock = ngx_lock();
         if let Some(destroy) = self.api.destroy_parameters {
             // SAFETY: `ptr` came from AllocateParameters or GetCapabilityParameters and is destroyed once.
             unsafe { destroy(self.map.ptr) };
@@ -506,6 +519,7 @@ pub struct ExtensionLists {
 impl Api {
     /// Names of the extensions NGX wants enabled, copied out of NGX's own tables.
     pub fn required_extensions(&self) -> Result<ExtensionLists, NgxError> {
+        let _lock = ngx_lock();
         let function = self.required_extensions.ok_or_else(|| {
             NgxError::Runtime("NVSDK_NGX_VULKAN_RequiredExtensions is not exported".into())
         })?;
@@ -587,8 +601,8 @@ pub struct Ngx {
     _feature_info: Box<ffi::FeatureCommonInfo>,
 }
 
-// SAFETY: NGX documents the entry points as callable from any thread given external synchronisation per device; the
-// raw pointers kept here only keep path buffers alive.
+// SAFETY: NGX is not thread safe, so every call into it goes through `lock::ngx_lock`; the raw pointers kept here only
+// keep path buffers alive.
 unsafe impl Send for Ngx {}
 
 pub struct VkInit {
@@ -608,6 +622,7 @@ impl Ngx {
         options: &DlssOptions,
         feature_dir: Option<&Path>,
     ) -> Result<Ngx, NgxError> {
+        let _lock = ngx_lock();
         let data_path = options
             .app_data_path
             .clone()
@@ -753,6 +768,7 @@ impl Ngx {
     }
 
     pub fn availability(&self) -> Availability {
+        let _lock = ngx_lock();
         let caps = &self.capabilities;
         Availability {
             available: caps
@@ -778,6 +794,7 @@ impl Ngx {
         output: [u32; 2],
         mode: super::modes::DlssMode,
     ) -> Result<OptimalSettings, NgxError> {
+        let _lock = ngx_lock();
         let callback = self
             .capabilities
             .get_ptr(names::OPTIMAL_SETTINGS_CALLBACK)
@@ -832,6 +849,7 @@ impl Ngx {
         mode: super::modes::DlssMode,
         flags: i32,
     ) -> Result<Feature, NgxError> {
+        let _lock = ngx_lock();
         let mut params = Parameters::allocate(&self.api)?;
         params.set_u32(names::CREATION_NODE_MASK, 1);
         params.set_u32(names::VISIBILITY_NODE_MASK, 1);
@@ -893,6 +911,7 @@ fn live_instances() -> std::sync::MutexGuard<'static, Live> {
 /// initialisation was destroyed (and `Shutdown1(device)` crashes too), so NGX is shut down only when it only ever had
 /// one initialisation; otherwise it stays initialised until the process ends.
 fn release(api: &Api, device: vk::Device, live: &mut Live) {
+    debug_assert!(held_by_this_thread(), "NGX shut down without the NGX lock");
     live.live = live.live.saturating_sub(1);
     if live.live > 0 || live.peak > 1 {
         return;
@@ -919,6 +938,7 @@ fn shutdown(api: &Api, device: vk::Device) {
 
 impl Drop for Ngx {
     fn drop(&mut self) {
+        let _lock = ngx_lock();
         // SAFETY: dropped once, here, and before NGX shuts down: the map belongs to the NGX instance.
         unsafe { std::mem::ManuallyDrop::drop(&mut self.capabilities) };
         shutdown(&self.api, self.device);
@@ -959,6 +979,7 @@ impl Feature {
         cmd: vk::CommandBuffer,
         eval: &EvalParams<'_>,
     ) -> Result<(), NgxError> {
+        let _lock = ngx_lock();
         let p = &mut self.params;
         let ptr = |r: &ffi::ResourceVk| r as *const ffi::ResourceVk as *mut c_void;
         // SAFETY: the resources are borrowed for the whole evaluate call below.
@@ -1007,6 +1028,7 @@ impl Feature {
 
 impl Drop for Feature {
     fn drop(&mut self) {
+        let _lock = ngx_lock();
         // SAFETY: the handle came from CreateFeature and is released once.
         unsafe { (self.api.release_feature)(self.handle) };
     }

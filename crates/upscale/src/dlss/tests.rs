@@ -125,13 +125,13 @@ extern "C" fn get_unused(_: *mut ffi::Parameter, _: *const c_char, _: *mut c_voi
 }
 
 /// A fake parameter object laid out like the C++ one: a pointer to a table of 17 slots.
-struct FakeParameter {
+pub(super) struct FakeParameter {
     table: [usize; 17],
     vptr: *const usize,
 }
 
 impl FakeParameter {
-    fn new() -> Box<FakeParameter> {
+    pub(super) fn new() -> Box<FakeParameter> {
         let mut table = [0usize; 17];
         table[..8].fill(nop as *const () as usize);
         table[8..16].fill(get_unused as *const () as usize);
@@ -154,7 +154,7 @@ impl FakeParameter {
         boxed
     }
 
-    fn map(&mut self) -> ParamMap {
+    pub(super) fn map(&mut self) -> ParamMap {
         // SAFETY: `vptr` is the first field and points at the table, which lives as long as `self`.
         unsafe { ParamMap::from_raw(&mut self.vptr as *mut *const usize as *mut ffi::Parameter) }
     }
@@ -366,12 +366,6 @@ fn the_real_factory_falls_back_when_no_library_is_found() {
     assert!(notice.contains("nvngx_dlss.dll was not found"), "{notice}");
 }
 
-/// NGX is process-wide and crashes when several threads use it at once, so the tests that run it take turns.
-fn ngx_turn() -> std::sync::MutexGuard<'static, ()> {
-    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 /// Whether this machine has NGX at all; the GPU tests skip when it does not.
 fn ngx_present() -> bool {
     match ngx::Api::open(None) {
@@ -404,7 +398,6 @@ fn ngx_names_the_vulkan_extensions_it_needs() {
 
 #[test]
 fn ngx_initialises_on_the_nvidia_gpu_and_reports_availability() {
-    let _turn = ngx_turn();
     if !ngx_present() {
         return;
     }
@@ -483,7 +476,7 @@ fn bilinear(image: &[f32], size: [u32; 2], u: f32, v: f32) -> [f32; 3] {
 
 /// The DLSS library to test with: `LEONIDA_DLSS_DLL`, else NVIDIA's folders. A missing one fails the test with the
 /// message that says where to put it.
-fn library_config() -> DlssConfig {
+pub(super) fn library_config() -> DlssConfig {
     let config = DlssConfig::default();
     match config.locate() {
         Ok(found) => eprintln!(
@@ -499,7 +492,6 @@ fn library_config() -> DlssConfig {
 #[test]
 #[ignore = "needs an NVIDIA GPU and nvngx_dlss.dll (set LEONIDA_DLSS_DLL)"]
 fn dlss_upscales_a_smooth_synthetic_frame_close_to_the_bilinear_upscale() {
-    let _turn = ngx_turn();
     let mut dlss = DlssUpscaler::new(&library_config()).expect("DLSS starts");
     eprintln!("GPU: {}", dlss.device_name());
     let output = [1280, 720];
@@ -677,7 +669,6 @@ mod locating {
 #[test]
 #[ignore = "needs an NVIDIA GPU and nvngx_dlss.dll (set LEONIDA_DLSS_DLL)"]
 fn several_dlss_instances_live_together_and_drop_in_any_order() {
-    let _turn = ngx_turn();
     let config = library_config();
     let flags = DlssOptions::default().feature_flags();
     let mut first = DlssUpscaler::new(&config).expect("first");
