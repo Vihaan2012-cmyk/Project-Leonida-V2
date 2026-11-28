@@ -4,6 +4,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use super::bc7_history::BC7_HISTORY;
 use super::bptc::{ANCHOR2, ANCHOR3A, ANCHOR3B, PART2, PART3, tables};
 use super::testenc::{Frag, Rng, encode_flush, interleave};
 use super::{BcPackCodec, BcPackError, DecodeOptions, HistoryStatus, decode_with};
@@ -219,6 +220,21 @@ fn put_indices(
 }
 
 /// Lane symbols of every block against the given distances (`de`, `di`); history distances predict from zeros.
+/// What a block that points at built-in history entry `entry` is predicted from: the entry's first subset in all
+/// three subsets and its first index set.
+fn history_prior(entry: usize) -> ([u8; 24], [u8; 32]) {
+    let super::codebooks::Hist::Provisional(v) = BC7_HISTORY[entry] else {
+        panic!("entry {entry} is not a provisional entry");
+    };
+    let mut e = [0u8; 24];
+    for sub in 0..3 {
+        e[sub * 8..sub * 8 + 8].copy_from_slice(&v[..8]);
+    }
+    let mut ix = [0u8; 32];
+    ix[..16].copy_from_slice(&v[8..]);
+    (e, ix)
+}
+
 fn encode_lanes(specs: &[Spec], dists: &[(usize, usize)]) -> Vec<Vec<u8>> {
     let n = specs.len();
     let mut lanes = vec![vec![0u8; 2 * n]; 16];
@@ -226,15 +242,15 @@ fn encode_lanes(specs: &[Spec], dists: &[(usize, usize)]) -> Vec<Vec<u8>> {
     for (i, s) in specs.iter().enumerate() {
         let (a, b) = (2 * i, 2 * i + 1);
         let (de, di) = dists[i];
-        let rep = if de == 0 || de > i {
-            [0u8; 24]
-        } else {
-            kept[i - de].0
+        let rep = match de {
+            0 => [0u8; 24],
+            d if d > i => history_prior(256 + i - d).0,
+            d => kept[i - d].0,
         };
-        let rix = if di == 0 || di > i {
-            [0u8; 32]
-        } else {
-            kept[i - di].1
+        let rix = match di {
+            0 => [0u8; 32],
+            d if d > i => history_prior(256 + i - d).1,
+            d => kept[i - d].1,
         };
         let (x, y) = split_nibbles(zig(de as i32 - di as i32, 256) as u8);
         (lanes[0][a], lanes[0][b]) = (x, y);
@@ -516,7 +532,7 @@ fn an_all_zero_mode_zero_block_stays_zero() {
 }
 
 #[test]
-fn a_built_in_history_reference_is_refused() {
+fn a_built_in_history_reference_needs_the_provisional_option() {
     let (specs, dists) = chunk(11, 8, Some(6));
     for index_side in [false, true] {
         let mut d = dists.clone();
@@ -533,11 +549,31 @@ fn a_built_in_history_reference_is_refused() {
                 codec: BcPackCodec::Bc7,
                 block: 3,
                 entry,
-                status: HistoryStatus::Unknown
+                status: HistoryStatus::Provisional
             }
         );
         assert!(err.is_missing_constants());
     }
+}
+
+#[test]
+fn blocks_predicted_from_history_entries_rebuild_and_are_marked_provisional() {
+    let (mut specs, mut dists) = chunk(11, 8, Some(6));
+    dists[0] = (0, 0);
+    dists[3] = (9, 5);
+    dists[6] = (255, 250);
+    let mut rng = Rng(77);
+    for (i, (de, di)) in [(3, (9, 5)), (6, (255, 250))] {
+        let (pe, _) = history_prior(256 + i - de);
+        let (_, pi) = history_prior(256 + i - di);
+        specs[i] = random_spec(&mut rng, 6, (&pe, &pi), true, true);
+    }
+    let opts = DecodeOptions {
+        allow_provisional: true,
+    };
+    let got = decode(&specs, encode_lanes(&specs, &dists), opts).unwrap();
+    assert_eq!(got.data, expected(&specs));
+    assert!(got.provisional_blocks >= 2);
 }
 
 #[test]
