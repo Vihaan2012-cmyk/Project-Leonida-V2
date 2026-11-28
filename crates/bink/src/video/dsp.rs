@@ -1,77 +1,76 @@
 //! Inverse transform and block output.
 
 #[inline]
-fn mul_a(v: i32) -> i32 {
-    v + (v >> 2)
+fn mul_a(v: i16) -> i16 {
+    v.wrapping_add(v >> 2)
 }
 #[inline]
-fn mul_b(v: i32) -> i32 {
+fn mul_b(v: i16) -> i16 {
     v >> 1
 }
 #[inline]
-fn mul_c(v: i32) -> i32 {
-    v - (v >> 2) - (v >> 4)
+fn mul_c(v: i16) -> i16 {
+    v.wrapping_sub(v >> 2).wrapping_sub(v >> 4)
 }
 #[inline]
-fn mul_d(v: i32) -> i32 {
-    v + (v >> 2) - (v >> 4)
+fn mul_d(v: i16) -> i16 {
+    v.wrapping_add(v >> 2).wrapping_sub(v >> 4)
 }
 #[inline]
-fn mul_e(v: i32) -> i32 {
+fn mul_e(v: i16) -> i16 {
     v >> 2
 }
 
-/// One 8-point pass. `src` is read with `step` between elements, the result is returned in order.
+/// One 8-point pass in the game's 16-bit lane arithmetic (RVA 0x1bae0).
 #[inline]
-fn pass(s: [i32; 8]) -> [i32; 8] {
-    let t00 = s[3] + s[5];
-    let t01 = s[3] - s[5];
-    let t02 = mul_a(s[2]) + mul_b(s[6]);
-    let t03 = mul_b(s[2]) - mul_a(s[6]);
-    let e0 = s[0] + s[4];
-    let t0 = e0 + t02;
-    let t1 = e0 - t02;
-    let t2 = s[0] - s[4];
-    let t3 = s[1] + t00;
-    let t4 = s[1] - t00;
-    let t5 = t01 + s[7];
-    let t6 = t01 - s[7];
-    let t7 = t4 + mul_c(t6);
-    let t8 = mul_c(t4) - t6;
-    let t9 = mul_d(t3) + mul_e(t5);
-    let t10 = mul_e(t3) - mul_d(t5);
-    let t11 = t2 + t03;
-    let t12 = t2 - t03;
+fn pass(s: [i16; 8]) -> [i16; 8] {
+    let add = i16::wrapping_add;
+    let sub = i16::wrapping_sub;
+    let t00 = add(s[3], s[5]);
+    let t01 = sub(s[3], s[5]);
+    let t02 = add(mul_a(s[2]), mul_b(s[6]));
+    let t03 = sub(mul_b(s[2]), mul_a(s[6]));
+    let e0 = add(s[0], s[4]);
+    let t0 = add(e0, t02);
+    let t1 = sub(e0, t02);
+    let t2 = sub(s[0], s[4]);
+    let t3 = add(s[1], t00);
+    let t4 = sub(s[1], t00);
+    let t5 = add(t01, s[7]);
+    let t6 = sub(t01, s[7]);
+    let t7 = add(t4, mul_c(t6));
+    let t8 = sub(mul_c(t4), t6);
+    let t9 = add(mul_d(t3), mul_e(t5));
+    let t10 = sub(mul_e(t3), mul_d(t5));
+    let t11 = add(t2, t03);
+    let t12 = sub(t2, t03);
     [
-        t0 + t9,
-        t11 + t7,
-        t12 + t8,
-        t1 + t10,
-        t1 - t10,
-        t12 - t8,
-        t11 - t7,
-        t0 - t9,
+        add(t0, t9),
+        add(t11, t7),
+        add(t12, t8),
+        add(t1, t10),
+        sub(t1, t10),
+        sub(t12, t8),
+        sub(t11, t7),
+        sub(t0, t9),
     ]
 }
 
-/// Inverse transform of coefficients stored `[horizontal frequency * 8 + vertical frequency]`; the result is
-/// `[x * 8 + y]` scaled so that a DC value of `8 * v` gives the sample `v / 8`... see the callers for rounding.
+/// Inverse transform of coefficients stored `[r * 8 + c]` as the scan order places them. The game transforms along
+/// `r` first and then along `c`, and the result is `[y * 8 + x]` with `x` the position along `r`; every step is
+/// 16 bits wide, as in its vector code.
 pub fn idct(coefs: &mut [i32; 64]) {
-    let mut tmp = [0i32; 64];
-    for i in 0..8 {
-        let mut row = [0i32; 8];
-        row.copy_from_slice(&coefs[i * 8..i * 8 + 8]);
-        let out = pass(row);
-        for (j, v) in out.iter().enumerate() {
-            tmp[j * 8 + i] = *v;
+    let mut first = [[0i16; 8]; 8];
+    for c in 0..8 {
+        let out = pass(std::array::from_fn(|r| coefs[r * 8 + c] as i16));
+        for (x, v) in out.iter().enumerate() {
+            first[x][c] = *v;
         }
     }
-    for i in 0..8 {
-        let mut row = [0i32; 8];
-        row.copy_from_slice(&tmp[i * 8..i * 8 + 8]);
-        let out = pass(row);
-        for (j, v) in out.iter().enumerate() {
-            coefs[i * 8 + j] = *v >> 6;
+    for (x, line) in first.iter().enumerate() {
+        let out = pass(*line);
+        for (y, v) in out.iter().enumerate() {
+            coefs[y * 8 + x] = i32::from(*v >> 6);
         }
     }
 }
@@ -132,6 +131,33 @@ mod tests {
         for col in 0..8 {
             for row in 1..8 {
                 assert_eq!(a[col * 8 + row], a[col * 8]);
+            }
+        }
+    }
+
+    #[test]
+    fn the_scan_row_is_transformed_before_the_scan_column() {
+        // Coefficients at scan positions (r, c) = (1, 0) and (0, 1) and a few more. Transforming along r first
+        // rounds differently from transforming along c first, so the order shows in the samples.
+        let mut c = [0i32; 64];
+        for (pos, v) in [(8, 37), (1, -21), (9, 13), (16, 7), (3, 5), (24, -9)] {
+            c[pos] = v * 8;
+        }
+        let mut a = c;
+        idct(&mut a);
+        // The same transform written out axis by axis.
+        let line = |s: [i16; 8]| pass(s);
+        let mut by_column = [[0i16; 8]; 8];
+        for col in 0..8 {
+            let out = line(std::array::from_fn(|r| c[r * 8 + col] as i16));
+            for x in 0..8 {
+                by_column[col][x] = out[x];
+            }
+        }
+        for x in 0..8 {
+            let out = line(std::array::from_fn(|col| by_column[col][x]));
+            for y in 0..8 {
+                assert_eq!(a[y * 8 + x], i32::from(out[y] >> 6), "{x},{y}");
             }
         }
     }

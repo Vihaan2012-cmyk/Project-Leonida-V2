@@ -66,6 +66,16 @@ fn block_sum(plane: &Plane, x: usize, y: usize) -> i32 {
     sum
 }
 
+/// The range inter DC values are kept in: frame flag 0x40000 widens it (RVA 0x15dc0 and 0x159e0 derive it from the
+/// flags before reading the DC differences).
+fn inter_dc_range(wide: bool) -> DcRange {
+    let limit = if wide { 2047 } else { 1023 };
+    DcRange {
+        lo: -limit,
+        hi: limit,
+    }
+}
+
 const LUMA_ORDER: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
 
 fn measure_luma(plane: &Plane, bx: usize, by: usize) -> [i32; 16] {
@@ -87,17 +97,28 @@ fn set_chroma_measured(dc: &mut ChromaDc, bx: usize, m: &[i32; 4]) {
     dc.set_measured(bx, m[1], m[2], m[3]);
 }
 
-fn predict_luma(dst: &mut Plane, src: &Plane, bx: usize, by: usize, mvs: &Mvs) {
-    for (k, mv) in mvs.iter().enumerate() {
+/// Where the four 16x16 quarters of a macroblock are read from, in half samples of the reference.
+fn sources(bx: usize, by: usize, mvs: &Mvs, size: [i32; 2], snug: bool) -> [[i32; 2]; 4] {
+    std::array::from_fn(|k| {
         let (x, y) = (bx * 32 + (k & 1) * 16, by * 32 + (k >> 1) * 16);
-        motion::luma_block(dst, src, x, y, *mv);
+        [
+            motion::clamp_source(2 * x as i32 + mvs[k][0], size[0], snug),
+            motion::clamp_source(2 * y as i32 + mvs[k][1], size[1], snug),
+        ]
+    })
+}
+
+fn predict_luma(dst: &mut Plane, src: &Plane, bx: usize, by: usize, from: &[[i32; 2]; 4]) {
+    for (k, pos) in from.iter().enumerate() {
+        let (x, y) = (bx * 32 + (k & 1) * 16, by * 32 + (k >> 1) * 16);
+        motion::luma_block(dst, src, x, y, *pos);
     }
 }
 
-fn predict_chroma(dst: &mut Plane, src: &Plane, bx: usize, by: usize, mvs: &Mvs) {
-    for (k, mv) in mvs.iter().enumerate() {
+fn predict_chroma(dst: &mut Plane, src: &Plane, bx: usize, by: usize, from: &[[i32; 2]; 4]) {
+    for (k, pos) in from.iter().enumerate() {
         let (x, y) = (bx * 16 + (k & 1) * 8, by * 16 + (k >> 1) * 8);
-        motion::chroma_block(dst, src, x, y, *mv);
+        motion::chroma_block(dst, src, x, y, *pos);
     }
 }
 
@@ -131,6 +152,11 @@ impl VideoDecoder {
             let (count, diffs) = read_mvs(r, &self.codes)?;
             let mvs = st.mvs.predict(bx, top, left, count, &diffs);
             meta.mvs[by * meta.mb_width + bx] = mvs;
+            let size = [
+                2 * refr.planes[0].stride as i32,
+                2 * ((self.height as i32 + 15) & !15),
+            ];
+            let from = sources(bx, by, &mvs, size, row.snug);
             let q = if kind == BlockKind::Residue {
                 let q = read_quant(r, inter_q)?;
                 st.quant.set(bx * 2 + 1, q);
@@ -141,9 +167,9 @@ impl VideoDecoder {
             for p in 0..planes {
                 let (dst, src) = (&mut frame.planes[p], &refr.planes[p]);
                 if p == 1 || p == 2 {
-                    predict_chroma(dst, src, bx, by, &mvs);
+                    predict_chroma(dst, src, bx, by, &from);
                 } else {
-                    predict_luma(dst, src, bx, by, &mvs);
+                    predict_luma(dst, src, bx, by, &from);
                 }
             }
             if kind == BlockKind::Residue {
@@ -185,7 +211,7 @@ impl VideoDecoder {
                     (&mut st.u, &mut st.cbp_inter[1])
                 };
                 let a = at(&frame.planes[p], 16);
-                self.residue_chroma(r, dc, cbp, q, &mut frame.planes[p], a)?;
+                self.residue_chroma(r, dc, cbp, q, wide, &mut frame.planes[p], a)?;
             }
         } else {
             st.cbp_inter[1] = 0;
@@ -213,13 +239,7 @@ impl VideoDecoder {
         let cbp = read_cbp_luma(r, *cbp_state, wide);
         *cbp_state = cbp;
         let d: [i32; 16] = read_dc_diffs(r, q);
-        let dcs = dc.predict_inter(
-            &d,
-            &DcRange {
-                lo: -1023,
-                hi: 1023,
-            },
-        );
+        let dcs = dc.predict_inter(&d, &inter_dc_range(wide));
         let mut blocks = [[0i32; 64]; 16];
         for quad in 0..4 {
             let group = &mut blocks[quad * 4..quad * 4 + 4];
@@ -243,25 +263,21 @@ impl VideoDecoder {
         Some(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn residue_chroma(
         &self,
         r: &mut BitReader,
         dc: &mut ChromaDc,
         cbp_state: &mut u32,
         q: i32,
+        wide: bool,
         plane: &mut Plane,
         at: usize,
     ) -> Option<()> {
         let cbp = read_cbp_chroma(r, *cbp_state);
         *cbp_state = cbp;
         let d: [i32; 4] = read_dc_diffs(r, q);
-        let dcs = dc.predict_inter(
-            &d,
-            &DcRange {
-                lo: -1023,
-                hi: 1023,
-            },
-        );
+        let dcs = dc.predict_inter(&d, &inter_dc_range(wide));
         let mut blocks = [[0i32; 64]; 4];
         read_acs(r, &self.codes, cbp, &tables::QUANT_INTER, q, &mut blocks)?;
         let stride = plane.stride;
