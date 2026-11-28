@@ -36,6 +36,8 @@
 //! 55 GB/s for the ones in VRAM. So where memory lands is decided here, by order and by the mirror's share, not left
 //! to the driver. A spilled run reads at the same 5 GB/s.
 //!
+//! Runs below 4 GiB are never spilled: descriptor heaps must be there (`LOW_LIMIT`) and every shader reads them.
+//!
 //! `promote_spilled` mirrors spilled runs again as device-local memory frees, and `spill_range` drops the
 //! device-local copy of runs the layer knows the GPU reads only through other objects (the detiled image of a
 //! texture is made from the host bytes, so the window's copy of a texture's memory is dead weight).
@@ -919,7 +921,8 @@ impl AddressSpace {
                 (memory, None, None)
             }
             Backing::Mirrored => {
-                let made = if self.spill && len > self.h.budget.mirror_room() {
+                let hot = va + len <= LOW_LIMIT;
+                let made = if self.spill && !hot && len > self.h.budget.mirror_room() {
                     self.import_spilled(host, len)
                 } else {
                     match self.import_mirrored(host, len) {

@@ -31,6 +31,11 @@ fn spilling(gpu: &TestGpu) -> Option<AddressSpace> {
     Some(space)
 }
 
+/// Memory above 4 GiB, where runs may be spilled; below it they are descriptor heaps and always mirrored.
+fn region(len: u64) -> Region {
+    Region::new_in(len, false, 5 << 30, 1 << 26, 28)
+}
+
 fn mirror_local(h: &Handles) -> u64 {
     h.budget.counters().local[Class::Mirror as usize]
 }
@@ -59,7 +64,7 @@ fn runs_past_the_mirror_limit_go_to_system_memory_and_both_sides_see_each_others
         let h = gpu.handles.clone();
         h.budget.set_mirror_limit(Some(2 * MIB));
         let kernel = Kernel::new(gpu);
-        let regions: Vec<Region> = (0..4).map(|_| Region::new(RUN, false)).collect();
+        let regions: Vec<Region> = (0..4).map(|_| region(RUN)).collect();
         let policies = [
             SyncPolicy::Always,
             SyncPolicy::Marked,
@@ -116,8 +121,8 @@ fn gpu_results_in_spilled_and_mirrored_runs_reach_the_cpu_through_the_layers_own
         let h = gpu.handles.clone();
         h.budget.set_mirror_limit(Some(MIB));
         let kernel = Kernel::new(gpu);
-        let local = Region::new(RUN, true);
-        let spilled = Region::new(RUN, true);
+        let local = Region::new_in(RUN, true, 5 << 30, 1 << 26, 28);
+        let spilled = Region::new_in(RUN, true, 5 << 30, 1 << 26, 28);
         space
             .map_host(local.address, RUN, SyncPolicy::WriteWatch)
             .unwrap();
@@ -153,7 +158,7 @@ fn spilled_runs_are_mirrored_again_when_device_local_memory_frees() {
         let h = gpu.handles.clone();
         h.budget.set_mirror_limit(Some(2 * MIB));
         let kernel = Kernel::new(gpu);
-        let regions: Vec<Region> = (0..4).map(|_| Region::new(RUN, false)).collect();
+        let regions: Vec<Region> = (0..4).map(|_| region(RUN)).collect();
         for region in &regions {
             space
                 .map_host(region.address, RUN, SyncPolicy::Always)
@@ -214,7 +219,7 @@ fn a_mirrored_run_moves_to_system_memory_keeping_what_the_gpu_wrote() {
         };
         let h = gpu.handles.clone();
         let kernel = Kernel::new(gpu);
-        let region = Region::new(RUN, false);
+        let region = self::region(RUN);
         space
             .map_host(region.address, RUN, SyncPolicy::Always)
             .unwrap();
@@ -252,26 +257,51 @@ fn a_mirrored_run_moves_to_system_memory_keeping_what_the_gpu_wrote() {
 #[test]
 fn spilled_runs_keep_working_when_the_window_is_rebuilt() {
     for gpu in &TestGpu::open_all() {
-        let mut space = space(gpu, 1 << 32);
+        let mut space = space(gpu, 1 << 33);
         if space.backing() != Backing::Mirrored || !space.spill_enabled() {
             continue;
         }
         let h = gpu.handles.clone();
         h.budget.set_mirror_limit(Some(0));
         let kernel = Kernel::new(gpu);
-        let region = Region::new(RUN, false);
+        let region = self::region(RUN);
         space
             .map_host(region.address, RUN, SyncPolicy::Marked)
             .unwrap();
         assert_eq!(space.spilled_bytes(), RUN);
         region.write(0, 7);
         let generation = space.generation();
-        space.ensure(0, 3 << 32).unwrap();
+        space.ensure(0, 3 << 33).unwrap();
         assert!(space.generation() > generation, "the window was rebuilt");
         assert_eq!(increment(gpu, &kernel, &mut space, &region), 8);
         space.unmap(region.address, RUN).unwrap();
         space.reclaim();
         kernel.finish(gpu);
+        h.budget.set_mirror_limit(None);
+    }
+}
+
+#[test]
+fn runs_below_4_gib_are_never_spilled() {
+    for gpu in &TestGpu::open_all() {
+        let Some(mut space) = spilling(gpu) else {
+            continue;
+        };
+        let h = gpu.handles.clone();
+        h.budget.set_mirror_limit(Some(0));
+        let low = Region::new(RUN, false);
+        assert!(low.address + RUN <= LOW_LIMIT);
+        let high = region(RUN);
+        space
+            .map_host(low.address, RUN, SyncPolicy::Always)
+            .unwrap();
+        space
+            .map_host(high.address, RUN, SyncPolicy::Always)
+            .unwrap();
+        assert_eq!((mirror_local(&h), mirror_spilled(&h)), (RUN, RUN));
+        space.unmap(low.address, RUN).unwrap();
+        space.unmap(high.address, RUN).unwrap();
+        space.reclaim();
         h.budget.set_mirror_limit(None);
     }
 }
@@ -287,7 +317,7 @@ fn with_the_tier_off_runs_past_the_limit_stay_in_device_local_memory() {
         assert!(!space.spill_enabled());
         let h = gpu.handles.clone();
         h.budget.set_mirror_limit(Some(0));
-        let region = Region::new(RUN, false);
+        let region = self::region(RUN);
         space
             .map_host(region.address, RUN, SyncPolicy::Always)
             .unwrap();
@@ -336,7 +366,7 @@ fn a_spilled_run_over_many_file_section_views_works() {
         // released at the end.
         unsafe {
             let mut sections = Vec::new();
-            let mut base = (6u64 << 29) + (1 << 28);
+            let mut base = (5u64 << 30) + (1 << 28);
             let views: Vec<u64> = 'search: loop {
                 let mut mapped: Vec<u64> = Vec::new();
                 for n in 0..VIEWS {
