@@ -35,7 +35,9 @@
 //! `sub_02241fd0`). `sub_01e0fb30` (`0x1e0fc94`) and `sub_022434a0` (`0x22435ce`) turn it into a microsecond
 //! interval, `1e6 / min(limit or 1000, 1000)`, in the global at `0x98f84ac`; a limit of 0 therefore means 1000.
 //! `sub_00120530`, a counter-based limiter that reads that interval, is gated by a byte at `0x7453ec9` that
-//! nothing in the image sets, so it is off.
+//! nothing in the image sets, so it is off. The waits of the frame record's modes 1, 3 and 4 use the same interval.
+//! [`crate::game_limiter`] tells what they do and why they are made to return at once with a custom frame limit
+//! ([`GAME_LIMITER`]).
 //!
 //! # The simulation step
 //!
@@ -257,24 +259,32 @@ pub const CEILING: Entry = Entry {
 
 pub const GAME_LIMITER: Entry = Entry {
     id: "game-limiter",
-    summary: "Counter-based limiter and mode 1/4 waits that use the frame record's interval",
+    summary: "Make the game's own counter waits (modes 1, 3 and 4, and the counter limiter) return at once",
     proof: Proof::Unproven,
-    activation: Activation::DataOnly,
+    activation: Activation::WithCustomLimit,
     evidence: &[
         Evidence {
-            rva: 0x0012_0530,
-            what: "limiter gated by a byte at 0x7453ec9 that nothing sets",
+            rva: 0x0248_2bc0,
+            what: "wait until a counter value: sleep when far, then spin; the end of the mode 1, 3 and 4 waits; patched to return 0",
         },
         Evidence {
-            rva: 0x0248_2bc0,
-            what: "wait until a counter value: sleep when far, then spin",
+            rva: 0x0012_0530,
+            what: "counter limiter behind a byte at 0x7453ec9 that nothing sets; patched to return 0",
         },
         Evidence {
             rva: 0x009e_f0f0,
-            what: "per-frame sync by mode byte at record +0x20 (1, 2, 4)",
+            what: "per-frame sync by mode byte at record +0x20 (1, 2, 4); the byte comes from 0x98f84b4, set to 0 once and never again",
+        },
+        Evidence {
+            rva: 0x0248_4540,
+            what: "mode 1: wait until the previous record's start plus the interval at +0x18",
+        },
+        Evidence {
+            rva: 0x0248_27c0,
+            what: "mode 3, in the render thread: the same wait from the previous frame's stamp",
         },
     ],
-    find: None,
+    find: Some(crate::game_limiter::find),
 };
 
 pub const FRAME_COUNTER_TIMERS: Entry = Entry {

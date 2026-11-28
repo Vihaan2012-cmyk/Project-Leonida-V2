@@ -3,6 +3,7 @@
 #![allow(unsafe_code)]
 
 use enhancements::framerate::{self, CLOCK_FLOOR, STEP_FLOOR};
+use enhancements::game_limiter;
 use enhancements::patch::{
     Buffer, CodeMemory, Finder, Mapped, PatchError, Pattern, apply, apply_all, revert_all, test,
 };
@@ -21,6 +22,7 @@ const DECOY: u32 = TEXT + 0x80;
 const POINTER: u32 = TEXT + 0x100;
 const SETUP: u32 = TEXT + 0x140;
 const SETTINGS: u32 = TEXT + 0x1A0;
+const LIMITER: u32 = TEXT + 0x1C0;
 const FLOOR_A: u32 = DATA + 0x30;
 const LIMIT_FLOOR: u32 = DATA + 0x34;
 const FLAG: u32 = DATA + 0x38;
@@ -104,6 +106,13 @@ fn settings_function() -> Vec<u8> {
     code
 }
 
+/// A routine that opens with three pushes and a stack frame, as the game's wait routines do.
+fn limiter_function() -> Vec<u8> {
+    vec![
+        0x56, 0x57, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x83, 0xC4, 0x20, 0x5B, 0x5F, 0x5E, 0xC3,
+    ]
+}
+
 fn put(file: &mut [u8], at: usize, bytes: &[u8]) {
     file[at..at + bytes.len()].copy_from_slice(bytes);
 }
@@ -133,7 +142,7 @@ fn image() -> Vec<u8> {
     put(&mut file, optional + 68, &3u16.to_le_bytes());
     put(&mut file, optional + 70, &0x160u16.to_le_bytes());
     put(&mut file, optional + 108, &16u32.to_le_bytes());
-    for (index, (rva, size)) in [(3, (PDATA, 60)), (5, (RELOC, 24))] {
+    for (index, (rva, size)) in [(3, (PDATA, 72)), (5, (RELOC, 24))] {
         put(&mut file, optional + 112 + 8 * index, &rva.to_le_bytes());
         put(
             &mut file,
@@ -169,6 +178,8 @@ fn image() -> Vec<u8> {
     let settings = settings_function();
     put(&mut file, 0x400 + 0x140, &setup);
     put(&mut file, 0x400 + 0x1A0, &settings);
+    let limiter = limiter_function();
+    put(&mut file, 0x400 + 0x1C0, &limiter);
     put(&mut file, 0x620, &ONE_THIRTIETH.to_le_bytes());
     put(&mut file, 0x624, &ONE_THREE_THOUSANDTH.to_le_bytes());
     put(&mut file, 0x628, &DT.to_le_bytes());
@@ -179,6 +190,7 @@ fn image() -> Vec<u8> {
         (POINTER, POINTER + pointer.len() as u32),
         (SETUP, SETUP + setup.len() as u32),
         (SETTINGS, SETTINGS + settings.len() as u32),
+        (LIMITER, LIMITER + limiter.len() as u32),
     ];
     for (index, (begin, end)) in entries.iter().enumerate() {
         let entry = [*begin, *end, PDATA + 0x80]
@@ -277,14 +289,79 @@ fn the_floor_patch_redirects_one_displacement() {
     assert_eq!(framerate::select(&finder, false, &[]).unwrap(), Vec::new());
     let mut all = patches;
     all.extend(CLOCK_FLOOR.patches(&finder).unwrap());
-    // This image has none of the sites of the frame timers, which stop the whole selection.
+    // This image has none of the sites of the frame timers or of the game's waits, which stop the whole selection.
     assert!(framerate::select(&finder, true, &[]).is_err());
     assert_eq!(all.len(), 3);
-    // Leaving the frame timers out, as `fix_frame_timers = false` does, selects the floors alone.
+    // Leaving the frame timers out, as `fix_frame_timers = false` does, still needs the game's waits.
+    assert!(framerate::select_without(&finder, true, &[], &[framerate::FRAME_TIMERS.id]).is_err());
+    // Leaving both out selects the floors alone.
     assert_eq!(
-        framerate::select_without(&finder, true, &[], &[framerate::FRAME_TIMERS.id]).unwrap(),
+        framerate::select_without(
+            &finder,
+            true,
+            &[],
+            &[framerate::FRAME_TIMERS.id, framerate::GAME_LIMITER.id]
+        )
+        .unwrap(),
         all
     );
+}
+
+fn limiter_wait(hash: u64) -> game_limiter::Wait {
+    game_limiter::Wait {
+        name: "wait",
+        rva: LIMITER,
+        hash,
+        what: "a synthetic wait routine",
+    }
+}
+
+#[test]
+fn a_wait_routine_is_patched_to_return_zero_when_its_hash_matches() {
+    let bytes = image();
+    let image = Image::parse(&bytes).unwrap();
+    let finder = Finder::new(&image);
+    let hash = enhancements::widescreen::fnv1a64(&limiter_function());
+    let wait = limiter_wait(hash);
+    assert_eq!(game_limiter::function_hash(&finder, &wait), Some(hash));
+    let patches = game_limiter::find_in(&finder, &[wait]).unwrap();
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].rva, LIMITER);
+    assert_eq!(patches[0].original, [0x56, 0x57, 0x53]);
+    assert_eq!(patches[0].replacement, game_limiter::RETURN_ZERO);
+
+    let mut memory = text_buffer(&bytes);
+    let applied = apply(&mut memory, &patches[0]).unwrap();
+    let code = memory.read(LIMITER, 4).unwrap();
+    assert_eq!(code, [0x31, 0xC0, 0xC3, 0x48]);
+    let decoded: Vec<_> = iced_x86::Decoder::new(64, &code[..3], iced_x86::DecoderOptions::NONE)
+        .iter()
+        .map(|i| i.mnemonic())
+        .collect();
+    assert_eq!(decoded, [iced_x86::Mnemonic::Xor, iced_x86::Mnemonic::Ret]);
+    applied.revert(&mut memory).unwrap();
+    assert_eq!(memory.read(LIMITER, 3).unwrap(), [0x56, 0x57, 0x53]);
+}
+
+#[test]
+fn a_wait_routine_that_is_not_the_one_expected_is_not_patched() {
+    let bytes = image();
+    let image = Image::parse(&bytes).unwrap();
+    let finder = Finder::new(&image);
+    let wrong = limiter_wait(1);
+    assert_eq!(
+        game_limiter::find_in(&finder, &[wrong]).unwrap_err(),
+        PatchError::NotFound {
+            name: "wait".into()
+        }
+    );
+    // Inside a function, not at its start.
+    let inside = game_limiter::Wait {
+        rva: LIMITER + 3,
+        ..limiter_wait(enhancements::widescreen::fnv1a64(&limiter_function()))
+    };
+    assert!(game_limiter::function_hash(&finder, &inside).is_none());
+    assert!(game_limiter::find_in(&finder, &[inside]).is_err());
 }
 
 #[test]

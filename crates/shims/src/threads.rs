@@ -307,6 +307,14 @@ pub fn sleep_plan(milliseconds: u32) -> SleepPlan {
     }
 }
 
+/// Asks Windows for 1 ms timer ticks for the whole process. Every finite wait of the game (`WaitForSingleObject`
+/// with a timeout, the polling loops around them) is rounded up to the tick, 15.6 ms by default, and the game never
+/// asks for finer ticks itself, so a frame limit above 64 frames a second would be held there by those waits.
+pub fn raise_timer_resolution() {
+    #[cfg(windows)]
+    imp::raise_timer_resolution();
+}
+
 #[cfg(windows)]
 mod imp {
     use std::collections::BTreeMap;
@@ -661,6 +669,14 @@ mod imp {
         } else {
             0
         }
+    }
+
+    pub fn raise_timer_resolution() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // SAFETY: a plain system call with no pointers; the request lasts for the process.
+            unsafe { windows_sys::Win32::Media::timeBeginPeriod(1) };
+        });
     }
 
     /// A thread's high-resolution timer; `None` when Windows lacks them, which makes `Sleep` pass through.
@@ -1158,6 +1174,34 @@ mod tests {
             times[10]
         );
         imp::sleep(0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_finite_kernel_wait_is_not_rounded_up_to_the_default_tick_once_raised() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+        raise_timer_resolution();
+        raise_timer_resolution();
+        // SAFETY: an unnamed manual-reset event that nothing signals, closed below.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        assert!(!event.is_null());
+        let mut times: Vec<std::time::Duration> = (0..20)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                // SAFETY: `event` is a live event handle.
+                unsafe { WaitForSingleObject(event, 1) };
+                start.elapsed()
+            })
+            .collect();
+        // SAFETY: the handle was made above and is closed once.
+        unsafe { CloseHandle(event) };
+        times.sort();
+        assert!(
+            times[10] < std::time::Duration::from_millis(5),
+            "median {:?}",
+            times[10]
+        );
     }
 
     #[test]

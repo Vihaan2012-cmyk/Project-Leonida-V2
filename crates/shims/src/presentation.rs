@@ -1,5 +1,5 @@
 //! What the player chose about how the game looks and paces, for the D3D12 layer to read when it makes the
-//! window and the presenter. `leonida run` sets it before the game starts; the defaults are the console's.
+//! window and the presenter. `leonida run` sets it before the game starts; the defaults are uncapped.
 
 use std::sync::RwLock;
 
@@ -15,7 +15,7 @@ pub struct Presentation {
 impl Default for Presentation {
     fn default() -> Self {
         Presentation {
-            frame_limit: FrameLimit::Console,
+            frame_limit: FrameLimit::Uncapped,
             graphics: Graphics::default(),
         }
     }
@@ -44,8 +44,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unset_choices_are_the_consoles_and_set_ones_are_returned() {
-        assert_eq!(get().frame_limit, FrameLimit::Console);
+    fn unset_choices_are_uncapped_and_set_ones_are_returned() {
+        assert_eq!(get().frame_limit, FrameLimit::Uncapped);
+        assert_eq!(get().graphics.frame_rate(), config::FrameRate::Uncapped);
         let chosen = Presentation {
             frame_limit: FrameLimit::Cap(90.0),
             graphics: Graphics {

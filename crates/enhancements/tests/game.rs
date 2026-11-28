@@ -2,6 +2,7 @@
 //! `LEONIDA_GAME_DIR`.
 
 use enhancements::framerate::{self, STEP_FLOOR};
+use enhancements::game_limiter::{self, WAITS};
 use enhancements::patch::Finder;
 use pe_image::Image;
 
@@ -68,4 +69,37 @@ fn the_clock_floor_stores_are_where_the_notes_say() {
     assert_eq!(patches[0].original.len(), 18);
     assert_eq!(patches[1].rva, 0x0224_35e6);
     assert_eq!(patches[1].original.len(), 12);
+}
+
+#[test]
+fn the_games_wait_routines_are_where_the_notes_say() {
+    let Some(bytes) = executable() else {
+        return;
+    };
+    let image = Image::parse(&bytes).unwrap();
+    let finder = Finder::new(&image);
+    for wait in &WAITS {
+        assert_eq!(
+            game_limiter::function_hash(&finder, wait),
+            Some(wait.hash),
+            "{}",
+            wait.name
+        );
+    }
+    let patches = game_limiter::find(&finder).unwrap();
+    assert_eq!(patches.len(), 2);
+    assert_eq!(patches[0].rva, 0x0248_2bc0);
+    assert_eq!(patches[1].rva, 0x0012_0530);
+    for patch in &patches {
+        assert_eq!(
+            patch.original,
+            [0x56, 0x57, 0x53],
+            "push rsi; push rdi; push rbx"
+        );
+        assert_eq!(patch.replacement, game_limiter::RETURN_ZERO);
+        // The frame timers' code cave and cells are in the last pages of `.text` and `.data`.
+        assert!(patch.rva < 0x05f4_0a00);
+    }
+    let selected = framerate::GAME_LIMITER.patches(&finder).unwrap();
+    assert_eq!(selected, patches);
 }

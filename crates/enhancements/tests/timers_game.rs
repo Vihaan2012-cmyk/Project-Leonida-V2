@@ -199,7 +199,7 @@ fn the_whole_selection_for_a_custom_limit_does_not_overlap() {
     let patches = enhancements::framerate::select(&finder, true, &[]).unwrap();
     assert_eq!(
         patches.len(),
-        1 + 2 + 2 + TICK_SITES.len() + 1 + 2 * DT_FLOOR_FUNCTIONS.len()
+        1 + 2 + 2 + TICK_SITES.len() + 1 + 2 * DT_FLOOR_FUNCTIONS.len() + 2
     );
     let mut ranges: Vec<(u32, u32, &str)> = patches
         .iter()

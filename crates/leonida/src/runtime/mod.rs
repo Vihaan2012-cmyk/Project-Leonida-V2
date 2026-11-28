@@ -70,6 +70,9 @@ pub fn configure(plan: &RuntimePlan) -> Result<()> {
         frame_limit: plan.frame_limit,
         graphics: plan.graphics.clone(),
     });
+    if plan.custom_limit {
+        shims::threads::raise_timer_resolution();
+    }
     shims::loader::set_language(&plan.language);
     audio::configure(plan);
     input::configure(&plan.input);
