@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use ash::vk;
-use xbox_d3d12::assembly::bridge::{self, BufferRef, Resolver};
+use xbox_d3d12::assembly::bridge::{self, BufferRef, Objects, Resolver};
 use xbox_d3d12::assembly::indirect::IndirectLayout;
 use xbox_d3d12::assembly::pipelines::PendingPipeline;
 use xbox_d3d12::assembly::{Assembly, AssemblyConfig, create_assembled_device_on};
@@ -352,6 +352,23 @@ struct Stub {
     target: TargetView,
 }
 
+impl Objects for Stub {
+    fn pipeline(&self, _object: &ComPtr) -> Option<Arc<dyn PendingPipeline>> {
+        None
+    }
+
+    fn command_signature(&self, _object: &ComPtr) -> Option<IndirectLayout> {
+        Some(IndirectLayout {
+            kind: Some(IndirectKind::Draw),
+            stride: 16,
+        })
+    }
+
+    fn bundle(&self, _object: &ComPtr) -> Option<Arc<CommandStream>> {
+        None
+    }
+}
+
 impl Resolver for Stub {
     fn buffer(&self, _resource: &ComPtr) -> Option<BufferRef> {
         Some(BufferRef {
@@ -372,17 +389,6 @@ impl Resolver for Stub {
         None
     }
 
-    fn pipeline(&self, _object: &ComPtr) -> Option<Arc<dyn PendingPipeline>> {
-        None
-    }
-
-    fn command_signature(&self, _object: &ComPtr) -> Option<IndirectLayout> {
-        Some(IndirectLayout {
-            kind: Some(IndirectKind::Draw),
-            stride: 16,
-        })
-    }
-
     fn heap_bases(&self, _heaps: &[ComPtr]) -> HeapBases {
         HeapBases::default()
     }
@@ -392,10 +398,6 @@ impl Resolver for Stub {
     }
 
     fn depth_target(&self, _handle: u64) -> Option<TargetView> {
-        None
-    }
-
-    fn bundle(&self, _object: &ComPtr) -> Option<Arc<CommandStream>> {
         None
     }
 

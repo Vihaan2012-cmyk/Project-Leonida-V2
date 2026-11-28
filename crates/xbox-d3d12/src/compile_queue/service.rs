@@ -587,11 +587,11 @@ fn seen_thread<B: PipelineBuilder>(
                 .or_insert_with(|| Wanted::Seen(entry.clone()));
         }
     }
+    queue.warm(warm.iter().map(|entry| entry.key));
     shared
         .counters
         .replayed
         .store(warm.len() as u64, Ordering::Relaxed);
-    queue.warm(warm.iter().map(|entry| entry.key));
 
     let mut saved_at = (Instant::now(), queue.stats().built);
     let mut swept_at = 0;

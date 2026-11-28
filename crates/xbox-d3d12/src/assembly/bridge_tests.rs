@@ -64,8 +64,27 @@ struct Fake {
     roots: HashMap<usize, Arc<RootSignature>>,
     hidden: Vec<u64>,
     targets: HashMap<u64, TargetView>,
+    pipelines: HashMap<usize, Arc<dyn PendingPipeline>>,
+    bundles: HashMap<usize, Arc<CommandStream>>,
     notes: RefCell<Vec<String>>,
     tables: RefCell<Vec<(u32, u64)>>,
+}
+
+impl Objects for Fake {
+    fn pipeline(&self, object: &ComPtr) -> Option<Arc<dyn PendingPipeline>> {
+        self.pipelines.get(&key(object)).cloned()
+    }
+
+    fn command_signature(&self, _object: &ComPtr) -> Option<IndirectLayout> {
+        Some(IndirectLayout {
+            kind: Some(IndirectKind::Draw),
+            stride: 16,
+        })
+    }
+
+    fn bundle(&self, object: &ComPtr) -> Option<Arc<CommandStream>> {
+        self.bundles.get(&key(object)).cloned()
+    }
 }
 
 impl Resolver for Fake {
@@ -88,17 +107,6 @@ impl Resolver for Fake {
         self.roots.get(&key(object)).cloned()
     }
 
-    fn pipeline(&self, _object: &ComPtr) -> Option<Arc<dyn PendingPipeline>> {
-        None
-    }
-
-    fn command_signature(&self, _object: &ComPtr) -> Option<IndirectLayout> {
-        Some(IndirectLayout {
-            kind: Some(IndirectKind::Draw),
-            stride: 16,
-        })
-    }
-
     fn heap_bases(&self, heaps: &[ComPtr]) -> HeapBases {
         HeapBases {
             resource: heaps.len() as u32,
@@ -112,10 +120,6 @@ impl Resolver for Fake {
 
     fn depth_target(&self, handle: u64) -> Option<TargetView> {
         self.targets.get(&handle).copied()
-    }
-
-    fn bundle(&self, _object: &ComPtr) -> Option<Arc<CommandStream>> {
-        None
     }
 
     fn table_bound(&self, _root: &RootSignature, param: u32, handle: u64) {
@@ -629,4 +633,184 @@ fn enhanced_texture_barriers_become_transitions_between_the_states_their_layouts
         }
     ));
     assert_eq!(list[1], Barrier::Uav);
+}
+
+/// A pipeline that is not built, or failed to, and counts how often it was asked.
+struct Unbuilt {
+    compute: bool,
+    failed: bool,
+    polls: std::sync::atomic::AtomicUsize,
+}
+
+impl Unbuilt {
+    fn new(compute: bool, failed: bool) -> Arc<Unbuilt> {
+        Arc::new(Unbuilt {
+            compute,
+            failed,
+            polls: Default::default(),
+        })
+    }
+
+    fn polls(&self) -> usize {
+        self.polls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl PendingPipeline for Unbuilt {
+    fn compute(&self) -> bool {
+        self.compute
+    }
+
+    fn resolve(&self) -> crate::compile_queue::Resolved<Arc<crate::pipeline::Pipeline>> {
+        self.poll()
+    }
+
+    fn poll(&self) -> crate::compile_queue::Resolved<Arc<crate::pipeline::Pipeline>> {
+        use crate::compile_queue::Resolved;
+        self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.failed {
+            Resolved::Failed("no shader".into())
+        } else {
+            Resolved::NotReady
+        }
+    }
+}
+
+fn draw() -> stream::Command {
+    stream::Command::DrawInstanced {
+        vertex_count: 3,
+        instance_count: 1,
+        start_vertex: 0,
+        start_instance: 0,
+    }
+}
+
+fn dispatch() -> stream::Command {
+    stream::Command::Dispatch {
+        x: 1,
+        y: 1,
+        z: 1,
+        extra: None,
+    }
+}
+
+fn pipeline_object(fake: &mut Fake, pending: &Arc<Unbuilt>) -> ComPtr {
+    let object = object();
+    let pending: Arc<dyn PendingPipeline> = pending.clone();
+    fake.pipelines.insert(key(&object), pending);
+    object
+}
+
+#[test]
+fn a_draw_whose_pipeline_is_not_built_is_dropped_each_time_it_is_asked() {
+    let mut fake = Fake::default();
+    let pending = Unbuilt::new(false, false);
+    let object = pipeline_object(&mut fake, &pending);
+    let done = convert(
+        &stream(vec![
+            stream::Command::SetPipelineState(Some(object)),
+            draw(),
+            draw(),
+            stream::Command::SetPrimitiveTopology(4),
+        ]),
+        &fake,
+    );
+    assert!(
+        matches!(done.commands[..], [Command::SetTopology(4)]),
+        "{:?}",
+        done.commands
+    );
+    assert_eq!(pending.polls(), 2);
+    assert!(fake.notes.borrow().is_empty());
+}
+
+#[test]
+fn a_pipeline_that_failed_is_noted_and_its_draws_are_dropped() {
+    let mut fake = Fake::default();
+    let pending = Unbuilt::new(false, true);
+    let object = pipeline_object(&mut fake, &pending);
+    let done = convert(
+        &stream(vec![
+            stream::Command::SetPipelineState(Some(object)),
+            draw(),
+        ]),
+        &fake,
+    );
+    assert!(done.commands.is_empty());
+    let notes = fake.notes.borrow();
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].contains("no shader"), "{notes:?}");
+}
+
+#[test]
+fn a_dispatch_asks_for_the_compute_pipeline_and_a_draw_for_the_graphics_one() {
+    let mut fake = Fake::default();
+    let compute = Unbuilt::new(true, false);
+    let object = pipeline_object(&mut fake, &compute);
+    let done = convert(
+        &stream(vec![
+            stream::Command::SetPipelineState(Some(object)),
+            draw(),
+            dispatch(),
+        ]),
+        &fake,
+    );
+    assert!(
+        matches!(done.commands[..], [Command::Draw { .. }]),
+        "no graphics pipeline was set, so the draw goes through: {:?}",
+        done.commands
+    );
+    assert_eq!(compute.polls(), 1);
+}
+
+#[test]
+fn only_the_pipelines_draws_and_dispatches_use_are_waited_for_bundles_included() {
+    let mut fake = Fake::default();
+    let (first, second, unused, inner, replaced) = (
+        Unbuilt::new(false, false),
+        Unbuilt::new(true, false),
+        Unbuilt::new(false, false),
+        Unbuilt::new(false, false),
+        Unbuilt::new(false, false),
+    );
+    let (first_object, second_object, unused_object, inner_object, replaced_object) = (
+        pipeline_object(&mut fake, &first),
+        pipeline_object(&mut fake, &second),
+        pipeline_object(&mut fake, &unused),
+        pipeline_object(&mut fake, &inner),
+        pipeline_object(&mut fake, &replaced),
+    );
+    let bundle = object();
+    fake.bundles.insert(
+        key(&bundle),
+        Arc::new(stream(vec![
+            stream::Command::SetPipelineState(Some(inner_object)),
+            draw(),
+        ])),
+    );
+    let list = stream(vec![
+        stream::Command::SetPipelineState(Some(replaced_object)),
+        stream::Command::SetPipelineState(Some(first_object)),
+        draw(),
+        draw(),
+        stream::Command::SetPipelineState(Some(second_object)),
+        dispatch(),
+        stream::Command::SetPipelineState(Some(unused_object)),
+        stream::Command::ExecuteBundle(bundle),
+    ]);
+    let used = used_pipelines(&list, &fake);
+    let polled: Vec<(bool, usize)> = used.iter().map(|p| (p.compute(), 0)).collect();
+    assert_eq!(polled, vec![(false, 0), (true, 0), (false, 0)]);
+    assert!(std::ptr::addr_eq(
+        Arc::as_ptr(&used[0]),
+        Arc::as_ptr(&first)
+    ));
+    assert!(std::ptr::addr_eq(
+        Arc::as_ptr(&used[1]),
+        Arc::as_ptr(&second)
+    ));
+    assert!(std::ptr::addr_eq(
+        Arc::as_ptr(&used[2]),
+        Arc::as_ptr(&inner)
+    ));
 }
