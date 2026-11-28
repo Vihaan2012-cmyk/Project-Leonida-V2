@@ -577,6 +577,7 @@ impl Assembly {
         }
         result?;
         self.resources().space().reclaim();
+        self.gpu.handles.budget.tick();
         drop(converted);
         Ok(())
     }
