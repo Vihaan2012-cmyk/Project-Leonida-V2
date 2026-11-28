@@ -18,6 +18,17 @@ pub enum Upscaler {
     Dlss,
 }
 
+/// What makes the extra frames when `frame_generation` is on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FrameGenerationMethod {
+    /// Leonida's own interpolation, which runs on any GPU.
+    #[default]
+    Leonida,
+    /// NVIDIA DLSS frame generation (GeForce RTX 40 series and newer); Leonida's own takes over when it cannot run.
+    Dlss,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FrameRateMode {
@@ -78,6 +89,7 @@ pub struct Graphics {
     pub resolution_scale: f32,
     pub upscaler: Upscaler,
     pub frame_generation: bool,
+    pub frame_generation_method: FrameGenerationMethod,
     pub frame_rate_mode: FrameRateMode,
     pub frame_rate_cap: u32,
     pub window_mode: WindowMode,
@@ -101,6 +113,7 @@ impl Default for Graphics {
             resolution_scale: 1.0,
             upscaler: Upscaler::Off,
             frame_generation: false,
+            frame_generation_method: FrameGenerationMethod::Leonida,
             frame_rate_mode: FrameRateMode::Console,
             frame_rate_cap: 60,
             window_mode: WindowMode::Windowed,
@@ -156,6 +169,10 @@ upscaler = \"off\"
 
 # Makes extra frames between the game's own to look smoother. Adds a little delay.
 frame_generation = false
+# Who makes the extra frames: \"leonida\" (Leonida's own, works on any GPU) or \"dlss\" (NVIDIA DLSS frame generation,
+# GeForce RTX 40 series and newer; needs NVIDIA's nvngx_dlssg.dll next to your nvngx_dlss.dll or in NVIDIA's NGX
+# folders). When DLSS cannot run, Leonida's own is used and `leonida run` says why.
+frame_generation_method = \"leonida\"
 
 # \"console\" keeps the console's 30 or 60 frames a second; \"cap\" stops at frame_rate_cap; \"uncapped\" runs as
 # fast as it can; \"vsync\" shows one frame per screen refresh.
@@ -225,6 +242,47 @@ fix_frame_timers = true
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_generation_stays_on_leonida_s_own_unless_dlss_is_chosen() {
+        let default = Graphics::default();
+        assert!(!default.frame_generation);
+        assert_eq!(
+            default.frame_generation_method,
+            FrameGenerationMethod::Leonida
+        );
+        assert_eq!(
+            Graphics::parse(
+                "frame_generation = true
+"
+            )
+            .unwrap()
+            .frame_generation_method,
+            FrameGenerationMethod::Leonida
+        );
+        let chosen = Graphics::parse(
+            "frame_generation = true
+frame_generation_method = \"dlss\"
+",
+        )
+        .unwrap();
+        assert!(chosen.frame_generation);
+        assert_eq!(chosen.frame_generation_method, FrameGenerationMethod::Dlss);
+        assert!(
+            Graphics::parse(
+                "frame_generation_method = \"fsr\"
+"
+            )
+            .is_err(),
+            "an unknown method is refused"
+        );
+        assert_eq!(Graphics::parse(&Graphics::default_text()).unwrap(), default);
+        assert!(
+            chosen
+                .to_text()
+                .contains("frame_generation_method = \"dlss\"")
+        );
+    }
 
     #[test]
     fn every_choice_parses() {

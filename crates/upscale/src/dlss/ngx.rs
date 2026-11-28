@@ -752,6 +752,11 @@ impl Ngx {
         &self.api
     }
 
+    /// The capability map NGX filled at initialisation, for features other than super resolution to read.
+    pub fn capability_map(&self) -> &ParamMap {
+        &self.capabilities
+    }
+
     pub fn availability(&self) -> Availability {
         let caps = &self.capabilities;
         Availability {
