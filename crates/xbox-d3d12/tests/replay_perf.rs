@@ -1531,6 +1531,142 @@ fn clears_after_the_targets_become_load_operations_and_stay_ordered_before_other
     all_pixels(&world, &[0xFF00_FF00]);
 }
 
+/// Replays `commands` cut into command buffers after `first` commands (and twice as many after each), each
+/// buffer submitted as soon as it is finished. Returns the report and how many buffers were used.
+fn replay_cut(world: &World, commands: &[Command], first: usize) -> (ReplayReport, usize) {
+    let d = &world.ctx.device;
+    // SAFETY: the pool and its buffers are used on this thread; the queue is idle before they are destroyed.
+    unsafe {
+        let pool = d
+            .create_command_pool(
+                &vk::CommandPoolCreateInfo::default().queue_family_index(world.ctx.family),
+                None,
+            )
+            .unwrap();
+        let begin = || {
+            let cb = d
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .command_buffer_count(1),
+                )
+                .unwrap()[0];
+            d.begin_command_buffer(
+                cb,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .unwrap();
+            cb
+        };
+        let submit = |cb: vk::CommandBuffer| {
+            d.end_command_buffer(cb).unwrap();
+            let buffers = [cb];
+            d.queue_submit(
+                world.ctx.queue,
+                &[vk::SubmitInfo::default().command_buffers(&buffers)],
+                vk::Fence::null(),
+            )
+            .unwrap();
+        };
+        let mut used = 1;
+        let cb = begin();
+        let out = Replayer::new(&world.ctx, world.env(), cb).record_chunked(
+            commands,
+            first,
+            &mut |old| {
+                submit(old);
+                used += 1;
+                Ok(begin())
+            },
+        );
+        submit(out.cb);
+        d.queue_wait_idle(world.ctx.queue).unwrap();
+        d.destroy_command_pool(pool, None);
+        (out.result.unwrap(), used)
+    }
+}
+
+#[test]
+fn a_list_cut_into_command_buffers_draws_the_same_and_sets_its_state_again_in_each() {
+    let Some(world) = World::new(2) else { return };
+    let mut commands = draw_setup(&world);
+    commands.push(draw());
+    commands.push(Command::Barriers(vec![Barrier::Uav]));
+    commands.push(draw());
+    commands.extend(readback(&world, 0));
+    let whole = replay(&world, &commands);
+    all_pixels(&world, &TRIANGLE);
+    assert_eq!(whole.stats.pipeline_binds, 1);
+    drop(commands);
+    drop(world);
+    let Some(world) = World::new(2) else { return };
+    let mut commands = draw_setup(&world);
+    commands.push(draw());
+    commands.push(Command::Barriers(vec![Barrier::Uav]));
+    commands.push(draw());
+    commands.extend(readback(&world, 0));
+    let (cut, buffers) = replay_cut(&world, &commands, 10);
+    all_pixels(&world, &TRIANGLE);
+    assert_eq!(buffers, 2);
+    assert_eq!(cut.draws, 2);
+    for (name, was, now) in [
+        (
+            "pipeline",
+            whole.stats.pipeline_binds,
+            cut.stats.pipeline_binds,
+        ),
+        (
+            "vertex buffers",
+            whole.stats.vertex_binds,
+            cut.stats.vertex_binds,
+        ),
+        (
+            "push constants",
+            whole.stats.push_calls,
+            cut.stats.push_calls,
+        ),
+        (
+            "topology",
+            whole.stats.topology_sets,
+            cut.stats.topology_sets,
+        ),
+        (
+            "viewport",
+            whole.stats.viewport_sets,
+            cut.stats.viewport_sets,
+        ),
+        ("scissor", whole.stats.scissor_sets, cut.stats.scissor_sets),
+        ("blend factor", whole.stats.blend_sets, cut.stats.blend_sets),
+        (
+            "stencil reference",
+            whole.stats.stencil_sets,
+            cut.stats.stencil_sets,
+        ),
+    ] {
+        assert_eq!(now, was + 1, "{name} is set again in the second buffer");
+    }
+    // the cut fell where a barrier ended the scope anyway
+    assert_eq!(cut.stats.rendering_scopes, whole.stats.rendering_scopes);
+    assert_eq!(cut.stats.push_words, whole.stats.push_words * 2);
+}
+
+#[test]
+fn a_list_too_short_to_cut_uses_one_command_buffer_and_the_chunks_grow() {
+    let Some(world) = World::new(2) else { return };
+    let mut commands = draw_setup(&world);
+    for _ in 0..40 {
+        commands.push(indexed());
+        commands.push(Command::Barriers(vec![Barrier::Uav]));
+    }
+    let (_, buffers) = replay_cut(&world, &commands, 1_000_000);
+    assert_eq!(buffers, 1);
+    // cuts at the first barrier after 4 commands, then after 8 more, 16, 32 and 64: the barriers come every
+    // other command, so the chunks hold 10, 9, 17 and 33 commands and the last 20 end the list
+    let (_, buffers) = replay_cut(&world, &commands, 4);
+    assert_eq!(buffers, 5);
+}
+
 fn replay_with_graphics(world: &World, tail: Vec<Command>) -> ReplayReport {
     let mut commands = vec![
         Command::SetRootSignature {

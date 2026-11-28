@@ -5,10 +5,9 @@
 //! descriptor kept here, and uploads the tables (`tables`) to the storage buffers at set 1 bindings 0 and 1
 //! (`shader_translate::images`). Slot 0 is the fallback every miss reads.
 
-use std::collections::HashMap;
-
 use shader_translate::images::{self, Number, TableError};
 
+use super::fasthash::FastMap;
 use super::gfx10::{self, Image, ImageWords, Sampler, SamplerWords};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -50,7 +49,7 @@ pub struct Tables {
 }
 
 struct Slots<T> {
-    by_key: HashMap<[u32; 8], u32>,
+    by_key: FastMap<[u32; 8], u32>,
     entries: Vec<Option<T>>,
     free: Vec<u32>,
 }
@@ -58,7 +57,7 @@ struct Slots<T> {
 impl<T> Default for Slots<T> {
     fn default() -> Slots<T> {
         Slots {
-            by_key: HashMap::new(),
+            by_key: FastMap::default(),
             entries: Vec::new(),
             free: Vec::new(),
         }
@@ -114,6 +113,9 @@ impl Registry {
 
     /// Gives a T# its slot; the same words always get the same one.
     pub fn register_texture(&mut self, words: &ImageWords) -> Result<Registration, RegistryError> {
+        if let Some(&index) = self.textures.by_key.get(words) {
+            return Ok(Registration { index, new: false });
+        }
         let image = gfx10::decode_image(words).ok_or(RegistryError::NotAnImage(*words))?;
         let entry = TextureEntry {
             words: *words,
@@ -168,27 +170,46 @@ impl Registry {
     /// 8). Slots that are not images (buffers, zeros, samplers) are skipped. Returns the registrations made.
     pub fn scan_textures(&mut self, heap: &[u32], stride: usize) -> Vec<(usize, Registration)> {
         let mut found = Vec::new();
+        self.scan_textures_with(heap, stride, |slot, r| found.push((slot, r)));
+        found
+    }
+
+    /// `scan_textures` handing each registration to `each` instead of collecting them.
+    pub fn scan_textures_with(
+        &mut self,
+        heap: &[u32],
+        stride: usize,
+        mut each: impl FnMut(usize, Registration),
+    ) {
         for (slot, chunk) in heap.chunks_exact(stride.max(8)).enumerate() {
             let words: ImageWords = chunk[..8].try_into().expect("eight words");
             if gfx10::is_image(&words)
                 && let Ok(registration) = self.register_texture(&words)
             {
-                found.push((slot, registration));
+                each(slot, registration);
             }
         }
-        found
     }
 
     /// Registers every non-zero S# in a block of heap memory laid out as slots of `stride` dwords (at least 4).
     pub fn scan_samplers(&mut self, heap: &[u32], stride: usize) -> Vec<(usize, Registration)> {
         let mut found = Vec::new();
+        self.scan_samplers_with(heap, stride, |slot, r| found.push((slot, r)));
+        found
+    }
+
+    pub fn scan_samplers_with(
+        &mut self,
+        heap: &[u32],
+        stride: usize,
+        mut each: impl FnMut(usize, Registration),
+    ) {
         for (slot, chunk) in heap.chunks_exact(stride.max(4)).enumerate() {
             let words: SamplerWords = chunk[..4].try_into().expect("four words");
             if words != [0; 4] {
-                found.push((slot, self.register_sampler(&words)));
+                each(slot, self.register_sampler(&words));
             }
         }
-        found
     }
 
     /// The slot word a shader gets for a T#: the bindless index with the number type in the top two bits; 0 when
