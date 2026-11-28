@@ -197,6 +197,7 @@ mod tests {
     fn the_dlss_report_is_shown_beside_the_library_field() {
         let root = tempfile::tempdir().unwrap();
         let mut config = Config::default();
+        config.graphics.upscaler = Upscaler::Off;
         let available =
             Line::Available("available on a GPU (nvngx_dlss.dll from NVIDIA's folders)".into());
         let said = |line: &Line, config: &Config| run_with(config, root.path(), 1, Some(line));

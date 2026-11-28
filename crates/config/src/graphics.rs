@@ -112,14 +112,14 @@ impl Default for Graphics {
     fn default() -> Self {
         Self {
             resolution_scale: 1.0,
-            upscaler: Upscaler::Off,
+            upscaler: Upscaler::Dlss,
             frame_generation: false,
-            frame_generation_method: FrameGenerationMethod::Leonida,
+            frame_generation_method: FrameGenerationMethod::Dlss,
             frame_rate_mode: FrameRateMode::Uncapped,
             frame_rate_cap: 60,
             window_mode: WindowMode::Windowed,
-            window_width: 1920,
-            window_height: 1080,
+            window_width: 2560,
+            window_height: 1440,
             hdr: false,
             anisotropic_filtering: 16,
             texture_lod_bias: 0.0,
@@ -165,15 +165,15 @@ impl Section for Graphics {
 resolution_scale = 1.0
 
 # What brings a smaller picture up to the window's size: \"off\", \"fsr1\" (spatial), \"temporal\" (from several
-# frames) or \"dlss\" (NVIDIA GPUs only).
-upscaler = \"off\"
+# frames) or \"dlss\" (NVIDIA GPUs only; on other GPUs \"temporal\" runs instead).
+upscaler = \"dlss\"
 
 # Makes extra frames between the game's own to look smoother. Adds a little delay.
 frame_generation = false
 # Who makes the extra frames: \"leonida\" (Leonida's own, works on any GPU) or \"dlss\" (NVIDIA DLSS frame generation,
 # GeForce RTX 40 series and newer; needs NVIDIA's nvngx_dlssg.dll next to your nvngx_dlss.dll or in NVIDIA's NGX
 # folders). When DLSS cannot run, Leonida's own is used and `leonida run` says why.
-frame_generation_method = \"leonida\"
+frame_generation_method = \"dlss\"
 
 # \"uncapped\" runs as fast as it can; \"cap\" stops at frame_rate_cap; \"vsync\" shows one frame per screen
 # refresh; \"console\" keeps the console's 30 or 60 frames a second.
@@ -184,8 +184,8 @@ frame_rate_cap = 60
 # \"windowed\", \"borderless\" (no border, covers the screen) or \"fullscreen\".
 window_mode = \"windowed\"
 # The window's size in pixels when windowed. 640 to 16384.
-window_width = 1920
-window_height = 1080
+window_width = 2560
+window_height = 1440
 
 # High dynamic range output. Needs a screen that supports it.
 hdr = false
@@ -245,13 +245,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frame_generation_stays_on_leonida_s_own_unless_dlss_is_chosen() {
+    fn frame_generation_is_off_by_default_and_prefers_dlss_when_turned_on() {
         let default = Graphics::default();
         assert!(!default.frame_generation);
-        assert_eq!(
-            default.frame_generation_method,
-            FrameGenerationMethod::Leonida
-        );
+        assert_eq!(default.frame_generation_method, FrameGenerationMethod::Dlss);
+        assert_eq!(default.upscaler, Upscaler::Dlss);
+        assert_eq!(default.resolution_scale, 1.0);
+        assert_eq!((default.window_width, default.window_height), (2560, 1440));
         assert_eq!(
             Graphics::parse(
                 "frame_generation = true
@@ -259,16 +259,19 @@ mod tests {
             )
             .unwrap()
             .frame_generation_method,
-            FrameGenerationMethod::Leonida
+            FrameGenerationMethod::Dlss
         );
         let chosen = Graphics::parse(
             "frame_generation = true
-frame_generation_method = \"dlss\"
+frame_generation_method = \"leonida\"
 ",
         )
         .unwrap();
         assert!(chosen.frame_generation);
-        assert_eq!(chosen.frame_generation_method, FrameGenerationMethod::Dlss);
+        assert_eq!(
+            chosen.frame_generation_method,
+            FrameGenerationMethod::Leonida
+        );
         assert!(
             Graphics::parse(
                 "frame_generation_method = \"fsr\"
@@ -281,7 +284,7 @@ frame_generation_method = \"dlss\"
         assert!(
             chosen
                 .to_text()
-                .contains("frame_generation_method = \"dlss\"")
+                .contains("frame_generation_method = \"leonida\"")
         );
     }
 
@@ -394,6 +397,8 @@ anisotropic_filtering = 0\n";
     fn upscaling_adds_mip_bias_only_below_native() {
         let mut graphics = Graphics {
             texture_lod_bias: -0.5,
+            upscaler: Upscaler::Off,
+            resolution_scale: 1.0,
             ..Graphics::default()
         };
         assert_eq!(graphics.effective_lod_bias(), -0.5);

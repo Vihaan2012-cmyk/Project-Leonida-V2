@@ -92,17 +92,26 @@ mod tests {
 
     const TRILINEAR: [u32; 4] = [0, 0xF00 << 12, (1 << 20) | (1 << 22) | (2 << 26), 0];
 
+    /// Native resolution with no upscaler, so only the field under test moves the bias.
+    fn native() -> Graphics {
+        Graphics {
+            upscaler: crate::Upscaler::Off,
+            resolution_scale: 1.0,
+            ..Graphics::default()
+        }
+    }
+
     fn plain() -> Graphics {
         Graphics {
             anisotropic_filtering: 1,
-            ..Graphics::default()
+            ..native()
         }
     }
 
     fn aniso(level: u32) -> Graphics {
         Graphics {
             anisotropic_filtering: level,
-            ..Graphics::default()
+            ..native()
         }
     }
 

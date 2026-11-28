@@ -328,7 +328,7 @@ mod tests {
         let plan = plan(&args(), &graphics("frame_rate_mode = \"console\"")).unwrap();
         assert_eq!(plan.frame_limit, FrameLimit::Console);
         assert!(!plan.custom_limit);
-        assert_eq!(plan.upscaler, Upscaler::Off);
+        assert_eq!(plan.upscaler, Upscaler::Dlss);
         assert!(!plan.frame_generation);
         assert_eq!(plan.widescreen, widescreen::Config::default());
         assert!(plan.block_nudity);
@@ -421,12 +421,9 @@ mod tests {
     }
 
     #[test]
-    fn the_frame_generation_method_follows_the_settings_and_defaults_to_leonida_s_own() {
+    fn the_frame_generation_method_follows_the_settings_and_defaults_to_dlss() {
         let default = plan(&args(), &Settings::default()).unwrap();
-        assert_eq!(
-            default.frame_generation_method,
-            FrameGenerationMethod::Leonida
-        );
+        assert_eq!(default.frame_generation_method, FrameGenerationMethod::Dlss);
         let settings = graphics(
             "upscaler = \"temporal\"
 frame_generation = true

@@ -713,6 +713,7 @@ mod tests {
         };
         let peak = find("display.hdr_peak_nits");
         let dlss = find("upscaling.dlss_path");
+        form.set("graphics.upscaler", "off");
         assert!(!form.is_enabled(&peak) && !form.is_enabled(&dlss));
         form.set("graphics.hdr", "true");
         form.set("graphics.upscaler", "dlss");
