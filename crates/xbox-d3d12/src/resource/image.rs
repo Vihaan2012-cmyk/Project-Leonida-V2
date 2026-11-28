@@ -90,8 +90,9 @@ fn storage_format(h: &Handles, info: &Format, usage: vk::ImageUsageFlags) -> vk:
     }
 }
 
-/// `usage`, less the uses the GPU cannot combine with `format`: a depth attachment on a color format first (typeless
-/// formats ask for both), then storage, then color attachment. Each use dropped is noted once.
+/// `usage`, less the uses the GPU cannot combine with `format`: for a color format a depth attachment first (typeless
+/// formats ask for both), then storage, then color attachment; for a depth format storage, then color attachment.
+/// Each use dropped is noted once.
 fn supported_usage(
     h: &Handles,
     format: vk::Format,
@@ -114,16 +115,34 @@ fn supported_usage(
                 .is_ok()
         }
     };
+    let depth = matches!(
+        format,
+        vk::Format::D16_UNORM
+            | vk::Format::D16_UNORM_S8_UINT
+            | vk::Format::D24_UNORM_S8_UINT
+            | vk::Format::X8_D24_UNORM_PACK32
+            | vk::Format::D32_SFLOAT
+            | vk::Format::D32_SFLOAT_S8_UINT
+    );
+    let order = if depth {
+        [
+            vk::ImageUsageFlags::STORAGE,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            vk::ImageUsageFlags::empty(),
+        ]
+    } else {
+        [
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            vk::ImageUsageFlags::STORAGE,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        ]
+    };
     let mut usage = usage;
-    for drop in [
-        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-        vk::ImageUsageFlags::STORAGE,
-        vk::ImageUsageFlags::COLOR_ATTACHMENT,
-    ] {
+    for drop in order {
         if fits(usage) {
             return Ok(usage);
         }
-        if usage.contains(drop) {
+        if !drop.is_empty() && usage.contains(drop) {
             usage &= !drop;
             crate::com::note_once(format!(
                 "{format:?} images cannot also be {drop:?} on this GPU: made without that use"
