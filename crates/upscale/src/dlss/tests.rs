@@ -133,21 +133,21 @@ struct FakeParameter {
 impl FakeParameter {
     fn new() -> Box<FakeParameter> {
         let mut table = [0usize; 17];
+        for slot in 0..8 {
+            table[slot] = nop as *const () as usize;
+        }
+        for slot in 8..16 {
+            table[slot] = get_unused as *const () as usize;
+        }
         table[slots::SET_U64] = set_u64 as *const () as usize;
         table[slots::SET_F32] = set_f32 as *const () as usize;
-        table[2] = set_f64 as *const () as usize;
+        table[slots::SET_F32 - 1] = set_f64 as *const () as usize;
         table[slots::SET_U32] = set_u32 as *const () as usize;
         table[slots::SET_I32] = set_i32 as *const () as usize;
-        table[5] = nop as *const () as usize;
-        table[6] = nop as *const () as usize;
         table[slots::SET_PTR] = set_ptr as *const () as usize;
-        table[slots::GET_U64] = get_unused as *const () as usize;
         table[slots::GET_F32] = get_f32 as *const () as usize;
-        table[10] = get_unused as *const () as usize;
         table[slots::GET_U32] = get_u32 as *const () as usize;
         table[slots::GET_I32] = get_i32 as *const () as usize;
-        table[13] = get_unused as *const () as usize;
-        table[14] = get_unused as *const () as usize;
         table[slots::GET_PTR] = get_ptr as *const () as usize;
         table[slots::RESET] = nop as *const () as usize;
         let mut boxed = Box::new(FakeParameter {

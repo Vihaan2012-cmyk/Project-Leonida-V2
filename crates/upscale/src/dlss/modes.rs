@@ -118,11 +118,15 @@ pub struct DlssOptions {
     pub auto_exposure: bool,
     /// Largest sizes the feature will see (a dynamic-resolution game creates for the maximum).
     pub max_render_size: Option<[u32; 2]>,
-    /// Initialise with `Init_ProjectID` (the project id below) instead of `Init` with application id 0. Off by
-    /// default: the driver tested crashes in `Init_ProjectID` with the header's argument list.
+    /// The NGX application id. 0 is accepted by the driver for applications without an id from NVIDIA; the driver's
+    /// project-id entry point is not used because its argument list is not published.
+    pub application_id: u64,
     pub use_project_id: bool,
     pub project_id: String,
     pub engine_version: String,
+    /// NGX logging: `LOGGING_OFF`, `LOGGING_ON` or `LOGGING_VERBOSE`. Lines are collected and read with
+    /// [`super::ngx::take_log`]; the debug DLSS library (`dev` folder of the SDK) also draws an overlay.
+    pub log_level: super::ffi::LoggingLevel,
     /// Folder NGX may write logs and caches to; the system temp folder when `None`.
     pub app_data_path: Option<std::path::PathBuf>,
 }
@@ -137,9 +141,11 @@ impl Default for DlssOptions {
             depth_inverted: true,
             auto_exposure: false,
             max_render_size: None,
-            use_project_id: false,
+            application_id: 0,
+            use_project_id: true,
             project_id: "6f1f8c1b-2d9e-4b5a-9a3a-4c7d0e5b1a10".into(),
             engine_version: env!("CARGO_PKG_VERSION").into(),
+            log_level: super::ffi::LOGGING_OFF,
             app_data_path: None,
         }
     }

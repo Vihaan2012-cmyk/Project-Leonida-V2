@@ -305,7 +305,28 @@ pub type FnRequiredExtensions = unsafe extern "C" fn(
     *mut u32,
     *mut *const *const c_char,
 ) -> Result;
+/// The Vulkan `Init` of the driver's NGX core (`nvngx.dll`). It is not the SDK's wrapper signature: that wrapper (a
+/// static library) forwards to these, and the version number is the sixth argument.
 pub type FnInit = unsafe extern "C" fn(
+    u64,
+    *const u16,
+    vk::Instance,
+    vk::PhysicalDevice,
+    vk::Device,
+    u32,
+) -> Result;
+/// Core `Init_Ext`: as [`FnInit`] plus the common feature info (search paths, logging) after the version.
+pub type FnInitExt = unsafe extern "C" fn(
+    u64,
+    *const u16,
+    vk::Instance,
+    vk::PhysicalDevice,
+    vk::Device,
+    u32,
+    *const FeatureCommonInfo,
+) -> Result;
+/// Core `Init_Ext2`, present in newer drivers: also takes the loader's function-pointer getters.
+pub type FnInitExt2 = unsafe extern "C" fn(
     u64,
     *const u16,
     vk::Instance,
@@ -313,10 +334,12 @@ pub type FnInit = unsafe extern "C" fn(
     vk::Device,
     Option<vk::PFN_vkGetInstanceProcAddr>,
     Option<vk::PFN_vkGetDeviceProcAddr>,
-    *const FeatureCommonInfo,
     u32,
+    *const FeatureCommonInfo,
 ) -> Result;
-pub type FnInitWithProjectId = unsafe extern "C" fn(
+/// Core `Init_ProjectID` (candidate layout: the `Init_Ext` arguments with the project description in place of the
+/// application id).
+pub type FnInitProjectId = unsafe extern "C" fn(
     *const c_char,
     EngineType,
     *const c_char,
@@ -324,10 +347,8 @@ pub type FnInitWithProjectId = unsafe extern "C" fn(
     vk::Instance,
     vk::PhysicalDevice,
     vk::Device,
-    Option<vk::PFN_vkGetInstanceProcAddr>,
-    Option<vk::PFN_vkGetDeviceProcAddr>,
-    *const FeatureCommonInfo,
     u32,
+    *const FeatureCommonInfo,
 ) -> Result;
 pub type FnShutdown = unsafe extern "C" fn() -> Result;
 pub type FnShutdown1 = unsafe extern "C" fn(vk::Device) -> Result;
@@ -375,16 +396,16 @@ pub type FnGetDeviceExtensionRequirements = unsafe extern "C" fn(
 /// `Get` overloads in the same order, then `Reset`. The Windows driver is built with MSVC, which lays virtual
 /// functions out in declaration order.
 pub mod slots {
-    pub const SET_U64: usize = 0;
-    pub const SET_F32: usize = 1;
-    pub const SET_U32: usize = 3;
-    pub const SET_I32: usize = 4;
-    pub const SET_PTR: usize = 7;
-    pub const GET_U64: usize = 8;
-    pub const GET_F32: usize = 9;
-    pub const GET_U32: usize = 11;
-    pub const GET_I32: usize = 12;
-    pub const GET_PTR: usize = 15;
+    pub const SET_U64: usize = 7;
+    pub const SET_F32: usize = 6;
+    pub const SET_U32: usize = 4;
+    pub const SET_I32: usize = 3;
+    pub const SET_PTR: usize = 0;
+    pub const GET_U64: usize = 15;
+    pub const GET_F32: usize = 14;
+    pub const GET_U32: usize = 12;
+    pub const GET_I32: usize = 11;
+    pub const GET_PTR: usize = 8;
     pub const RESET: usize = 16;
 }
 
@@ -450,15 +471,13 @@ mod tests {
     }
 
     #[test]
-    fn parameter_table_slots_follow_the_declaration_order() {
-        assert_eq!(slots::GET_U64, 8);
-        assert_eq!(
-            slots::GET_PTR - slots::GET_U64,
-            slots::SET_PTR - slots::SET_U64
-        );
+    fn parameter_table_slots_follow_the_msvc_overload_order() {
+        assert_eq!(slots::SET_U64 - slots::SET_PTR, 7);
+        assert_eq!(slots::GET_U64 - slots::GET_PTR, 7);
+        assert_eq!(slots::GET_PTR, slots::SET_U64 + 1);
+        assert_eq!(slots::SET_U32 - slots::SET_I32, 1);
+        assert_eq!(slots::GET_U32 - slots::GET_I32, 1);
         assert_eq!(slots::RESET, 16);
-        assert_eq!(slots::SET_U32 - slots::SET_F32, 2);
-        assert_eq!(slots::GET_I32 - slots::GET_U32, 1);
     }
 
     #[test]
