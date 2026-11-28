@@ -31,8 +31,11 @@ pub struct MovieHeader {
 
 pub const HEADER_BYTES: usize = 0x2C;
 
+/// Revisions from `i` on have one more word between the fixed header and the audio descriptors.
+const EXTRA_WORD: usize = 4;
+
 /// Enough of the stream's start for the fixed header and the descriptors of 32 audio tracks.
-pub const PREFIX_BYTES: usize = HEADER_BYTES + 32 * 12;
+pub const PREFIX_BYTES: usize = HEADER_BYTES + EXTRA_WORD + 32 * 12;
 
 impl MovieHeader {
     /// What a movie whose header cannot be read looks like: one frame that ends it at once.
@@ -85,11 +88,17 @@ pub fn parse_header(bytes: &[u8]) -> Result<MovieHeader, MediaError> {
     Ok(header)
 }
 
-/// The per-track sample rate, channel count and id, from the region after the fixed header: `count` maximum
-/// sizes, `count` pairs of u16 (rate, flags; 0x2000 is stereo), then `count` ids. Empty when the bytes stop short.
+/// The per-track sample rate, channel count and id, from the region after the fixed header (and the extra word of
+/// revisions `i` and later): `count` maximum sizes, `count` pairs of u16 (rate, flags; 0x2000 is stereo), then
+/// `count` ids. Empty when the bytes stop short.
 pub fn parse_audio_tracks(bytes: &[u8], count: u32) -> Vec<AudioTrackInfo> {
     let count = count as usize;
-    let rates = HEADER_BYTES + count * 4;
+    let extra = if bytes.get(3).is_some_and(|r| *r >= b'i') {
+        EXTRA_WORD
+    } else {
+        0
+    };
+    let rates = HEADER_BYTES + extra + count * 4;
     let ids = rates + count * 4;
     if bytes.len() < ids + count * 4 {
         return Vec::new();
@@ -151,5 +160,15 @@ mod tests {
             ]
         );
         assert!(parse_audio_tracks(&stream_header(10, 640, 480, 2)[..0x40], 2).is_empty());
+    }
+
+    #[test]
+    fn revisions_before_i_have_no_extra_word_before_the_descriptors() {
+        let mut bytes = stream_header(10, 640, 480, 1);
+        bytes[3] = b'h';
+        bytes.drain(HEADER_BYTES..HEADER_BYTES + 4);
+        let tracks = parse_audio_tracks(&bytes, 1);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!((tracks[0].rate, tracks[0].channels), (48000, 2));
     }
 }

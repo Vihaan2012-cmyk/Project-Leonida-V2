@@ -40,6 +40,28 @@ impl Clock for SystemClock {
 /// The longest a call that was told to wait for a frame forever waits.
 pub const WAIT_CAP: Duration = Duration::from_secs(2);
 
+/// How much of a new reading of the audio against the wall clock moves the clock's lead.
+const LEAD_SMOOTHING: f64 = 0.1;
+
+/// A reading this far (seconds) from the lead is a break in the audio, not drift: the lead follows it at once.
+const LEAD_SNAP: f64 = 0.1;
+
+/// Past this many seconds the audio is not trusted as the clock.
+const LEAD_LIMIT: f64 = 1.0;
+
+/// What the audio engine says about movie time. The movie's own frame period keeps time between readings, and
+/// each frame installed corrects it by how far the audio has got, so the picture follows the sound through
+/// device clock drift and stalls but never waits for a device that plays nothing.
+#[derive(Default)]
+struct AudioClock {
+    /// Movie time of the first sample played after the last flush.
+    origin: Duration,
+    /// The audio's position at the last reading.
+    seen: Option<Duration>,
+    /// Seconds the audio's movie time is ahead of the wall-based clock; `None` while the audio does not drive it.
+    lead: Option<f64>,
+}
+
 pub struct Player {
     info: StreamInfo,
     /// Decoder track indices the movie plays, in the order the game numbers them.
@@ -60,6 +82,7 @@ pub struct Player {
     started: bool,
     media: Duration,
     running_since: Option<Duration>,
+    audio_clock: AudioClock,
     registered: Option<usize>,
     slot: u32,
 }
@@ -92,6 +115,7 @@ impl Player {
             started: false,
             media: Duration::ZERO,
             running_since: None,
+            audio_clock: AudioClock::default(),
             registered: None,
             slot: 0,
         }
@@ -127,11 +151,52 @@ impl Player {
         Duration::from_secs_f64(f64::from(frames) * f64::from(self.info.fps_den.max(1)) / rate)
     }
 
-    fn media_now(&self) -> Duration {
+    fn wall_media(&self) -> Duration {
         self.media
             + self
                 .running_since
                 .map_or(Duration::ZERO, |s| self.clock.now().saturating_sub(s))
+    }
+
+    fn media_now(&self) -> Duration {
+        let wall = self.wall_media();
+        match self.audio_clock.lead {
+            Some(lead) => Duration::from_secs_f64((wall.as_secs_f64() + lead).max(0.0)),
+            None => wall,
+        }
+    }
+
+    /// Reads how far the audio has played and corrects the clock by it.
+    fn read_audio(&mut self) {
+        let clock = &mut self.audio_clock;
+        let Some(played) = self.sink.position() else {
+            clock.seen = None;
+            clock.lead = None;
+            return;
+        };
+        let advancing = clock
+            .seen
+            .map_or(played > Duration::ZERO, |seen| played > seen);
+        clock.seen = Some(played);
+        if self.paused || !self.started {
+            return;
+        }
+        if !advancing {
+            clock.lead = None;
+            return;
+        }
+        let wall = self.media
+            + self
+                .running_since
+                .map_or(Duration::ZERO, |s| self.clock.now().saturating_sub(s));
+        let reading = (clock.origin + played).as_secs_f64() - wall.as_secs_f64();
+        clock.lead = match clock.lead {
+            _ if reading.abs() > LEAD_LIMIT => None,
+            Some(lead) if (reading - lead).abs() <= LEAD_SNAP => {
+                Some(lead + (reading - lead) * LEAD_SMOOTHING)
+            }
+            _ => Some(reading),
+        };
     }
 
     /// # Safety
@@ -260,6 +325,7 @@ impl Player {
             self.started = true;
             self.running_since = (!self.paused).then(|| self.clock.now());
         }
+        self.read_audio();
     }
 
     /// Decodes the current frame, waiting for it a bounded time (`BinkDoFrame`).
@@ -285,6 +351,10 @@ impl Player {
         self.media = self.period(self.cur - 1);
         self.running_since = (self.started && !self.paused).then(|| self.clock.now());
         self.sink.flush();
+        self.audio_clock = AudioClock {
+            origin: self.media,
+            ..AudioClock::default()
+        };
         if let Some(worker) = &self.worker
             && !worker.reaches(self.cur - 1)
         {
@@ -552,6 +622,96 @@ mod tests {
             &events[events.len() - 2..],
             [SinkEvent::Gain(1, 0.5), SinkEvent::Pause(true)]
         );
+    }
+
+    fn set_audio(r: &Rig, played: Option<Duration>) {
+        *r.sink.1.lock().unwrap() = played;
+    }
+
+    #[test]
+    fn the_picture_follows_the_audio_when_it_runs_ahead_of_the_wall_clock() {
+        let mut r = rig(10);
+        set_audio(&r, Some(Duration::ZERO));
+        r.player.do_frame();
+        r.clock.advance(Duration::from_millis(33));
+        set_audio(&r, Some(Duration::from_millis(40)));
+        r.player.next_frame();
+        r.player.do_frame();
+        r.clock.advance(Duration::from_millis(27));
+        assert!(
+            !r.player.wait(),
+            "the audio is 7 ms ahead, so frame 3 (due at 66.7 ms) is due at 60 ms of wall time"
+        );
+        let mut plain = rig(10);
+        plain.player.do_frame();
+        plain.clock.advance(Duration::from_millis(33));
+        plain.player.next_frame();
+        plain.player.do_frame();
+        plain.clock.advance(Duration::from_millis(27));
+        assert!(plain.player.wait(), "without audio the wall clock decides");
+    }
+
+    #[test]
+    fn a_stalled_audio_device_gives_the_clock_back_to_the_wall() {
+        let mut r = rig(10);
+        set_audio(&r, Some(Duration::ZERO));
+        r.player.do_frame();
+        r.clock.advance(Duration::from_millis(33));
+        set_audio(&r, Some(Duration::from_millis(80)));
+        r.player.next_frame();
+        r.player.do_frame();
+        assert!(r.player.audio_clock.lead.is_some());
+        r.clock.advance(Duration::from_millis(33));
+        r.player.next_frame();
+        r.player.do_frame();
+        assert_eq!(r.player.audio_clock.lead, None, "the audio did not move");
+        r.clock.advance(Duration::from_millis(34));
+        assert!(!r.player.wait(), "frame 4 is due after 100 ms of wall time");
+    }
+
+    #[test]
+    fn a_seek_restarts_the_audio_clock_at_the_frames_movie_time() {
+        let mut r = rig(40);
+        set_audio(&r, Some(Duration::ZERO));
+        r.player.do_frame();
+        r.clock.advance(Duration::from_millis(33));
+        set_audio(&r, Some(Duration::from_millis(33)));
+        r.player.next_frame();
+        r.player.do_frame();
+        r.player.goto(31);
+        assert_eq!(r.player.audio_clock.lead, None);
+        assert_eq!(r.player.audio_clock.origin, Duration::from_secs(1));
+        set_audio(&r, Some(Duration::ZERO));
+        r.player.do_frame();
+        r.clock.advance(Duration::from_millis(33));
+        set_audio(&r, Some(Duration::from_millis(33)));
+        r.player.next_frame();
+        r.player.do_frame();
+        let lead = r.player.audio_clock.lead.expect("audio plays again");
+        assert!(
+            lead.abs() < 0.01,
+            "audio at 1.033 s and wall at 1.033 s: {lead}"
+        );
+    }
+
+    #[test]
+    fn a_paused_movie_keeps_its_audio_lead_and_a_missing_position_drops_it() {
+        let mut r = rig(10);
+        set_audio(&r, Some(Duration::ZERO));
+        r.player.do_frame();
+        r.clock.advance(Duration::from_millis(33));
+        set_audio(&r, Some(Duration::from_millis(43)));
+        r.player.next_frame();
+        r.player.do_frame();
+        let lead = r.player.audio_clock.lead.unwrap();
+        r.player.pause(true);
+        r.clock.advance(Duration::from_secs(3));
+        assert_eq!(r.player.audio_clock.lead, Some(lead));
+        set_audio(&r, None);
+        r.player.pause(false);
+        r.player.next_frame();
+        r.player.do_frame();
+        assert_eq!(r.player.audio_clock.lead, None);
     }
 
     #[test]

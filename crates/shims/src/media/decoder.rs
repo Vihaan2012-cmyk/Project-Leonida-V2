@@ -58,13 +58,18 @@ pub type DecoderFactory = fn(Arc<[u8]>) -> Result<Box<dyn MovieDecoder>, DecodeE
 
 static FACTORY: Mutex<Option<DecoderFactory>> = Mutex::new(None);
 
-/// Chooses the decoder every movie opened from now on uses. Without one, movies end at once and show black.
+/// Chooses the decoder every movie opened from now on uses instead of the `bink` crate's.
 pub fn set_decoder_factory(factory: Option<DecoderFactory>) {
     if let Ok(mut slot) = FACTORY.lock() {
         *slot = factory;
     }
 }
 
+/// The installed decoder, or the `bink` crate's.
 pub fn decoder_factory() -> Option<DecoderFactory> {
-    FACTORY.lock().ok().and_then(|slot| *slot)
+    FACTORY
+        .lock()
+        .ok()
+        .and_then(|slot| *slot)
+        .or(Some(super::bink_decoder::open))
 }
