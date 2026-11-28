@@ -36,6 +36,7 @@ fn main() -> ExitCode {
             ShadersCommand::Report(args) => cmd_shaders::report_command(args),
             ShadersCommand::Census(args) => cmd_census::census_command(args),
             ShadersCommand::Verify(args) => cmd_verify::verify_command(args),
+            ShadersCommand::Translate(args) => cmd_verify::translate_command(args),
         },
         Some(Command::Exe(exe)) => cmd_exe::exe_command(exe),
         Some(Command::Check(args)) => cmd_check::check_command(args),
