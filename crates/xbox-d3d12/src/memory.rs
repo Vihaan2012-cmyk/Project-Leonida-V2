@@ -9,11 +9,28 @@
 //!
 //! - **Direct**: the imported memory itself is bound into the window with sparse binding, so the GPU and the CPU
 //!   share the bytes. Drivers whose sparse buffers accept host-visible memory (Intel, probably AMD) take this.
-//! - **Mirrored**: NVIDIA's sparse buffers accept only device-local memory, so the window is bound to device-local
+//! - **Mirrored**: NVIDIA's sparse buffers list only device-local memory, so the window is bound to device-local
 //!   memory and the imported host buffer is copied to it before the GPU reads (`record_uploads`) and back after
 //!   the GPU writes (`record_downloads`). Writes the CPU made are found by `GetWriteWatch`, by the caller's
 //!   `mark_dirty`, or by copying the whole region. The `sync` module says how uploads, the transfer queue
 //!   (`submit_uploads`) and the copies back (`note_gpu_write`, `HostAccess`, `read_back`) keep neither side stale.
+//!
+//! # The spill tier
+//!
+//! A mirrored window holds a second copy of every mapped run in device-local memory, and the title maps about
+//! 7.1 GiB of GPU memory at boot (the executable's pools: 6236 MiB, 710 MiB and about 185 MiB of descriptor
+//! heaps), more than a card with 8 GB can give. So a run is mirrored only while the mirror's share of the budget
+//! (`Budget::mirror_room`) has room, and is otherwise **spilled**: the imported host memory is bound into the
+//! window itself, as a direct window does, so the GPU reads and writes the title's own bytes over PCIe and nothing
+//! is copied. The driver's memory requirements for a sparse buffer do not list that memory, but the RTX 4060's
+//! driver (616.64) binds it and reads and writes it correctly (`memory::probe`, run by hand); a driver that does
+//! not is found out at start by a self-test, and `AddressSpace::set_spill` turns the tier off. Without it a run
+//! past the budget is tried in device-local memory at a low priority (the driver then pages it to system memory,
+//! measured to work up to 10 GiB with no refusals on the 4060), and failing that left unbound.
+//!
+//! `promote_spilled` mirrors spilled runs again as device-local memory frees, and `spill_range` drops the
+//! device-local copy of runs the layer knows the GPU reads only through other objects (the detiled image of a
+//! texture is made from the host bytes, so the window's copy of a texture's memory is dead weight).
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, c_void};
@@ -24,6 +41,7 @@ use ash::vk;
 
 mod budget;
 mod dirty;
+mod spill;
 mod sync;
 mod transfer;
 
@@ -163,7 +181,8 @@ pub struct Config {
     pub base: u64,
     /// The window's size; `None` takes the largest the GPU allows.
     pub size: Option<u64>,
-    /// The largest memory object made for one mapped run; longer runs are split.
+    /// The largest memory object made for one mapped run; longer runs are split. Each is mirrored or spilled as a
+    /// whole, so the smaller it is the more exactly the mirror fills its share of the budget.
     pub chunk: u64,
 }
 
@@ -172,7 +191,7 @@ impl Default for Config {
         Config {
             base: 0,
             size: None,
-            chunk: 1 << 30,
+            chunk: 256 << 20,
         }
     }
 }
@@ -292,8 +311,11 @@ struct Memory {
     /// Where the imported host memory is. It equals the window address except for runs seen at another address.
     host: u64,
     tiles: Tiles,
-    /// The device-local memory of a mirrored run, as the budget granted it.
+    /// The device-local memory of a mirrored run, as the budget granted it; for a spilled run, the record that
+    /// counts it as system memory.
     grant: Option<Grant>,
+    /// Moved to system memory by `spill_range`: `promote_spilled` leaves it there.
+    pinned: bool,
 }
 
 /// A mapped run no device-local memory could back: the host memory is the game's and intact, the window has
@@ -331,6 +353,8 @@ pub struct AddressSpace {
     retired_memory: Vec<vk::DeviceMemory>,
     retired_grants: Vec<Grant>,
     deferred: BTreeMap<u64, Deferred>,
+    /// Runs past the mirror's share of the budget go to system memory bound straight into the window.
+    spill: bool,
     lenient: bool,
     reclaims: u32,
     generation: u64,
@@ -425,6 +449,7 @@ impl AddressSpace {
             retired_memory: Vec::new(),
             retired_grants: Vec::new(),
             deferred: BTreeMap::new(),
+            spill: false,
             lenient: false,
             reclaims: 0,
             generation: 0,
@@ -449,6 +474,11 @@ impl AddressSpace {
             && space.backing == Backing::Mirrored
         {
             space.transfer = Some(transfer::Transfer::new(&space.h.device, queue)?);
+        }
+        if space.backing == Backing::Mirrored
+            && std::env::var("LEONIDA_VRAM_SPILL").as_deref() != Ok("0")
+        {
+            space.spill = space.spill_works();
         }
         Ok(space)
     }
@@ -882,7 +912,19 @@ impl AddressSpace {
                 (memory, None, None)
             }
             Backing::Mirrored => {
-                let (handle, mirror, grant) = self.import_mirrored(host, len)?;
+                let made = if self.spill && len > self.h.budget.mirror_room() {
+                    self.import_spilled(host, len)
+                } else {
+                    match self.import_mirrored(host, len) {
+                        Err(MemoryError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY))
+                            if self.spill =>
+                        {
+                            self.import_spilled(host, len)
+                        }
+                        other => other,
+                    }
+                };
+                let (handle, mirror, grant) = made?;
                 (handle, mirror, Some(grant))
             }
         };
@@ -898,6 +940,7 @@ impl AddressSpace {
                 host,
                 tiles: Tiles::default(),
                 grant,
+                pinned: false,
             },
         );
         self.extents.insert(
@@ -1073,13 +1116,20 @@ impl AddressSpace {
                 self.h.device.free_memory(memory, None);
             }
         }
-        let freed = !self.retired_grants.is_empty();
+        let freed = self
+            .retired_grants
+            .iter()
+            .any(|g| g.placement == Placement::DeviceLocal);
         for grant in self.retired_grants.drain(..) {
             self.h.budget.release(&grant);
         }
         self.reclaims = self.reclaims.wrapping_add(1);
-        if !self.deferred.is_empty() && (freed || self.reclaims.is_multiple_of(64)) {
+        let now = freed || self.reclaims.is_multiple_of(64);
+        if !self.deferred.is_empty() && now {
             let _ = self.retry_deferred();
+        }
+        if self.spill && now && self.h.budget.counters().spilled[Class::Mirror as usize] > 0 {
+            let _ = self.promote_spilled();
         }
     }
 }
@@ -1114,6 +1164,8 @@ mod bench;
 #[cfg(test)]
 mod budget_tests;
 pub mod hooks;
+#[cfg(test)]
+mod spill_tests;
 #[cfg(test)]
 mod sync_tests;
 #[cfg(test)]
