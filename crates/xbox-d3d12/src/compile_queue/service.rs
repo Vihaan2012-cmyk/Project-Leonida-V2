@@ -555,6 +555,13 @@ impl<B: PipelineBuilder> PipelineService<B> {
     }
 }
 
+/// `LEONIDA_PIPELINE_WARM=0`: the pipelines earlier sessions created are not built when the service starts. With a
+/// warm driver cache each is quick to build when the game asks for it, and building them all at once kept every
+/// one of them in the driver's memory: a boot took 10 GB more within seconds while the replay ran.
+fn replay_enabled() -> bool {
+    std::env::var("LEONIDA_PIPELINE_WARM").map_or(true, |v| v != "0")
+}
+
 /// Opens the log, queues what earlier sessions created, then writes what this session creates and saves the
 /// pipeline cache now and then, until the service is dropped.
 fn seen_thread<B: PipelineBuilder>(
@@ -578,7 +585,11 @@ fn seen_thread<B: PipelineBuilder>(
         }
     };
     let _ = shared.log.set(log.clone());
-    let warm = log.warm_list();
+    let warm = if replay_enabled() {
+        log.warm_list()
+    } else {
+        Default::default()
+    };
     {
         let mut descs = shared.descs.lock().expect("descriptions");
         for entry in warm {
