@@ -13,6 +13,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, RwLock};
 
 pub mod convert;
+mod dlssg;
 pub mod frames;
 pub mod generate;
 pub mod interleave;
@@ -26,6 +27,7 @@ mod generate_tests;
 mod gpu_tests;
 
 pub use convert::{ScaleMode, SdrEotf};
+pub use dlssg::set_library_dir as set_dlss_library_dir;
 pub use frames::{
     ConsolePolicy, DXGI_ERROR_UNSUPPORTED, E_FAIL, E_INVALID_STATE, E_INVALIDARG,
     FRAME_EVENT_ORIGIN, FRAME_INTERVAL_30_HZ, FRAME_INTERVAL_60_HZ, FRAME_INTERVAL_120_HZ,
@@ -133,6 +135,17 @@ pub struct PresentConfig {
     pub frame_generation: FrameGeneration,
 }
 
+/// What makes the generated frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FrameGenMethod {
+    /// Leonida's own interpolation (`upscale::framegen`).
+    #[default]
+    Own,
+    /// NVIDIA DLSS frame generation through NGX on the presenter's device. When NGX cannot run, the own passes make the
+    /// frame and a note says why.
+    Dlss,
+}
+
 /// Frame generation: a frame built from the game's motion vectors and depth is shown halfway between two real ones.
 ///
 /// Only a multiplier of 2 is served; larger values are shown as 2. A frame is never generated across a camera cut,
@@ -143,6 +156,7 @@ pub struct FrameGeneration {
     pub multiplier: u32,
     /// The colour step that still counts as unchanged when the HUD is looked for; 0 turns the HUD test off.
     pub hud_threshold: f32,
+    pub method: FrameGenMethod,
 }
 
 impl Default for FrameGeneration {
@@ -151,6 +165,7 @@ impl Default for FrameGeneration {
             enabled: false,
             multiplier: 2,
             hud_threshold: 0.06,
+            method: FrameGenMethod::Own,
         }
     }
 }
@@ -920,6 +935,7 @@ impl Presentation {
                 generate,
                 phase: plan.map_or(0.5, |p| p.phase),
                 hud_threshold: setting.hud_threshold,
+                method: setting.method,
             });
         let captured = match captured {
             Ok(c) => c,
@@ -933,6 +949,14 @@ impl Presentation {
                 return None;
             }
         };
+        if let Some(why) = &captured.fallback {
+            self.note_once(
+                "dlss frame generation fallback",
+                &format!(
+                    "frame generation: {why}; Leonida's own frame generation makes the frames"
+                ),
+            );
+        }
         let sync = if sync == SyncMode::Immediate {
             SyncMode::Immediate
         } else {

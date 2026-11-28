@@ -496,6 +496,7 @@ fn capture<'a>(u: &'a Uploaded, inputs: &'a FrameInputs, generate: bool) -> Capt
         generate,
         phase: 0.5,
         hud_threshold: 0.06,
+        method: super::FrameGenMethod::Own,
     }
 }
 
@@ -849,6 +850,7 @@ fn bench(display: (u32, u32), render: (u32, u32)) {
         generate: true,
         phase: 0.5,
         hud_threshold: 0.06,
+        method: super::FrameGenMethod::Own,
     };
     let mut totals = Vec::new();
     for i in 0..14 {
@@ -884,4 +886,80 @@ fn gpu_cost_of_a_generated_frame_at_1080p() {
 #[ignore = "measures; run with --ignored --nocapture"]
 fn gpu_cost_of_a_generated_frame_at_4k() {
     bench((3840, 2160), (1920, 1080));
+}
+
+/// Frame generation by NGX on the device the layer assembles (which enables the extensions NGX names), between two
+/// frames of a square moving over a static background.
+#[test]
+#[ignore = "needs an RTX 40 series GPU and nvngx_dlssg.dll (set LEONIDA_DLSSG_DLL)"]
+fn dlss_makes_the_midpoint_frame_on_the_assembled_device() {
+    use crate::assembly::gpu::{Gpu, GpuConfig};
+
+    let gpu = Gpu::create(&GpuConfig {
+        gpu: Some("nvidia".into()),
+        ..GpuConfig::default()
+    })
+    .expect("an NVIDIA device");
+    assert!(gpu.optional.dlss, "the device lacks NGX's extensions");
+    let ctx = &gpu.vulkan;
+    let mut generator = FrameGen::new(ctx).unwrap();
+    for srgb in [false, true] {
+        generator.forget();
+        let prev = upload_scene(ctx, 16, srgb, vk::Format::R32_SFLOAT);
+        let cur = upload_scene(ctx, 16 + STEP, srgb, vk::Format::R32_SFLOAT);
+        let inputs = frame_inputs(false);
+        let mut ask = |u: &Uploaded| {
+            let mut request = capture(u, &inputs, true);
+            request.method = super::FrameGenMethod::Dlss;
+            generator.capture(&request).unwrap()
+        };
+        let first = ask(&prev);
+        assert_eq!(first.fallback, None);
+        assert!(first.generated.is_none(), "no frame before the first");
+        let second = ask(&cur);
+        assert_eq!(second.fallback, None, "NGX ran");
+        let generated = second.generated.expect("a generated frame");
+        let rgba = read_held(ctx, &generated);
+        assert!(rgba.iter().all(|v| v.is_finite()));
+        let (middle, _) = mean_error(&rgba, 16 + STEP / 2);
+        let (to_prev, _) = mean_error(&rgba, 16);
+        let (to_cur, _) = mean_error(&rgba, 16 + STEP);
+        eprintln!(
+            "srgb {srgb}: mean error to the midpoint {middle:.4}, to the previous frame {to_prev:.4}, to the newest {to_cur:.4}"
+        );
+        assert!(
+            middle < to_prev && middle < to_cur,
+            "not between the frames"
+        );
+        let real = read_held(ctx, &second.real);
+        let (mean, wrong) = mean_error(&real, 16 + STEP);
+        assert!(
+            mean < 0.004 && wrong == 0,
+            "the real frame: {mean}, {wrong}"
+        );
+    }
+}
+
+/// When NGX cannot run, the presenter's own passes make the frame and the capture says why.
+#[test]
+fn a_dlss_request_that_cannot_be_served_falls_back_to_the_own_passes() {
+    let Some(vk) = gpu() else { return };
+    let ctx = &vk.ctx;
+    let mut generator = FrameGen::new(ctx).unwrap();
+    generator.refuse_dlss("DLSS frame generation cannot start (no NVIDIA driver)");
+    let prev = upload_scene(ctx, 16, false, vk::Format::R32_SFLOAT);
+    let cur = upload_scene(ctx, 16 + STEP, false, vk::Format::R32_SFLOAT);
+    let inputs = frame_inputs(false);
+    let mut ask = |u: &Uploaded| {
+        let mut request = capture(u, &inputs, true);
+        request.method = super::FrameGenMethod::Dlss;
+        generator.capture(&request).unwrap()
+    };
+    ask(&prev);
+    let second = ask(&cur);
+    let why = second.fallback.expect("a reason");
+    assert!(why.contains("no NVIDIA driver"), "{why}");
+    let generated = second.generated.expect("the own passes still generate");
+    let (mean, _) = mean_error(&read_held(ctx, &generated), 16 + STEP / 2);
+    assert!(mean < 0.01, "{mean}");
 }

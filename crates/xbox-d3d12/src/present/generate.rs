@@ -19,11 +19,12 @@ use ash::vk;
 use upscale::framegen::FrameInputs;
 use upscale::shaders;
 
-use super::PresentError;
 use super::convert::Rect;
+use super::dlssg::{self, DlssState};
 use super::vulkan::{
     SourceImage, VulkanContext, color_range, find_memory, is_displayable, is_srgb,
 };
+use super::{FrameGenMethod, PresentError};
 
 const SLOTS: usize = 2;
 /// Held frames: the real and the generated image each have this many, so a frame can still be on its way to the
@@ -113,6 +114,8 @@ pub struct Capture<'a> {
     pub generate: bool,
     pub phase: f32,
     pub hud_threshold: f32,
+    /// What makes the generated frame.
+    pub method: FrameGenMethod,
 }
 
 /// The images a capture leaves behind, in `SHADER_READ_ONLY_OPTIMAL`, valid until two more frames are captured.
@@ -121,6 +124,8 @@ pub struct Captured {
     pub generated: Option<SourceImage>,
     /// The held values are the linear form of an sRGB-encoded frame.
     pub srgb_values: bool,
+    /// Why DLSS frame generation was asked for and not used: this capture was made by Leonida's own passes.
+    pub fallback: Option<String>,
 }
 
 /// Where the GPU time of the last capture went.
@@ -150,6 +155,8 @@ pub struct FrameGen {
     held: usize,
     period_ns: f64,
     timestamps: bool,
+    dlss: Option<DlssState>,
+    dlss_failure: Option<String>,
 }
 
 fn depth_aspects(format: vk::Format) -> Option<(vk::ImageAspectFlags, vk::ImageAspectFlags)> {
@@ -453,6 +460,8 @@ impl FrameGen {
                 held: 0,
                 period_ns: f64::from(props.limits.timestamp_period),
                 timestamps,
+                dlss: None,
+                dlss_failure: None,
             };
             for _ in 0..SLOTS {
                 let slot = generator.make_slot()?;
@@ -699,6 +708,49 @@ impl FrameGen {
         self.have_previous = false;
     }
 
+    /// Makes every later DLSS request fall back, as a failed start of NGX does.
+    #[cfg(test)]
+    pub(super) fn refuse_dlss(&mut self, why: &str) {
+        self.dlss_failure = Some(why.to_string());
+    }
+
+    /// NGX ready for these sizes, or the reason it is not (and will not be tried again).
+    fn dlss_ready(&mut self, size: [u32; 2], render: [u32; 2]) -> Result<DlssState, String> {
+        if let Some(why) = &self.dlss_failure {
+            return Err(why.clone());
+        }
+        let mut state = match self.dlss.take() {
+            Some(state) => state,
+            None => match DlssState::open(&self.ctx, dlssg::library_dir().as_deref()) {
+                Ok(state) => state,
+                Err(why) => {
+                    let why = format!("DLSS frame generation cannot start ({why})");
+                    self.dlss_failure = Some(why.clone());
+                    return Err(why);
+                }
+            },
+        };
+        match state.prepare(&self.ctx, self.command_pool, size, render, HOLD_FORMAT) {
+            Ok(()) => Ok(state),
+            Err(why) => {
+                let why = format!("DLSS frame generation cannot be set up ({why})");
+                self.dlss = Some(state);
+                self.give_up_on_dlss(why.clone());
+                Err(why)
+            }
+        }
+    }
+
+    /// Stops using NGX for the rest of the run. The GPU finishes what it was given first, so the feature can go.
+    fn give_up_on_dlss(&mut self, why: String) {
+        // SAFETY: waiting for the device to be idle has no preconditions.
+        unsafe {
+            let _ = self.ctx.device.device_wait_idle();
+        }
+        self.dlss = None;
+        self.dlss_failure = Some(why);
+    }
+
     fn check_inputs(&self, c: &Capture<'_>, size: [u32; 2]) -> Result<(), PresentError> {
         let no = |why: &str| Err(PresentError::Unsupported(why.to_string()));
         let render = c.inputs.render_size;
@@ -780,12 +832,31 @@ impl FrameGen {
         self.check_inputs(c, size)?;
         let render = c.inputs.render_size;
         self.ensure_sized(size, render)?;
-        let generate = c.generate && self.have_previous;
+        let mut fallback = None;
+        let mut dlss = None;
+        if c.method == FrameGenMethod::Dlss {
+            match self.dlss_ready(size, render) {
+                Ok(state) => dlss = Some(state),
+                Err(why) => fallback = Some(why),
+            }
+        }
+        let mut generate = c.generate && self.have_previous;
         let index = self.next;
         let mut slot = std::mem::take(&mut self.slots[index]);
-        let result = self.record(&mut slot, c, r, size, render, generate);
+        let mut result = self.record(&mut slot, c, r, size, render, generate, dlss.as_mut());
+        if let (Err(error), Some(_)) = (&result, &dlss) {
+            let why = format!("DLSS frame generation failed ({error})");
+            self.give_up_on_dlss(why.clone());
+            dlss = None;
+            fallback = Some(why);
+            self.have_previous = false;
+            generate = false;
+            result = self.record(&mut slot, c, r, size, render, generate, None);
+        }
         self.slots[index] = slot;
-        let captured = result?;
+        self.dlss = dlss;
+        let mut captured = result?;
+        captured.fallback = fallback;
         self.next = (self.next + 1) % SLOTS;
         self.current ^= 1;
         self.have_previous = true;
@@ -793,6 +864,7 @@ impl FrameGen {
         Ok(captured)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
         slot: &mut Slot,
@@ -801,6 +873,7 @@ impl FrameGen {
         size: [u32; 2],
         render: [u32; 2],
         generate: bool,
+        mut dlss: Option<&mut DlssState>,
     ) -> Result<Captured, PresentError> {
         let device = self.ctx.device.clone();
         let Some(sized) = self.sized.as_ref() else {
@@ -976,8 +1049,10 @@ impl FrameGen {
                 );
             };
             hold(&sized.real);
-            if generate {
+            if generate || dlss.is_some() {
                 hold(&sized.generated);
+            }
+            if generate && dlss.is_none() {
                 device.cmd_fill_buffer(cmd, sized.key.buffer, 0, vk::WHOLE_SIZE, 0);
             }
             let whole = |b: &Buf| Res::Buffer(b.buffer, 0, vk::WHOLE_SIZE);
@@ -990,24 +1065,26 @@ impl FrameGen {
                 ],
                 size,
             )?;
-            rec.run(
-                load_depth_pass,
-                &[
-                    Res::Sampled(depth_view),
-                    whole(&sized.depth[cur]),
-                    rec.params(REGION_DEPTH),
-                ],
-                render,
-            )?;
-            rec.run(
-                &self.passes.load_motion,
-                &[
-                    Res::Sampled(motion_view),
-                    whole(&sized.motion),
-                    rec.params(REGION_MOTION),
-                ],
-                render,
-            )?;
+            if dlss.is_none() {
+                rec.run(
+                    load_depth_pass,
+                    &[
+                        Res::Sampled(depth_view),
+                        whole(&sized.depth[cur]),
+                        rec.params(REGION_DEPTH),
+                    ],
+                    render,
+                )?;
+                rec.run(
+                    &self.passes.load_motion,
+                    &[
+                        Res::Sampled(motion_view),
+                        whole(&sized.motion),
+                        rec.params(REGION_MOTION),
+                    ],
+                    render,
+                )?;
+            }
             rec.sync();
             if self.timestamps {
                 device.cmd_write_timestamp(
@@ -1017,7 +1094,7 @@ impl FrameGen {
                     1,
                 );
             }
-            if generate {
+            if generate && dlss.is_none() {
                 let main = rec.params(REGION_MAIN);
                 rec.run(
                     &self.passes.key,
@@ -1075,7 +1152,7 @@ impl FrameGen {
                 ],
                 size,
             )?;
-            if generate {
+            if generate && dlss.is_none() {
                 rec.run(
                     &self.passes.store,
                     &[
@@ -1105,7 +1182,53 @@ impl FrameGen {
                 );
             };
             readable(&sized.real);
-            if generate {
+            if let Some(state) = dlss.as_deref_mut() {
+                let held_image = |img: &Img| dlssg::Image {
+                    image: img.image,
+                    view: img.view,
+                    format: HOLD_FORMAT,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    size,
+                };
+                let frame = dlssg::Frame {
+                    color: held_image(&sized.real[held]),
+                    depth: dlssg::Image {
+                        image: c.depth.image,
+                        view: depth_view,
+                        format: c.depth.format,
+                        aspect: depth_aspect.unwrap_or(vk::ImageAspectFlags::COLOR),
+                        size: [c.depth.extent.0, c.depth.extent.1],
+                    },
+                    motion: dlssg::Image {
+                        image: c.motion.image,
+                        view: motion_view,
+                        format: c.motion.format,
+                        aspect: vk::ImageAspectFlags::COLOR,
+                        size: [c.motion.extent.0, c.motion.extent.1],
+                    },
+                    output: held_image(&sized.generated[held]),
+                    render_size: render,
+                    inputs: c.inputs,
+                    reset: !generate || c.inputs.reset,
+                };
+                state
+                    .evaluate(cmd, &frame)
+                    .map_err(PresentError::Unsupported)?;
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+                        )],
+                    &[],
+                    &[],
+                );
+            }
+            if generate || dlss.is_some() {
                 readable(&sized.generated);
             }
             for (image, aspect, layout) in [
@@ -1185,6 +1308,7 @@ impl FrameGen {
             real: held_image(&sized.real[held]),
             generated: generate.then(|| held_image(&sized.generated[held])),
             srgb_values: is_srgb(c.color.format),
+            fallback: None,
         })
     }
 
