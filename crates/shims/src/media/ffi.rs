@@ -169,7 +169,7 @@ fn open_source(source: *const u8, flags: u32) -> Option<Box<dyn ByteSource>> {
         }
         name.push(byte);
     }
-    let file = std::fs::File::open(String::from_utf8(name).ok()?).ok()?;
+    let file = crate::files::open_read(&String::from_utf8(name).ok()?).ok()?;
     Some(Box::new(FileSource(file)))
 }
 
