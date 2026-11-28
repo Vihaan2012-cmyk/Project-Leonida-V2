@@ -515,6 +515,7 @@ impl Assembly {
         let filter = hooks::content_filter();
         let resources = self.resources();
         self.refresh_placed_textures(&resources, lists);
+        resources.refresh_written();
         if let Some(filter) = &filter {
             self.filter_uploads(filter, &resources, lists);
         }
@@ -542,6 +543,9 @@ impl Assembly {
         let (pool, fence) = (exec.pool, exec.fence);
         let spill: &mut dyn SpillAllocator = &mut exec.spill;
         let mut space = resources.space();
+        for &(start, len) in &writes {
+            space.mark_hot(start, len);
+        }
         let backing = space.backing();
         let layout = self.pipelines.layout;
         let set = self.bindless.set;
@@ -576,7 +580,11 @@ impl Assembly {
             com::note_once(note);
         }
         result?;
-        self.resources().space().reclaim();
+        {
+            let resources = self.resources();
+            resources.release_detiled();
+            resources.space().reclaim();
+        }
         self.gpu.handles.budget.tick();
         drop(converted);
         Ok(())
