@@ -335,6 +335,47 @@ fn intra_blocks_decode_as_in_a_key_frame() {
     );
 }
 
+/// A key frame of one intra macroblock whose first two blocks differ by `step` coded DC steps (16 DC values, two
+/// samples, at the default quantiser), with no coefficients.
+fn two_flat_blocks(flags: u32, step: i32) -> Frame {
+    let dec = decoder(W, H);
+    let mut b = Bits::default();
+    let mut d = [0; 16];
+    d[1] = step;
+    intra_bits(&mut b, &d);
+    intra_bits(&mut b, &[0; 16]);
+    dec.decode(0, &payload_with_flags(flags, &b), true, None)
+        .unwrap()
+}
+
+#[test]
+fn flat_intra_blocks_follow_their_neighbours_when_the_threshold_allows() {
+    // Eight DC units are one sample: the second block is two samples brighter than the first.
+    let flat = two_flat_blocks(0x2E000 | 0xC000, 1);
+    assert_eq!(sample(&flat.planes[0], 7, 3), sample(&flat.planes[0], 0, 3));
+    assert_eq!(sample(&flat.planes[0], 7, 3), 128);
+    assert_eq!(sample(&flat.planes[0], 8, 3), 130);
+    let smooth = two_flat_blocks(0x2E000 | 0xC000 | 0x18, 1);
+    let row: Vec<u8> = (0..16).map(|x| sample(&smooth.planes[0], x, 3)).collect();
+    assert!(row.windows(2).all(|w| w[0] <= w[1]), "{row:?}");
+    assert!(row[7] > row[0] && row[15] > row[8], "{row:?}");
+    // Beyond the threshold (the flag byte times eight) the neighbour is ignored again.
+    let far = two_flat_blocks(0x2E000 | 0xC000 | 0x1, 1);
+    assert_eq!(far.planes[0].data[..16], flat.planes[0].data[..16]);
+}
+
+#[test]
+fn block_edges_are_filtered_unless_the_frame_flags_say_otherwise() {
+    let on = two_flat_blocks(0x22000, 1);
+    // The step across the edge at x = 8 is two samples; both blocks have no coefficients, so both sides move.
+    assert_eq!(sample(&on.planes[0], 7, 3), 129);
+    assert_eq!(sample(&on.planes[0], 8, 3), 129);
+    assert_eq!(sample(&on.planes[0], 6, 3), 128);
+    let no_columns = two_flat_blocks(0x22000 | 0x4000, 1);
+    assert_eq!(sample(&no_columns.planes[0], 7, 3), 128);
+    assert_eq!(sample(&no_columns.planes[0], 8, 3), 130);
+}
+
 #[test]
 fn inter_frames_need_a_reference_of_the_same_size() {
     let dec = decoder(W, H);
