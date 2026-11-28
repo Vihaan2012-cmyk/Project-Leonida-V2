@@ -13,7 +13,7 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 use crate::trace::note;
 
 /// The most read notes one boot writes.
-const LIMIT: usize = 4000;
+const LIMIT: usize = 200_000;
 
 static WRITTEN: AtomicUsize = AtomicUsize::new(0);
 static HANDLES: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
