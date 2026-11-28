@@ -460,6 +460,8 @@ pub struct ConfigArgs {
 pub enum ConfigCommand {
     /// Print every setting in use (the default command).
     Show,
+    /// Say whether DLSS can run on this PC and, when it cannot, why not.
+    Dlss,
     /// Replace settings files with their documented defaults.
     Reset {
         /// Only these files, such as graphics or input.toml. All of them when omitted.
