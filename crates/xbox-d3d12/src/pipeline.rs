@@ -108,6 +108,20 @@ pub struct GraphicsPsoDesc {
 }
 
 impl GraphicsPsoDesc {
+    /// What is wrong with the description whatever the GPU: refused when the title creates the pipeline.
+    pub fn check(&self) -> Result<(), PipelineError> {
+        let mesh = !self.ms.is_empty();
+        if mesh && !(self.vs.is_empty() && self.gs.is_empty()) {
+            return Err(PipelineError::Invalid(
+                "a mesh shader beside a vertex or geometry shader",
+            ));
+        }
+        if !mesh && self.vs.is_empty() {
+            return Err(PipelineError::Invalid("no vertex or mesh shader"));
+        }
+        Ok(())
+    }
+
     pub fn new(root: Arc<RootSignature>) -> GraphicsPsoDesc {
         GraphicsPsoDesc {
             root,
@@ -461,16 +475,9 @@ impl PipelineEnv {
     }
 
     pub fn create_graphics(&self, desc: &GraphicsPsoDesc) -> Result<Arc<Pipeline>, PipelineError> {
+        desc.check()?;
         let features = &self.ctx.features;
         let mesh = !desc.ms.is_empty();
-        if mesh && !(desc.vs.is_empty() && desc.gs.is_empty()) {
-            return Err(PipelineError::Invalid(
-                "a mesh shader beside a vertex or geometry shader",
-            ));
-        }
-        if !mesh && desc.vs.is_empty() {
-            return Err(PipelineError::Invalid("no vertex or mesh shader"));
-        }
         if !features.pixel_shaders {
             return Err(PipelineError::NoFeature(
                 "dynamic rendering and fragment barycentrics",
