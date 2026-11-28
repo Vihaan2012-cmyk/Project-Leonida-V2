@@ -611,6 +611,7 @@ mod imp {
             depth_reversed: inputs.depth_inverted,
             camera_near: inputs.camera_near,
             camera_far: inputs.camera_far,
+            camera_fov_y: inputs.camera_fov_vertical,
             reset: inputs.reset,
         });
     }

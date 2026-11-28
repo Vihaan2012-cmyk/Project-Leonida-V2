@@ -38,6 +38,8 @@ pub struct FrameInputs {
     pub depth_reversed: bool,
     pub camera_near: f32,
     pub camera_far: f32,
+    /// Vertical field of view in radians; 0 when the dispatch did not give one.
+    pub camera_fov_y: f32,
     /// A camera cut or a history reset: nothing may be generated between the previous frame and this one.
     pub reset: bool,
 }
