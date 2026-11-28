@@ -13,6 +13,8 @@ use pe_loader::ImportRef;
 #[cfg(windows)]
 mod crash;
 #[cfg(windows)]
+pub mod probes;
+#[cfg(windows)]
 mod threads;
 
 const CAPACITY: usize = 1 << 14;

@@ -164,6 +164,15 @@ fn run(path: &Path, args: &RunArgs, plan: &RuntimePlan) -> Result<ExitCode> {
                 Err(error) => eprintln!("warning: breakpoints not set: {error}"),
             }
         }
+        #[cfg(windows)]
+        {
+            let probes = shims::trace::probes::sites_from_env();
+            if !probes.is_empty() {
+                // SAFETY: the image just loaded, before any of its threads run.
+                let armed = unsafe { shims::trace::probes::arm(module.base(), &probes) };
+                println!("trace: {armed} pass probes set");
+            }
+        }
         let folder = boot.clone();
         std::thread::spawn(move || {
             loop {
