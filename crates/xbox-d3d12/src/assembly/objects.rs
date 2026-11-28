@@ -107,7 +107,20 @@ pub fn new_resource(
         },
     );
     // SAFETY: the creation reference is handed out.
-    unsafe { hand_out(object as *mut c_void, riid, out) }
+    let result = unsafe { hand_out(object as *mut c_void, riid, out) };
+    if std::env::var_os("LEONIDA_TRACE_RESOURCES").is_some() {
+        // SAFETY: `out` was checked by `hand_out`; read back what it wrote.
+        let written = if out.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe { *out }
+        };
+        crate::com::note(format!(
+            "resource {id:?} ({:?}, {}x{}) object {object:p} written to {out:p} as {written:p}, result {result:#x}",
+            desc.dimension, desc.width, desc.height
+        ));
+    }
+    result
 }
 
 /// The resource id behind a COM pointer of this layer.
@@ -234,7 +247,9 @@ pub unsafe fn write_resource_desc(out: *mut u8, d: &ResourceDesc) {
 }
 
 /// `GetDesc`: a 56-byte struct, buffer first on the console.
-unsafe extern "win64" fn r_get_desc(buffer: *mut u8, this: *mut c_void) -> *mut u8 {
+/// Slot 10, `GetDesc`: the title calls it as a member, `(this, &desc)` (rva 0x0501f530 passes the resource first and
+/// its stack buffer second). Reading it the other way round wrote a description over the object itself.
+unsafe extern "win64" fn r_get_desc(this: *mut c_void, buffer: *mut u8) -> *mut u8 {
     // SAFETY: a resource of this layer; `buffer` has room for 56 bytes.
     unsafe { write_resource_desc(buffer, &state::<ResourceObject>(this).desc) };
     buffer

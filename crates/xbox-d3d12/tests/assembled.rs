@@ -971,3 +971,28 @@ fn a_display_buffer_made_through_slot_127_is_a_resource() {
     assert_eq!(result, 0);
     assert!(!out.is_null());
 }
+
+/// The title calls a resource's `GetDesc` (slot 10) as a member, `(this, &desc)` (rva 0x0501f530). The
+/// description lands in the buffer, and the object, whose vtable comes first, is left alone.
+#[test]
+fn a_resource_describes_itself_into_the_callers_buffer_and_stays_whole() {
+    let Some(h) = harness() else { return };
+    let texture = h.committed(1, &texture_desc(64, 32, 28, 0), 0);
+    // SAFETY: the object's first word is its vtable.
+    let vtable_before = unsafe { *(texture as *const usize) };
+    let mut desc = [0u8; 56];
+    // SAFETY: slot 10 with the title's argument order; the buffer has room for the description.
+    unsafe {
+        let get_desc: unsafe extern "win64" fn(Ptr, *mut u8) -> *mut u8 = slot(texture, 10);
+        assert_eq!(get_desc(texture, desc.as_mut_ptr()), desc.as_mut_ptr());
+    }
+    assert_eq!(
+        u32::from_le_bytes(desc[0..4].try_into().unwrap()),
+        3,
+        "Texture2D"
+    );
+    assert_eq!(u64::from_le_bytes(desc[16..24].try_into().unwrap()), 64);
+    assert_eq!(u32::from_le_bytes(desc[24..28].try_into().unwrap()), 32);
+    // SAFETY: as above.
+    assert_eq!(unsafe { *(texture as *const usize) }, vtable_before);
+}
