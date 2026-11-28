@@ -12,7 +12,7 @@ use ash::vk;
 pub use command::*;
 pub use context::{Features, VkContext};
 pub use replay::{
-    Arena, ReplayEnv, ReplayReport, ReplayStats, Replayer, SpillAllocator, index_type, run,
+    Arena, Chunked, ReplayEnv, ReplayReport, ReplayStats, Replayer, SpillAllocator, index_type, run,
 };
 
 #[derive(Debug, thiserror::Error)]

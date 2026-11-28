@@ -113,6 +113,12 @@ impl VertexBinder {
         self.mask & !self.set_mask != 0
     }
 
+    /// The command buffer binds nothing any more (a new one): every slot the list set is to be bound again.
+    pub fn invalidate(&mut self) {
+        self.applied = [None; VERTEX_SLOTS];
+        self.dirty = self.set_mask;
+    }
+
     /// Whether a bind call is due.
     pub fn any_pending(&self) -> bool {
         self.dirty & self.mask != 0
@@ -260,6 +266,17 @@ mod tests {
         binder.pipeline_bound(0);
         binder.pipeline_bound(0b11);
         assert_eq!(bind_all(&mut binder), vec![(0, 2)]);
+    }
+
+    #[test]
+    fn invalidated_bindings_are_all_bound_again() {
+        let mut binder = VertexBinder::default();
+        binder.pipeline_bound(0b101);
+        binder.set(0, &[view(1), view(2), view(3)]);
+        bind_all(&mut binder);
+        assert_eq!(bind_all(&mut binder), vec![]);
+        binder.invalidate();
+        assert_eq!(bind_all(&mut binder), vec![(0, 1), (2, 1)]);
     }
 
     #[test]
