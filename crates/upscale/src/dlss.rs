@@ -163,3 +163,41 @@ pub fn query_capabilities(
         modes,
     })
 }
+
+/// Whether DLSS can run on this machine and, when it cannot, the reason in a sentence for the player.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DlssReport {
+    pub available: bool,
+    pub summary: String,
+}
+
+/// Looks for the DLSS library and NGX, opens an NVIDIA device and asks NGX whether DLSS is available. Needs no
+/// renderer; takes a second or two because it creates a Vulkan device.
+pub fn report(config: &DlssConfig) -> DlssReport {
+    let unavailable = |reason: String| DlssReport {
+        available: false,
+        summary: format!("unavailable: {reason}"),
+    };
+    let located = match config.locate() {
+        Ok(located) => located,
+        Err(missing) => return unavailable(missing.to_string()),
+    };
+    if let Err(reason) = ngx::Api::open(config.ngx_runtime.as_deref()) {
+        return unavailable(reason);
+    }
+    match query_capabilities(config, [1920, 1080]) {
+        Err(reason) => unavailable(reason),
+        Ok(capabilities) => match capabilities.availability.reason() {
+            Some(reason) => unavailable(format!("{reason} ({})", capabilities.device_name)),
+            None => DlssReport {
+                available: true,
+                summary: format!(
+                    "available on {} (nvngx_dlss.dll from {}: {})",
+                    capabilities.device_name,
+                    located.source.describe(),
+                    located.path.display()
+                ),
+            },
+        },
+    }
+}
