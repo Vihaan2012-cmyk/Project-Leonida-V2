@@ -22,10 +22,12 @@ use std::sync::{Arc, Mutex};
 use ash::ext::external_memory_host;
 use ash::vk;
 
+mod budget;
 mod dirty;
 mod sync;
 mod transfer;
 
+pub use budget::{Budget, Class, Counters, Grant, MemoryExtensions, Placement, Request};
 use dirty::Tiles;
 pub use sync::HostAccess;
 pub use transfer::{TimelineWait, TransferQueue, pick_transfer_family};
@@ -151,6 +153,8 @@ pub struct Handles {
     pub queue_family: u32,
     /// Held while binding, so the queue can also be submitted to by the code that shares it.
     pub queue_lock: Arc<Mutex<()>>,
+    /// The device-local budget every allocation of the layer goes through.
+    pub budget: Arc<Budget>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,6 +292,17 @@ struct Memory {
     /// Where the imported host memory is. It equals the window address except for runs seen at another address.
     host: u64,
     tiles: Tiles,
+    /// The device-local memory of a mirrored run, as the budget granted it.
+    grant: Option<Grant>,
+}
+
+/// A mapped run no device-local memory could back: the host memory is the game's and intact, the window has
+/// nothing bound there, and `retry_deferred` binds it when memory is free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Deferred {
+    len: u64,
+    host: u64,
+    policy: SyncPolicy,
 }
 
 struct Bind {
@@ -314,6 +329,10 @@ pub struct AddressSpace {
     batching: bool,
     retired_buffers: Vec<vk::Buffer>,
     retired_memory: Vec<vk::DeviceMemory>,
+    retired_grants: Vec<Grant>,
+    deferred: BTreeMap<u64, Deferred>,
+    lenient: bool,
+    reclaims: u32,
     generation: u64,
     transfer: Option<transfer::Transfer>,
     /// The families the window and the copy buffers are shared by: more than one when a transfer queue of another
@@ -404,6 +423,10 @@ impl AddressSpace {
             batching: false,
             retired_buffers: Vec::new(),
             retired_memory: Vec::new(),
+            retired_grants: Vec::new(),
+            deferred: BTreeMap::new(),
+            lenient: false,
+            reclaims: 0,
             generation: 0,
             transfer: None,
             families,
@@ -649,13 +672,109 @@ impl AddressSpace {
         let mut done = 0;
         while done < len {
             let part = chunk.min(len - done);
-            self.import(va + done, host + done, part, policy)?;
+            match self.import(va + done, host + done, part, policy) {
+                Ok(()) => {}
+                Err(MemoryError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY))
+                    if self.lenient && self.backing == Backing::Mirrored =>
+                {
+                    self.defer_run(va + done, host + done, part, policy);
+                }
+                Err(e) => return Err(e),
+            }
             done += part;
         }
         if self.backing == Backing::Mirrored {
             self.sync.dirty.add(va, va + len);
         }
         self.finish()
+    }
+
+    /// Runs `body`, in which a mirrored run that no device-local memory can back is left unbound
+    /// (`deferred_bytes`) and bound by `retry_deferred` once memory is free, rather than failing the mapping. For
+    /// the game's own memory: it asked for an allocation the console would have given it, and the GPU reads zeros
+    /// from the run meanwhile.
+    pub fn lenient<R>(&mut self, body: impl FnOnce(&mut AddressSpace) -> R) -> R {
+        let was = std::mem::replace(&mut self.lenient, true);
+        let result = body(self);
+        self.lenient = was;
+        result
+    }
+
+    fn defer_run(&mut self, va: u64, host: u64, len: u64, policy: SyncPolicy) {
+        self.deferred.insert(va, Deferred { len, host, policy });
+        self.h.budget.defer(len as i64);
+        self.h.budget.note_unbound(va, len);
+    }
+
+    /// The bytes of the game's memory left unbound for want of device-local memory.
+    pub fn deferred_bytes(&self) -> u64 {
+        self.deferred.values().map(|d| d.len).sum()
+    }
+
+    /// Forgets what is deferred inside `va..va + len`, keeping the rest of each run.
+    fn forget_deferred(&mut self, va: u64, len: u64) {
+        let end = va + len;
+        let hit: Vec<u64> = self
+            .deferred
+            .range(..end)
+            .filter(|(s, d)| **s + d.len > va)
+            .map(|(s, _)| *s)
+            .collect();
+        for start in hit {
+            let run = self.deferred.remove(&start).expect("found above");
+            let cut_from = start.max(va);
+            let cut_to = (start + run.len).min(end);
+            self.h.budget.defer(-((cut_to - cut_from) as i64));
+            if start < cut_from {
+                self.deferred.insert(
+                    start,
+                    Deferred {
+                        len: cut_from - start,
+                        ..run
+                    },
+                );
+            }
+            if cut_to < start + run.len {
+                self.deferred.insert(
+                    cut_to,
+                    Deferred {
+                        len: start + run.len - cut_to,
+                        host: run.host + (cut_to - start),
+                        ..run
+                    },
+                );
+            }
+        }
+    }
+
+    /// Tries again to back the runs that were deferred, in address order, until one is refused. Returns the
+    /// bytes bound now.
+    pub fn retry_deferred(&mut self) -> Result<u64, MemoryError> {
+        if self.deferred.is_empty() {
+            return Ok(0);
+        }
+        let runs: Vec<(u64, Deferred)> = self.deferred.iter().map(|(k, v)| (*k, *v)).collect();
+        let mut bound = 0;
+        let mut result = Ok(());
+        for (va, run) in runs {
+            match self.import(va, run.host, run.len, run.policy) {
+                Ok(()) => {
+                    self.deferred.remove(&va);
+                    self.h.budget.defer(-(run.len as i64));
+                    self.sync.dirty.add(va, va + run.len);
+                    bound += run.len;
+                }
+                Err(MemoryError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)) => break,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        let committed = self.commit();
+        result?;
+        committed?;
+        Ok(bound)
     }
 
     /// `XMemMapPhysicalPages`: `count` pages, now mapped at `va`.
@@ -747,7 +866,7 @@ impl AddressSpace {
         len: u64,
         policy: SyncPolicy,
     ) -> Result<(), MemoryError> {
-        let (handle, mirror) = match self.backing {
+        let (handle, mirror, grant) = match self.backing {
             Backing::Direct => {
                 // SAFETY: the caller of `map_host` keeps the memory mapped until `unmap`.
                 let (memory, bits) = unsafe { self.import_memory(host, len, true)? };
@@ -760,9 +879,12 @@ impl AddressSpace {
                         host: bits,
                     });
                 }
-                (memory, None)
+                (memory, None, None)
             }
-            Backing::Mirrored => self.import_mirrored(host, len)?,
+            Backing::Mirrored => {
+                let (handle, mirror, grant) = self.import_mirrored(host, len)?;
+                (handle, mirror, Some(grant))
+            }
         };
         let id = self.next_memory;
         self.next_memory += 1;
@@ -775,6 +897,7 @@ impl AddressSpace {
                 policy,
                 host,
                 tiles: Tiles::default(),
+                grant,
             },
         );
         self.extents.insert(
@@ -798,7 +921,7 @@ impl AddressSpace {
         &self,
         va: u64,
         len: u64,
-    ) -> Result<(vk::DeviceMemory, Option<Mirror>), MemoryError> {
+    ) -> Result<(vk::DeviceMemory, Option<Mirror>, Grant), MemoryError> {
         let device = &self.h.device;
         // SAFETY: fresh objects; on failure each one made so far is destroyed. The host memory stays mapped, as
         // `map_host` requires.
@@ -836,22 +959,17 @@ impl AddressSpace {
                 device.free_memory(import, None);
                 return Err(e.into());
             }
-            let kind = self.pick_type(
-                self.window.type_bits,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                vk::MemoryPropertyFlags::HOST_VISIBLE,
-            );
-            let mut flags = vk::MemoryAllocateFlagsInfo::default()
-                .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-            let local = device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(len)
-                    .memory_type_index(kind)
-                    .push_next(&mut flags),
-                None,
+            let local = self.h.budget.allocate(
+                device,
+                &Request {
+                    size: len,
+                    type_bits: self.window.type_bits,
+                    class: Class::Mirror,
+                    device_address: true,
+                },
             );
             match local {
-                Ok(local) => Ok((local, Some(Mirror { buffer, import }))),
+                Ok(grant) => Ok((grant.memory, Some(Mirror { buffer, import }), grant)),
                 Err(e) => {
                     device.destroy_buffer(buffer, None);
                     device.free_memory(import, None);
@@ -870,6 +988,7 @@ impl AddressSpace {
     }
 
     fn unmap_range(&mut self, va: u64, len: u64) {
+        self.forget_deferred(va, len);
         self.sync.forget(va, va + len);
         for cut in self.extents.remove(va, len) {
             self.pending.push(Bind {
@@ -883,6 +1002,7 @@ impl AddressSpace {
                 if memory.live == 0 {
                     let memory = self.memories.remove(&cut.memory).expect("found above");
                     self.retired_memory.push(memory.handle);
+                    self.retired_grants.extend(memory.grant);
                     if let Some(mirror) = memory.mirror {
                         self.retired_buffers.push(mirror.buffer);
                         self.retired_memory.push(mirror.import);
@@ -953,11 +1073,20 @@ impl AddressSpace {
                 self.h.device.free_memory(memory, None);
             }
         }
+        let freed = !self.retired_grants.is_empty();
+        for grant in self.retired_grants.drain(..) {
+            self.h.budget.release(&grant);
+        }
+        self.reclaims = self.reclaims.wrapping_add(1);
+        if !self.deferred.is_empty() && (freed || self.reclaims.is_multiple_of(64)) {
+            let _ = self.retry_deferred();
+        }
     }
 }
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
+        self.forget_deferred(0, u64::MAX / 2);
         let _ = self.commit();
         // SAFETY: the owner drops the address space only once the GPU is idle.
         unsafe {
@@ -969,6 +1098,7 @@ impl Drop for AddressSpace {
             self.h.device.destroy_buffer(self.window.buffer, None);
             for memory in self.memories.drain().map(|(_, m)| m) {
                 self.h.device.free_memory(memory.handle, None);
+                self.retired_grants.extend(memory.grant);
                 if let Some(mirror) = memory.mirror {
                     self.h.device.destroy_buffer(mirror.buffer, None);
                     self.h.device.free_memory(mirror.import, None);
@@ -981,6 +1111,8 @@ impl Drop for AddressSpace {
 
 #[cfg(test)]
 mod bench;
+#[cfg(test)]
+mod budget_tests;
 pub mod hooks;
 #[cfg(test)]
 mod sync_tests;

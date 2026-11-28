@@ -36,6 +36,9 @@ pub struct GpuConfig {
     pub gpu: Option<String>,
     /// Enable the Khronos validation layer when it is installed (`LEONIDA_VALIDATION`).
     pub validation: bool,
+    /// Pretend the GPU has this many MiB of device-local memory for the layer's own allocations
+    /// (`LEONIDA_VRAM_LIMIT_MB`), to see how the title behaves with less.
+    pub vram_limit_mib: Option<u64>,
 }
 
 impl GpuConfig {
@@ -44,6 +47,9 @@ impl GpuConfig {
             window,
             gpu: std::env::var("LEONIDA_GPU").ok().map(|n| n.to_lowercase()),
             validation: std::env::var_os("LEONIDA_VALIDATION").is_some(),
+            vram_limit_mib: std::env::var("LEONIDA_VRAM_LIMIT_MB")
+                .ok()
+                .and_then(|v| v.trim().parse().ok()),
         }
     }
 }
@@ -396,6 +402,11 @@ impl Gpu {
                 .fragment_shader_pixel_interlock(true);
             let mut e_atomics = vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT::default()
                 .shader_image_int64_atomics(true);
+            let memory_extensions = memory::MemoryExtensions::available(&instance, physical);
+            let mut e_priority =
+                vk::PhysicalDeviceMemoryPriorityFeaturesEXT::default().memory_priority(true);
+            let mut e_pageable = vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT::default()
+                .pageable_device_local_memory(true);
             let mut chain = vk::PhysicalDeviceFeatures2::default()
                 .features(enabled)
                 .push_next(&mut e13)
@@ -428,6 +439,15 @@ impl Gpu {
                 if config.window || has(&extensions, name) {
                     add(name);
                 }
+            }
+            for name in memory_extensions.names() {
+                add(name);
+            }
+            if memory_extensions.priority {
+                chain = chain.push_next(&mut e_priority);
+            }
+            if memory_extensions.pageable {
+                chain = chain.push_next(&mut e_pageable);
             }
             let mut optional = OptionalExtensions::default();
             if !ngx_device.is_empty() && ngx_device.iter().all(|n| has(&extensions, n)) {
@@ -487,6 +507,10 @@ impl Gpu {
                 queue: Arc::new(Mutex::new(main_queue)),
                 family: choice.family,
             };
+            let budget = memory::Budget::new(&instance, physical, memory_extensions);
+            if let Some(mib) = config.vram_limit_mib {
+                budget.set_limit(Some(mib << 20));
+            }
             let handles = Handles {
                 instance,
                 physical,
@@ -494,6 +518,7 @@ impl Gpu {
                 queue: bind_queue,
                 queue_family: choice.family,
                 queue_lock: Arc::new(Mutex::new(())),
+                budget,
             };
             let per_stage_images = limits
                 .max_per_stage_descriptor_sampled_images
