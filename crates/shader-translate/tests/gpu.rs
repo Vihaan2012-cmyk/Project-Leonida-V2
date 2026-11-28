@@ -307,6 +307,23 @@ fn hand_written_programs_match_on_the_gpu() {
          s_cbranch_scc1 -7
          s_endpgm",
     ];
+    let mut padded = String::from(
+        "s_mov_b32 s5, 0
+",
+    );
+    for _ in 0..650 {
+        padded += "s_add_u32 s5, s5, 1
+s_cmp_eq_u32 s5, 100000
+s_cbranch_scc1 0
+";
+    }
+    padded += programs[programs.len() - 1];
+    let blocks = shader_ir::lift(&rdna::assemble(&padded, true).unwrap(), false)
+        .unwrap()
+        .blocks
+        .len();
+    assert!(blocks >= 600, "{blocks}");
+    let programs: Vec<&str> = programs.iter().copied().chain([padded.as_str()]).collect();
     for (index, source) in programs.iter().enumerate() {
         let (wave, memory) = prepared(index as u64 + 11, false);
         assert!(run(&gpu, source, wave, memory, &format!("fixed{index}")));
