@@ -1,4 +1,5 @@
-//! `LEONIDA_MEMORY_MAP=<seconds>`: every that many seconds, `memory.txt` in the trace folder says where the process's
+//! `LEONIDA_MEMORY_MAP=<seconds>`: every that many seconds, and at once whenever private memory has grown 3 GiB since
+//! the last report (kept as `memory-<n>gib.txt`), `memory.txt` in the trace folder says where the process's
 //! memory is: committed and resident bytes by kind (private, mapped sections, images), and the allocations holding
 //! the most resident memory, with the image offset of the call that made each when it is known.
 
@@ -212,11 +213,54 @@ pub fn schedule(folder: PathBuf) {
         return;
     };
     std::thread::spawn(move || {
+        let mut last_written = 0usize;
+        let mut since = 0u64;
         loop {
-            std::thread::sleep(Duration::from_secs(seconds.max(1)));
-            let _ = std::fs::write(folder.join("memory.txt"), report());
+            std::thread::sleep(Duration::from_secs(1));
+            since += 1;
+            let now = private_bytes();
+            let grew = now.saturating_sub(last_written) >= GROWTH;
+            if since >= seconds.max(1) || grew {
+                let mut text = report();
+                if grew {
+                    text = format!(
+                        "written because private memory grew to {:.2} GiB
+{text}",
+                        gib(now)
+                    );
+                    let index = now >> 30;
+                    let _ = std::fs::write(folder.join(format!("memory-{index}gib.txt")), &text);
+                }
+                let _ = std::fs::write(folder.join("memory.txt"), text);
+                last_written = now;
+                since = 0;
+            }
         }
     });
+}
+
+/// How much private memory has to grow between two reports for one to be written at once.
+const GROWTH: usize = 3 << 30;
+
+/// The process's private (committed) bytes.
+fn private_bytes() -> usize {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    // SAFETY: an all-zero counters structure, sized for the call, which fills it for this process.
+    unsafe {
+        let mut counters: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        if K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast(),
+            counters.cb,
+        ) == 0
+        {
+            return 0;
+        }
+        counters.PrivateUsage
+    }
 }
 
 #[cfg(test)]
