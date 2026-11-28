@@ -100,7 +100,8 @@ pub struct StreamInfo {
 
 impl StreamInfo {
     pub fn parse(bytes: &[u8; INFO_BYTES]) -> StreamInfo {
-        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+        let word =
+            |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
         StreamInfo {
             kind: word(0),
             flags: word(4),
@@ -141,8 +142,10 @@ pub struct Command {
 
 impl Command {
     pub fn parse(bytes: &[u8; COMMAND_BYTES]) -> Command {
-        let float = |at: usize| f32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
-        let address = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"));
+        let float =
+            |at: usize| f32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+        let address =
+            |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"));
         Command {
             gains: [float(0), float(4)],
             input: address(8),
@@ -217,8 +220,16 @@ impl Stream {
         let stereo = info.stereo();
         let (processor, floats) = match info.kind {
             KIND_CONVOLUTION => {
-                let (channels, batch) = if stereo { (2, STEREO_BATCH) } else { (1, MONO_BATCH) };
-                let planes = if info.flags & FLAG_STEREO_RESPONSE != 0 { 2 } else { 1 };
+                let (channels, batch) = if stereo {
+                    (2, STEREO_BATCH)
+                } else {
+                    (1, MONO_BATCH)
+                };
+                let planes = if info.flags & FLAG_STEREO_RESPONSE != 0 {
+                    2
+                } else {
+                    1
+                };
                 let each = response.len() / planes;
                 let convolvers = (0..channels)
                     .map(|c| {
@@ -353,7 +364,11 @@ impl Dsp {
         self.note_once("connect", || {
             format!("XDspConnectWithMaximumStreamLimit version {version:#x}: the title's shared block is not used")
         });
-        let limit = if limit == 0 { DEFAULT_LIMIT } else { limit as usize };
+        let limit = if limit == 0 {
+            DEFAULT_LIMIT
+        } else {
+            limit as usize
+        };
         self.connections.insert(
             handle,
             Connection {
@@ -537,7 +552,10 @@ mod tests {
             (2, 2, 2)
         );
         let tail = 1200 - MONO_BATCH;
-        assert!((second[tail] - 0.5).abs() < 1e-4, "0.25 at the second batch, doubled by the gain");
+        assert!(
+            (second[tail] - 0.5).abs() < 1e-4,
+            "0.25 at the second batch, doubled by the gain"
+        );
         assert!(
             second
                 .iter()
@@ -570,7 +588,10 @@ mod tests {
         stream.process([1.0, 1.0], &input, &mut output);
         assert!((output[5] - 1.0).abs() < 1e-4);
         assert!((output[STEREO_BATCH + 2 + 9] - 0.5).abs() < 1e-4);
-        assert!(output[STEREO_BATCH + 5].abs() < 1e-4, "left's response does not reach the right channel");
+        assert!(
+            output[STEREO_BATCH + 5].abs() < 1e-4,
+            "left's response does not reach the right channel"
+        );
     }
 
     #[test]
@@ -594,12 +615,18 @@ mod tests {
             Err(DspError::TooManyStreams(2))
         );
         let other = dsp.connect(0x18, 0x80);
-        assert_eq!(dsp.activate(other, &info(0, 0), &[]), Err(DspError::NoResponse));
+        assert_eq!(
+            dsp.activate(other, &info(0, 0), &[]),
+            Err(DspError::NoResponse)
+        );
         let odd = StreamInfo {
             kind: 9,
             ..info(0, 8)
         };
-        assert_eq!(dsp.activate(other, &odd, &response), Err(DspError::UnknownKind(9)));
+        assert_eq!(
+            dsp.activate(other, &odd, &response),
+            Err(DspError::UnknownKind(9))
+        );
         assert!(matches!(dsp.stream(5), Err(DspError::UnknownStream(5))));
         assert_eq!(DspError::UnknownKind(9).code(), 0x8000_4001);
     }
@@ -613,7 +640,10 @@ mod tests {
         let kept = dsp.stream(a.stream).unwrap();
         dsp.deactivate(a.stream).unwrap();
         assert!(!lock_stream(&kept).status().running());
-        assert_eq!(dsp.deactivate(a.stream), Err(DspError::UnknownStream(a.stream)));
+        assert_eq!(
+            dsp.deactivate(a.stream),
+            Err(DspError::UnknownStream(a.stream))
+        );
         assert_eq!(dsp.stream_count(), 1);
         dsp.disconnect(connection).unwrap();
         assert_eq!((dsp.stream_count(), dsp.connection_count()), (0, 0));
@@ -665,9 +695,16 @@ mod tests {
         assert!(output[0].abs() < 1e-4);
         assert!((output[2] - input[0]).abs() < 1e-3);
         assert!((output[10] - input[8]).abs() < 1e-3);
-        let null = Command { input: 0, ..command };
+        let null = Command {
+            input: 0,
+            ..command
+        };
         // SAFETY: a null address is refused before it is read.
         assert_eq!(unsafe { stream.run(&null) }, Err(DspError::NullBuffer));
-        assert_eq!(stream.status().done(), 1, "a refused command leaves the fence alone");
+        assert_eq!(
+            stream.status().done(),
+            1,
+            "a refused command leaves the fence alone"
+        );
     }
 }

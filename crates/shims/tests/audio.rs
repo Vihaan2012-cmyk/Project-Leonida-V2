@@ -216,40 +216,258 @@ fn opus_commands_open_decode_and_close_with_results_the_title_state_machine_expe
     }
 }
 
+type DspConnect = unsafe extern "win64" fn(usize, u32, u32, u32, u32, *mut u64) -> u32;
+type DspActivate = unsafe extern "win64" fn(u64, *const u8, *mut usize, *mut u64) -> u32;
+type DspSubmit = unsafe extern "win64" fn(u64, *const u8, *mut u32) -> u32;
+type DspClose = unsafe extern "win64" fn(u64) -> u32;
+
+struct Dsp {
+    connect: DspConnect,
+    activate: DspActivate,
+    submit: DspSubmit,
+    deactivate: DspClose,
+    disconnect: DspClose,
+}
+
+fn dsp_shims() -> Dsp {
+    Dsp {
+        connect: shim("chad.dll", "XDspConnectWithMaximumStreamLimit"),
+        activate: shim("chad.dll", "XDspActivate"),
+        submit: shim("chad.dll", "XDspSubmitCommand"),
+        deactivate: shim("chad.dll", "XDspDeactivate"),
+        disconnect: shim("chad.dll", "XDspDisconnect"),
+    }
+}
+
+/// The reverb node's side of the protocol: the 0x1c-byte info it builds for a stream.
+fn info_bytes(flags: u32, mode: u32, response: &[f32]) -> [u8; 0x1c] {
+    let mut info = [0u8; 0x1c];
+    info[0..4].copy_from_slice(&1u32.to_le_bytes());
+    info[4..8].copy_from_slice(&flags.to_le_bytes());
+    info[8..12].copy_from_slice(&0x400u32.to_le_bytes());
+    info[12..16].copy_from_slice(&mode.to_le_bytes());
+    info[16..20].copy_from_slice(&(response.len() as u32).to_le_bytes());
+    info[0x14..0x1c].copy_from_slice(&(response.as_ptr() as u64).to_le_bytes());
+    info
+}
+
+/// The 0x20-byte command: a pair of gains of 1.0, then the pair's two buffers.
+fn command_bytes(input: &[f32], output: &mut [f32]) -> [u8; 0x20] {
+    let mut command = [0u8; 0x20];
+    command[0..4].copy_from_slice(&1.0f32.to_le_bytes());
+    command[4..8].copy_from_slice(&1.0f32.to_le_bytes());
+    command[8..0x10].copy_from_slice(&(input.as_ptr() as u64).to_le_bytes());
+    command[0x10..0x18].copy_from_slice(&(output.as_mut_ptr() as u64).to_le_bytes());
+    command
+}
+
+/// What the title checks before it reads a batch back (0x4e5acc0): the status block's fence and error words.
+fn status_words(status: usize) -> [u32; 4] {
+    // SAFETY: the DSP gave this address; the block is four words and lives until the stream is deactivated.
+    unsafe { (status as *const [u32; 4]).read_volatile() }
+}
+
 #[test]
-fn the_dsp_calls_return_zero_and_voices_finish_on_the_clock() {
+fn a_reverb_stream_completes_its_fence_before_the_submit_returns_the_way_the_title_polls_it() {
     let _guard = serial();
-    type Connect = unsafe extern "win64" fn(u64, u64, u64, u64) -> u32;
-    type Call0 = unsafe extern "win64" fn() -> u32;
-    type Submit = unsafe extern "win64" fn(u64, u64) -> u32;
-    let connect: Connect = shim("chad.dll", "XDspConnectWithMaximumStreamLimit");
-    let activate: Call0 = shim("chad.dll", "XDspActivate");
-    let deactivate: Call0 = shim("chad.dll", "XDspDeactivate");
-    let disconnect: Call0 = shim("chad.dll", "XDspDisconnect");
-    let submit: Submit = shim("chad.dll", "XDspSubmitCommand");
-    // SAFETY: the shapes the executable uses.
+    let dsp = dsp_shims();
+    let mut response = vec![0.0f32; 1500];
+    response[3] = 0.5;
+    response[1100] = -0.25;
+    let (mut connection, mut status, mut stream, mut fence) = (0u64, 0usize, 0u64, 0u32);
+    let info = info_bytes(0, 1, &response);
+    let mut input = vec![0.0f32; 1024];
+    input[0] = 1.0;
+    let mut output = vec![7.0f32; 1024];
+    // SAFETY: the shapes the executable uses; every pointer is valid.
     unsafe {
-        assert_eq!(connect(0, 0, 0, 0x80), 0);
-        assert_eq!(activate(), 0);
-        with_engine(|e| e.take_completions());
-        assert!(with_engine(|e| e.is_active() && !e.has_device()));
-        let voice = with_engine(|e| e.add_voice(VoiceParams::new(48_000)));
-        let buffer = with_engine(|e| {
-            let id = e.new_buffer_id();
-            let pcm = vec![100i16; 4800];
-            e.queue_buffer(voice, Buffer::from_i16(id, &pcm, 1, Looping::Once));
-            id
-        });
-        assert_eq!(submit(1, 2), 0);
+        assert_eq!((dsp.connect)(0, 0x60000, 0x18, 0x80, 1, &mut connection), 0);
+        assert_ne!(connection, 0);
+        assert_eq!(
+            (dsp.activate)(connection, info.as_ptr(), &mut status, &mut stream),
+            0
+        );
+        assert!(status != 0 && stream != 0);
+        let words = status_words(status);
+        assert_eq!(
+            (words[0], words[1], words[3]),
+            (1, 0, 0),
+            "running, nothing done, no error"
+        );
+
+        let command = command_bytes(&input, &mut output);
+        assert_eq!((dsp.submit)(stream, command.as_ptr(), &mut fence), 0);
+        assert_eq!(fence, 1);
+        let words = status_words(status);
+        assert_eq!(
+            (words[1], words[3]),
+            (fence, 0),
+            "done matches the fence, no error"
+        );
+        assert!((output[3] - 0.5).abs() < 1e-4);
+        assert!(
+            output[4..].iter().all(|s| s.abs() < 1e-4),
+            "the rest of the batch is quiet"
+        );
+
+        let silence = vec![0.0f32; 1024];
+        let mut tail = vec![7.0f32; 1024];
+        let command = command_bytes(&silence, &mut tail);
+        assert_eq!((dsp.submit)(stream, command.as_ptr(), &mut fence), 0);
+        assert_eq!(fence, 2);
+        assert_eq!(status_words(status)[1], 2);
+        assert!(
+            (tail[1100 - 1024] + 0.25).abs() < 1e-4,
+            "the tail rings into the next batch"
+        );
+
+        assert_eq!((dsp.deactivate)(stream), 0);
+        assert_eq!(
+            status_words(status)[0],
+            0,
+            "a stopped stream no longer runs"
+        );
+        assert_ne!(
+            (dsp.deactivate)(stream),
+            0,
+            "a second close names no stream"
+        );
+        let command = command_bytes(&silence, &mut tail);
+        assert_ne!((dsp.submit)(stream, command.as_ptr(), &mut fence), 0);
+        assert_eq!((dsp.disconnect)(connection), 0);
+        assert_ne!((dsp.disconnect)(connection), 0);
+    }
+}
+
+#[test]
+fn a_stereo_reverb_stream_takes_left_then_right_and_gives_them_back_the_same_way() {
+    let _guard = serial();
+    let dsp = dsp_shims();
+    let mut response = vec![0.0f32; 2 * 64];
+    response[2] = 1.0;
+    response[64 + 4] = 0.5;
+    let (mut connection, mut status, mut stream, mut fence) = (0u64, 0usize, 0u64, 0u32);
+    let info = info_bytes(2 | 8, 2, &response);
+    let mut input = vec![0.0f32; 512];
+    input[10] = 1.0;
+    input[256 + 20] = 1.0;
+    let mut output = vec![0.0f32; 512];
+    // SAFETY: the shapes the executable uses; every pointer is valid.
+    unsafe {
+        assert_eq!((dsp.connect)(0, 0x60000, 0x1e, 0x80, 1, &mut connection), 0);
+        assert_eq!(
+            (dsp.activate)(connection, info.as_ptr(), &mut status, &mut stream),
+            0
+        );
+        let command = command_bytes(&input, &mut output);
+        assert_eq!((dsp.submit)(stream, command.as_ptr(), &mut fence), 0);
+        assert_eq!(status_words(status)[1], fence);
+        assert!((output[12] - 1.0).abs() < 1e-4);
+        assert!((output[256 + 24] - 0.5).abs() < 1e-4);
+        assert!(output[256 + 12].abs() < 1e-4);
+        assert_eq!((dsp.disconnect)(connection), 0);
+        assert_ne!(
+            (dsp.deactivate)(stream),
+            0,
+            "disconnecting closed the stream"
+        );
+    }
+}
+
+#[test]
+fn a_stream_without_a_response_or_over_the_limit_is_refused_and_never_blocks() {
+    let _guard = serial();
+    let dsp = dsp_shims();
+    let response = vec![1.0f32; 16];
+    let (mut connection, mut status, mut stream) = (0u64, 0usize, 0u64);
+    // SAFETY: the shapes the executable uses; every pointer is valid.
+    unsafe {
+        assert_eq!((dsp.connect)(0, 0, 0x18, 2, 1, &mut connection), 0);
+        let none = info_bytes(0, 1, &[]);
+        assert_ne!(
+            (dsp.activate)(connection, none.as_ptr(), &mut status, &mut stream),
+            0
+        );
+        let info = info_bytes(0, 1, &response);
+        for _ in 0..2 {
+            assert_eq!(
+                (dsp.activate)(connection, info.as_ptr(), &mut status, &mut stream),
+                0
+            );
+        }
+        assert_ne!(
+            (dsp.activate)(connection, info.as_ptr(), &mut status, &mut stream),
+            0
+        );
+        assert_ne!(
+            (dsp.activate)(0xdead, info.as_ptr(), &mut status, &mut stream),
+            0
+        );
+        assert_ne!(
+            (dsp.activate)(connection, std::ptr::null(), &mut status, &mut stream),
+            0
+        );
+        let mut fence = 0u32;
+        let (input, mut output) = (vec![0.0f32; 1024], vec![0.0f32; 1024]);
+        let mut command = command_bytes(&input, &mut output);
+        command[8..0x10].fill(0);
+        assert_ne!(
+            (dsp.submit)(stream, command.as_ptr(), &mut fence),
+            0,
+            "a null buffer"
+        );
+        assert_eq!(status_words(status)[1], 0, "the fence is untouched");
+        assert_eq!((dsp.disconnect)(connection), 0);
+    }
+}
+
+#[test]
+fn closing_a_reverb_stream_leaves_the_mixer_and_its_voices_alone() {
+    let _guard = serial();
+    let dsp = dsp_shims();
+    with_engine(|e| e.deactivate());
+    with_engine(|e| e.take_completions());
+    let voice = with_engine(|e| {
+        e.mixer();
+        e.add_voice(VoiceParams::new(48_000))
+    });
+    let buffer = with_engine(|e| {
+        let id = e.new_buffer_id();
+        let pcm = vec![100i16; 4800];
+        e.queue_buffer(voice, Buffer::from_i16(id, &pcm, 1, Looping::Once));
+        id
+    });
+    assert!(with_engine(|e| e.is_active() && !e.has_device()));
+    let response = vec![1.0f32; 8];
+    let (mut connection, mut status, mut stream, mut fence) = (0u64, 0usize, 0u64, 0u32);
+    let info = info_bytes(0, 1, &response);
+    let (input, mut output) = (vec![0.0f32; 1024], vec![0.0f32; 1024]);
+    // SAFETY: the shapes the executable uses; every pointer is valid.
+    unsafe {
+        assert_eq!((dsp.connect)(0, 0x60000, 0x18, 0x80, 1, &mut connection), 0);
+        assert_eq!(
+            (dsp.activate)(connection, info.as_ptr(), &mut status, &mut stream),
+            0
+        );
+        let command = command_bytes(&input, &mut output);
+        assert_eq!((dsp.submit)(stream, command.as_ptr(), &mut fence), 0);
         assert!(with_engine(|e| e.take_completions()).is_empty());
         std::thread::sleep(Duration::from_millis(250));
-        assert_eq!(submit(1, 2), 0);
+        assert_eq!((dsp.submit)(stream, command.as_ptr(), &mut fence), 0);
         let done = with_engine(|e| e.take_completions());
-        assert_eq!(done.len(), 1);
+        assert_eq!(
+            done.len(),
+            1,
+            "each submit also keeps the silent clock running"
+        );
         assert_eq!(done[0].buffer, buffer);
-        assert_eq!(deactivate(), 0);
-        assert_eq!(disconnect(), 0);
+        assert_eq!((dsp.deactivate)(stream), 0);
+        assert_eq!((dsp.disconnect)(connection), 0);
     }
+    assert!(
+        with_engine(|e| e.is_active()),
+        "closing a DSP stream does not stop the mixer"
+    );
 }
 
 fn fake_decoder(request: &XmaRequest<'_>) -> Result<Decoded, DecodeError> {

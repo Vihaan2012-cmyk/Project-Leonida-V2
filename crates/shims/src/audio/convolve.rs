@@ -12,7 +12,10 @@ pub struct Fft {
 
 impl Fft {
     pub fn new(n: usize) -> Fft {
-        assert!(n.is_power_of_two() && n >= 2, "FFT size must be a power of two");
+        assert!(
+            n.is_power_of_two() && n >= 2,
+            "FFT size must be a power of two"
+        );
         let bits = n.trailing_zeros();
         let cos = (0..n / 2)
             .map(|k| (2.0 * PI * k as f64 / n as f64).cos() as f32)
