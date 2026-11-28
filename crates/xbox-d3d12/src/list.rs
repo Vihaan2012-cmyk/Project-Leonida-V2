@@ -146,6 +146,8 @@ fn allocator_vtable(core: &DeviceCore) -> *const usize {
 #[derive(Default)]
 struct ListState {
     open: bool,
+    /// How many commands the list held when it was last closed: the next recording starts with room for them.
+    expected: usize,
     commands: Vec<Command>,
     uploads: Vec<Box<[u8]>>,
     error: Option<u32>,
@@ -381,6 +383,7 @@ unsafe extern "win64" fn l_close(this: *mut c_void) -> u32 {
         return E_FAIL;
     }
     s.open = false;
+    s.expected = s.commands.len();
     let stream = CommandStream {
         list_type: list.list_type,
         commands: std::mem::take(&mut s.commands),
@@ -413,6 +416,8 @@ unsafe extern "win64" fn l_reset(
         }
         *s = ListState {
             open: true,
+            commands: Vec::with_capacity(s.expected),
+            expected: s.expected,
             ..Default::default()
         };
     }
