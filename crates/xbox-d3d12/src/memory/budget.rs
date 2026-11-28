@@ -5,14 +5,18 @@
 //! (`VK_EXT_memory_budget`, or a limit injected with `set_limit`) and what the layer has taken:
 //!
 //! - **Render targets, depth buffers and unordered-access images** (`Class::Target`) are tried in device-local
-//!   memory whatever the budget says, at the highest priority, so the driver pages other memory out for them.
+//!   memory whatever the budget says, at the highest priority. Priority does not make the driver move other memory
+//!   out for them (measured on an RTX 4060, see `memory`): what keeps room for them is the mirror's cap below.
 //! - **Textures** (`Class::Texture`) go to device-local memory while they fit, and to system memory the GPU reads
 //!   over PCIe when they do not or when device-local allocation fails.
-//! - **The mirror of the game's memory** (`Class::Mirror`) must live where the sparse window accepts it: device-local
-//!   memory on NVIDIA (the window's memory types, measured on an RTX 4060, are the device-local type alone). Past
-//!   the budget it is still tried there at a low priority, which with `VK_EXT_pageable_device_local_memory` lets
-//!   the driver demote it to system memory first. Where even that fails, `AddressSpace` leaves the run unbound and
-//!   retries it later rather than failing the game's allocation.
+//! - **The mirror of the game's memory** (`Class::Mirror`) is what shaders read the game's memory through. It takes
+//!   at most `mirror_room` of device-local memory, a share of the budget that leaves the rest to targets, textures
+//!   and the layer's own buffers. `AddressSpace` places the runs beyond that in system memory instead (its spill
+//!   tier: the title's own host memory bound into the window, which the GPU reads over PCIe and nothing copies).
+//!   Where the spill tier is not available a run past the budget is still tried in device-local memory at a low
+//!   priority, which with `VK_EXT_pageable_device_local_memory` lets the driver demote it to system memory first,
+//!   and where even that fails, `AddressSpace` leaves the run unbound and retries it later rather than failing the
+//!   game's allocation.
 //!
 //! Counters are kept for all of it, and the notes say when spilling starts and when the numbers move.
 
@@ -23,6 +27,10 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use ash::vk;
 
 const MIB: u64 = 1 << 20;
+
+/// The share of the device-local budget, in percent, the mirror of the game's memory may take: what is left holds
+/// render targets, depth buffers, the detiled copies of textures and what the layer allocates outside the budget.
+pub const MIRROR_SHARE: u64 = 55;
 
 /// The memory extensions the layer uses when the GPU has them. Each must be enabled when the device is made, with
 /// the features `memory_priority` and `pageable_device_local_memory` name.
@@ -217,6 +225,8 @@ pub struct Budget {
     limit: AtomicU64,
     /// With a limit set, refuse device-local allocations past it as a GPU of that size would.
     enforced: AtomicBool,
+    /// What the mirror may take of device-local memory; `u64::MAX` for `MIRROR_SHARE` of the budget.
+    mirror_limit: AtomicU64,
     local: [AtomicU64; Class::COUNT],
     spilled: [AtomicU64; Class::COUNT],
     peak_spilled: AtomicU64,
@@ -252,6 +262,7 @@ impl Budget {
             local_heap_size,
             limit: AtomicU64::new(u64::MAX),
             enforced: AtomicBool::new(false),
+            mirror_limit: AtomicU64::new(u64::MAX),
             local: Default::default(),
             spilled: Default::default(),
             peak_spilled: AtomicU64::new(0),
@@ -282,6 +293,44 @@ impl Budget {
     /// that small would refuse them (a test hook). Without it the limit only steers where textures go.
     pub fn set_enforced(&self, enforced: bool) {
         self.enforced.store(enforced, Ordering::Relaxed);
+    }
+
+    /// Replaces the share of the budget the mirror of the game's memory may take with `bytes` (a test hook, and
+    /// `LEONIDA_VRAM_MIRROR_MB`); `None` goes back to `MIRROR_SHARE`.
+    pub fn set_mirror_limit(&self, bytes: Option<u64>) {
+        self.mirror_limit
+            .store(bytes.unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// How much more device-local memory the mirror of the game's memory may take: what its cap leaves, and no
+    /// more than `available`. A run longer than this goes to system memory.
+    pub fn mirror_room(&self) -> u64 {
+        let taken = self.local[Class::Mirror.index()].load(Ordering::Relaxed);
+        self.mirror_cap()
+            .saturating_sub(taken)
+            .min(self.available())
+    }
+
+    /// The most device-local memory the mirror of the game's memory may hold.
+    pub fn mirror_cap(&self) -> u64 {
+        match self.mirror_limit.load(Ordering::Relaxed) {
+            u64::MAX => self.heap_state().0 / 100 * MIRROR_SHARE,
+            bytes => bytes,
+        }
+    }
+
+    /// Counts `size` bytes of `class` placed in system memory without any device memory being allocated for them
+    /// (the spill tier of the game's memory). Give the grant to `release` when the memory is unmapped.
+    pub(super) fn record_spill(&self, class: Class, size: u64) -> Grant {
+        let grant = Grant {
+            memory: vk::DeviceMemory::null(),
+            memory_type: u32::MAX,
+            size,
+            class,
+            placement: Placement::Spilled,
+        };
+        self.account(&grant);
+        grant
     }
 
     /// Whether the GPU has memory outside its device-local heaps to spill to.
@@ -577,7 +626,7 @@ impl Budget {
     pub fn announce(&self) {
         let limit = self.limit.load(Ordering::Relaxed);
         self.say(format!(
-            "vram: device-local heaps {} MiB, VK_EXT_memory_budget {}, VK_EXT_memory_priority {},              VK_EXT_pageable_device_local_memory {}{}",
+            "vram: device-local heaps {} MiB, VK_EXT_memory_budget {}, VK_EXT_memory_priority {}, VK_EXT_pageable_device_local_memory {}{}",
             self.local_heap_size / MIB,
             if self.extensions.budget { "on" } else { "off" },
             if self.extensions.priority { "on" } else { "off" },
@@ -587,6 +636,10 @@ impl Budget {
             } else {
                 format!(", limited to {} MiB by LEONIDA_VRAM_LIMIT_MB", limit / MIB)
             }
+        ));
+        self.say(format!(
+            "vram: the game's memory may take {} MiB of device-local memory, the rest of it is read from system              memory over PCIe",
+            self.mirror_cap() / MIB
         ));
         self.note_counters();
     }

@@ -151,6 +151,9 @@ impl AddressSpace {
             let Some(memory) = self.memories.get_mut(&extent.memory) else {
                 continue;
             };
+            if memory.mirror.is_none() {
+                continue;
+            }
             match memory.policy {
                 SyncPolicy::Marked => {}
                 SyncPolicy::Always => implicit.push((va, va + extent.len)),

@@ -880,3 +880,45 @@ fn the_list_slots_the_render_context_calls_beyond_the_flush_do_nothing_and_note_
     }
     assert_eq!(capture.streams.lock().unwrap().len(), 0);
 }
+
+#[test]
+fn the_breadcrumb_write_and_the_wait_slot_record_nothing_and_note_once() {
+    let device = new_device(Arc::default());
+    let allocator = make_allocator(device, 0);
+    let (result, list) = make_list(device, allocator, &guid_bytes(&iid::GRAPHICS_COMMAND_LIST));
+    assert_eq!(result, 0);
+    let table = [0u32; 54];
+    // SAFETY: slot 71 takes `(address, value, 0, 0)`; the address is never written through.
+    unsafe {
+        for frame in 0..3u64 {
+            let write: unsafe extern "win64" fn(Ptr, u64, u64, u64, u64) -> u32 = slot(list, 71);
+            assert_eq!(
+                write(list, table.as_ptr() as u64 + frame * 72, frame, 0, 0),
+                0
+            );
+        }
+        let wait: unsafe extern "win64" fn(Ptr, u64, u64, u64, u64) -> u32 = slot(list, 73);
+        assert_eq!(wait(list, 1, 0, 0, 0), 0);
+        let close: unsafe extern "win64" fn(Ptr) -> u32 = slot(list, 9);
+        assert_eq!(close(list), 0);
+    }
+    assert!(table.iter().all(|w| *w == 0));
+    let notes = com::notes();
+    for s in [71, 73] {
+        let prefix = format!("ID3D12GraphicsCommandList slot {s} ");
+        assert_eq!(
+            notes.iter().filter(|n| n.starts_with(&prefix)).count(),
+            1,
+            "{notes:?}"
+        );
+    }
+}
+
+#[test]
+fn the_device_byte_the_title_reads_at_0x18_sends_it_through_the_descriptor_calls() {
+    let device = new_device(Arc::new(Capture::default()));
+    // SAFETY: a device object of this layer: the byte at +0x18 is the first byte of its state.
+    let flag = unsafe { *(device as *const u8).add(0x18) };
+    assert_eq!(flag, xbox_d3d12::device::DESCRIPTORS_THROUGH_API);
+    assert_ne!(flag, 0);
+}

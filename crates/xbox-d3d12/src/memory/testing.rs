@@ -341,6 +341,54 @@ impl Kernel {
         }
     }
 
+    /// One submission of each `(base, src, dst)` increment, with no address space: `base` is any device address.
+    pub fn run_raw(&self, gpu: &TestGpu, jobs: &[(u64, u64, u64)]) {
+        let device = &gpu.handles.device;
+        // SAFETY: test-only Vulkan use; the command buffer completes before returning.
+        unsafe {
+            let command = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(self.pool)
+                        .command_buffer_count(1),
+                )
+                .unwrap()[0];
+            device
+                .begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
+                .unwrap();
+            device.cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            for &(base, src, dst) in jobs {
+                let mut push = Vec::new();
+                for word in [base, src, dst] {
+                    push.extend_from_slice(&word.to_le_bytes());
+                }
+                device.cmd_push_constants(
+                    command,
+                    self.layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &push,
+                );
+                device.cmd_dispatch(command, 1, 1, 1);
+            }
+            device.end_command_buffer(command).unwrap();
+            let fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .unwrap();
+            let commands = [command];
+            device
+                .queue_submit(
+                    gpu.handles.queue,
+                    &[vk::SubmitInfo::default().command_buffers(&commands)],
+                    fence,
+                )
+                .unwrap();
+            device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            device.destroy_fence(fence, None);
+            device.free_command_buffers(self.pool, &commands);
+        }
+    }
+
     /// One submission built from the layer's own calls: `submit_uploads`, `record_uploads`, each `(src, dst)`
     /// increment with `note_gpu_write` for its destination word, then `record_pending_downloads`. Returns the
     /// bytes the in-queue uploads copied and whether a transfer-queue submission was waited for.

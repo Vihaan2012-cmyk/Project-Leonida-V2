@@ -129,6 +129,7 @@ fn mirrored_game_memory_is_counted_and_works_past_the_budget() {
             );
             continue;
         }
+        space.set_spill(false);
         let h = gpu.handles.clone();
         h.budget.set_limit(Some(2 * MIB));
         let kernel = Kernel::new(gpu);
@@ -168,6 +169,7 @@ fn a_run_the_gpu_refuses_is_left_unbound_then_bound_when_memory_is_freed() {
         if space.backing() != Backing::Mirrored {
             continue;
         }
+        space.set_spill(false);
         let h = gpu.handles.clone();
         let notes = capture(&h.budget);
         h.budget.set_limit(Some(2 * MIB));

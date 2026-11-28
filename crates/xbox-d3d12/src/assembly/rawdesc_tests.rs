@@ -335,6 +335,33 @@ fn a_sampler_description_is_read_from_its_52_bytes() {
 }
 
 #[test]
+fn a_console_sampler_description_is_read_from_the_offsets_the_builder_writes() {
+    let mut b = Block::new(0x54);
+    b.u32(4, 3)
+        .u32(8, 3)
+        .u32(0xC, 2)
+        .u32(0x10, 2)
+        .u32(0x14, 1)
+        .u32(0x18, 1)
+        .u32(0x1C, 3)
+        .u32(0x20, 4)
+        .f32(0x24, 0.5)
+        .f32(0x28, 12.0)
+        .f32(0x30, -0.25)
+        .u32(0x34, 8)
+        .u32(0x40, 5)
+        .f32(0x44, 1.0)
+        .f32(0x4C, 0.5);
+    // SAFETY: a 0x54-byte block.
+    let c = unsafe { read_console_sampler(b.p()) };
+    assert_eq!((c.mag, c.min, c.mip, c.reduction), (3, 3, 2, 1));
+    assert_eq!(c.clamp, [1, 3, 4]);
+    assert_eq!((c.min_lod, c.max_lod, c.lod_bias), (0.5, 12.0, -0.25));
+    assert_eq!((c.max_anisotropy, c.compare), (8, 5));
+    assert_eq!(c.border_color, [1.0, 0.0, 0.5, 0.0]);
+}
+
+#[test]
 fn the_console_compute_description_is_four_pairs_after_the_root_signature() {
     let (a, b, c, d) = ([1u8; 4], [2u8; 5], [3u8; 6], [4u8; 7]);
     let mut m = Block::new(72);
