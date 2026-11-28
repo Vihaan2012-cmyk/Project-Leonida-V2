@@ -369,6 +369,8 @@ mod tests {
         };
         let mut settings = super::super::plan::Settings::default();
         settings.input.mouse_camera = mouse_camera;
+        // The synthetic image carries only the mouse site, so the frame rate patches stay off.
+        settings.graphics.frame_rate_mode = config::FrameRateMode::Console;
         RuntimePlan::from(&args, &settings, std::path::Path::new(r"E:\Game")).unwrap()
     }
 
