@@ -849,3 +849,34 @@ fn the_state_flush_slots_the_game_calls_per_draw_do_nothing_and_note_once() {
         );
     }
 }
+
+#[test]
+fn the_list_slots_the_render_context_calls_beyond_the_flush_do_nothing_and_note_once() {
+    let capture = Arc::new(Capture::default());
+    let device = new_device(capture.clone());
+    let allocator = make_allocator(device, 0);
+    let (result, list) = make_list(device, allocator, &guid_bytes(&iid::GRAPHICS_COMMAND_LIST));
+    assert_eq!(result, 0);
+    let slots = [28, 74, 86, 101, 129];
+    // SAFETY: each slot takes `this` and at most four argument words the executable passes; none are read.
+    unsafe {
+        for _ in 0..2 {
+            for s in slots {
+                let call: unsafe extern "win64" fn(Ptr, u64, u64, u64, u64) -> u32 = slot(list, s);
+                assert_eq!(call(list, 2, 1, 0, 0), 0, "slot {s}");
+            }
+        }
+        let close: unsafe extern "win64" fn(Ptr) -> u32 = slot(list, 9);
+        assert_eq!(close(list), 0);
+    }
+    let notes = com::notes();
+    for s in slots {
+        let prefix = format!("ID3D12GraphicsCommandList slot {s} ");
+        assert_eq!(
+            notes.iter().filter(|n| n.starts_with(&prefix)).count(),
+            1,
+            "{notes:?}"
+        );
+    }
+    assert_eq!(capture.streams.lock().unwrap().len(), 0);
+}
