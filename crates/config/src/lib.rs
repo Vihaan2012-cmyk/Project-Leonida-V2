@@ -22,8 +22,8 @@ use serde::de::DeserializeOwned;
 pub use display::DisplayConfig;
 pub use general::{Audio, AudioOutput, Content, General, Nudity};
 pub use graphics::{
-    AspectMode, FrameRate, FrameRateMode, Graphics, PipelineNotReady, Upscaler, WindowMode,
-    adjust_sampler,
+    AspectMode, FrameGenerationMethod, FrameRate, FrameRateMode, Graphics, PipelineNotReady,
+    Upscaler, WindowMode, adjust_sampler,
 };
 pub use input::Input;
 pub use mods::Mods;
