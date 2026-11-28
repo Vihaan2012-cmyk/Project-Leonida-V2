@@ -170,6 +170,8 @@ pub fn verify_command(args: &VerifyArgs) -> Result<ExitCode> {
     }
     let gpu = Gpu::new().context("opening the GPU")?;
     let built: Outcomes = Arc::new(Mutex::new(HashMap::new()));
+    let every = args.every.max(1);
+    let seen = AtomicUsize::new(0);
     let started = Instant::now();
     let selection = Selection {
         game: args.game.as_ref(),
@@ -192,6 +194,9 @@ pub fn verify_command(args: &VerifyArgs) -> Result<ExitCode> {
             Ok((Partners::new()?, verify))
         },
         |(partners, verify), shader| {
+            if !seen.fetch_add(1, Ordering::Relaxed).is_multiple_of(every) {
+                return;
+            }
             verify.containers += 1;
             verify.container(&gpu, partners, shader);
         },
@@ -354,7 +359,18 @@ fn translate_container(
                     .flat_map(|w| w.to_le_bytes())
                     .collect();
                 let kind = translated.built.kind().replace(' ', "_");
-                let path = folder.join(format!("{}.{index}.{kind}.spv", shader.name));
+                let name: String = shader
+                    .name
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '_' {
+                            c
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect();
+                let path = folder.join(format!("{name}.{index}.{kind}.spv"));
                 if std::fs::write(&path, bytes).is_ok() {
                     state.saved += 1;
                 }
@@ -390,7 +406,7 @@ pub fn translate_command(args: &TranslateArgs) -> Result<ExitCode> {
         args.jobs,
         || -> Result<Translation> { Ok(Translation::default()) },
         |state, shader| {
-            if seen.fetch_add(1, Ordering::Relaxed) % every == 0 {
+            if seen.fetch_add(1, Ordering::Relaxed).is_multiple_of(every) {
                 translate_container(state, args, &saved, shader);
             }
         },

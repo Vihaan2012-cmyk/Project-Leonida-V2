@@ -1212,8 +1212,10 @@ unsafe extern "win64" fn l_unmeasured_132(
 
 /// Slots the game's per-draw and per-dispatch state flushes call whose meaning is not measured (an executable
 /// census: 70 with two floats, depth-bounds shaped; 75 with a pipeline flag byte; 142 with a u64 kept next to the
-/// scratch buffer; 62, 72, 126, 127 and 128 at single sites). They record nothing; the note is made once without
-/// allocating on later calls, since some run for every draw.
+/// scratch buffer; 28 beside 29 and 30 with the same event-table arguments; 74 as `(address, 7, value, 0)`; 86 as
+/// `(a, a, 0x10)`; 101 as `(2, 0 or 1)` around a group of clears; 129 as `(a, 1, 1)`; 62, 72, 126, 127 and 128 at
+/// single sites). They record nothing; the note is made once without allocating on later calls, since some run
+/// for every draw.
 macro_rules! ignored_slot {
     ($name:ident, $slot:literal) => {
         unsafe extern "win64" fn $name(
@@ -1232,13 +1234,18 @@ macro_rules! ignored_slot {
     };
 }
 
+ignored_slot!(l_ignored_28, 28);
 ignored_slot!(l_ignored_62, 62);
 ignored_slot!(l_ignored_70, 70);
 ignored_slot!(l_ignored_72, 72);
+ignored_slot!(l_ignored_74, 74);
 ignored_slot!(l_ignored_75, 75);
+ignored_slot!(l_ignored_86, 86);
+ignored_slot!(l_ignored_101, 101);
 ignored_slot!(l_ignored_126, 126);
 ignored_slot!(l_ignored_127, 127);
 ignored_slot!(l_ignored_128, 128);
+ignored_slot!(l_ignored_129, 129);
 ignored_slot!(l_ignored_142, 142);
 
 fn list_vtable(core: &DeviceCore) -> *const usize {
@@ -1270,6 +1277,7 @@ fn list_vtable(core: &DeviceCore) -> *const usize {
         (24, f!(l_set_stencil_ref)),
         (25, f!(l_set_pipeline_state)),
         (26, f!(l_resource_barrier)),
+        (28, f!(l_ignored_28)),
         (29, f!(l_unmeasured_29)),
         (30, f!(l_unmeasured_30)),
         (32, f!(l_set_descriptor_heaps)),
@@ -1303,12 +1311,16 @@ fn list_vtable(core: &DeviceCore) -> *const usize {
         (71, f!(l_write_value)),
         (72, f!(l_ignored_72)),
         (73, f!(l_wait_value)),
+        (74, f!(l_ignored_74)),
         (75, f!(l_ignored_75)),
         (80, f!(l_dispatch_x)),
         (85, f!(l_copy_texture_region)),
+        (86, f!(l_ignored_86)),
+        (101, f!(l_ignored_101)),
         (126, f!(l_ignored_126)),
         (127, f!(l_ignored_127)),
         (128, f!(l_ignored_128)),
+        (129, f!(l_ignored_129)),
         (131, f!(l_unmeasured_131)),
         (132, f!(l_unmeasured_132)),
         (141, f!(l_set_scratch_buffer)),

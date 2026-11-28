@@ -49,11 +49,19 @@ ID3D12Device 49 SetFeature49X measured (called as (0x11f, 1) once after creation
 ID3D12Device 50 RegisterGpuCrashCallbackX measured (called as (callback, 0, callback) in the crash-handler set-up; accepted)
 ID3D12Device 55 CreatePipelineStateFromCacheX inferred
 ID3D12Device 57 CreateGraphicsPipelineStateFromCacheX inferred
+ID3D12Device 61 CreateSamplerX measured (called as (desc, handle) from the one sampler builder, rva 0x012b96b0; the console's own 0x54-byte description: S# XY filter codes, mip and Z filters, reduction, D3D12 address modes, anisotropy at +0x34, comparison function at +0x40)
 ID3D12Device 62 CreateComputePipelineStateX measured
 ID3D12Device 67 CreateComputePipelineStateFromNativeCodeX measured
+ID3D12Device 70 CreateShaderResourceViewX measured (called as (resource desc, view desc, handle) with the GPU address in the view description's word at 0x28; six sites)
+ID3D12Device 71 CreateUnorderedAccessViewX measured (as slot 70; two sites)
+ID3D12Device 74 RegisterVirtualRangeX measured (called as (address, pages, &out) before the queue's MapTilesX; the out word is never read)
 ID3D12Device 73 CreateCommandListX measured
 ID3D12Device 76 CreateCommittedResourceX measured
 ID3D12Device 86 CreatePipelineStateStreamX measured
+ID3D12Device 101 CreateStateObject measured (a ray tracing subobject list with riid and out; the title continues when it fails)
+ID3D12Device 108 GetResourceAllocationInfo1 measured (slot 25's arguments and an array of three-word infos; the title retries with alignment 0 when the answer is not the 4 KiB it asked)
+ID3D12Device 119 CrashContextAppendX measured (only from the crash handler: buffer, size, 0)
+ID3D12Device 132 RequestGpuDumpX measured (only from the crash handler: called as (3))
 ID3D12Device 78 SetFrameIntervalX measured
 ID3D12Device 79 ScheduleFrameEventX measured
 ID3D12Device 80 WaitFrameEventX measured
@@ -135,6 +143,7 @@ ID3D12GraphicsCommandList 23 OMSetBlendFactor pc sites=1
 ID3D12GraphicsCommandList 24 OMSetStencilRef pc sites=1
 ID3D12GraphicsCommandList 25 SetPipelineState measured sites=3
 ID3D12GraphicsCommandList 26 ResourceBarrier measured
+ID3D12GraphicsCommandList 28 Unnamed28 measured (one site beside 29 and 30 with the same event-table arguments; ignored)
 ID3D12GraphicsCommandList 29 Unnamed29 measured (called as (ptr, u32, u32); meaning unknown, ignored)
 ID3D12GraphicsCommandList 30 Unnamed30 measured (called as (ptr, u32, first, count, ptr, byte offset); meaning unknown, ignored)
 ID3D12GraphicsCommandList 32 SetDescriptorHeaps measured
@@ -170,6 +179,10 @@ ID3D12GraphicsCommandList 85 CopyTextureRegion inferred
 ID3D12GraphicsCommandList 131 Unnamed131 measured (called as (a, b, c, mask) once per list before Close; meaning unknown, ignored)
 ID3D12GraphicsCommandList 132 Unnamed132 measured (called as (a, b, c, mask) once per list before Close; meaning unknown, ignored)
 ID3D12GraphicsCommandList 62 Unnamed62 measured (one site; meaning unknown, ignored)
+ID3D12GraphicsCommandList 74 Unnamed74 measured (called as (address, 7, value, 0) on the context's list; meaning unknown, ignored)
+ID3D12GraphicsCommandList 86 Unnamed86 measured (called as (a, a, 0x10) at one site; ignored)
+ID3D12GraphicsCommandList 101 Unnamed101 measured (called as (2, 1) and (2, 0) around a group of clears; ignored)
+ID3D12GraphicsCommandList 129 Unnamed129 measured (called as (a, 1, 1) at one site; ignored)
 ID3D12GraphicsCommandList 70 Unnamed70 measured (two floats from the render context, in the graphics flush; depth-bounds shaped; ignored)
 ID3D12GraphicsCommandList 72 Unnamed72 measured (called as (addr, 0, 0, 1) at one site; meaning unknown, ignored)
 ID3D12GraphicsCommandList 75 Unnamed75 measured (a pipeline flag byte, in the graphics flush; meaning unknown, ignored)

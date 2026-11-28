@@ -160,6 +160,48 @@ unsafe extern "win64" fn d_resource_allocation_info(
     buffer
 }
 
+/// Slot 108, `GetResourceAllocationInfo1`: slot 25's arguments and a sixth, an array of `count` 24-byte
+/// `D3D12_RESOURCE_ALLOCATION_INFO1` (offset, alignment, size) that the title may leave null.
+unsafe extern "win64" fn d_resource_allocation_info1(
+    buffer: *mut u64,
+    _this: *mut c_void,
+    _mask: u32,
+    count: u32,
+    descs: *const u8,
+    info1: *mut u64,
+) -> *mut u64 {
+    let (mut size, mut alignment) = (0u64, 0u64);
+    for i in 0..count as usize {
+        // SAFETY: `count` descriptions of 56 bytes each.
+        let Some(desc) = (unsafe { read_resource_desc(descs.add(56 * i)) }) else {
+            continue;
+        };
+        if let Ok(AllocationInfo {
+            size: s,
+            alignment: a,
+        }) = desc.allocation_info()
+        {
+            let offset = size.next_multiple_of(a);
+            if !info1.is_null() {
+                // SAFETY: `count` entries of three words.
+                unsafe {
+                    *info1.add(3 * i) = offset;
+                    *info1.add(3 * i + 1) = a;
+                    *info1.add(3 * i + 2) = s;
+                }
+            }
+            size = offset + s;
+            alignment = alignment.max(a);
+        }
+    }
+    // SAFETY: `buffer` has room for 16 bytes.
+    unsafe {
+        *buffer = size;
+        *buffer.add(1) = alignment.max(1);
+    }
+    buffer
+}
+
 /// Slot 38: `(desc, first, count, base offset, layouts, rows, row sizes, total)`.
 #[allow(clippy::too_many_arguments)]
 unsafe extern "win64" fn d_copyable_footprints(
@@ -433,6 +475,99 @@ unsafe extern "win64" fn d_create_dsv(
     dest: u64,
 ) {
     target_view(this, resource, desc, dest, true);
+}
+
+/// Slots 70 and 71, `CreateShaderResourceViewX` and `CreateUnorderedAccessViewX`: `(resource desc, view desc,
+/// handle)`. The view description is the PC structure with the GPU address of the memory in the word at 0x28, so
+/// no resource object is involved; the title makes these for memory it placed itself.
+fn view_from_address(
+    this: *mut c_void,
+    resource_desc: *const u8,
+    view_desc: *const u8,
+    dest: u64,
+    unordered: bool,
+) {
+    let Some(asm) = asm(this) else { return };
+    if resource_desc.is_null() || view_desc.is_null() || dest == 0 {
+        return;
+    }
+    // SAFETY: the title's resource description and its view description, 0x38 bytes.
+    let (desc, address) = unsafe { (read_resource_desc(resource_desc), Mem(view_desc).u64(0x28)) };
+    let Some(desc) = desc else {
+        com::note_once(
+            "a view over a resource description with an unknown dimension was left empty",
+        );
+        return;
+    };
+    let view = ViewResource { address, desc };
+    let made = if unordered {
+        // SAFETY: as above.
+        let Some(uav) = (unsafe { read_uav(view_desc, &view) }) else {
+            com::note_once(
+                "an unordered access view of a kind this layer has no descriptor for was left empty",
+            );
+            return;
+        };
+        asm.descriptors().create_uav(Some(&view), None, &uav)
+    } else {
+        // SAFETY: as above.
+        let Some(srv) = (unsafe { read_srv(view_desc, &view) }) else {
+            com::note_once(
+                "a shader resource view of a kind this layer has no descriptor for was left empty",
+            );
+            return;
+        };
+        asm.descriptors().create_srv(Some(&view), &srv)
+    };
+    match made {
+        Ok((slot, registration)) => {
+            // SAFETY: a heap slot.
+            unsafe { descriptor::write_slot(dest, &slot) };
+            if let Some(r) = registration
+                && r.new
+            {
+                asm.bindless.note_texture(r.index);
+            }
+        }
+        Err(e) => com::note_once(format!("a view made from an address was refused: {e}")),
+    }
+}
+
+unsafe extern "win64" fn d_create_srv_x(
+    this: *mut c_void,
+    resource_desc: *const u8,
+    view_desc: *const u8,
+    dest: u64,
+) {
+    view_from_address(this, resource_desc, view_desc, dest, false);
+}
+
+unsafe extern "win64" fn d_create_uav_x(
+    this: *mut c_void,
+    resource_desc: *const u8,
+    view_desc: *const u8,
+    dest: u64,
+) {
+    view_from_address(this, resource_desc, view_desc, dest, true);
+}
+
+/// Slot 61, `CreateSamplerX(desc, handle)`: the title's only sampler creation. The description is the console's
+/// own 0x54-byte structure, which `read_console_sampler` documents.
+unsafe extern "win64" fn d_create_sampler_x(this: *mut c_void, desc: *const u8, dest: u64) {
+    let Some(asm) = asm(this) else { return };
+    if desc.is_null() || dest == 0 {
+        return;
+    }
+    // SAFETY: the title's sampler description and a heap slot.
+    unsafe {
+        let (words, registration) = asm
+            .descriptors()
+            .create_sampler_console(&read_console_sampler(desc));
+        descriptor::write_sampler_slot(dest, &words);
+        if registration.new {
+            asm.bindless.note_sampler(registration.index);
+        }
+    }
 }
 
 unsafe extern "win64" fn d_create_sampler(this: *mut c_void, desc: *const u8, dest: u64) {
@@ -735,6 +870,55 @@ unsafe extern "win64" fn d_register_crash_callback_50(
     S_OK
 }
 
+/// Slot 74, `(address, pages, &out)`: the title registers the range of 64 KiB pages it reserved before mapping
+/// it with queue slot 31, and keeps the word written to `out` without reading it again. Accepted; the word is 1.
+unsafe extern "win64" fn d_register_virtual_range_74(
+    _this: *mut c_void,
+    _address: u64,
+    _pages: u32,
+    out: *mut u64,
+) -> u32 {
+    com::note_once(
+        "device slot 74 (virtual range registration) is accepted; the handle it returns is 1",
+    );
+    if !out.is_null() {
+        // SAFETY: an out pointer.
+        unsafe { *out = 1 };
+    }
+    S_OK
+}
+
+/// Slot 101, `CreateStateObject(desc, riid, out)`: a ray tracing pipeline made from subobject lists. The title
+/// takes a failure as "no ray tracing" and goes on without it.
+unsafe extern "win64" fn d_create_state_object(
+    _this: *mut c_void,
+    _desc: *const u8,
+    _riid: *const u8,
+    out: *mut *mut c_void,
+) -> u32 {
+    com::note_once(
+        "device slot 101 (ray tracing state object) is declined; the title goes on without ray tracing",
+    );
+    if !out.is_null() {
+        // SAFETY: an out pointer.
+        unsafe { *out = std::ptr::null_mut() };
+    }
+    super::DXGI_ERROR_UNSUPPORTED
+}
+
+/// Slots 119 and 132 are called only from the title's crash handler (an unhandled exception filter and the GPU
+/// crash callback it registers through slot 50): a crash-context append `(buffer, size, 0)` and a dump request
+/// `(3)`. Nothing is recorded.
+unsafe extern "win64" fn d_crash_handler_call(
+    _this: *mut c_void,
+    _a: usize,
+    _b: usize,
+    _c: usize,
+) -> u32 {
+    com::note_once("a device slot only the title's crash handler calls (119 or 132) is accepted");
+    S_OK
+}
+
 /// Slot 39: `D3D12_QUERY_HEAP_DESC`, `(type, count, node mask)`.
 unsafe extern "win64" fn d_create_query_heap(
     this: *mut c_void,
@@ -792,10 +976,18 @@ pub fn table() -> Vec<(usize, usize)> {
         (50, f!(d_register_crash_callback_50)),
         (55, f!(d_create_pipeline_from_cache_55)),
         (57, f!(d_create_graphics_from_cache)),
+        (61, f!(d_create_sampler_x)),
         (62, f!(d_create_compute_pipeline_state_x)),
         (67, f!(d_create_compute_from_cache)),
+        (70, f!(d_create_srv_x)),
+        (71, f!(d_create_uav_x)),
+        (74, f!(d_register_virtual_range_74)),
         (76, f!(d_create_committed_resource)),
         (86, f!(d_create_pipeline_state_stream)),
+        (101, f!(d_create_state_object)),
+        (108, f!(d_resource_allocation_info1)),
+        (119, f!(d_crash_handler_call)),
+        (132, f!(d_crash_handler_call)),
         (133, f!(d_create_placed_resource_x)),
     ]
 }

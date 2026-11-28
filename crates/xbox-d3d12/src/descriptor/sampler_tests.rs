@@ -140,3 +140,188 @@ fn minimum_and_maximum_filters_and_integer_borders() {
     assert_eq!(max.reduction, Reduction::Maximum);
     assert!(max.integer_border);
 }
+
+/// The title's sampler settings as the builder at rva 0x012b96b0 reads them.
+struct Settings {
+    modes: [u32; 3],
+    filter: u32,
+    max_anisotropy: u32,
+    compare: u32,
+    border: [f32; 4],
+}
+
+impl Settings {
+    fn new(filter: u32) -> Settings {
+        Settings {
+            modes: [1; 3],
+            filter,
+            max_anisotropy: 1,
+            compare: 1,
+            border: [0.0; 4],
+        }
+    }
+
+    /// What the builder writes: the XY codes from filter bits 2 and 4 (3 for both when bit 6 is set), the mip and Z
+    /// filters from bits 0 and 2, the reduction table indexed by the filter shifted right by 7, and the comparison
+    /// function kept only when bit 7 is set.
+    fn console(&self) -> ConsoleSampler {
+        let f = self.filter;
+        let xy = |bit: u32| {
+            if f & 0x40 != 0 {
+                3
+            } else if f & bit != 0 {
+                1
+            } else {
+                2
+            }
+        };
+        ConsoleSampler {
+            mag: xy(4),
+            min: xy(16),
+            mip: if f & 1 != 0 { 2 } else { 1 },
+            reduction: [0, 0, 1, 2][((f >> 7) & 3) as usize],
+            clamp: self.modes,
+            min_lod: 0.0,
+            max_lod: 12.0,
+            lod_bias: 0.0,
+            max_anisotropy: self.max_anisotropy & 0x1F,
+            compare: if f & 0x80 != 0 { self.compare } else { 1 },
+            border_color: self.border,
+        }
+    }
+
+    fn sampler(&self) -> Sampler {
+        from_console(&self.console(), &mut BorderTable::default())
+    }
+}
+
+#[test]
+fn the_title_s_trilinear_wrap_sampler_stays_trilinear_and_wrapping() {
+    let s = Settings::new(0x15).sampler();
+    assert_eq!((s.mag, s.min), (Filter::Bilinear, Filter::Bilinear));
+    assert_eq!(s.mip, MipFilter::Linear);
+    assert_eq!(s.max_anisotropy, 1);
+    assert_eq!(
+        [s.address_u, s.address_v, s.address_w],
+        [AddressMode::Wrap; 3]
+    );
+    assert_eq!(s.reduction, Reduction::Blend);
+    assert_eq!(s.compare, Compare::Never);
+    assert!(!s.compare_never);
+    assert_eq!(s.max_lod, 12.0);
+}
+
+#[test]
+fn a_point_sampler_has_point_filters_and_a_point_mip_filter() {
+    let s = Settings::new(0).sampler();
+    assert_eq!((s.mag, s.min), (Filter::AnisoPoint, Filter::AnisoPoint));
+    assert!(!s.mag.linear() && !s.min.linear());
+    assert_eq!(s.mip, MipFilter::Point);
+    assert_eq!(s.max_anisotropy, 1);
+}
+
+#[test]
+fn mixed_filters_follow_their_own_bits() {
+    let s = Settings::new(0x10).sampler();
+    assert!(!s.mag.linear() && s.min.linear());
+    assert_eq!(s.mip, MipFilter::Point);
+    let s = Settings::new(0x05).sampler();
+    assert!(s.mag.linear() && !s.min.linear());
+    assert_eq!(s.mip, MipFilter::Linear);
+}
+
+#[test]
+fn the_title_s_address_modes_are_d3d12_numbered() {
+    let modes = |m: [u32; 3]| {
+        let mut set = Settings::new(0x15);
+        set.modes = m;
+        let s = set.sampler();
+        [s.address_u, s.address_v, s.address_w]
+    };
+    assert_eq!(modes([1, 1, 1]), [AddressMode::Wrap; 3]);
+    assert_eq!(
+        modes([2, 3, 5]),
+        [
+            AddressMode::Mirror,
+            AddressMode::ClampLastTexel,
+            AddressMode::MirrorOnceLastTexel
+        ]
+    );
+    assert_eq!(modes([4, 1, 3])[0], AddressMode::ClampBorder);
+}
+
+#[test]
+fn anisotropic_samplers_take_the_ratio_the_title_set() {
+    for ratio in [2, 4, 8, 16] {
+        let mut set = Settings::new(0x55);
+        set.max_anisotropy = ratio;
+        let s = set.sampler();
+        assert_eq!(
+            (s.mag, s.min),
+            (Filter::AnisoBilinear, Filter::AnisoBilinear)
+        );
+        assert_eq!(s.mip, MipFilter::Linear);
+        assert_eq!(s.max_anisotropy, ratio);
+    }
+    let mut set = Settings::new(0x15);
+    set.max_anisotropy = 8;
+    assert_eq!(set.sampler().max_anisotropy, 1);
+}
+
+#[test]
+fn a_comparison_filter_carries_its_function_and_others_never_compare() {
+    let mut set = Settings::new(0x94);
+    set.compare = 5;
+    set.modes = [4; 3];
+    set.border = [1.0; 4];
+    let s = set.sampler();
+    assert_eq!(s.compare, Compare::Greater);
+    assert_eq!(s.border, Border::OpaqueWhite);
+    assert_eq!(s.reduction, Reduction::Blend);
+    for (func, expected) in [
+        (2, Compare::Less),
+        (3, Compare::Equal),
+        (4, Compare::LessEqual),
+        (6, Compare::NotEqual),
+        (7, Compare::GreaterEqual),
+        (8, Compare::Always),
+    ] {
+        set.compare = func;
+        assert_eq!(set.sampler().compare, expected);
+    }
+    let mut plain = Settings::new(0x15);
+    plain.compare = 8;
+    assert_eq!(plain.sampler().compare, Compare::Never);
+}
+
+#[test]
+fn minimum_and_maximum_filters_map_through_the_reduction_table() {
+    assert_eq!(
+        Settings::new(0x100 | 0x15).sampler().reduction,
+        Reduction::Minimum
+    );
+    assert_eq!(
+        Settings::new(0x180 | 0x15).sampler().reduction,
+        Reduction::Maximum
+    );
+    assert_eq!(
+        Settings::new(0x80 | 0x15).sampler().reduction,
+        Reduction::Blend
+    );
+}
+
+#[test]
+fn custom_border_colours_go_to_the_table() {
+    let mut set = Settings::new(0x15);
+    set.modes = [4, 4, 1];
+    set.border = [0.25, 0.5, 0.75, 1.0];
+    let mut borders = BorderTable::default();
+    let s = from_console(&set.console(), &mut borders);
+    assert_eq!(s.border, Border::Table);
+    assert_eq!(borders.get(s.border_index), Some([0.25, 0.5, 0.75, 1.0]));
+    set.border = [0.0, 0.0, 0.0, 1.0];
+    assert_eq!(set.sampler().border, Border::OpaqueBlack);
+    set.modes = [3; 3];
+    set.border = [0.25; 4];
+    assert_eq!(set.sampler().border, Border::TransparentBlack);
+}

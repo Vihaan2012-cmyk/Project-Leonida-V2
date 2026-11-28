@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use crate::descriptor::format::{DEFAULT_MAPPING, dxgi};
-use crate::descriptor::sampler::SamplerDesc;
+use crate::descriptor::sampler::{ConsoleSampler, SamplerDesc};
 use crate::descriptor::views::{ALL, SrvDesc, SrvKind, TargetDesc, UavDesc, UavKind, ViewResource};
 use crate::pipeline::state::{
     BlendState, DepthStencilState, InputElement, RasterizerState, RenderTargetBlend, StencilFace,
@@ -461,6 +461,33 @@ pub unsafe fn read_sampler(p: *const u8) -> SamplerDesc {
             min_lod: m.f32(44),
             max_lod: m.f32(48),
             flags: 0,
+        }
+    }
+}
+
+/// The console sampler description the title hands to `CreateSamplerX`, 0x54 bytes: the S# XY filter codes at 4 and
+/// 8, the mip filter at 0xC (the one at 0x10 is the Z filter, which the S# model here does not keep), the reduction
+/// at 0x14, the three address modes at 0x18, 0x1C and 0x20, the LOD range at 0x24 and 0x28, the bias at 0x30, the
+/// anisotropy at 0x34, the comparison function at 0x40 and the border colour at 0x44.
+///
+/// # Safety
+/// `p` is 0x54 readable bytes.
+pub unsafe fn read_console_sampler(p: *const u8) -> ConsoleSampler {
+    // SAFETY: as the caller promises.
+    unsafe {
+        let m = Mem(p);
+        ConsoleSampler {
+            mag: m.u32(4),
+            min: m.u32(8),
+            mip: m.u32(0xC),
+            reduction: m.u32(0x14),
+            clamp: [m.u32(0x18), m.u32(0x1C), m.u32(0x20)],
+            min_lod: m.f32(0x24),
+            max_lod: m.f32(0x28),
+            lod_bias: m.f32(0x30),
+            max_anisotropy: m.u32(0x34),
+            compare: m.u32(0x40),
+            border_color: [m.f32(0x44), m.f32(0x48), m.f32(0x4C), m.f32(0x50)],
         }
     }
 }
