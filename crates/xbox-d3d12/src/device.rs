@@ -159,7 +159,17 @@ impl DeviceCore {
     }
 }
 
+/// The byte at `+0x18` of the device object, the first byte of its state, is read by the title (rvas 0x00063110,
+/// 0x04d95850, 0x04edf480, 0x04e25850, 0x04fc9bb0, 0x0554cd50, 0x02478440) before every descriptor it creates.
+/// Zero: it writes constant buffer views as raw buffer descriptors, and copies image descriptors, straight into
+/// the heap memory. Non-zero: it calls `CreateConstantBufferView` (slot 17, `(desc, handle)`) and
+/// `CopyDescriptorsSimple` (slot 24, `(1, dest, source, 0)`) instead. This layer wants the calls, which register
+/// and encode each descriptor as it is made.
+pub const DESCRIPTORS_THROUGH_API: u8 = 1;
+
+#[repr(C)]
 pub struct Device {
+    pub descriptors_through_api: u8,
     pub core: Arc<DeviceCore>,
 }
 
@@ -212,7 +222,14 @@ pub unsafe fn create_device(
         "D3D12XboxCreateDevice asked for {wanted} with parameters {words}"
     ));
     let core = Arc::new(DeviceCore::new(integration));
-    let object = com::new_object(Kind::Device, device_vtable(&core), Device { core });
+    let object = com::new_object(
+        Kind::Device,
+        device_vtable(&core),
+        Device {
+            descriptors_through_api: DESCRIPTORS_THROUGH_API,
+            core,
+        },
+    );
     // SAFETY: just allocated; the reference goes to the caller, `riid` decides what it sees.
     unsafe {
         // An IID the layer does not know is the console's own device interface: the device itself answers.

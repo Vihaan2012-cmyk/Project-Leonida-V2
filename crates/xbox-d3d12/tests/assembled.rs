@@ -789,12 +789,14 @@ fn a_sampler_made_through_slot_61_is_written_and_registered() {
     let mut put = |at: usize, v: u32| desc[at..at + 4].copy_from_slice(&v.to_le_bytes());
     put(4, 1);
     put(8, 1);
-    put(0x10, 1);
-    put(0x14, 1);
-    put(0x18, 2);
-    put(0x1C, 2);
-    put(0x20, 2);
+    put(0xC, 2);
+    put(0x10, 2);
+    put(0x18, 3);
+    put(0x1C, 3);
+    put(0x20, 3);
     put(0x28, 15.0f32.to_bits());
+    put(0x34, 1);
+    put(0x40, 1);
     let before = h.asm.descriptors().registry.sampler_count();
     // SAFETY: device slot 61, `(desc, handle)`; the handle is a sampler heap slot.
     let words = unsafe {
@@ -802,13 +804,32 @@ fn a_sampler_made_through_slot_61_is_written_and_registered() {
         create(h.device, desc.as_ptr(), cpu);
         std::slice::from_raw_parts(cpu as usize as *const u32, 4).to_vec()
     };
-    // Clamp codes 2 in X, Y and Z, a bilinear magnification, minimisation and a linear mip filter.
+    // D3D12 clamp (3) in X, Y and Z is the hardware's clamp to the last texel (2), with bilinear filters and a
+    // linear mip filter.
     assert_eq!(words[0] & 0x1FF, 0b010_010_010);
     assert_eq!((words[2] >> 20) & 3, 1);
     assert_eq!((words[2] >> 22) & 3, 1);
     assert_eq!((words[2] >> 26) & 3, 2);
     assert_eq!(words[1] >> 12, 0xF00);
     assert!(h.asm.descriptors().registry.sampler_count() > before);
+}
+
+#[test]
+fn a_constant_buffer_view_made_through_slot_17_takes_a_description_and_a_handle() {
+    let Some(h) = harness() else { return };
+    let (_heap, cpu) = heap_of(&h, 0);
+    let mut desc = [0u8; 16];
+    desc[..8].copy_from_slice(&0x2_0000_4000u64.to_le_bytes());
+    desc[8..12].copy_from_slice(&0x100u32.to_le_bytes());
+    // SAFETY: device slot 17, `(desc, handle)`; the handle is a heap slot.
+    let words = unsafe {
+        let create: unsafe extern "win64" fn(Ptr, *const u8, u64) = slot(h.device, 17);
+        create(h.device, desc.as_ptr(), cpu);
+        std::slice::from_raw_parts(cpu as usize as *const u32, 4).to_vec()
+    };
+    let base = u64::from(words[0]) | (u64::from(words[1] & 0xFFFF) << 32);
+    assert_eq!(base, 0x2_0000_4000);
+    assert_eq!(words[2], 0x100);
 }
 
 #[test]
