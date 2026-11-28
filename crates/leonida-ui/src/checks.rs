@@ -6,6 +6,7 @@ use std::path::Path;
 use config::{Config, Upscaler};
 use game_package::Manifest;
 
+use crate::dlss::Line;
 use crate::game::GameState;
 use crate::model::FieldError;
 use crate::play::Paths;
@@ -15,6 +16,8 @@ pub struct World<'a> {
     pub paths: &'a Paths,
     /// How many screens are connected.
     pub monitors: usize,
+    /// What NGX said about DLSS on this PC; `None` while DLSS is not the chosen upscaler.
+    pub dlss: Option<&'a Line>,
 }
 
 /// What the game folder is, as the Game page shows it.
@@ -33,6 +36,19 @@ pub fn game_state(path: &Path, manifests: &[Manifest]) -> Result<GameState, Stri
     }
 }
 
+/// The hint beside the DLSS library field: what NGX said, in the words `leonida config dlss` uses.
+fn dlss_line(line: &Line) -> FieldError {
+    const ID: &str = "upscaling.dlss_path";
+    match line {
+        Line::Checking => FieldError::info(ID, "Checking whether DLSS can run on this PC..."),
+        Line::Available(summary) => FieldError::info(ID, format!("DLSS is {summary}")),
+        Line::Unavailable(summary) => FieldError::note(
+            ID,
+            format!("DLSS is {summary}. The temporal upscaler runs instead."),
+        ),
+    }
+}
+
 pub fn check(config: &Config, world: &World) -> Vec<FieldError> {
     let mut found = Vec::new();
     if let Some(game) = &world.paths.game_dir
@@ -47,17 +63,15 @@ pub fn check(config: &Config, world: &World) -> Vec<FieldError> {
             "is a file, not a folder",
         ));
     }
+    let dlss_chosen = config.graphics.upscaler == Upscaler::Dlss;
     match &config.upscaling.dlss_path {
-        Some(path) if config.graphics.upscaler == Upscaler::Dlss && !path.is_file() => {
+        Some(path) if dlss_chosen && !path.is_file() => {
             found.push(FieldError::error(
                 "upscaling.dlss_path",
                 "there is no file at this path",
             ));
         }
-        None if config.graphics.upscaler == Upscaler::Dlss => found.push(FieldError::note(
-            "upscaling.dlss_path",
-            "without it the temporal upscaler runs instead",
-        )),
+        _ if dlss_chosen => found.extend(world.dlss.map(dlss_line)),
         _ => {}
     }
     let screens = config.display.monitor as usize;
@@ -98,6 +112,15 @@ mod tests {
     }
 
     fn run(config: &Config, root: &Path, monitors: usize) -> Vec<FieldError> {
+        run_with(config, root, monitors, None)
+    }
+
+    fn run_with(
+        config: &Config,
+        root: &Path,
+        monitors: usize,
+        dlss: Option<&Line>,
+    ) -> Vec<FieldError> {
         let paths = Paths::of(root, "Config", &config.general);
         check(
             config,
@@ -105,6 +128,7 @@ mod tests {
                 manifests: &manifests(),
                 paths: &paths,
                 monitors,
+                dlss,
             },
         )
     }
@@ -150,8 +174,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.graphics.upscaler = Upscaler::Dlss;
-        let found = run(&config, root.path(), 1);
-        assert_eq!(found[0].severity, Severity::Note);
+        assert!(
+            run(&config, root.path(), 1).is_empty(),
+            "nothing is said until NGX has been asked"
+        );
         let dll = root.path().join("nvngx_dlss.dll");
         config.upscaling.dlss_path = Some(dll.clone());
         let found = run(&config, root.path(), 1);
@@ -165,6 +191,40 @@ mod tests {
             run(&config, root.path(), 1).is_empty(),
             "only checked while DLSS is chosen"
         );
+    }
+
+    #[test]
+    fn the_dlss_report_is_shown_beside_the_library_field() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        let available =
+            Line::Available("available on a GPU (nvngx_dlss.dll from NVIDIA's folders)".into());
+        let said = |line: &Line, config: &Config| run_with(config, root.path(), 1, Some(line));
+        assert!(
+            said(&available, &config).is_empty(),
+            "only while DLSS is chosen"
+        );
+        config.graphics.upscaler = Upscaler::Dlss;
+        let found = said(&Line::Checking, &config);
+        assert_eq!(found[0].severity, Severity::Info);
+        let found = said(&available, &config);
+        assert_eq!(found[0].severity, Severity::Info);
+        assert_eq!(
+            found[0].message,
+            "DLSS is available on a GPU (nvngx_dlss.dll from NVIDIA's folders)"
+        );
+        assert_eq!(found[0].id.as_deref(), Some("upscaling.dlss_path"));
+        let found = said(
+            &Line::Unavailable("unavailable: no NVIDIA GPU".into()),
+            &config,
+        );
+        assert_eq!(found[0].severity, Severity::Note);
+        assert!(
+            found[0]
+                .message
+                .starts_with("DLSS is unavailable: no NVIDIA GPU")
+        );
+        assert!(!found[0].message.contains("without it"));
     }
 
     #[test]
