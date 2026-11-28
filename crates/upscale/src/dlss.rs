@@ -1,6 +1,9 @@
 //! Optional NVIDIA DLSS super resolution through NGX, the runtime that comes with NVIDIA's driver. Nothing of
 //! NVIDIA's is linked, bundled or shipped.
 //!
+//! Every call into NGX goes through [`lock::ngx_lock`] (NGX is not thread safe), and NGX's over-the-air updater is switched
+//! off when the loader is opened (see [`ngx::Library::open`]), so nothing here reaches the network.
+//!
 //! The player supplies NVIDIA's files: the driver installs the NGX loader (`nvngx.dll`), and the player puts a DLSS
 //! library (`nvngx_dlss.dll`) they obtained from NVIDIA where [`locate::locate`] looks (the `dlss_path` setting,
 //! NVIDIA's NGX folders, next to the executable). DLSS only works on NVIDIA GPUs with
