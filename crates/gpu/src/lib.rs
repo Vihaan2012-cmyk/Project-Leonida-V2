@@ -9,7 +9,7 @@ mod check;
 mod pipeline_cache;
 
 pub use check::{BindingKind, Check};
-pub use pipeline_cache::CacheLoad;
+pub use pipeline_cache::{CacheLoad, cache_id};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GpuError {

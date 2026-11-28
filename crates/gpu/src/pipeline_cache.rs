@@ -1,4 +1,8 @@
 //! The persistent `VkPipelineCache`: loaded from and saved to one file.
+//!
+//! The file is the driver's own cache data, as the game's device (`xbox-d3d12`'s `PipelineCache`) keeps it, so
+//! one file serves a prebuild and the game. Files in this crate's earlier wrapped form (magic and checksum before
+//! the driver data) still load.
 
 use std::path::Path;
 
@@ -6,9 +10,9 @@ use ash::vk;
 
 use crate::{Gpu, GpuError};
 
-const MAGIC: &[u8; 8] = b"LVPCACH1";
-/// The file's magic and the checksum of the driver's data after it.
-const FILE_HEADER: usize = 16;
+/// The magic and checksum an earlier version of this file put before the driver's data.
+const LEGACY_MAGIC: &[u8; 8] = b"LVPCACH1";
+const LEGACY_HEADER: usize = 16;
 /// The driver's own header: size, version, vendor, device and cache UUID.
 const DRIVER_HEADER: usize = 32;
 
@@ -26,6 +30,16 @@ fn checksum(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
     })
+}
+
+/// Names a GPU and driver build as `Gpu::pipeline_cache_id` does, from the device's vendor and device ids and its
+/// pipeline cache UUID.
+pub fn cache_id(vendor_id: u32, device_id: u32, uuid: &[u8; 16]) -> u64 {
+    let mut identity = [0u8; 24];
+    identity[..4].copy_from_slice(&vendor_id.to_le_bytes());
+    identity[4..8].copy_from_slice(&device_id.to_le_bytes());
+    identity[8..].copy_from_slice(uuid);
+    checksum(&identity)
 }
 
 impl Gpu {
@@ -50,13 +64,19 @@ impl Gpu {
             }
             Err(error) => return Err(error.into()),
         };
-        if bytes.len() < FILE_HEADER + DRIVER_HEADER || &bytes[..8] != MAGIC {
-            return Ok(CacheLoad::Rejected("not a Leonida pipeline cache"));
-        }
-        let data = &bytes[FILE_HEADER..];
-        let stored = u64::from_le_bytes(bytes[8..FILE_HEADER].try_into().expect("8 bytes"));
-        if checksum(data) != stored {
-            return Ok(CacheLoad::Rejected("the file is damaged"));
+        let data = match bytes.strip_prefix(LEGACY_MAGIC) {
+            Some(rest) if rest.len() >= 8 => {
+                let stored = u64::from_le_bytes(rest[..8].try_into().expect("8 bytes"));
+                let data = &bytes[LEGACY_HEADER..];
+                if checksum(data) != stored {
+                    return Ok(CacheLoad::Rejected("the file is damaged"));
+                }
+                data
+            }
+            _ => &bytes[..],
+        };
+        if data.len() < DRIVER_HEADER {
+            return Ok(CacheLoad::Rejected("not a pipeline cache"));
         }
         let version = u32::from_le_bytes(data[4..8].try_into().expect("4 bytes"));
         if version != vk::PipelineCacheHeaderVersion::ONE.as_raw() as u32
@@ -82,15 +102,11 @@ impl Gpu {
     /// size of the driver's data.
     pub fn save_pipeline_cache(&self, path: &Path) -> Result<usize, GpuError> {
         let data = self.pipeline_cache_data()?;
-        let mut file = Vec::with_capacity(FILE_HEADER + data.len());
-        file.extend_from_slice(MAGIC);
-        file.extend_from_slice(&checksum(&data).to_le_bytes());
-        file.extend_from_slice(&data);
         if let Some(folder) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(folder)?;
         }
         let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, &file)?;
+        std::fs::write(&temporary, &data)?;
         std::fs::rename(&temporary, path)?;
         Ok(data.len())
     }
