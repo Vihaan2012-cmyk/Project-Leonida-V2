@@ -3,6 +3,7 @@
 use super::block::{
     read_acs, read_cbp_chroma, read_cbp_luma, read_dc_diffs, read_mvs, read_quant, read_zeros,
 };
+use super::deblock::Meta;
 use super::motion::{self, Mvs};
 use super::pred::{ChromaDc, DcRange, LumaDc};
 use super::{Frame, Plane, Row, SliceState, VideoDecoder, dsp};
@@ -107,6 +108,7 @@ impl VideoDecoder {
         r: &mut BitReader,
         st: &mut SliceState,
         frame: &mut Frame,
+        meta: &mut Meta,
         refr: &Frame,
         row: &Row,
         bx: usize,
@@ -128,6 +130,7 @@ impl VideoDecoder {
         } else {
             let (count, diffs) = read_mvs(r, &self.codes)?;
             let mvs = st.mvs.predict(bx, top, left, count, &diffs);
+            meta.mvs[by * meta.mb_width + bx] = mvs;
             let q = if kind == BlockKind::Residue {
                 let q = read_quant(r, inter_q)?;
                 st.quant.set(bx * 2 + 1, q);
@@ -220,16 +223,14 @@ impl VideoDecoder {
         let mut blocks = [[0i32; 64]; 16];
         for quad in 0..4 {
             let group = &mut blocks[quad * 4..quad * 4 + 4];
-            if !read_acs(
+            read_acs(
                 r,
                 &self.codes,
                 cbp >> (4 * quad),
                 &tables::QUANT_INTER,
                 q,
                 group,
-            ) {
-                return None;
-            }
+            )?;
         }
         let stride = plane.stride;
         for (k, block) in blocks.iter_mut().enumerate() {
@@ -262,9 +263,7 @@ impl VideoDecoder {
             },
         );
         let mut blocks = [[0i32; 64]; 4];
-        if !read_acs(r, &self.codes, cbp, &tables::QUANT_INTER, q, &mut blocks) {
-            return None;
-        }
+        read_acs(r, &self.codes, cbp, &tables::QUANT_INTER, q, &mut blocks)?;
         let stride = plane.stride;
         for (k, block) in blocks.iter_mut().enumerate() {
             block[0] = dcs[k] * 8 + 32;
