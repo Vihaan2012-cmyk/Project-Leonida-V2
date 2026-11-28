@@ -17,7 +17,7 @@ ID3D12Device 13 CheckFeatureSupport pc
 ID3D12Device 14 CreateDescriptorHeap measured sites=3
 ID3D12Device 15 GetDescriptorHandleIncrementSize pc sites=10
 ID3D12Device 16 CreateRootSignature pc sites=1
-ID3D12Device 17 CreateConstantBufferView pc sites=1
+ID3D12Device 17 CreateConstantBufferView measured (called as (desc, handle) with the description {address, size}; the null view is {0, 0}; the title calls it only because the device byte at +0x18 is non-zero)
 ID3D12Device 18 CreateShaderResourceView pc sites=1
 ID3D12Device 19 CreateUnorderedAccessView pc sites=1
 ID3D12Device 20 CreateRenderTargetView pc sites=1
@@ -58,7 +58,7 @@ ID3D12Device 74 RegisterVirtualRangeX measured (called as (address, pages, &out)
 ID3D12Device 73 CreateCommandListX measured
 ID3D12Device 76 CreateCommittedResourceX measured
 ID3D12Device 86 CreatePipelineStateStreamX measured
-ID3D12Device 101 CreateStateObject measured (a ray tracing subobject list with riid and out; the title continues when it fails)
+ID3D12Device 101 CreateStateObject measured (a ray tracing subobject list with riid and out, one site: the library builder at rva 0x024801b0; a failure only returns 0 from that builder and leaves the holder's state object null; the HRESULT check at rva 0x04e9b660 reacts only to device removed, hung, reset and driver internal error)
 ID3D12Device 108 GetResourceAllocationInfo1 measured (slot 25's arguments and an array of three-word infos; the title retries with alignment 0 when the answer is not the 4 KiB it asked)
 ID3D12Device 119 CrashContextAppendX measured (only from the crash handler: buffer, size, 0)
 ID3D12Device 132 RequestGpuDumpX measured (only from the crash handler: called as (3))
@@ -172,8 +172,8 @@ ID3D12GraphicsCommandList 54 ClearUnorderedAccessViewFloat measured
 ID3D12GraphicsCommandList 55 DiscardResource measured
 ID3D12GraphicsCommandList 59 GpuEventX measured
 ID3D12GraphicsCommandList 61 ExecuteIndirect measured sites=10
-ID3D12GraphicsCommandList 71 WriteValueX inferred
-ID3D12GraphicsCommandList 73 WaitValueX inferred
+ID3D12GraphicsCommandList 71 WriteValueX measured (called as (address, value) with two zero words; writes a frame or marker value into the title's own 3 by 18 word table that nothing reads back; ignored)
+ID3D12GraphicsCommandList 73 WaitValueX inferred (no command list call site in the executable; ignored)
 ID3D12GraphicsCommandList 80 DispatchX inferred
 ID3D12GraphicsCommandList 85 CopyTextureRegion inferred
 ID3D12GraphicsCommandList 131 Unnamed131 measured (called as (a, b, c, mask) once per list before Close; meaning unknown, ignored)
