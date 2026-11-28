@@ -277,7 +277,12 @@ fn the_floor_patch_redirects_one_displacement() {
     assert_eq!(framerate::select(&finder, false, &[]).unwrap(), Vec::new());
     let mut all = patches;
     all.extend(CLOCK_FLOOR.patches(&finder).unwrap());
-    assert_eq!(framerate::select(&finder, true, &[]).unwrap(), all);
+    // This image has none of the sites of the time step floors, which stop the whole selection.
+    assert!(matches!(
+        framerate::select(&finder, true, &[]),
+        Err(PatchError::Ambiguous { .. })
+    ));
+    assert_eq!(all.len(), 3);
 }
 
 #[test]
