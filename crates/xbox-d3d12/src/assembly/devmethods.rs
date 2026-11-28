@@ -318,6 +318,7 @@ unsafe extern "win64" fn d_create_cbv(this: *mut c_void, desc: *const u8, dest: 
     // SAFETY: the title's constant buffer view description and a heap slot.
     unsafe {
         let m = Mem(desc);
+        asm.resources().mark_hot(m.u64(0), u64::from(m.u32(8)));
         let slot = asm.descriptors().create_cbv(m.u64(0), m.u32(8));
         descriptor::write_slot(dest, &slot);
     }
@@ -500,6 +501,9 @@ fn view_from_address(
         return;
     };
     let view = ViewResource { address, desc };
+    if desc.is_buffer() {
+        asm.resources().mark_hot(address, desc.width);
+    }
     let made = if unordered {
         // SAFETY: as above.
         let Some(uav) = (unsafe { read_uav(view_desc, &view) }) else {

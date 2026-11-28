@@ -106,6 +106,7 @@ impl AddressSpace {
             state.dirty.add(va, va + len);
             state.stale.remove(va, va + len);
             state.noted.remove(va, va + len);
+            self.temp.note_written(va, va + len);
         }
     }
 
@@ -170,6 +171,12 @@ impl AddressSpace {
                         implicit.extend(host_runs.iter().map(|&(lo, hi)| {
                             (va + (lo - host), (va + (hi - host)).min(va + extent.len))
                         }));
+                        for &(lo, hi) in &host_runs {
+                            self.temp.note_written(
+                                va + (lo - host),
+                                (va + (hi - host)).min(va + extent.len),
+                            );
+                        }
                     } else {
                         implicit.push((va, va + extent.len));
                     }

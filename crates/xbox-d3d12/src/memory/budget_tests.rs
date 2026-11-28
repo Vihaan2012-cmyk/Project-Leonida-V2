@@ -242,6 +242,7 @@ fn counters_name_every_figure() {
         peak_spilled: 9 * MIB,
         refused: 2,
         deferred: 3 * MIB,
+        released: 11 * MIB,
     };
     assert_eq!(counters.local_total(), 600 * MIB);
     assert_eq!(counters.spilled_total(), 6 * MIB);
@@ -253,6 +254,7 @@ fn counters_name_every_figure() {
         "peak 9 MiB",
         "refused 2",
         "left unbound 3 MiB",
+        "released by detiled textures 11 MiB",
     ] {
         assert!(line.contains(part), "{part} in {line}");
     }

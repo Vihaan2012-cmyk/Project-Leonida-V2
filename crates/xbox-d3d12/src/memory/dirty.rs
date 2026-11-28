@@ -315,7 +315,7 @@ impl Scanner {
 
 /// The pages written in `lo..hi`, queried in calls of at most `QUERY_PAGES` pages; `None` where the system cannot
 /// say.
-fn fetch(lo: u64, hi: u64) -> Option<Vec<usize>> {
+pub(super) fn fetch(lo: u64, hi: u64) -> Option<Vec<usize>> {
     let mut found = Vec::new();
     let mut window = Vec::new();
     let mut at = lo;

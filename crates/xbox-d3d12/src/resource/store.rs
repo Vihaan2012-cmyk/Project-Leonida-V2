@@ -7,8 +7,14 @@
 //! placed by the game (`CreatePlacedResourceX`) lives in memory the game already mapped. A texture is a
 //! `VkImage`; its GPU address is only the key its descriptors carry, the game address of a placed texture or an
 //! address from a range no memory is mapped at.
+//!
+//! What a range of game memory holds is told to the address space, which decides where to keep it. A texture
+//! whose tiled data was detiled into its image (`upload_texture`) is **cold**: only the image is read, so the
+//! window's device-local copy of its memory is released. Buffers, placed or committed, targets and unordered-access
+//! textures are **hot**, and so is whatever a view over an address names (`mark_hot`, called from the layers that
+//! create them). `refresh_written` finds the textures the title wrote again and makes their images anew.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::desc::{AllocationInfo, DescError, ResourceDesc};
@@ -102,6 +108,8 @@ pub struct Resources {
     by_address: BTreeMap<u64, ResourceId>,
     items: HashMap<ResourceId, Resource>,
     next: ResourceId,
+    /// Placed textures whose image was made from their memory, by the game address of that memory.
+    detiled: Mutex<BTreeSet<(u64, ResourceId)>>,
 }
 
 impl Resources {
@@ -127,6 +135,7 @@ impl Resources {
             by_address: BTreeMap::new(),
             items: HashMap::new(),
             next: 1,
+            detiled: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -224,10 +233,13 @@ impl Resources {
         if !commit_host(va, len, write_watch) {
             return Err(ResourceError::HostMemory(len, va));
         }
-        if let Err(e) = self.space().map_host(va, len, policy) {
+        let mut space = self.space();
+        if let Err(e) = space.map_host(va, len, policy) {
+            drop(space);
             release_host(va);
             return Err(e.into());
         }
+        space.mark_hot(va, len);
         Ok(())
     }
 
@@ -326,9 +338,13 @@ impl Resources {
                 self.space().map_host(at, end - at, SyncPolicy::Always)?;
                 at = end;
             }
+            self.space().mark_hot(va, size);
             return Ok(self.insert(*desc, Origin::Placed, (va, va, size), None, false));
         }
         let image = GpuImage::create(&self.handles(), desc)?;
+        if !desc.detiles_for_sampling() {
+            self.space().mark_hot(va, size);
+        }
         let (address, keyed) = if self.by_address.contains_key(&va) {
             let key = self
                 .keys
@@ -392,9 +408,10 @@ impl Resources {
     ) -> Result<(), ResourceError> {
         let r = self.items.get(&id).ok_or(ResourceError::Unknown(id))?;
         let va = r.address + offset;
-        Ok(self
-            .space()
-            .map_host_at(va, host, len, SyncPolicy::Always)?)
+        let mut space = self.space();
+        space.map_host_at(va, host, len, SyncPolicy::Always)?;
+        space.mark_hot(va, len);
+        Ok(())
     }
 
     /// A tile range back to nothing.
@@ -411,6 +428,10 @@ impl Resources {
     pub fn destroy(&mut self, id: ResourceId) -> Result<(), ResourceError> {
         let r = self.items.remove(&id).ok_or(ResourceError::Unknown(id))?;
         self.by_address.remove(&r.address);
+        self.detiled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(r.memory, id));
         let key = r.image.is_some() && (r.origin != Origin::Placed || r.keyed);
         if let Some(image) = r.image {
             image.destroy(&self.handles());
@@ -481,6 +502,10 @@ impl Resources {
         if info.kind != Kind::Color {
             return Err(ResourceError::Format(info.kind));
         }
+        let sampled = desc.detiles_for_sampling();
+        if sampled {
+            self.space().rebase_writes(r.memory, r.size);
+        }
         // SAFETY: a placed texture's memory is host memory the game mapped at its address, `size` bytes long.
         let memory = unsafe { std::slice::from_raw_parts(r.memory as *const u8, r.size as usize) };
         let handles = self.handles();
@@ -515,7 +540,51 @@ impl Resources {
                 image.upload(&handles, mip, slice, &rows)?;
             }
         }
+        if sampled {
+            self.space().mark_cold(r.memory, r.size);
+            self.detiled
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert((r.memory, id));
+        }
         Ok(())
+    }
+
+    /// Makes the image of every detiled texture again whose memory the title wrote since it was made (the host's
+    /// own writes reported to the address space, and the write watch). Returns how many it made.
+    pub fn refresh_written(&self) -> usize {
+        let written = self.space().take_cold_writes();
+        if written.is_empty() {
+            return 0;
+        }
+        let hit: Vec<ResourceId> = {
+            let detiled = self.detiled.lock().unwrap_or_else(PoisonError::into_inner);
+            detiled
+                .iter()
+                .filter(|(memory, id)| {
+                    let size = self.items.get(id).map_or(0, |r| r.size);
+                    written
+                        .iter()
+                        .any(|&(lo, hi)| *memory < hi && lo < memory + size)
+                })
+                .map(|&(_, id)| id)
+                .collect()
+        };
+        hit.into_iter()
+            .filter(|&id| self.upload_texture(id).is_ok())
+            .count()
+    }
+
+    /// Gives the device-local copy of detiled textures' memory back (`AddressSpace::release_cold`). Call it between
+    /// submissions, with the GPU idle.
+    pub fn release_detiled(&self) -> u64 {
+        self.space().release_cold().unwrap_or(0)
+    }
+
+    /// Says the GPU reads or writes `address..address + len` through the window: a view named it, a submission
+    /// writes it. Not texture memory then.
+    pub fn mark_hot(&self, address: u64, len: u64) {
+        self.space().mark_hot(address, len);
     }
 
     /// The reverse: the image's texels written back into the game memory of a placed texture.
