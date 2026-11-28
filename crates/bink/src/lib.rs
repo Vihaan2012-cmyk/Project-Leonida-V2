@@ -1,4 +1,8 @@
 //! Pure-Rust decoder for Bink 2 movies (`KB2` streams) and their Bink audio tracks.
+//!
+//! Video frames come out as the game's own Bink library produces them: motion compensation, the inverse DCT and the
+//! in-loop block filters follow that library's arithmetic (see the module docs of `video` for what was read where),
+//! so a long chain of inter frames stays in step with the encoder.
 
 mod audio;
 mod bits;
