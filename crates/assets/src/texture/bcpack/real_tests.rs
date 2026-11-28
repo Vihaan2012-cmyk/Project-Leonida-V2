@@ -267,50 +267,191 @@ fn decode_speed_on_real_chunks() {
     }
 }
 
-/// How many BC7 chunks decode without built-in history, and how the ones that decode compare with their mips.
+/// PSNR in dB between the 2x2 box filter of `big` and `small` (all channels), `shift` pixels to the right.
+fn box_psnr(big: &Plane, small: &Plane, shift: usize) -> f64 {
+    let ch = big.channels;
+    let (w, h) = (
+        small.width.min(big.width / 2),
+        small.height.min(big.height / 2),
+    );
+    let mut sq = 0f64;
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..ch {
+                let at = |xx: usize, yy: usize| u32::from(big.px[(yy * big.width + xx) * ch + c]);
+                let avg = (at(2 * x, 2 * y)
+                    + at(2 * x + 1, 2 * y)
+                    + at(2 * x, 2 * y + 1)
+                    + at(2 * x + 1, 2 * y + 1)
+                    + 2)
+                    / 4;
+                let sx = (x + shift) % w;
+                let d = f64::from(avg) - f64::from(small.px[(y * small.width + sx) * ch + c]);
+                sq += d * d;
+            }
+        }
+    }
+    let mse = sq / (w * h * ch) as f64;
+    if mse < 1e-9 {
+        99.0
+    } else {
+        10.0 * (255.0f64 * 255.0 / mse).log10()
+    }
+}
+
+/// Per mip level `k` (mip `k` against the box filter of mip `k - 1`): PSNR and the shifted control.
+#[derive(Default)]
+struct ChainStats {
+    textures: usize,
+    refused: usize,
+    psnr: BTreeMap<usize, Vec<f64>>,
+    control: BTreeMap<usize, Vec<f64>>,
+}
+
+fn bc7_mip_chains(file: &[u8], per_pool: usize) -> ChainStats {
+    let pool = Pool::parse(file)
+        .unwrap()
+        .with_bcpack_options(DecodeOptions {
+            allow_provisional: true,
+        });
+    let mut st = ChainStats::default();
+    let mut cache = ChunkCache::new();
+    for index in 0..pool.texture_count() {
+        let Some(d) = pool.descriptor(index) else {
+            continue;
+        };
+        if !matches!(d.format, 98 | 99)
+            || d.dimension != 1
+            || d.depth != 1
+            || d.mips < 2
+            || d.width < 16
+            || d.height < 16
+            || d.is_unmapped()
+        {
+            continue;
+        }
+        let (start, size) = (d.base, pool.span(index, d.base).unwrap_or(0));
+        let Ok(set) = pool.codecs(start, size) else {
+            continue;
+        };
+        if !set.contains(7) {
+            continue;
+        }
+        if st.textures >= per_pool {
+            break;
+        }
+        st.textures += 1;
+        cache.clear();
+        let Ok(TextureResult::Complete(t)) = pool.decode_texture(index, &mut cache) else {
+            st.refused += 1;
+            continue;
+        };
+        let fi = format_info(d.format).unwrap();
+        let mut at = 0usize;
+        let mut prev: Option<Plane> = None;
+        for k in 0..d.mips as usize {
+            let (w, h) = ((d.width >> k).max(1), (d.height >> k).max(1));
+            let bytes = mip_bytes(&fi, w, h) as usize;
+            let Some(blocks) = t.data.get(at..at + bytes) else {
+                break;
+            };
+            at += bytes;
+            if w < 8 || h < 8 {
+                break;
+            }
+            let Some(plane) = to_pixels(d.format, w, h, blocks) else {
+                break;
+            };
+            if let Some(big) = &prev {
+                st.psnr.entry(k).or_default().push(box_psnr(big, &plane, 0));
+                let shift = (plane.width / 3).max(2);
+                st.control
+                    .entry(k)
+                    .or_default()
+                    .push(box_psnr(big, &plane, shift));
+            }
+            prev = Some(plane);
+        }
+    }
+    st
+}
+
+/// BC7 chunks of the pools: how many decode when history entries are refused (`strict`, which is what decoding
+/// was limited to before the history was added) and when provisional ones are allowed, and how the mips of the
+/// decoded textures agree.
 #[test]
-fn bc7_self_contained_chunks_on_real_pools() {
+fn bc7_history_chunks_and_mip_agreement_on_real_pools() {
+    let (mut total, mut strict_ok, mut prov_ok) = (0usize, 0usize, 0usize);
+    let mut refused: BTreeMap<String, usize> = BTreeMap::new();
+    let mut all_psnr: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
+    let mut all_control: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
     for rel in survey_pools() {
         let Some(file) = pool_file(&rel) else {
             continue;
         };
         let pool = Pool::parse(&file).unwrap();
-        let (mut total, mut ok, mut history, mut other) = (0usize, 0usize, 0usize, 0usize);
+        let (mut n, mut s_ok, mut p_ok) = (0usize, 0usize, 0usize);
         for c in pool.chunks().iter().filter(|c| c.codec == 7) {
-            total += 1;
+            n += 1;
             let raw = &file[c.src as usize..(c.src + c.packed) as usize];
-            let opts = DecodeOptions {
+            let size = c.size as usize;
+            let strict = DecodeOptions {
                 allow_provisional: false,
             };
-            match super::decode_with(BcPackCodec::Bc7, raw, c.size as usize, &opts) {
-                Ok(_) => ok += 1,
-                Err(super::BcPackError::History { block, entry, .. }) => {
-                    history += 1;
-                    if history <= 12 {
-                        eprintln!(
-                            "  chunk size {}: first history reference at block {block} entry {entry}",
-                            c.size
-                        );
-                    }
-                }
+            s_ok += usize::from(super::decode_with(BcPackCodec::Bc7, raw, size, &strict).is_ok());
+            let loose = DecodeOptions {
+                allow_provisional: true,
+            };
+            match super::decode_with(BcPackCodec::Bc7, raw, size, &loose) {
+                Ok(_) => p_ok += 1,
                 Err(e) => {
-                    other += 1;
-                    eprintln!("{rel}: BC7 chunk at {}: {e}", c.src);
+                    let key = format!("{e}")
+                        .split(|ch: char| ch.is_ascii_digit())
+                        .collect::<String>();
+                    *refused.entry(key).or_default() += 1;
                 }
             }
         }
-        eprintln!("{rel}: {total} BC7 chunks, {ok} decode, {history} need history, {other} other");
-        if ok == 0 {
-            continue;
-        }
-        let mut stats = survey(
-            &file,
-            DecodeOptions {
-                allow_provisional: true,
-            },
-            400,
-            &["BC7"],
+        eprintln!("{rel}: {n} BC7 chunks, {s_ok} decode without history, {p_ok} with it");
+        total += n;
+        strict_ok += s_ok;
+        prov_ok += p_ok;
+        let cap = std::env::var("LEONIDA_BCPACK_TEXTURES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let chains = bc7_mip_chains(&file, cap);
+        eprintln!(
+            "  {} BC7 textures sampled, {} not fully decoded",
+            chains.textures, chains.refused
         );
-        report(&format!("{rel} [bc7]"), &mut stats);
+        for (k, v) in chains.psnr {
+            all_psnr.entry(k).or_default().extend(v);
+        }
+        for (k, v) in chains.control {
+            all_control.entry(k).or_default().extend(v);
+        }
+    }
+    eprintln!("BC7 chunks: {total} total, {strict_ok} without history, {prov_ok} with history");
+    for (why, n) in &refused {
+        eprintln!("  refused: {n} x {why}");
+    }
+    for (k, v) in all_psnr.iter_mut() {
+        let ctl = all_control.get_mut(k).map_or(f64::NAN, |c| median(c));
+        let n = v.len();
+        let p10 = {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[n / 10]
+        };
+        eprintln!(
+            "  mip {k} vs box filter of mip {}: {n} textures, PSNR median {:.1} dB, p10 {p10:.1}; shifted control {ctl:.1}",
+            k - 1,
+            median(v)
+        );
+    }
+    if let Some(v) = all_psnr.get_mut(&1).filter(|v| v.len() >= 10) {
+        let c = median(all_control.get_mut(&1).unwrap());
+        let m = median(v);
+        assert!(m > c + 3.0, "mip 1 PSNR {m} is not above the control {c}");
     }
 }
