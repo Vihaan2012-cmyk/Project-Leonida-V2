@@ -68,16 +68,23 @@ fn whole_pel_motion_shifts_the_block() {
     single_mv(&mut b, 4, 4);
     kind(&mut b, SKIP);
     let (reference, out) = run(&b);
-    for y in 0..32 {
+    // The upper quarters stay inside the picture; the lower ones would reach below it and move back up.
+    for y in 0..16 {
         for x in 0..32 {
-            let want = sample(&reference.planes[0], x + 2, (y + 2).min(31));
+            let want = sample(&reference.planes[0], x + 2, y + 2);
+            assert_eq!(sample(&out.planes[0], x, y), want, "luma {x},{y}");
+        }
+    }
+    for y in 16..32 {
+        for x in 0..32 {
+            let want = sample(&reference.planes[0], x + 2, y);
             assert_eq!(sample(&out.planes[0], x, y), want, "luma {x},{y}");
         }
     }
     for p in 1..3 {
-        for y in 0..16 {
+        for y in 0..8 {
             for x in 0..16 {
-                let want = sample(&reference.planes[p], x + 1, (y + 1).min(15));
+                let want = sample(&reference.planes[p], x + 1, y + 1);
                 assert_eq!(sample(&out.planes[p], x, y), want, "chroma {p} {x},{y}");
             }
         }
@@ -93,19 +100,16 @@ fn whole_pel_motion_shifts_the_block() {
 }
 
 #[test]
-fn vectors_pointing_outside_replicate_the_edge() {
+fn a_source_outside_the_picture_moves_back_inside() {
     let mut b = Bits::default();
     kind(&mut b, MOTION);
     single_mv(&mut b, -12, -6);
     kind(&mut b, SKIP);
     let (reference, out) = run(&b);
+    // The whole quarter is read from the corner instead of repeating the edge samples.
     for y in 0..16usize {
         for x in 0..16usize {
-            let want = sample(
-                &reference.planes[0],
-                x.saturating_sub(6),
-                y.saturating_sub(3),
-            );
+            let want = sample(&reference.planes[0], x, y);
             assert_eq!(sample(&out.planes[0], x, y), want, "luma {x},{y}");
         }
     }
@@ -120,8 +124,15 @@ fn half_pel_luma_uses_the_six_tap_filter() {
     let (reference, out) = run(&b);
     let px = &reference.planes[0];
     for y in 0..32 {
-        for x in 8..24 {
+        for x in 16..32 {
             let s = std::array::from_fn(|k| i32::from(sample(px, x + k - 2, y)));
+            assert_eq!(sample(&out.planes[0], x, y), six_tap(s), "{x},{y}");
+        }
+    }
+    // The left quarter would start half a sample outside and moves right to leave the taps inside.
+    for y in 0..32 {
+        for x in 0..16 {
+            let s = std::array::from_fn(|k| i32::from(sample(px, x + k, y)));
             assert_eq!(sample(&out.planes[0], x, y), six_tap(s), "{x},{y}");
         }
     }
@@ -131,9 +142,10 @@ fn half_pel_luma_uses_the_six_tap_filter() {
     kind(&mut b, SKIP);
     let (reference, out) = run(&b);
     let px = &reference.planes[0];
-    for y in 8..24 {
+    // The upper quarters start half a sample above the picture and move down to leave the taps inside.
+    for y in 0..16 {
         for x in 0..32 {
-            let s = std::array::from_fn(|k| i32::from(sample(px, x, y + k - 2)));
+            let s = std::array::from_fn(|k| i32::from(sample(px, x, y + k)));
             assert_eq!(sample(&out.planes[0], x, y), six_tap(s), "{x},{y}");
         }
     }
@@ -147,10 +159,10 @@ fn diagonal_half_pel_filters_rows_then_columns() {
     kind(&mut b, SKIP);
     let (reference, out) = run(&b);
     let px = &reference.planes[0];
-    for y in 8..24 {
-        for x in 8..24 {
+    for y in 0..16 {
+        for x in 0..16 {
             let col: [i32; 6] = std::array::from_fn(|r| {
-                let s = std::array::from_fn(|k| i32::from(sample(px, x + k - 2, y + r - 2)));
+                let s = std::array::from_fn(|k| i32::from(sample(px, x + k, y + r)));
                 i32::from(six_tap(s))
             });
             assert_eq!(sample(&out.planes[0], x, y), six_tap(col), "{x},{y}");
@@ -167,8 +179,9 @@ fn quarter_pel_chroma_blends_two_samples() {
         kind(&mut b, SKIP);
         let (reference, out) = run(&b);
         let px = &reference.planes[2];
-        for y in 0..16 {
-            for x in 0..15 {
+        // The right half of the macroblock starts at chroma column 8, away from the picture's edge.
+        for y in 0..8 {
+            for x in 8..15 {
                 let (a, c) = (i32::from(sample(px, x, y)), i32::from(sample(px, x + 1, y)));
                 let want = ((wa * a + wb * c + 4) >> 3) as u8;
                 assert_eq!(sample(&out.planes[2], x, y), want, "mv {mv} at {x},{y}");
@@ -181,12 +194,12 @@ fn quarter_pel_chroma_blends_two_samples() {
 fn four_vectors_move_the_quarters_separately() {
     let mut b = Bits::default();
     kind(&mut b, MOTION);
-    // Differences (2,0), (-2,0), (-2,2), (0,0) become the vectors (2,0), (0,0), (0,2), (0,0).
+    // Differences (2,0), (-2,0), (-2,-2), (0,0) become the vectors (2,0), (0,0), (0,-2), (0,0).
     b.put(0, 1);
     for x in [2, -2, -2, 0] {
         b.mv(x);
     }
-    for y in [0, 0, 2, 0] {
+    for y in [0, 0, -2, 0] {
         b.mv(y);
     }
     kind(&mut b, SKIP);
@@ -194,7 +207,7 @@ fn four_vectors_move_the_quarters_separately() {
     let px = &reference.planes[0];
     assert_eq!(sample(&out.planes[0], 3, 3), sample(px, 4, 3));
     assert_eq!(sample(&out.planes[0], 20, 3), sample(px, 20, 3));
-    assert_eq!(sample(&out.planes[0], 3, 20), sample(px, 3, 21));
+    assert_eq!(sample(&out.planes[0], 3, 20), sample(px, 3, 19));
     assert_eq!(sample(&out.planes[0], 20, 20), sample(px, 20, 20));
 }
 
@@ -207,7 +220,7 @@ fn the_next_macroblock_predicts_its_vector_from_the_left() {
     single_mv(&mut b, 0, 0);
     let (reference, out) = run(&b);
     for y in 0..32 {
-        for x in 32..60 {
+        for x in 32..48 {
             let want = sample(&reference.planes[0], x + 1, y);
             assert_eq!(sample(&out.planes[0], x, y), want, "{x},{y}");
         }
@@ -221,9 +234,16 @@ fn escaped_vector_components_round_trip() {
     single_mv(&mut b, 8, -10);
     kind(&mut b, SKIP);
     let (reference, out) = run(&b);
-    let want = |x: usize, y: usize| sample(&reference.planes[0], x + 4, y.saturating_sub(5));
-    assert_eq!(sample(&out.planes[0], 10, 12), want(10, 12));
-    assert_eq!(sample(&out.planes[0], 2, 30), want(2, 30));
+    // The upper quarter would start above the picture and moves down to its top edge; the lower one is read from
+    // five rows up.
+    assert_eq!(
+        sample(&out.planes[0], 10, 12),
+        sample(&reference.planes[0], 14, 12)
+    );
+    assert_eq!(
+        sample(&out.planes[0], 2, 30),
+        sample(&reference.planes[0], 6, 25)
+    );
 }
 
 #[test]

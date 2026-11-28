@@ -122,12 +122,34 @@ fn chroma_tap(a: i32, b: i32, frac: i32) -> i32 {
     4 * ((4 - frac) * a + frac * b)
 }
 
-/// Predicts the 16x16 luma block at (`bx`, `by`) of `dst` from `src` displaced by the half-pel vector `mv`. A
+/// Where a block's source lies, clamped the way the game does (RVA 0x1cf40) before it predicts anything: the vector
+/// is added to the block's own position in half samples, and a source that would reach outside the picture (taps
+/// of the luma filter included) moves back in as a whole. `size` is the picture's extent in half samples along the
+/// axis, `snug` the frame flag 0x20000 that lets a block with a fractional position sit one half sample closer to
+/// the far edge.
+pub fn clamp_source(position: i32, size: i32, snug: bool) -> i32 {
+    let frac = (position & 1) as usize;
+    let reach = [32, 42][frac];
+    let (low, high) = if snug {
+        let low = [0, 5][frac];
+        (low, low + size - reach)
+    } else {
+        let low = [0, 4][frac];
+        (low, size - reach)
+    };
+    if position < low {
+        low
+    } else {
+        position.min(high)
+    }
+}
+
+/// Predicts the 16x16 luma block at (`bx`, `by`) of `dst` from `src` at the half-sample position `pos`. A
 /// two-dimensional position filters the rows first and keeps those results unclipped for the column pass.
-pub fn luma_block(dst: &mut Plane, src: &Plane, bx: usize, by: usize, mv: [i32; 2]) {
+pub fn luma_block(dst: &mut Plane, src: &Plane, bx: usize, by: usize, pos: [i32; 2]) {
     let s = Source::new(src);
-    let (x0, y0) = (bx as i32 + (mv[0] >> 1), by as i32 + (mv[1] >> 1));
-    let (fx, fy) = (mv[0] & 1 != 0, mv[1] & 1 != 0);
+    let (x0, y0) = (pos[0] >> 1, pos[1] >> 1);
+    let (fx, fy) = (pos[0] & 1 != 0, pos[1] & 1 != 0);
     let mut tmp = [[0i32; 16]; 21];
     for (r, row) in tmp.iter_mut().enumerate() {
         let y = y0 + r as i32 - 2;
@@ -153,12 +175,13 @@ pub fn luma_block(dst: &mut Plane, src: &Plane, bx: usize, by: usize, mv: [i32; 
     }
 }
 
-/// Predicts the 8x8 chroma block at (`bx`, `by`) of `dst` from `src` displaced by the quarter-pel vector `mv`. The
-/// rows are interpolated at sixteen times the sample scale and rounded once after the columns.
-pub fn chroma_block(dst: &mut Plane, src: &Plane, bx: usize, by: usize, mv: [i32; 2]) {
+/// Predicts the 8x8 chroma block at (`bx`, `by`) of `dst` from `src` at the quarter-sample position `pos` (the
+/// luma half-sample position of the block is the chroma quarter-sample position). The rows are interpolated at
+/// sixteen times the sample scale and rounded once after the columns.
+pub fn chroma_block(dst: &mut Plane, src: &Plane, bx: usize, by: usize, pos: [i32; 2]) {
     let s = Source::new(src);
-    let (x0, y0) = (bx as i32 + (mv[0] >> 2), by as i32 + (mv[1] >> 2));
-    let (fx, fy) = (mv[0] & 3, mv[1] & 3);
+    let (x0, y0) = (pos[0] >> 2, pos[1] >> 2);
+    let (fx, fy) = (pos[0] & 3, pos[1] & 3);
     let mut tmp = [[0i32; 8]; 9];
     for (r, row) in tmp.iter_mut().enumerate() {
         for (c, v) in row.iter_mut().enumerate() {
@@ -234,7 +257,7 @@ mod tests {
         luma_block(&mut dst, &src, 0, 0, [-6, 4]);
         assert_eq!(dst.data[0], src.data[2 * 32]);
         assert_eq!(dst.data[5 * 32 + 10], src.data[7 * 32 + 7]);
-        luma_block(&mut dst, &src, 16, 16, [0, 0]);
+        luma_block(&mut dst, &src, 16, 16, [32, 32]);
         assert_eq!(dst.data[16 * 32 + 16], src.data[16 * 32 + 16]);
     }
 
@@ -242,10 +265,10 @@ mod tests {
     fn half_pel_luma_of_a_ramp_lands_between_samples() {
         let src = plane(48, 48, |x, _| (x * 4) as u8);
         let mut dst = plane(48, 48, |_, _| 0);
-        luma_block(&mut dst, &src, 16, 16, [1, 0]);
+        luma_block(&mut dst, &src, 16, 16, [33, 32]);
         // The filter taps sum to one, so a ramp of slope 4 is sampled half a step along.
         assert_eq!(dst.data[16 * 48 + 20], 82);
-        luma_block(&mut dst, &src, 16, 16, [0, 1]);
+        luma_block(&mut dst, &src, 16, 16, [32, 33]);
         assert_eq!(dst.data[16 * 48 + 20], 80);
     }
 
@@ -258,6 +281,24 @@ mod tests {
             let (a, b) = (4 * 8, 5 * 8);
             assert_eq!(i32::from(dst.data[4]), (wa * a + wb * b + 4) >> 3);
         }
+    }
+
+    #[test]
+    fn sources_are_moved_back_inside_the_picture() {
+        // A 64 sample wide picture is 128 half samples across.
+        for snug in [false, true] {
+            assert_eq!(clamp_source(-20, 128, snug), 0, "far left, whole sample");
+            assert_eq!(clamp_source(200, 128, snug), 96, "far right, whole sample");
+            assert_eq!(clamp_source(40, 128, snug), 40);
+        }
+        // A fractional position needs the filter taps inside too: 5 half samples from the left edge, and with
+        // the snug flag the last allowed position leaves the taps exactly at the right edge.
+        assert_eq!(clamp_source(-3, 128, true), 5);
+        assert_eq!(clamp_source(201, 128, true), 91);
+        assert_eq!(clamp_source(-3, 128, false), 4);
+        assert_eq!(clamp_source(201, 128, false), 86);
+        assert_eq!(clamp_source(91, 128, true), 91);
+        assert_eq!(clamp_source(93, 128, true), 91);
     }
 
     #[test]
@@ -277,7 +318,7 @@ mod tests {
         let hash = |x: usize, y: usize| ((x * 7919 + y * 104_729 + x * y * 31) % 5 / 4 * 255) as u8;
         let src = plane(48, 48, hash);
         let mut dst = plane(48, 48, |_, _| 0);
-        luma_block(&mut dst, &src, 16, 16, [1, 1]);
+        luma_block(&mut dst, &src, 16, 16, [33, 33]);
         let tap = |s: [i32; 6]| {
             ((((s[2] + s[3]) * 19) >> 1) - (s[1] + s[4]) * 2 + ((s[0] + s[5]) >> 1) + 8) >> 4
         };

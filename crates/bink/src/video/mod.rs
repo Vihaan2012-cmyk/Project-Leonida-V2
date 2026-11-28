@@ -55,6 +55,8 @@ struct Row {
     by: usize,
     top: bool,
     wide: bool,
+    /// Frame flag 0x20000: sources may sit one half sample closer to the far edge of the picture.
+    snug: bool,
     alpha: bool,
 }
 
@@ -309,6 +311,7 @@ impl VideoDecoder {
             by,
             top,
             wide: flags & 0x4_0000 != 0,
+            snug: flags & 0x2_0000 != 0,
             alpha: self.alpha && with_alpha,
         };
         for bx in 0..bw {
@@ -335,6 +338,7 @@ impl VideoDecoder {
     }
 
     /// An intra macroblock. In inter frames it also keeps the inter quantiser and vector predictors current.
+    #[allow(clippy::too_many_arguments)]
     fn intra_mb(
         &self,
         r: &mut BitReader,
