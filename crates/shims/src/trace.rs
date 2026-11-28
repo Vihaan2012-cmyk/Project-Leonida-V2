@@ -12,6 +12,8 @@ use pe_loader::ImportRef;
 
 #[cfg(windows)]
 mod crash;
+#[cfg(windows)]
+mod threads;
 
 const CAPACITY: usize = 1 << 14;
 
@@ -481,12 +483,14 @@ pub fn watch_crashes(folder: PathBuf, base: usize, size: usize) {
     }
     #[cfg(windows)]
     {
+        let dumps = folder.clone();
         let first = crash::WATCH
             .lock()
             .map(|mut watch| watch.replace((folder, base, size)).is_none())
             .unwrap_or(false);
         if first {
             crash::install();
+            threads::schedule(dumps);
         }
     }
     #[cfg(not(windows))]
