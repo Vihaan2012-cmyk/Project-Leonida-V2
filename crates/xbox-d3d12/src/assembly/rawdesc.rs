@@ -631,11 +631,22 @@ pub unsafe fn read_slot67(p: *const u8) -> Slot67Parts {
     }
 }
 
+/// Why a versioned root signature description could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RootDescError {
+    #[error("unknown root signature version {0}")]
+    Version(u32),
+    #[error("parameter {index} has the unknown shader visibility {value}")]
+    Visibility { index: usize, value: u32 },
+    #[error("parameter {index} has the unknown type {value}")]
+    ParameterType { index: usize, value: u32 },
+}
+
 /// `D3D12_VERSIONED_ROOT_SIGNATURE_DESC`.
 ///
 /// # Safety
 /// `p` is a readable description whose parameter, range and static sampler arrays are readable.
-pub unsafe fn read_versioned_root_signature(p: *const u8) -> Option<RootSignature> {
+pub unsafe fn read_versioned_root_signature(p: *const u8) -> Result<RootSignature, RootDescError> {
     // SAFETY: as the caller promises.
     unsafe {
         let m = Mem(p);
@@ -643,7 +654,7 @@ pub unsafe fn read_versioned_root_signature(p: *const u8) -> Option<RootSignatur
             1 => RootVersion::V1_0,
             2 => RootVersion::V1_1,
             3 => RootVersion::V1_2,
-            _ => return None,
+            other => return Err(RootDescError::Version(other)),
         };
         let with_flags = version != RootVersion::V1_0;
         let body = Mem(p.add(8));
@@ -662,7 +673,7 @@ pub unsafe fn read_versioned_root_signature(p: *const u8) -> Option<RootSignatur
                 5 => Visibility::Pixel,
                 6 => Visibility::Amplification,
                 7 => Visibility::Mesh,
-                _ => return None,
+                value => return Err(RootDescError::Visibility { index: i, value }),
             };
             let view = |q: Mem| (q.u32(8), q.u32(12), if with_flags { q.u32(16) } else { 0 });
             let kind = match q.u32(0) {
@@ -717,7 +728,7 @@ pub unsafe fn read_versioned_root_signature(p: *const u8) -> Option<RootSignatur
                         flags,
                     }
                 }
-                _ => return None,
+                value => return Err(RootDescError::ParameterType { index: i, value }),
             };
             parameters.push(RootParameter { kind, visibility });
         }
@@ -742,7 +753,7 @@ pub unsafe fn read_versioned_root_signature(p: *const u8) -> Option<RootSignatur
                 flags: if stride == 56 { s.u32(52) } else { 0 },
             });
         }
-        Some(RootSignature {
+        Ok(RootSignature {
             version,
             parameters,
             static_samplers,

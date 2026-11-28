@@ -183,18 +183,21 @@ pub unsafe fn serialize_versioned_root_signature(
     // SAFETY: as the caller promises.
     unsafe {
         match rawdesc::read_versioned_root_signature(desc) {
-            Some(root) => {
+            Ok(root) => {
                 *blob = objects::new_blob(root.serialize());
                 if !error.is_null() {
                     *error = std::ptr::null_mut();
                 }
                 com::S_OK
             }
-            None => {
+            Err(e) => {
+                com::note(format!(
+                    "a root signature was refused when serializing: {e}"
+                ));
                 if !error.is_null() {
-                    *error = objects::new_blob(
-                        b"unknown root signature version or parameter\0".to_vec(),
-                    );
+                    let mut text = e.to_string().into_bytes();
+                    text.push(0);
+                    *error = objects::new_blob(text);
                 }
                 com::E_INVALIDARG
             }
