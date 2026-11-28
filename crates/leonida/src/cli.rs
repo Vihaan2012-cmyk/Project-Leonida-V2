@@ -345,6 +345,13 @@ pub enum ExeCommand {
         #[arg(long, default_value_t = 4)]
         threads: usize,
     },
+    /// Look at every executable image in the game folder (the executable and all DLLs) for signs of malware, without
+    /// running or loading anything: entropy, risky imports, strings, overlay and Authenticode hash checks.
+    Triage {
+        /// Folder with the Windows copies of the runtime libraries to compare with. Defaults to System32.
+        #[arg(long)]
+        system: Option<PathBuf>,
+    },
     /// Readable text in the executable's data sections.
     Strings {
         /// Only strings containing this text.

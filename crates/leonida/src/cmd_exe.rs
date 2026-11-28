@@ -60,6 +60,9 @@ fn image_by_prefix(game: &Path, prefix: &str) -> Result<PathBuf> {
 
 pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
     let game = resolve_game(args.game.as_ref(), &Manifest::builtin())?;
+    if let ExeCommand::Triage { system } = &args.command {
+        return crate::cmd_triage::triage_command(&game, system.as_deref());
+    }
     let path = match &args.image {
         Some(prefix) => image_by_prefix(&game, prefix)?,
         None => executable(&game)?,
@@ -95,6 +98,7 @@ pub fn exe_command(args: &ExeArgs) -> Result<ExitCode> {
                 ..source_export::Options::default()
             },
         )?,
+        ExeCommand::Triage { .. } => unreachable!("handled before the image is opened"),
         ExeCommand::Imports { dll } => imports(&image, dll.as_deref()),
         ExeCommand::Network => network(&image),
         ExeCommand::Functions { top } => functions(&image, *top),
