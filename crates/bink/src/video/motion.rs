@@ -110,24 +110,20 @@ fn clip(v: i32) -> i32 {
     v.clamp(0, 255)
 }
 
-/// Half-sample position of the six-tap luma filter between `s[1]` and `s[2]` of `s[0..6]`.
+/// Half-sample position of the six-tap luma filter between `s[1]` and `s[2]` of `s[0..6]`, not clipped.
 #[inline]
 fn luma_tap(s: [i32; 6]) -> i32 {
-    clip(((((s[2] + s[3]) * 19) >> 1) - (s[1] + s[4]) * 2 + ((s[0] + s[5]) >> 1) + 8) >> 4)
+    ((((s[2] + s[3]) * 19) >> 1) - (s[1] + s[4]) * 2 + ((s[0] + s[5]) >> 1) + 8) >> 4
 }
 
-/// Quarter-sample position of the two-tap chroma filter.
+/// Chroma interpolation of `a` and `b` at quarter position `frac`, kept at sixteen times the sample scale.
 #[inline]
 fn chroma_tap(a: i32, b: i32, frac: i32) -> i32 {
-    match frac {
-        1 => (6 * a + 2 * b + 4) >> 3,
-        2 => (a + b + 1) >> 1,
-        3 => (2 * a + 6 * b + 4) >> 3,
-        _ => a,
-    }
+    4 * ((4 - frac) * a + frac * b)
 }
 
-/// Predicts the 16x16 luma block at (`bx`, `by`) of `dst` from `src` displaced by the half-pel vector `mv`.
+/// Predicts the 16x16 luma block at (`bx`, `by`) of `dst` from `src` displaced by the half-pel vector `mv`. A
+/// two-dimensional position filters the rows first and keeps those results unclipped for the column pass.
 pub fn luma_block(dst: &mut Plane, src: &Plane, bx: usize, by: usize, mv: [i32; 2]) {
     let s = Source::new(src);
     let (x0, y0) = (bx as i32 + (mv[0] >> 1), by as i32 + (mv[1] >> 1));
@@ -152,12 +148,13 @@ pub fn luma_block(dst: &mut Plane, src: &Plane, bx: usize, by: usize, mv: [i32; 
             } else {
                 tmp[j + 2][i]
             };
-            *o = v as u8;
+            *o = clip(v) as u8;
         }
     }
 }
 
-/// Predicts the 8x8 chroma block at (`bx`, `by`) of `dst` from `src` displaced by the quarter-pel vector `mv`.
+/// Predicts the 8x8 chroma block at (`bx`, `by`) of `dst` from `src` displaced by the quarter-pel vector `mv`. The
+/// rows are interpolated at sixteen times the sample scale and rounded once after the columns.
 pub fn chroma_block(dst: &mut Plane, src: &Plane, bx: usize, by: usize, mv: [i32; 2]) {
     let s = Source::new(src);
     let (x0, y0) = (bx as i32 + (mv[0] >> 2), by as i32 + (mv[1] >> 2));
@@ -172,9 +169,16 @@ pub fn chroma_block(dst: &mut Plane, src: &Plane, bx: usize, by: usize, mv: [i32
     for j in 0..8 {
         let out = &mut dst.data[(by + j) * dst.stride + bx..][..8];
         for (i, o) in out.iter_mut().enumerate() {
-            *o = chroma_tap(tmp[j][i], tmp[j + 1][i], fy) as u8;
+            let v = (chroma_vertical(tmp[j][i], tmp[j + 1][i], fy) + 8) >> 4;
+            *o = clip(v) as u8;
         }
     }
+}
+
+/// Column step of the chroma filter on rows already at sixteen times the sample scale.
+#[inline]
+fn chroma_vertical(a: i32, b: i32, frac: i32) -> i32 {
+    ((4 - frac) * a + frac * b) / 4
 }
 
 /// Copies the `size` x `size` block at (`bx`, `by`) unchanged.
@@ -254,5 +258,48 @@ mod tests {
             let (a, b) = (4 * 8, 5 * 8);
             assert_eq!(i32::from(dst.data[4]), (wa * a + wb * b + 4) >> 3);
         }
+    }
+
+    #[test]
+    fn chroma_rounds_once_after_both_directions() {
+        // Values chosen so that rounding the rows first would give 21 where the single rounding gives 20.
+        let rows = [[10u8, 27], [11, 30]];
+        let src = plane(16, 16, |x, y| if x < 2 && y < 2 { rows[y][x] } else { 0 });
+        let mut dst = plane(16, 16, |_, _| 0);
+        chroma_block(&mut dst, &src, 0, 0, [1, 1]);
+        let h = |r: usize| 4 * (3 * i32::from(rows[r][0]) + i32::from(rows[r][1]));
+        let exact = ((3 * h(0) + h(1)) / 4 + 8) >> 4;
+        assert_eq!(i32::from(dst.data[0]), exact);
+    }
+
+    #[test]
+    fn luma_columns_see_unclipped_row_results() {
+        let hash = |x: usize, y: usize| ((x * 7919 + y * 104_729 + x * y * 31) % 5 / 4 * 255) as u8;
+        let src = plane(48, 48, hash);
+        let mut dst = plane(48, 48, |_, _| 0);
+        luma_block(&mut dst, &src, 16, 16, [1, 1]);
+        let tap = |s: [i32; 6]| {
+            ((((s[2] + s[3]) * 19) >> 1) - (s[1] + s[4]) * 2 + ((s[0] + s[5]) >> 1) + 8) >> 4
+        };
+        let mut overshoot = false;
+        for j in 0..16 {
+            for i in 0..16 {
+                let rows: [i32; 6] = std::array::from_fn(|k| {
+                    let y = 16 + j + k - 2;
+                    tap(std::array::from_fn(|t| {
+                        i32::from(src.data[y * 48 + 16 + i + t - 2])
+                    }))
+                });
+                overshoot |= rows.iter().any(|&r| !(0..=255).contains(&r));
+                assert_eq!(
+                    i32::from(dst.data[(16 + j) * 48 + 16 + i]),
+                    tap(rows).clamp(0, 255)
+                );
+            }
+        }
+        assert!(
+            overshoot,
+            "the pattern never made a row result leave the sample range"
+        );
     }
 }
