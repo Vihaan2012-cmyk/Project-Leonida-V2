@@ -26,6 +26,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use crate::Shim;
 
 mod apu;
+mod convolve;
 mod engine;
 pub mod hal;
 mod mixer;
@@ -36,6 +37,7 @@ mod xma;
 pub mod xma_hw;
 
 pub use apu::{ApuError, ApuSpace};
+pub use convolve::{Convolver, Fft};
 pub use engine::{DEFAULT_RATE, Engine, OutputMode, ReopenGate};
 pub use mixer::{Buffer, BufferId, Completion, Looping, Mixer, VoiceId, VoiceParams};
 pub use output::{Output, OutputError, SharedMixer};
