@@ -122,6 +122,16 @@ impl Descriptors {
         (words, registration)
     }
 
+    /// `CreateSamplerX`: the console's own sampler description.
+    pub fn create_sampler_console(
+        &mut self,
+        desc: &sampler::ConsoleSampler,
+    ) -> (SamplerWords, Registration) {
+        let words = gfx10::encode_sampler(&sampler::from_console(desc, &mut self.borders));
+        let registration = self.registry.register_sampler(&words);
+        (words, registration)
+    }
+
     /// Registers the image descriptors the game wrote into heap memory itself (`stride` dwords a slot).
     pub fn scan_textures(&mut self, heap: &[u32], stride: usize) -> Vec<(usize, Registration)> {
         self.registry.scan_textures(heap, stride)
