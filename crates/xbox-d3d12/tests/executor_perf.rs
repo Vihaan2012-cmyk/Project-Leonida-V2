@@ -55,7 +55,7 @@ static COUNTING: Counting = Counting;
 
 type Ptr = *mut c_void;
 
-const SIZE: u32 = 128;
+const SIZE: u32 = 16;
 const FORMAT: u32 = 28;
 const TARGETS: usize = 6;
 
@@ -312,6 +312,9 @@ struct World {
     geometry: u64,
     constants: u64,
     output: u64,
+    open: std::cell::Cell<bool>,
+    /// More lists and their allocators, for frames of several lists; whether each was recorded.
+    extras: std::cell::RefCell<Vec<(Ptr, Ptr, std::cell::Cell<bool>)>>,
     _guard: MutexGuard<'static, ()>,
 }
 
@@ -491,34 +494,8 @@ fn compute_pso(device: Ptr, root: Ptr, variant: u32) -> Ptr {
     pipeline
 }
 
-fn world() -> Option<World> {
-    let guard = ONE_GPU_TEST_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    static ASSEMBLY: OnceLock<Option<Arc<Assembly>>> = OnceLock::new();
-    let asm = ASSEMBLY
-        .get_or_init(|| {
-            let source = Arc::new(Source {
-                fixed: triangle_stages(),
-                direct: DirectTranslation::new(FloatMode::default()),
-            });
-            match Assembly::build_with_source(&AssemblyConfig::offscreen(64, 64), source, |env| env)
-            {
-                Ok(asm) => Some(asm),
-                Err(e) => {
-                    eprintln!("skipped: {e}");
-                    None
-                }
-            }
-        })
-        .clone()?;
-    let params = [0u32; 24];
-    let mut device = std::ptr::null_mut();
-    // SAFETY: valid pointers for each argument.
-    let result = unsafe {
-        create_assembled_device_on(&asm, params.as_ptr(), [7u8; 16].as_ptr(), &mut device)
-    };
-    assert_eq!(result, 0);
+/// A command list and its allocator, and whether it was recorded.
+fn make_list(device: Ptr) -> (Ptr, Ptr, std::cell::Cell<bool>) {
     let (mut allocator, mut list) = (std::ptr::null_mut(), std::ptr::null_mut());
     // SAFETY: device slots 9 and 73.
     unsafe {
@@ -554,6 +531,41 @@ fn world() -> Option<World> {
             0
         );
     }
+    (list, allocator, std::cell::Cell::new(false))
+}
+
+fn world() -> Option<World> {
+    let guard = ONE_GPU_TEST_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    static ASSEMBLY: OnceLock<Option<Arc<Assembly>>> = OnceLock::new();
+    let asm = ASSEMBLY
+        .get_or_init(|| {
+            let source = Arc::new(Source {
+                fixed: triangle_stages(),
+                direct: DirectTranslation::new(FloatMode::default()),
+            });
+            match Assembly::build_with_source(&AssemblyConfig::offscreen(64, 64), source, |env| env)
+            {
+                Ok(asm) => Some(asm),
+                Err(e) => {
+                    eprintln!("skipped: {e}");
+                    None
+                }
+            }
+        })
+        .clone()?;
+    let params = [0u32; 24];
+    let mut device = std::ptr::null_mut();
+    // SAFETY: valid pointers for each argument.
+    let result = unsafe {
+        create_assembled_device_on(&asm, params.as_ptr(), [7u8; 16].as_ptr(), &mut device)
+    };
+    assert_eq!(result, 0);
+    let (list, allocator) = {
+        let (list, allocator, _) = make_list(device);
+        (list, allocator)
+    };
     let targets: Vec<Ptr> = (0..TARGETS)
         .map(|_| create_resource(device, 1, &texture_desc(SIZE, SIZE, FORMAT, 1), 0))
         .collect();
@@ -661,6 +673,8 @@ fn world() -> Option<World> {
         geometry,
         constants,
         output,
+        open: std::cell::Cell::new(true),
+        extras: std::cell::RefCell::default(),
         _guard: guard,
     })
 }
@@ -677,8 +691,13 @@ impl World {
     /// pipeline about every 20, mesh buffers changing as meshes do and the redundant sets a D3D12 title issues; a
     /// few dispatches that write a buffer. The title also rewrites a part of its constant upload buffer.
     fn record(&self, shape: Shape) {
-        let list = self.list;
-        let mut rng = Lcg(7);
+        self.record_into(self.list, shape, 0);
+        self.open.set(false);
+    }
+
+    /// `record` into `list`, as the passes `base` onward of a frame.
+    fn record_into(&self, list: Ptr, shape: Shape, base: usize) {
+        let mut rng = Lcg(7 + base as u64);
         // SAFETY: the constant buffer is committed host memory of 256 KiB at its address.
         unsafe {
             let words =
@@ -715,7 +734,7 @@ impl World {
                 slot(list, 39);
             let compute_uav: unsafe extern "win64" fn(Ptr, u32, u64) = slot(list, 45);
             heaps(list, 1, &self.srv_heap);
-            for pass in 0..shape.passes {
+            for pass in base..base + shape.passes {
                 let target = pass % TARGETS;
                 let mut transitions = vec![transition(
                     self.targets[target],
@@ -806,11 +825,47 @@ impl World {
         }
     }
 
+    /// A frame of `lists` lists of `shape` each, the first on the world's own list. Returns their streams.
+    fn record_lists(
+        &self,
+        lists: usize,
+        shape: Shape,
+    ) -> Vec<Arc<xbox_d3d12::stream::CommandStream>> {
+        let mut extras = self.extras.borrow_mut();
+        while extras.len() + 1 < lists {
+            extras.push(make_list(self.device));
+        }
+        self.reopen();
+        self.record(shape);
+        let mut streams = vec![self.stream()];
+        for (k, extra) in extras.iter().take(lists - 1).enumerate() {
+            // SAFETY: list slot 10 on a closed list of this device, then its stream.
+            unsafe {
+                if extra.2.get() {
+                    let reset: unsafe extern "win64" fn(Ptr, Ptr, Ptr) -> u32 = slot(extra.0, 10);
+                    assert_eq!(reset(extra.0, extra.1, std::ptr::null_mut()), 0);
+                }
+            }
+            self.record_into(extra.0, shape, (k + 1) * shape.passes);
+            extra.2.set(true);
+            // SAFETY: the list is one of this layer's, closed.
+            streams.push(unsafe { xbox_d3d12::list::closed_stream(extra.0) }.expect("closed"));
+        }
+        streams
+    }
+
+    fn reopen(&self) {
+        if !self.open.get() {
+            self.reset();
+        }
+    }
+
     fn reset(&self) {
         // SAFETY: list slot 10.
         unsafe {
             let reset: unsafe extern "win64" fn(Ptr, Ptr, Ptr) -> u32 = slot(self.list, 10);
             assert_eq!(reset(self.list, self.allocator, std::ptr::null_mut()), 0);
+            self.open.set(true);
         }
     }
 
@@ -838,24 +893,21 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
 
-fn run_frames(w: &World, shape: Shape, rounds: usize) {
-    let draws = (shape.passes * shape.draws_per_pass) as f64;
+fn run_frames(w: &World, lists: usize, shape: Shape, rounds: usize) {
+    let draws = (lists * shape.passes * shape.draws_per_pass) as f64;
     let (mut record, mut convert_freed) = (Vec::new(), Vec::new());
-    let mut phases: Vec<[Duration; 9]> = Vec::new();
+    let mut phases: Vec<[Duration; 11]> = Vec::new();
     let mut counts = [0u64; 2];
     w.timings();
     for round in 0..rounds {
-        if round > 0 {
-            w.reset();
-        }
         let a0 = ALLOCS.load(Ordering::Relaxed);
         let t = Instant::now();
-        w.record(shape);
+        let streams = w.record_lists(lists, shape);
         let recorded = t.elapsed();
-        let stream = w.stream();
         let a1 = ALLOCS.load(Ordering::Relaxed);
         let t = Instant::now();
-        w.asm.execute(&[stream]).expect("the frame runs");
+        w.asm.execute(&streams).expect("the frame runs");
+        drop(streams);
         let executed = t.elapsed();
         let a2 = ALLOCS.load(Ordering::Relaxed);
         let t = w.timings();
@@ -869,7 +921,9 @@ fn run_frames(w: &World, shape: Shape, rounds: usize) {
                 t.bindless,
                 t.memory,
                 t.record,
-                t.submit_wait,
+                t.end,
+                t.submit,
+                t.gpu,
                 t.finish,
                 t.total,
                 executed.saturating_sub(t.total),
@@ -877,9 +931,8 @@ fn run_frames(w: &World, shape: Shape, rounds: usize) {
         }
     }
     println!(
-        "frame of {} draws in {} passes",
-        shape.passes * shape.draws_per_pass,
-        shape.passes
+        "frame of {} draws in {} lists of {} passes",
+        draws as usize, lists, shape.passes
     );
     println!(
         "  list recording through the vtable: median {:.3} ms, {} allocations",
@@ -898,7 +951,9 @@ fn run_frames(w: &World, shape: Shape, rounds: usize) {
         "bindless update",
         "memory (write ranges, dirty hot marking)",
         "record (replay into the command buffer, uploads, downloads)",
-        "submit and wait (end, queue submit, GPU, fence)",
+        "end command buffer",
+        "queue submit call",
+        "wait for the GPU",
         "finish (release detiled, reclaim, budget)",
         "total as the phases add up",
         "outside the phases (stream drop, locks)",
@@ -925,19 +980,27 @@ fn a_game_frame_through_the_real_executor() {
         "address space backing: {:?}",
         w.asm.resources().space().backing()
     );
-    run_frames(
-        &w,
-        Shape {
-            passes: 20,
-            draws_per_pass: 500,
-        },
-        70,
-    );
+    for (lists, passes, draws_per_pass) in [(1, 20, 50), (1, 20, 500), (4, 5, 500), (8, 2, 625)] {
+        for first_chunk in [usize::MAX, 1024, usize::MAX, 1024] {
+            w.asm.exec.lock().unwrap().first_chunk = first_chunk;
+            println!("first chunk {first_chunk}");
+            run_frames(
+                &w,
+                lists,
+                Shape {
+                    passes,
+                    draws_per_pass,
+                },
+                70,
+            );
+        }
+    }
 }
 
 #[test]
 fn the_frame_shape_executes_without_notes_of_failure() {
     let Some(w) = world() else { return };
+    w.timings();
     w.record(Shape {
         passes: 7,
         draws_per_pass: 40,
@@ -952,4 +1015,87 @@ fn the_frame_shape_executes_without_notes_of_failure() {
         .collect();
     assert!(bad.is_empty(), "{bad:?}");
     let _ = (w.rtv_heap, w.device);
+}
+
+fn output_words(w: &World) -> Vec<u32> {
+    // SAFETY: the output buffer is committed host memory of 64 KiB at its address and the GPU is done with it.
+    unsafe { std::slice::from_raw_parts(w.output as usize as *const u32, 128).to_vec() }
+}
+
+fn clear_output(w: &World) {
+    // SAFETY: as `output_words`.
+    unsafe { std::ptr::write_bytes(w.output as usize as *mut u8, 0, 512) };
+}
+
+fn run_with_first_chunk(w: &World, shape: Shape, first_chunk: usize) -> (Vec<u32>, usize) {
+    w.asm.exec.lock().unwrap().first_chunk = first_chunk;
+    w.reopen();
+    clear_output(w);
+    w.record(shape);
+    let stream = w.stream();
+    let commands = stream.commands.len();
+    w.asm.execute(&[stream]).expect("the frame runs");
+    (output_words(w), commands)
+}
+
+#[test]
+fn a_submission_cut_into_command_buffers_writes_what_a_single_buffer_does() {
+    let Some(w) = world() else { return };
+    let shape = Shape {
+        passes: 10,
+        draws_per_pass: 30,
+    };
+    let (whole, commands) = run_with_first_chunk(&w, shape, usize::MAX);
+    assert!(commands > 300);
+    assert!(
+        whole.iter().any(|v| *v != 0),
+        "the dispatches wrote nothing"
+    );
+    for first_chunk in [16, 100, 1000] {
+        let (cut, _) = run_with_first_chunk(&w, shape, first_chunk);
+        assert_eq!(cut, whole, "first chunk {first_chunk}");
+    }
+    w.asm.exec.lock().unwrap().first_chunk = 1024;
+    let bad: Vec<String> = xbox_d3d12::com::notes()
+        .into_iter()
+        .filter(|n| n.contains("could not be replayed") || n.contains("failed"))
+        .collect();
+    assert!(bad.is_empty(), "{bad:?}");
+}
+
+#[test]
+fn a_table_bound_again_in_a_later_submission_registers_descriptors_released_since() {
+    let Some(w) = world() else { return };
+    let shape = Shape {
+        passes: 2,
+        draws_per_pass: 40,
+    };
+    let words_at = |slot: u64| -> [u32; 8] {
+        // SAFETY: slots of the shader-visible heap this world made, 32 bytes each.
+        unsafe {
+            std::slice::from_raw_parts((w.srv_start + 32 * slot) as usize as *const u32, 8)
+                .try_into()
+                .unwrap()
+        }
+    };
+    let slots: Vec<[u32; 8]> = (0..TARGETS as u64).map(words_at).collect();
+    let registered = w.asm.descriptors().registry.texture_count();
+    for _ in 0..2 {
+        w.reopen();
+        w.record(shape);
+        let stream = w.stream();
+        {
+            let mut descriptors = w.asm.descriptors();
+            for words in &slots {
+                descriptors.registry.release_texture(words);
+            }
+            assert_eq!(descriptors.registry.texture_count(), registered - TARGETS);
+        }
+        w.asm.execute(&[stream]).expect("the frame runs");
+        assert_eq!(
+            w.asm.descriptors().registry.texture_count(),
+            registered,
+            "the descriptors the tables reach are registered again"
+        );
+    }
 }

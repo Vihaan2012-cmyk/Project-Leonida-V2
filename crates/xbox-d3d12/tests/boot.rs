@@ -938,7 +938,11 @@ fn the_pool_reset_slot_and_the_allocator_callback_slot_succeed() {
         assert_eq!(set_callback(allocator, 0x1000, std::ptr::null_mut()), 0);
         let close: unsafe extern "win64" fn(Ptr) -> u32 = slot(list, 9);
         let reset_x: unsafe extern "win64" fn(Ptr, Ptr, Ptr, u64) -> u32 = slot(list, 139);
-        assert_eq!(reset_x(list, allocator, std::ptr::null_mut(), 0), E_FAIL, "still open");
+        assert_eq!(
+            reset_x(list, allocator, std::ptr::null_mut(), 0),
+            E_FAIL,
+            "still open"
+        );
         assert_eq!(close(list), 0);
         assert_eq!(reset_x(list, allocator, std::ptr::null_mut(), 0), 0);
         assert_eq!(close(list), 0);

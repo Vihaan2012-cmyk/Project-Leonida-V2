@@ -1,0 +1,21 @@
+[package]
+name = "shader-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+game-package.workspace = true
+gpu.workspace = true
+rdna.workspace = true
+rspirv.workspace = true
+shader-census.workspace = true
+shader-container.workspace = true
+shader-ir.workspace = true
+shader-store.workspace = true
+shader-translate.workspace = true
+
+[lints]
+workspace = true

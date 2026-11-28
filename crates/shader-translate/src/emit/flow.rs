@@ -34,8 +34,9 @@ fn targets(terminator: &Terminator) -> Vec<usize> {
 }
 
 /// The loops: each spans from a block some later block branches back to, through the last such block. Loops
-/// that only partly overlap are joined into one, which runs again from whichever block was branched back to.
-fn loops(function: &Function) -> Vec<Loop> {
+/// that only partly overlap are joined into one, which runs again from whichever block was branched back to;
+/// the flag says whether any were.
+fn loops(function: &Function) -> (Vec<Loop>, bool) {
     let mut back = Vec::new();
     let mut ends: BTreeMap<usize, usize> = BTreeMap::new();
     for (id, block) in function.blocks.iter().enumerate() {
@@ -48,9 +49,11 @@ fn loops(function: &Function) -> Vec<Loop> {
         }
     }
     let mut spans: Vec<(usize, usize)> = ends.into_iter().collect();
+    let mut joined = false;
     while let Some((outer, inner)) = partial_overlap(&spans) {
         spans[outer].1 = spans[inner].1;
         spans.remove(inner);
+        joined = true;
     }
     let mut loops: Vec<Loop> = spans
         .into_iter()
@@ -70,7 +73,7 @@ fn loops(function: &Function) -> Vec<Loop> {
             innermost.targets.push(target);
         }
     }
-    loops
+    (loops, joined)
 }
 
 /// Two spans (by index) where the second starts inside the first and ends after it.
@@ -85,8 +88,16 @@ fn partial_overlap(spans: &[(usize, usize)]) -> Option<(usize, usize)> {
     None
 }
 
-pub(super) fn flow(b: &mut Builder, function: &Function, ptr_bool: Word) -> Flow {
-    let loops = loops(function);
+/// Programs with overlapping loops this small build faster in the driver as a loop over a switch of their blocks;
+/// from this many blocks the guarded form is the faster one (the large ray-tracing resolve programs take about a
+/// quarter of the time).
+const JOIN_FROM_BLOCKS: usize = 600;
+
+pub(super) fn flow(b: &mut Builder, function: &Function, ptr_bool: Word) -> Option<Flow> {
+    let (loops, joined) = loops(function);
+    if joined && function.blocks.len() < JOIN_FROM_BLOCKS {
+        return None;
+    }
     let mut flag = || b.variable(ptr_bool, None, StorageClass::Function, None);
     let reached = function.blocks.iter().map(|_| flag()).collect();
     let again = loops
@@ -94,11 +105,11 @@ pub(super) fn flow(b: &mut Builder, function: &Function, ptr_bool: Word) -> Flow
         .flat_map(|l| l.targets.iter().copied())
         .map(|target| (target, flag()))
         .collect();
-    Flow {
+    Some(Flow {
         reached,
         again,
         loops,
-    }
+    })
 }
 
 impl Emitter {
@@ -274,7 +285,7 @@ mod tests {
             Terminator::Branch(0, 1, 4),
             Terminator::End,
         ]);
-        assert_eq!(shape(&loops(&function)), vec![(1, 3, vec![1])]);
+        assert_eq!(shape(&loops(&function).0), vec![(1, 3, vec![1])]);
     }
 
     #[test]
@@ -287,7 +298,7 @@ mod tests {
             Terminator::Branch(0, 2, 5),
             Terminator::End,
         ]);
-        assert_eq!(shape(&loops(&function)), vec![(1, 4, vec![1, 2])]);
+        assert_eq!(shape(&loops(&function).0), vec![(1, 4, vec![1, 2])]);
     }
 
     #[test]
@@ -300,7 +311,7 @@ mod tests {
             Terminator::End,
         ]);
         assert_eq!(
-            shape(&loops(&function)),
+            shape(&loops(&function).0),
             vec![(1, 3, vec![1]), (2, 2, vec![2])]
         );
     }

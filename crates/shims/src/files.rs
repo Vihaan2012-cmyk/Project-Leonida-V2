@@ -120,6 +120,8 @@ pub fn resolve(path: &str) -> Result<Target, Refusal> {
 #[cfg(windows)]
 mod imp;
 #[cfg(windows)]
+pub mod readtrace;
+#[cfg(windows)]
 pub use imp::read_location;
 
 /// Opens a file the game named for reading, through the same mapping and sandbox as its own file calls.

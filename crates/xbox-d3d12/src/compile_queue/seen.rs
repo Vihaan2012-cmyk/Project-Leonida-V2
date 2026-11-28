@@ -465,6 +465,33 @@ fn frames(bytes: &[u8]) -> (Vec<(u8, &[u8])>, usize) {
 /// The session that last created a pipeline, its place in that session, and its encoded description.
 type Latest = (u64, usize, Arc<[u8]>);
 
+/// Every pipeline a log file holds, in file order, without opening the file for writing.
+pub fn read_entries(path: &Path) -> Vec<SeenEntry> {
+    let bytes = std::fs::read(path).unwrap_or_default();
+    if bytes.len() < HEADER
+        || bytes[..4] != MAGIC
+        || u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")) != VERSION
+    {
+        return Vec::new();
+    }
+    let mut session = 0u64;
+    let mut entries = Vec::new();
+    for (tag, payload) in frames(&bytes).0 {
+        match tag {
+            SESSION if payload.len() == 8 => {
+                session = u64::from_le_bytes(payload.try_into().expect("8 bytes"));
+            }
+            PIPELINE if payload.len() > 32 => entries.push(SeenEntry {
+                key: payload[..32].try_into().expect("32 bytes"),
+                session,
+                body: payload[32..].into(),
+            }),
+            _ => {}
+        }
+    }
+    entries
+}
+
 /// One recorded pipeline: when it was last created and its description, kept encoded until it is wanted.
 #[derive(Debug, Clone)]
 pub struct SeenEntry {

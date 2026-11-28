@@ -278,17 +278,21 @@ unsafe extern "win64" fn create_file_w(
     let text = wide_ptr_to_string(name);
     match create_file_common(&text, access, disposition, flags) {
         // SAFETY: a terminated path of our own making; the other arguments are the program's.
-        Ok(path) => unsafe {
-            fs_api::CreateFileW(
-                path.as_ptr(),
-                access,
-                share,
-                security,
-                disposition,
-                flags,
-                template,
-            )
-        },
+        Ok(path) => {
+            let handle = unsafe {
+                fs_api::CreateFileW(
+                    path.as_ptr(),
+                    access,
+                    share,
+                    security,
+                    disposition,
+                    flags,
+                    template,
+                )
+            };
+            super::readtrace::opened(handle, &text);
+            handle
+        }
         Err(code) => {
             set_error(code);
             INVALID_HANDLE_VALUE
@@ -312,9 +316,12 @@ unsafe extern "win64" fn create_file2(
     };
     match create_file_common(&text, access, disposition, flags) {
         // SAFETY: as in `create_file_w`.
-        Ok(path) => unsafe {
-            fs_api::CreateFile2(path.as_ptr(), access, share, disposition, params)
-        },
+        Ok(path) => {
+            let handle =
+                unsafe { fs_api::CreateFile2(path.as_ptr(), access, share, disposition, params) };
+            super::readtrace::opened(handle, &text);
+            handle
+        }
         Err(code) => {
             set_error(code);
             INVALID_HANDLE_VALUE
@@ -832,8 +839,16 @@ const FILE_SETS: &[&str] = &[
 ];
 
 pub fn shims() -> Vec<Shim> {
-    let functions: [(&str, usize); 16] = [
+    let functions: [(&str, usize); 18] = [
         ("CreateFileW", create_file_w as *const () as usize),
+        (
+            "ReadFile",
+            super::readtrace::read_file as *const () as usize,
+        ),
+        (
+            "SetFilePointerEx",
+            super::readtrace::set_file_pointer_ex as *const () as usize,
+        ),
         ("CreateFile2", create_file2 as *const () as usize),
         (
             "GetFileAttributesW",

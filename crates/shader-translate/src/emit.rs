@@ -34,6 +34,7 @@ pub const EXPORT_BUFFER_WORDS: usize = MESSAGE_BASE as usize + 1 + 2 * MESSAGE_L
 const EXEC: u8 = 126;
 const VCC: u8 = 106;
 const M0: u8 = 124;
+const END: u32 = u32::MAX;
 const ITERATION_LIMIT: u32 = 1 << 20;
 
 #[derive(Debug, thiserror::Error)]
@@ -653,17 +654,9 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
         BTreeMap::new()
     };
     let scc = b.variable(t.ptr_function_bool, None, StorageClass::Function, None);
+    let current = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let iterations = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
-    let linear = function
-        .blocks
-        .iter()
-        .enumerate()
-        .all(|(id, block)| match block.terminator {
-            Terminator::Jump(target) => target == id + 1,
-            Terminator::Branch(..) => false,
-            Terminator::End => true,
-        });
-    let flow = (!linear).then(|| flow::flow(&mut b, function, t.ptr_function_bool));
+    let flow = flow::flow(&mut b, function, t.ptr_function_bool);
     let messages = b.variable(t.ptr_function_u32, None, StorageClass::Function, None);
     let alive = b.variable(t.ptr_function_bool, None, StorageClass::Function, None);
     let stage_lds = match (&es_options, &gs_options) {
@@ -800,16 +793,28 @@ fn build(function: &Function, entry: Entry<'_>) -> Result<Vec<u32>, EmitError> {
             e.store(var, zero)?;
         }
     }
-    match &flow {
-        None => {
-            for (index, block) in function.blocks.iter().enumerate() {
-                e.block_stmts(index, block)?;
-                if block.terminator == Terminator::End {
-                    break;
-                }
+    let linear = function
+        .blocks
+        .iter()
+        .enumerate()
+        .all(|(id, block)| match block.terminator {
+            Terminator::Jump(target) => target == id + 1,
+            Terminator::Branch(..) => false,
+            Terminator::End => true,
+        });
+    if linear {
+        for (index, block) in function.blocks.iter().enumerate() {
+            e.block_stmts(index, block)?;
+            if block.terminator == Terminator::End {
+                break;
             }
         }
-        Some(flow) => e.structured(function, flow, iterations)?,
+    } else {
+        if let Some(flow) = &flow {
+            e.structured(function, flow, iterations)?;
+        } else {
+            e.dispatch(function, current, iterations)?;
+        }
     }
     if !heap_mode {
         e.epilogue()?;
@@ -1133,6 +1138,77 @@ impl Emitter {
             let ptr = e.element(exports, index)?;
             e.store(ptr, count)
         })
+    }
+
+    fn dispatch(
+        &mut self,
+        function: &Function,
+        current: Word,
+        iterations: Word,
+    ) -> Result<(), EmitError> {
+        let zero = self.u32c(0);
+        self.store(current, zero)?;
+        self.store(iterations, zero)?;
+        let (header, body, switch_merge, cont, merge) = (
+            self.b.id(),
+            self.b.id(),
+            self.b.id(),
+            self.b.id(),
+            self.b.id(),
+        );
+        let default = self.b.id();
+        let cases: Vec<Word> = function.blocks.iter().map(|_| self.b.id()).collect();
+        ok(self.b.branch(header))?;
+        self.begin(header)?;
+        self.looping(merge, cont)?;
+        ok(self.b.branch(body))?;
+        self.begin(body)?;
+        let selector = self.load(current)?;
+        self.selection(switch_merge)?;
+        let targets: Vec<(Operand, Word)> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, label)| (Operand::LiteralBit32(i as u32), *label))
+            .collect();
+        ok(self.b.switch(selector, default, targets))?;
+        for (index, (block, label)) in function.blocks.iter().zip(&cases).enumerate() {
+            self.begin(*label)?;
+            self.block_stmts(index, block)?;
+            let next = match block.terminator {
+                Terminator::Jump(target) => self.u32c(target as u32),
+                Terminator::End => self.u32c(END),
+                Terminator::Branch(condition, taken, fallthrough) => {
+                    let condition = self.val(condition);
+                    let (taken, fallthrough) =
+                        (self.u32c(taken as u32), self.u32c(fallthrough as u32));
+                    let u32_ = self.t.u32_;
+                    ok(self.b.select(u32_, None, condition, taken, fallthrough))?
+                }
+            };
+            self.store(current, next)?;
+            ok(self.b.branch(switch_merge))?;
+        }
+        self.begin(default)?;
+        let end = self.u32c(END);
+        self.store(current, end)?;
+        ok(self.b.branch(switch_merge))?;
+        self.begin(switch_merge)?;
+        ok(self.b.branch(cont))?;
+        self.begin(cont)?;
+        let u32_ = self.t.u32_;
+        let bool_ = self.t.bool_;
+        let count = self.load(iterations)?;
+        let one = self.u32c(1);
+        let count = ok(self.b.i_add(u32_, None, count, one))?;
+        self.store(iterations, count)?;
+        let limit = self.u32c(ITERATION_LIMIT);
+        let exhausted = ok(self.b.u_greater_than_equal(bool_, None, count, limit))?;
+        let next = self.load(current)?;
+        let finished = ok(self.b.i_equal(bool_, None, next, end))?;
+        let leave = ok(self.b.logical_or(bool_, None, finished, exhausted))?;
+        ok(self.b.branch_conditional(leave, merge, header, []))?;
+        self.begin(merge)?;
+        Ok(())
     }
 
     fn sgpr_var(&self, reg: u8) -> Word {

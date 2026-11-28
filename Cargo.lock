@@ -2329,6 +2329,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "shader-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "game-package",
+ "gpu",
+ "rdna",
+ "rspirv",
+ "shader-census",
+ "shader-container",
+ "shader-ir",
+ "shader-store",
+ "shader-translate",
+]
+
+[[package]]
 name = "shader-census"
 version = "0.1.0"
 dependencies = [

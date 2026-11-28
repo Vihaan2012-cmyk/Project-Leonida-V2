@@ -308,8 +308,11 @@ fn run_pass(
     let selection = Selection {
         game: args.game.as_ref(),
         limit: args.limit,
-        stage: (pass == Pass::Compute).then_some("cs"),
-        ..Selection::default()
+        stage: match pass {
+            Pass::Compute => Some("cs"),
+            Pass::Graphics => args.stage.as_deref(),
+        },
+        name: args.name.as_deref(),
     };
     let worked = for_each_container(&selection, args.jobs, Partners::new, |partners, shader| {
         run.container(partners, shader)
@@ -362,7 +365,7 @@ pub fn pipelines_command(args: &PipelinesArgs) -> Result<ExitCode> {
         .with_overrides(args.overrides.clone());
     let started = Instant::now();
     let mut clean = true;
-    {
+    if args.stage.as_deref().is_none_or(|stage| stage == "cs") {
         let compute = ComputeEnv::open(&cache_path)?;
         println!(
             "pipeline cache: {}",
@@ -381,6 +384,14 @@ pub fn pipelines_command(args: &PipelinesArgs) -> Result<ExitCode> {
             compute.cache_id(),
             &cache_path,
         )?;
+    }
+    if args.stage.as_deref() == Some("cs") {
+        println!("took {:.1} s", started.elapsed().as_secs_f64());
+        return Ok(if clean {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
     }
     let gpu = Gpu::new().context("opening the GPU")?;
     report_cache(
