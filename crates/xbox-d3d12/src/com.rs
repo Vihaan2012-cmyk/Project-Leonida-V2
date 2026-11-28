@@ -470,10 +470,25 @@ pub unsafe extern "win64" fn release(this: *mut c_void) -> u32 {
     // SAFETY: as the caller promises.
     let left = unsafe { (*head).refs.fetch_sub(1, Ordering::AcqRel) }.saturating_sub(1);
     if left == 0 {
+        // SAFETY: as the caller promises.
+        let kind = unsafe { (*head).kind };
+        if kind == Kind::Resource as u32 && keep_resources() {
+            note_once(format!(
+                "a resource reached zero references and is kept ({this:p})"
+            ));
+            return left;
+        }
         // SAFETY: the last reference is gone, so nothing else uses the object.
         unsafe { ((*head).destroy)(head) };
     }
     left
+}
+
+/// `LEONIDA_KEEP_RESOURCES`: resources that reach zero references stay alive, to tell a lifetime problem from
+/// another one.
+fn keep_resources() -> bool {
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| std::env::var_os("LEONIDA_KEEP_RESOURCES").is_some())
 }
 
 /// A counted reference to a COM object, ours or another layer's: it calls `AddRef` and `Release` through
