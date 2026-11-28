@@ -1,8 +1,8 @@
 //! Video: `Bink2Scarlett.dll`, and the Media Foundation calls the game makes.
 //!
-//! The 23 functions the executable imports play movies for real when a decoder is installed
-//! ([`set_decoder_factory`]) and show black frames that end at once when none is (every frame due at once,
-//! `BinkNextFrame` walking the counter to the last frame, which is how a play loop ends).
+//! The 23 functions the executable imports play movies with the `bink` crate's decoder, or the one installed with
+//! [`set_decoder_factory`] (a movie whose stream cannot be read shows black frames that end at once: every frame
+//! due at once, `BinkNextFrame` walking the counter to the last frame, which is how a play loop ends).
 //!
 //! - Opening reads the stream header through the executable's own file callbacks (`BinkSetOSFileCallbacks`),
 //!   from a stream in memory, or from a host file. The decode thread ([`worker`]) reads the rest and decodes a
@@ -61,6 +61,7 @@
 //!   audio of the frame just decoded).
 //! - The decode thread calls the game's read callback from a thread the game did not start.
 
+mod bink_decoder;
 mod decoder;
 mod header;
 pub mod layout;

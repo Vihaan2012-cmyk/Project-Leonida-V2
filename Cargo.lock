@@ -2394,6 +2394,7 @@ version = "0.1.0"
 dependencies = [
  "assets",
  "audio-codec",
+ "bink",
  "bvh-build",
  "config",
  "cpal",
