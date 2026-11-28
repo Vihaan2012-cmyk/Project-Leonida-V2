@@ -35,6 +35,12 @@ struct Boxed {
     mods: PathBuf,
 }
 
+impl Drop for Boxed {
+    fn drop(&mut self) {
+        crate::files::unconfigure();
+    }
+}
+
 fn boxed() -> Boxed {
     let s = setup();
     let plain = |path: &Path| PathBuf::from(path.to_string_lossy().trim_start_matches("\\\\?\\"));

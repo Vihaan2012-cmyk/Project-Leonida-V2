@@ -30,6 +30,7 @@ unsafe fn method<F: Copy>(object: *mut c_void, slot: usize) -> F {
 
 struct Setup {
     _guard: std::sync::MutexGuard<'static, ()>,
+    _files: std::sync::MutexGuard<'static, ()>,
     factory: *mut c_void,
     queue: *mut c_void,
     status: *mut c_void,
@@ -44,6 +45,10 @@ fn desc() -> [u8; 32] {
 
 fn setup() -> Setup {
     let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let files = crate::files::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    crate::files::unconfigure();
     let mut factory = std::ptr::null_mut();
     // SAFETY: the shim under test, with a valid out pointer.
     unsafe {
@@ -68,6 +73,7 @@ fn setup() -> Setup {
         );
         Setup {
             _guard: guard,
+            _files: files,
             factory,
             queue,
             status,
