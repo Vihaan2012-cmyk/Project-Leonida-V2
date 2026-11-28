@@ -76,6 +76,7 @@ const HOST_DLLS: &[&str] = &[
     "ucrtbase.dll",
     "mfplat.dll",
     "mfreadwrite.dll",
+    "rpcrt4.dll",
 ];
 
 const HOST_PREFIXES: &[&str] = &[
